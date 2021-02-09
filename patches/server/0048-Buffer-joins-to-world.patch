@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nopjmp <kthompson@hey.com>
+Date: Mon, 8 Feb 2021 22:13:01 -0600
+Subject: [PATCH 48/59] Buffer joins to world
+
+- Backport Dionysus server/0021-Buffer-joins-to-world.patch
+- Source: https://github.com/nopjmp/Dionysus at b5c71b62f6f1f555b22bd52f5751e33be4690b6e
+- Buffer player joins per tick via settings.max-joins-per-tick to mitigate join floods
+
+diff --git a/main/java/com/destroystokyo/paper/PaperConfig.java b/main/java/com/destroystokyo/paper/PaperConfig.java
+index d8b0a86..7ea7dd0 100644
+--- a/main/java/com/destroystokyo/paper/PaperConfig.java
++++ b/main/java/com/destroystokyo/paper/PaperConfig.java
+@@ -270,6 +270,12 @@ public class PaperConfig {
+         }
+     }
+ 
++
++    public static int maxJoinsPerTick;
++    private static void maxJoinsPerTick() {
++        maxJoinsPerTick = getInt("settings.max-joins-per-tick", 3);
++    }
++
+     public static boolean removeInvalidStatistics = false;
+     private static void removeInvalidStatistics() {
+         if (version < 12) {
+diff --git a/main/java/net/minecraft/server/LoginListener.java b/main/java/net/minecraft/server/LoginListener.java
+index be43d92..a3820ce 100644
+--- a/main/java/net/minecraft/server/LoginListener.java
++++ b/main/java/net/minecraft/server/LoginListener.java
+@@ -39,7 +39,7 @@ public class LoginListener implements PacketLoginInListener, ITickable {
+     private final byte[] e = new byte[4];
+     private final MinecraftServer server;
+     public final NetworkManager networkManager;
+-    private LoginListener.EnumProtocolState g;
++    private LoginListener.EnumProtocolState g; public final LoginListener.EnumProtocolState getLoginState() { return this.g; }; // Paper - OBFHELPER
+     private int h;
+     private GameProfile i; private void setGameProfile(GameProfile profile) { i = profile; } private GameProfile getGameProfile() { return i; } // Paper - OBFHELPER
+     private final String j;
+diff --git a/main/java/net/minecraft/server/NetworkManager.java b/main/java/net/minecraft/server/NetworkManager.java
+index 96c4d4b..ed02568 100644
+--- a/main/java/net/minecraft/server/NetworkManager.java
++++ b/main/java/net/minecraft/server/NetworkManager.java
+@@ -267,10 +267,27 @@ public class NetworkManager extends SimpleChannelInboundHandler<Packet<?>> {
+     }
+     // Paper end
+ 
++    private static final int MAX_PER_TICK = com.destroystokyo.paper.PaperConfig.maxJoinsPerTick; // Paper
++    private static int joinAttemptsThisTick; // Paper
++    private static int currTick; // Paper
+     public void a() {
+         this.m();
+-        if (this.m instanceof ITickable) {
+-            ((ITickable) this.m).e();
++        // Paper start
++        if (currTick != MinecraftServer.currentTick) {
++            currTick = MinecraftServer.currentTick;
++            joinAttemptsThisTick = 0;
++        }
++        // Paper end
++        if (this.m instanceof LoginListener) {
++            LoginListener loginListener = (LoginListener) this.m;
++            if (loginListener.getLoginState() != LoginListener.EnumProtocolState.READY_TO_ACCEPT  // Paper
++                    || (joinAttemptsThisTick++ < MAX_PER_TICK)) { // Paper - limit the number of joins which can be processed each tick
++                loginListener.e();
++            }
++        }
++
++        if (this.m instanceof PlayerConnection) {
++            ((PlayerConnection)this.m).e();
+         }
+ 
+         if (this.channel != null) {
