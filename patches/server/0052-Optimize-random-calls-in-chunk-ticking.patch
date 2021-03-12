@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nopjmp <kthompson@hey.com>
+Date: Thu, 11 Mar 2021 23:21:10 -0600
+Subject: [PATCH 52/59] Optimize random calls in chunk ticking
+
+- Backport Dionysus server/0033-Optimize-random-calls-in-chunk-ticking.patch
+- Source: https://github.com/nopjmp/Dionysus at b5c71b62f6f1f555b22bd52f5751e33be4690b6e
+- Chunk: maintain lightningTick interval instead of running RNG every tick
+- WorldServer: use single incrementing counter for ice and snow checks across chunks
+
+diff --git a/main/java/net/minecraft/server/Chunk.java b/main/java/net/minecraft/server/Chunk.java
+index a86744b..f4233ed 100644
+--- a/main/java/net/minecraft/server/Chunk.java
++++ b/main/java/net/minecraft/server/Chunk.java
+@@ -121,6 +121,18 @@ public class Chunk {
+     }
+     // CraftBukkit end
+ 
++    // Airplane start - instead of using a random every time the chunk is ticked, define when lightning strikes preemptively
++    private int lightningTick;
++    // shouldDoLightning compiles down to 29 bytes, which with the default of 35 byte inlining should guarantee an inline
++    public final boolean shouldDoLightning(Random random) {
++        if (this.lightningTick-- <= 0) {
++            this.lightningTick = random.nextInt(100000) << 1;
++            return true;
++        }
++        return false;
++    }
++    // Airplane end
++
+     public Chunk(World world, int i, int j) {
+         this.sections = new ChunkSection[16];
+         this.g = new byte[256];
+@@ -144,6 +156,8 @@ public class Chunk {
+         // CraftBukkit start
+         this.bukkitChunk = new org.bukkit.craftbukkit.CraftChunk(this);
+         this.chunkKey = ChunkCoordIntPair.a(this.locX, this.locZ);
++
++        this.lightningTick = this.world.random.nextInt(100000) << 1; // Airplane - initialize lightning tick
+     }
+ 
+     public org.bukkit.Chunk bukkitChunk;
+diff --git a/main/java/net/minecraft/server/WorldServer.java b/main/java/net/minecraft/server/WorldServer.java
+index 9406379..9ccd047 100644
+--- a/main/java/net/minecraft/server/WorldServer.java
++++ b/main/java/net/minecraft/server/WorldServer.java
+@@ -455,6 +455,8 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+         this.methodProfiler.b();
+     }
+ 
++    private int currentIceAndSnowTick = 0; protected void resetIceAndSnowTick() { this.currentIceAndSnowTick = this.random.nextInt(16); } // Airplane
++
+     protected void j() {
+         this.i();
+         if (this.worldData.getType() == WorldType.DEBUG_ALL_BLOCK_STATES) {
+@@ -470,6 +472,7 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+             boolean flag1 = this.X();
+ 
+             this.methodProfiler.a("pollingChunks");
++            this.resetIceAndSnowTick();
+ 
+             for (Iterator iterator1 = this.manager.b(); iterator1.hasNext(); this.methodProfiler.b()) {
+                 this.methodProfiler.a("getChunk");
+@@ -487,7 +490,7 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+                 BlockPosition blockposition;
+ 
+                 // Paper - Disable thunder
+-                if (!this.paperConfig.disableThunder && flag && flag1 && this.random.nextInt(100000) == 0) {
++                if (!this.paperConfig.disableThunder && flag && flag1 && chunk.shouldDoLightning(this.random)) {
+                     this.l = this.l * 3 + 1013904223;
+                     l = this.l >> 2;
+                     blockposition = this.a(new BlockPosition(j + (l & 15), 0, k + (l >> 8 & 15)));
+@@ -509,7 +512,7 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+                 }
+ 
+                 this.methodProfiler.c("iceandsnow");
+-                if (!this.paperConfig.disableIceAndSnow && this.random.nextInt(16) == 0) { // Paper - Disable ice and snow
++                if (!this.paperConfig.disableIceAndSnow && (currentIceAndSnowTick++ & 15) == 0) { // Paper - Disable ice and snow // Airplane - optimize further random ticking
+                     this.l = this.l * 3 + 1013904223;
+                     l = this.l >> 2;
+                     blockposition = this.p(new BlockPosition(j + (l & 15), 0, k + (l >> 8 & 15)));
