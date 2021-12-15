@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: RemainingToast <59129680+RemainingToast@users.noreply.github.com>
+Date: Wed, 15 Dec 2021 19:39:21 +1000
+Subject: [PATCH 61/63] Map Decoration Limit
+
+- Limit custom map decorations to map-decorations-limit (defaults to 25)
+- Exempt player, monument, and mansion icons
+- Prevent client lag and crash exploits caused by excessive map icons
+- Optimize count iteration using primitive loop counter
+
+diff --git a/main/java/com/destroystokyo/paper/AntarcticConfig.java b/main/java/com/destroystokyo/paper/AntarcticConfig.java
+index fd7f3a3..8c2b099 100644
+--- a/main/java/com/destroystokyo/paper/AntarcticConfig.java
++++ b/main/java/com/destroystokyo/paper/AntarcticConfig.java
+@@ -240,4 +240,13 @@ public class AntarcticConfig {
+         if (chunkOverloadDupeLog) Bukkit.getLogger().info("Chunk overload dupes will be logged.");
+     }
+ 
++    public static int mapDecorationsLimit = 25;
++    private static void mapDecorationsLimit() {
++        setComment("map-decorations-limit",
++            "Maximum number of custom decorations (banners, frames, etc.) allowed on a WorldMap.",
++            "Helps mitigate lag and crash exploits caused by packing thousands of markers into a single map.",
++            "Player, monument, and mansion icons are exempted.");
++        mapDecorationsLimit = getInt("map-decorations-limit", 25);
++    }
++
+ }
+diff --git a/main/java/net/minecraft/server/WorldMap.java b/main/java/net/minecraft/server/WorldMap.java
+index 5917360..edbf9af 100644
+--- a/main/java/net/minecraft/server/WorldMap.java
++++ b/main/java/net/minecraft/server/WorldMap.java
+@@ -282,9 +282,35 @@ public class WorldMap extends PersistentBase {
+             }
+         }
+ 
++        // Dionysus start - limit decorations
++        if (countMapIcon(this.decorations) >= com.destroystokyo.paper.AntarcticConfig.mapDecorationsLimit) {
++            return;
++        }
++        // Dionysus end
+         this.decorations.put(s, new MapIcon(mapicon_type, b0, b1, b2));
+     }
+ 
++    // Dionysus start - limit decorations
++    // Not all map decorations need to be prevented
++    // See https://minecraft.fandom.com/wiki/Map#Map_icons
++    private int countMapIcon(Map<UUID, MapIcon> icons) {
++        int count = 0;
++        for (MapIcon icon : icons.values()) {
++            switch (MapIcon.Type.a(icon.getType())) {
++                case PLAYER_OFF_MAP:
++                case PLAYER_OFF_LIMITS:
++                case PLAYER:
++                case MANSION:
++                case MONUMENT:
++                    continue;
++                default:
++                    count++;
++            }
++        }
++        return count;
++    }
++    // Dionysus end
++
+     @Nullable
+     public Packet<?> a(ItemStack itemstack, World world, EntityHuman entityhuman) {
+         WorldMap.WorldMapHumanTracker worldmap_worldmaphumantracker = (WorldMap.WorldMapHumanTracker) this.k.get(entityhuman);
