@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: RemainingToast <remainingtoast@gmail.com>
+Date: Wed, 12 Jan 2022 21:30:45 +1000
+Subject: [PATCH 59/59] optimize armour stands
+
+- Backport Dionysus server/0043-optimize-armour-stands.patch
+- Source: https://github.com/nopjmp/Dionysus at b5c71b62f6f1f555b22bd52f5751e33be4690b6e
+- Author: RemainingToast <remainingtoast@gmail.com>
+- Add optimize-armourstands setting to AntarcticConfig (defaults to false)
+- EntityArmorStand: skip move processing when optimize-armourstands is enabled
+
+diff --git a/main/java/com/destroystokyo/paper/AntarcticConfig.java b/main/java/com/destroystokyo/paper/AntarcticConfig.java
+index e2f4ca7..cf54cb0 100644
+--- a/main/java/com/destroystokyo/paper/AntarcticConfig.java
++++ b/main/java/com/destroystokyo/paper/AntarcticConfig.java
+@@ -217,4 +217,12 @@ public class AntarcticConfig {
+         maxProjectileLoadsPerProjectile = getInt("projectile.max-loads-per-projectile", 10);
+     }
+ 
++    public static boolean optimizeArmourStands = false;
++    private static void optimizeArmourStands() {
++        setComment("optimize-armourstands",
++            "When enabled, skips movement processing on armor stands to save CPU.",
++            "Defaults to false to preserve vanilla physics and piston interactions.");
++        optimizeArmourStands = getBoolean("optimize-armourstands", optimizeArmourStands);
++    }
++
+ }
+diff --git a/main/java/net/minecraft/server/EntityArmorStand.java b/main/java/net/minecraft/server/EntityArmorStand.java
+index 9074992..cfd50e1 100644
+--- a/main/java/net/minecraft/server/EntityArmorStand.java
++++ b/main/java/net/minecraft/server/EntityArmorStand.java
+@@ -784,6 +784,7 @@ public class EntityArmorStand extends EntityLiving {
+     // Paper start
+     @Override
+     public void move(EnumMoveType moveType, double x, double y, double z) {
++        if (com.destroystokyo.paper.AntarcticConfig.optimizeArmourStands) return; // Antarctic - optimize armor stands
+         if (this.canMove) {
+             super.move(moveType, x, y, z);
+         }
