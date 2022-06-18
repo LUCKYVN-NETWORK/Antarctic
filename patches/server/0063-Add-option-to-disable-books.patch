@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AlexProgrammerDE <40795980+AlexProgrammerDE@users.noreply.github.com>
+Date: Sat, 18 Jun 2022 09:40:26 +0200
+Subject: [PATCH 63/63] Add option to disable books
+
+- Add enable-books option in AntarcticConfig (defaults to true)
+- Reject book editing packets when disabled unless player has antarctic.usebooks permission
+
+diff --git a/main/java/com/destroystokyo/paper/AntarcticConfig.java b/main/java/com/destroystokyo/paper/AntarcticConfig.java
+index 2fca861..e33272f 100644
+--- a/main/java/com/destroystokyo/paper/AntarcticConfig.java
++++ b/main/java/com/destroystokyo/paper/AntarcticConfig.java
+@@ -257,4 +257,12 @@ public class AntarcticConfig {
+         noChunksPastWorldBorder = getBoolean("no-chunks-past-world-border", false);
+     }
+ 
++    public static boolean enableBooks = true;
++    private static void enableBooks() {
++        setComment("enable-books",
++            "When disabled, book editing and signing packets are rejected unless the player has the 'antarctic.usebooks' permission.",
++            "Defaults to true. Set to false to prevent book-based exploit vectors completely.");
++        enableBooks = getBoolean("enable-books", true);
++    }
++
+ }
+diff --git a/main/java/net/minecraft/server/PlayerConnection.java b/main/java/net/minecraft/server/PlayerConnection.java
+index 590bcfe..b790e98 100644
+--- a/main/java/net/minecraft/server/PlayerConnection.java
++++ b/main/java/net/minecraft/server/PlayerConnection.java
+@@ -2385,6 +2385,7 @@ public class PlayerConnection implements PacketListenerPlayIn, ITickable {
+ 
+     // Paper start
+     private boolean validateBook(ItemStack testStack, boolean kick) {
++        if (!com.destroystokyo.paper.AntarcticConfig.enableBooks && !this.player.getBukkitEntity().hasPermission("antarctic.usebooks")) return false; // Dionysus
+         NBTTagList pageList = testStack.getTag().getList("pages", 8);
+         long byteTotal = 0;
+         int maxBookPageSize = com.destroystokyo.paper.PaperConfig.maxBookPageSize;
