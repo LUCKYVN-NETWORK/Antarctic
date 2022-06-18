@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AlexProgrammerDE <40795980+AlexProgrammerDE@users.noreply.github.com>
+Date: Sat, 18 Jun 2022 10:11:13 +0200
+Subject: [PATCH 57/59] Optimize suffocation
+
+- Backport Dionysus server/0051-Optimize-suffocation.patch
+- Source: https://github.com/nopjmp/Dionysus at b5c71b62f6f1f555b22bd52f5751e33be4690b6e
+- Author: AlexProgrammerDE <40795980+AlexProgrammerDE@users.noreply.github.com>
+- Copyright: (C) 2022 Pufferfish Studios LLC (GPL-3.0-or-later)
+- Add suffocation-optimization setting to AntarcticConfig (defaults to true)
+- EntityLiving: throttle inBlock collision checks when entity is within invulnerability window
+
+diff --git a/main/java/com/destroystokyo/paper/AntarcticConfig.java b/main/java/com/destroystokyo/paper/AntarcticConfig.java
+index 9c5f8bd..6eacb9b 100644
+--- a/main/java/com/destroystokyo/paper/AntarcticConfig.java
++++ b/main/java/com/destroystokyo/paper/AntarcticConfig.java
+@@ -198,4 +198,11 @@ public class AntarcticConfig {
+         improveMergeChecks = getBoolean("improve-merge-checks", improveMergeChecks);
+     }
+ 
++    public static boolean enableSuffocationOptimization = true;
++    private static void suffocationOptimization() {
++        setComment("suffocation-optimization",
++            "Optimize suffocation damage checks by throttling voxel collision tests for invulnerable entities.");
++        enableSuffocationOptimization = getBoolean("suffocation-optimization", enableSuffocationOptimization);
++    }
++
+ }
+diff --git a/main/java/net/minecraft/server/EntityLiving.java b/main/java/net/minecraft/server/EntityLiving.java
+index 5909b8c..4be93f6 100644
+--- a/main/java/net/minecraft/server/EntityLiving.java
++++ b/main/java/net/minecraft/server/EntityLiving.java
+@@ -209,7 +209,7 @@ public abstract class EntityLiving extends Entity {
+         boolean flag = this instanceof EntityHuman;
+ 
+         if (this.isAlive()) {
+-            if (this.inBlock()) {
++            if ((!com.destroystokyo.paper.AntarcticConfig.enableSuffocationOptimization || (ticksLived % 10 == 0 && couldPossiblyBeHurt(1.0F))) && this.inBlock()) {
+                 this.damageEntity(DamageSource.STUCK, 1.0F);
+             } else if (flag && !this.world.getWorldBorder().a(this.getBoundingBox())) {
+                 double d0 = this.world.getWorldBorder().a((Entity) this) + this.world.getWorldBorder().getDamageBuffer();
+@@ -315,6 +315,14 @@ public abstract class EntityLiving extends Entity {
+     }
+ 
+     // CraftBukkit start
++        // Dionysus start - optimize suffocation
++    public boolean couldPossiblyBeHurt(float amount) {
++        if ((float) this.noDamageTicks > (float) this.maxNoDamageTicks / 2.0F && amount <= this.lastDamage) {
++            return false;
++        }
++        return true;
++    }
++    // Dionysus end
+     public int getExpReward() {
+         int exp = this.getExpValue(this.killer);
+ 
