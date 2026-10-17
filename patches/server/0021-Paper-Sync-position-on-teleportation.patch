@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Softik Lord <dimap9986@gmail.com>
+Date: Mon, 18 Jul 2022 13:09:45 +0500
+Subject: [PATCH 21/43] Paper-Sync-position-on-teleportation - Backport
+ Dionysus server/0115-Paper-Sync-position-on-teleportation.patch - Source:
+ https://github.com/nopjmp/Dionysus at
+ b5c71b62f6f1f555b22bd52f5751e33be4690b6e
+
+
+diff --git a/main/java/net/minecraft/server/PlayerConnection.java b/main/java/net/minecraft/server/PlayerConnection.java
+index fc18563..0406b46 100644
+--- a/main/java/net/minecraft/server/PlayerConnection.java
++++ b/main/java/net/minecraft/server/PlayerConnection.java
+@@ -474,6 +474,7 @@ public class PlayerConnection implements PacketListenerPlayIn, ITickable {
+                 this.o = this.teleportPos.x;
+                 this.p = this.teleportPos.y;
+                 this.q = this.teleportPos.z;
++                this.syncPosition(); // Paper
+                 this.player.M();
+             }
+ 
+@@ -521,6 +522,7 @@ public class PlayerConnection implements PacketListenerPlayIn, ITickable {
+                 if (this.teleportPos != null) {
+                     if (this.e - this.A > 20) {
+                         this.A = this.e;
++                        this.syncPosition(); // Paper
+                         this.a(this.teleportPos.x, this.teleportPos.y, this.teleportPos.z, this.player.yaw, this.player.pitch);
+                     }
+                     this.allowedPlayerTicks = 20; // CraftBukkit
