@@ -1,0 +1,3 @@
+rootProject.name = 'Antarctic'
+
+include 'Antarctic-API', 'Antarctic-Server'

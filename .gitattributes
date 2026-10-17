@@ -1,0 +1,15 @@
+# Normalise text files; keep line endings stable across platforms.
+* text=auto
+
+# Shell scripts must stay LF (git-bash / WSL)
+*.sh text eol=lf
+gradlew text eol=lf
+upstream/paper-1.12.2/paper text eol=lf
+
+# Windows batch files stay CRLF
+*.bat text eol=crlf
+
+# Binary files
+*.jar binary
+
+*.patch text eol=lf

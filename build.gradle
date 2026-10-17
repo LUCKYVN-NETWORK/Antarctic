@@ -1,0 +1,53 @@
+allprojects {
+    group = 'com.destroystokyo.paper'
+    version = '1.12.2-R0.1-SNAPSHOT'
+    description = 'Antarctic: a patch-based Paper 1.12.2 fork'
+}
+
+subprojects {
+    apply plugin: 'java-library'
+    java { toolchain { languageVersion = JavaLanguageVersion.of(21) } }
+    tasks.withType(JavaCompile).configureEach {
+        options.encoding = 'UTF-8'
+        options.release = 21
+        doFirst {
+            if (!file('src/main/java').isDirectory()) {
+                throw new GradleException('Initialize local sources with setupSources first.')
+            }
+        }
+    }
+    tasks.withType(AbstractArchiveTask).configureEach {
+        preserveFileTimestamps = false
+        reproducibleFileOrder = true
+    }
+    repositories {
+        mavenCentral()
+        maven { url = 'https://libraries.minecraft.net/' }
+        maven { url = 'https://repo.aikar.co/content/groups/aikar/' }
+        maven { url = 'https://repo.md-5.net/content/repositories/releases/' }
+        maven { url = 'https://hub.spigotmc.org/nexus/content/repositories/snapshots/' }
+        maven { url = 'https://oss.sonatype.org/content/repositories/snapshots/' }
+    }
+    tasks.named('compileJava') {
+        doFirst {
+            if (!rootProject.file('Antarctic-Server/libs/minecraft-server-1.12.2-mapped.jar').exists()) {
+                throw new GradleException('Run setupSources before building.')
+            }
+        }
+    }
+}
+
+def bash = providers.gradleProperty('bashExecutable').getOrElse(System.getenv('BASH_EXECUTABLE') ?: 'bash')
+['setupSources': 'setup', 'applyPatches': 'apply', 'rebuildPatches': 'rebuild'].each { taskName, action ->
+    tasks.register(taskName, Exec) {
+        group = 'patching'
+        description = [setup: 'Generate ignored local sources from pinned Paper and apply Antarctic patches.',
+                       apply: 'Reset clean local source repositories and apply Antarctic patches.',
+                       rebuild: 'Export committed local source changes into patches/.'][action]
+        workingDir rootDir
+        commandLine bash, 'scripts/patches.sh', action
+        if (action == 'setup' && providers.gradleProperty('upstreamDir').isPresent()) {
+            args providers.gradleProperty('upstreamDir').get()
+        }
+    }
+}

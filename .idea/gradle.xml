@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="GradleSettings">
+    <option name="gradleJvm" value="temurin-21" />
+    <linkedProjectsOptions>
+      <option>
+        <option name="delegatedBuild" value="true" />
+        <option name="externalProjectPath" value="$PROJECT_DIR$" />
+        <option name="gradleJvm" value="temurin-21" />
+        <option name="modules">
+          <set>
+            <option value="$PROJECT_DIR$" />
+            <option value="$PROJECT_DIR$/Antarctic-API" />
+            <option value="$PROJECT_DIR$/Antarctic-Server" />
+          </set>
+        </option>
+      </option>
+    </linkedProjectsOptions>
+  </component>
+</project>

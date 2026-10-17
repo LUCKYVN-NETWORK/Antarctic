@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Sat, 17 Oct 2026 13:19:28 +0700
+Subject: [PATCH] Add Antarctic branding constants
+
+
+diff --git a/main/java/com/destroystokyo/paper/Antarctic.java b/main/java/com/destroystokyo/paper/Antarctic.java
+new file mode 100644
+index 0000000..379f283
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/Antarctic.java
+@@ -0,0 +1,23 @@
++package com.destroystokyo.paper;
++
++/**
++ * Branding constants for the Antarctic fork of Paper.
++ *
++ * <p>Placeholder for the project scaffold; the overhauled Paper 1.12.2
++ * API sources will be imported into this module as the overhaul
++ * progresses.</p>
++ */
++public final class Antarctic {
++
++    /** Fork name. */
++    public static final String NAME = "Antarctic";
++    /** Upstream project this fork overhauls. */
++    public static final String FORK_OF = "Paper";
++    /** Minecraft version targeted by the fork. */
++    public static final String MINECRAFT_VERSION = "1.12.2";
++    /** Java version the fork is modernised to. */
++    public static final int JAVA_VERSION = 21;
++
++    private Antarctic() {
++    }
++}

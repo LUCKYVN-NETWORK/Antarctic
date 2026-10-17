@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Sat, 17 Oct 2026 13:19:28 +0700
+Subject: [PATCH] Add Antarctic branding constants
+
+
+diff --git a/main/java/net/minecraft/server/AntarcticVersion.java b/main/java/net/minecraft/server/AntarcticVersion.java
+new file mode 100644
+index 0000000..73e6ef8
+--- /dev/null
++++ b/main/java/net/minecraft/server/AntarcticVersion.java
+@@ -0,0 +1,21 @@
++package net.minecraft.server;
++
++/**
++ * Server-side branding constants for the Antarctic fork of Paper.
++ *
++ * <p>Placeholder for the project scaffold; the overhauled Paper 1.12.2
++ * server sources will be imported into this module as the overhaul
++ * progresses.</p>
++ */
++public final class AntarcticVersion {
++
++    /** Fork name. */
++    public static final String NAME = "Antarctic";
++    /** Minecraft version targeted by the fork. */
++    public static final String MINECRAFT_VERSION = "1.12.2";
++    /** Java version the fork is modernised to. */
++    public static final int JAVA_VERSION = 21;
++
++    private AntarcticVersion() {
++    }
++}

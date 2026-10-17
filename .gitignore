@@ -1,0 +1,18 @@
+# Generated sources, reference sources and vanilla binaries: NEVER publish.
+/Antarctic-API/src/
+/Antarctic-Server/src/
+/Antarctic-Server/mc-dev/
+/Antarctic-Server/libs/
+/.upstream/
+/.codex/
+.gradle/
+build/
+out/
+upstream/**/work/
+run/
+*.log
+.DS_Store
+Thumbs.db
+*~
+.idea/workspace.xml
+.idea/jdk.table.xml
