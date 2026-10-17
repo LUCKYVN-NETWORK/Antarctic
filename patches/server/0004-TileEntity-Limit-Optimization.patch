@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nopjmp <kthompson@hey.com>
+Date: Fri, 5 Feb 2021 00:10:45 -0600
+Subject: [PATCH 04/43] TileEntity Limit Optimization
+
+This limits the number of entities that are sent when a chunk is loaded.
+- Backported from Dionysus 0013 by nopjmp (original notices retained; see licenses/Dionysus-MIT.md)
+
+diff --git a/main/java/net/minecraft/server/PacketPlayOutMapChunk.java b/main/java/net/minecraft/server/PacketPlayOutMapChunk.java
+index 4fe7c99..d941e3e 100644
+--- a/main/java/net/minecraft/server/PacketPlayOutMapChunk.java
++++ b/main/java/net/minecraft/server/PacketPlayOutMapChunk.java
+@@ -18,7 +18,7 @@ public class PacketPlayOutMapChunk implements Packet<PacketListenerPlayOut> {
+     private int b;
+     private int c;
+     private byte[] d;
+-    private List<NBTTagCompound> e;
++    private List<NBTTagCompound> e; private List<NBTTagCompound> getTileDataEntityData() { return this.e; } // Dionysus - Tuinity - OBFHELPER
+     private boolean f;
+     private volatile boolean ready = false; // Paper - Async-Anti-Xray - Ready flag for the network manager
+ 
+@@ -30,12 +30,16 @@ public class PacketPlayOutMapChunk implements Packet<PacketListenerPlayOut> {
+ 
+     // Paper start
+     private final java.util.List<Packet> extraPackets = new java.util.ArrayList<>();
+-    private static final int SKIP_EXCESSIVE_SIGNS_LIMIT = Integer.getInteger("Paper.excessiveSignsLimit", 500);
++    private static final int TE_LIMIT = Integer.getInteger("antarctic.te-limit", 750); // Dionysus - Tuinity - handle oversized chunk data packets more robustly
++    private static final int TE_SPLIT_LIMIT = Math.max(4096 + 1, Integer.getInteger("antarctic.te-split-limit", 15_000)); // Dionysus - Tuinity- handle oversized chunk data packets more robustly
++    private boolean mustSplit = false; // Dionysus - Tuinity - handle oversized chunk data packets more robustly
++
+     public java.util.List<Packet> getExtraPackets() {
+         return extraPackets;
+     }
+     // Paper end
+-    public PacketPlayOutMapChunk(Chunk chunk, int i) {
++
++    public PacketPlayOutMapChunk(Chunk chunk, int i) { final int chunkSectionBitSet = i; // Dionysus - Tuinity - handle oversized chunk data packets more robustly
+         PacketPlayOutMapChunkInfo packetPlayOutMapChunkInfo = chunk.world.chunkPacketBlockController.getPacketPlayOutMapChunkInfo(this, chunk, i); // Paper - Anti-Xray - Add chunk packet info
+         this.a = chunk.locX;
+         this.b = chunk.locZ;
+@@ -53,7 +57,7 @@ public class PacketPlayOutMapChunk implements Packet<PacketListenerPlayOut> {
+         this.c = this.writeChunk(new PacketDataSerializer(this.g()), chunk, flag, i, packetPlayOutMapChunkInfo); // Paper - Anti-Xray - Add chunk packet info
+         this.e = Lists.newArrayList();
+         Iterator iterator = chunk.getTileEntities().entrySet().iterator();
+-        int totalSigns = 0; // Paper
++        int totalTileEntities = 0; // Dionysus
+ 
+         while (iterator.hasNext()) {
+             Entry entry = (Entry) iterator.next();
+@@ -62,14 +66,22 @@ public class PacketPlayOutMapChunk implements Packet<PacketListenerPlayOut> {
+             int j = blockposition.getY() >> 4;
+ 
+             if (this.e() || (i & 1 << j) != 0) {
+-                // Paper start - send signs separately
+-                if (tileentity instanceof TileEntitySign) {
+-                    if (SKIP_EXCESSIVE_SIGNS_LIMIT < 0 || ++totalSigns < SKIP_EXCESSIVE_SIGNS_LIMIT) {
+-                        extraPackets.add(tileentity.getUpdatePacket());
++                // Dionysus Start - handle tile entities better
++                ++totalTileEntities;
++                if (totalTileEntities > TE_SPLIT_LIMIT) {
++                    this.mustSplit = true;
++                    this.getTileDataEntityData().clear();
++                    this.extraPackets.clear();
++                    break;
++                }
++                if (totalTileEntities > TE_LIMIT) {
++                    PacketPlayOutTileEntityData updatePacket = tileentity.getUpdatePacket();
++                    if (updatePacket != null) {
++                        extraPackets.add(updatePacket);
++                        continue;
+                     }
+-                    continue;
+                 }
+-                // Paper end
++                // Dionysus end
+                 NBTTagCompound nbttagcompound = tileentity.d();
+ 
+                 this.e.add(nbttagcompound);
+@@ -77,6 +89,21 @@ public class PacketPlayOutMapChunk implements Packet<PacketListenerPlayOut> {
+         }
+ 
+         chunk.world.chunkPacketBlockController.modifyBlocks(this, packetPlayOutMapChunkInfo); // Paper - Anti-Xray - Modify blocks
++        // Dionysus - Tuinity start - improve oversized chunk data packet handling
++        if (this.mustSplit) {
++            int chunkSectionBitSetCopy = chunkSectionBitSet;
++            for (int a = 0, len = Integer.bitCount(chunkSectionBitSet); a < len; ++a) {
++                // IntegerUtil.getTrailingBit (-n & n)
++                int trailingBit = -chunkSectionBitSetCopy & chunkSectionBitSetCopy;
++                int sectionIndex = Integer.numberOfTrailingZeros(trailingBit);
++                chunkSectionBitSetCopy ^= trailingBit; // move on to the next
++
++                if (chunk.getSections()[sectionIndex] != null) {
++                    this.extraPackets.add(new PacketPlayOutMapChunk(chunk, trailingBit));
++                }
++            }
++        }
++        // Dionysus - Tuinity end - improve oversized chunk data packet handling
+     }
+ 
+     // Paper start - Async-Anti-Xray - Getter and Setter for the ready flag
