@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Sat, 17 Oct 2026 15:39:36 +0700
-Subject: [PATCH 02/44] Add ArcticConfig configuration system
+Subject: [PATCH 02/59] Add ArcticConfig configuration system
 
 - Add com.destroystokyo.paper.AntarcticConfig backed by antarctic.yml with reflective option loading and comment rendering
 - Add /antarctic command with reload and version subcommands
