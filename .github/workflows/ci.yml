@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  patch-roundtrip:
+    name: Patch script round-trip
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Round-trip and dirty-source protection
+        run: bash scripts/test-patches.sh
+
+  build-and-test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Configure git identity for patch application
+        run: |
+          git config --global user.name "GitHub Action"
+          git config --global user.email "action@github.com"
+
+      - name: Set up JDK 8 (legacy source generation)
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '8'
+
+      - name: Record JDK 8 home
+        run: echo "JAVA8_HOME=$JAVA_HOME" >> "$GITHUB_ENV"
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Cache pinned Paper upstream state
+        uses: actions/cache@v6
+        with:
+          path: |
+            .upstream
+            ~/.m2/repository
+          key: upstream-e39995d213616cc7d60c38e6e86e562f30637ef7-v1
+
+      - name: Generate sources and apply patches
+        run: ./gradlew setupSources
+        env:
+          JAVA8_HOME: ${{ env.JAVA8_HOME }}
+
+      - name: Compile
+        run: ./gradlew compileJava compileTestJava
+
+      - name: API test suite
+        run: ./gradlew :Antarctic-API:test
+
+      - name: Targeted server regression tests
+        run: ./gradlew :Antarctic-Server:cleanTest :Antarctic-Server:test --tests com.destroystokyo.paper.AntarcticConfigTest
+
+      - name: Full server suite (diagnostic; known failures tracked)
+        run: ./gradlew :Antarctic-Server:cleanTest :Antarctic-Server:test
+        continue-on-error: true
+
+      - name: Patch integrity
+        run: |
+          ./gradlew rebuildPatches
+          if [[ -n "$(git status --porcelain patches/)" ]]; then
+            git status --porcelain patches/
+            echo "patches/ is out of sync with the source repositories; run rebuildPatches and commit" >&2
+            exit 1
+          fi
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-reports
+          path: |
+            Antarctic-API/build/reports/tests/
+            Antarctic-Server/build/reports/tests/
+          if-no-files-found: ignore

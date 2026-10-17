@@ -18,7 +18,7 @@
 
 ---
 
-## dYO� Branches & Release Model
+## Branches & Release Model
 
 Antarctic uses a dual-branch development lifecycle:
 
@@ -31,7 +31,7 @@ Pull requests and patch contributions should target **`dev`**.
 
 ---
 
-## �s� Highlights & Features
+## Highlights & Features
 
 - **Modern Java 21 Runtime:** Built and verified for Java 21 LTS, leveraging modern bytecode capabilities while maintaining full protocol parity for 1.12.2 clients.
 - **Optimized Hot Paths & Primitives:** Incorporates Fastutil collections, primitive unboxing in map decorations and coordinates, and reduced object allocation overhead across tick loops.
@@ -41,7 +41,7 @@ Pull requests and patch contributions should target **`dev`**.
 
 ---
 
-## dY"S Performance & Benchmarks
+## Performance & Benchmarks
 
 Antarctic aims to eliminate tick stalls and reduce heap churn during entity tracking, tile-entity ticking, and chunk I/O.
 
@@ -51,7 +51,7 @@ Antarctic aims to eliminate tick stalls and reduce heap churn during entity trac
     <tr>
       <td align="center">
         <br />
-        <p><em>dY"^ Performance benchmark metrics and comparison graphs against upstream Paper 1.12.2 will be published here upon test suite completion.</em></p>
+        <p><em>Performance benchmark metrics and comparison graphs against upstream Paper 1.12.2 will be published here upon test suite completion.</em></p>
         <br />
       </td>
     </tr>
@@ -60,7 +60,7 @@ Antarctic aims to eliminate tick stalls and reduce heap churn during entity trac
 
 ---
 
-## dY>��,? Building from Source
+## Building from Source
 
 ### Prerequisites
 - **JDK 21** configured on `JAVA_HOME` (compilation & runtime target)
@@ -85,7 +85,7 @@ Generated module JARs will be available under `Antarctic-API/build/libs/` and `A
 
 ---
 
-## dY", Patch Workflow
+## Patch Workflow
 
 Antarctic manages modifications as Git patch sets against upstream Paper:
 
@@ -97,10 +97,10 @@ Antarctic manages modifications as Git patch sets against upstream Paper:
 
 ---
 
-## dY", License & Credits
+## License & Credits
 
 - Antarctic is licensed under **[GPL-3.0](LICENSE.md)**, inheriting licensing from Paper, Spigot, and Bukkit.
 - Permissive contributions and backported components are released under the **[MIT License](LICENSE.md#the-mit-license-mit)** where designated.
 - A single canonical [**LICENSE.md**](LICENSE.md) is maintained at the root of the project.
 - Sincere appreciation to upstream developers and contributors from [PaperMC](https://papermc.io/), [SpigotMC](https://www.spigotmc.org/), [Dionysus](https://github.com/nopjmp/Dionysus), [Pufferfish](https://github.com/pufferfish-gg/Pufferfish), and the wider Minecraft open-source ecosystem.
-
+
