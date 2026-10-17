@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Sat, 17 Oct 2026 15:39:37 +0700
+Subject: [PATCH 2/5] Expose the Arctic config to plugins and timings - Add
+ Server.Spigot#getAntarcticConfig returning the antarctic.yml configuration -
+ Include the Arctic configuration in the timings report export - Adapted from
+ Dionysus (dev.pomf.dionysus) by nopjmp and AlexProgrammerDE (Pufferfish),
+ original MIT/GPL notices retained
+
+
+diff --git a/main/java/co/aikar/timings/TimingsExport.java b/main/java/co/aikar/timings/TimingsExport.java
+index 40546c0..111b587 100644
+--- a/main/java/co/aikar/timings/TimingsExport.java
++++ b/main/java/co/aikar/timings/TimingsExport.java
+@@ -203,7 +203,8 @@ class TimingsExport extends Thread {
+         parent.put("config", createObject(
+             pair("spigot", mapAsJSON(Bukkit.spigot().getSpigotConfig(), null)),
+             pair("bukkit", mapAsJSON(Bukkit.spigot().getBukkitConfig(), null)),
+-            pair("paper", mapAsJSON(Bukkit.spigot().getPaperConfig(), null))
++            pair("paper", mapAsJSON(Bukkit.spigot().getPaperConfig(), null)), // Paper
++            pair("antarctic", mapAsJSON(Bukkit.spigot().getAntarcticConfig(), null)) // Arctic
+         ));
+ 
+         new TimingsExport(listeners, parent, history).start();
+diff --git a/main/java/org/bukkit/Server.java b/main/java/org/bukkit/Server.java
+index 2912bda..1c62db9 100644
+--- a/main/java/org/bukkit/Server.java
++++ b/main/java/org/bukkit/Server.java
+@@ -1015,6 +1015,16 @@ public interface Server extends PluginMessageRecipient {
+             throw new UnsupportedOperationException("Not supported yet.");
+         }
+ 
++        /**
++         * Returns the Arctic configuration file in YamlConfiguration format.
++         *
++         * @return the antarctic.yml configuration
++         */
++        public org.bukkit.configuration.file.YamlConfiguration getAntarcticConfig()
++        {
++            throw new UnsupportedOperationException("Not supported yet.");
++        }
++
+         /**
+          * Sends the component to the player
+          *
