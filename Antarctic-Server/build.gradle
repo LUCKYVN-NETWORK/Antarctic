@@ -25,6 +25,7 @@ dependencies {
     implementation 'org.apache.logging.log4j:log4j-iostreams:2.17.0'
     implementation 'com.lmax:disruptor:3.4.4'
 
+    testImplementation files('libs/minecraft-server-1.12.2-mapped.jar')
     testImplementation 'junit:junit:4.12'
     testImplementation 'org.hamcrest:hamcrest-library:1.3'
 }
