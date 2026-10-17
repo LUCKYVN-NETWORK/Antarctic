@@ -84,7 +84,7 @@ cd "$basedir"
 
 echo "Importing MC Dev"
 
-./scripts/importmcdev.sh "$basedir" >/dev/null 2>&1
+"$basedir/scripts/upstream/importmcdev.sh" "$basedir" >/dev/null 2>&1
 
 # Apply paper
 cd "$basedir"

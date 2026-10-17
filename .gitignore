@@ -5,10 +5,12 @@
 /Antarctic-Server/libs/
 /.upstream/
 /.codex/
+/.agents/
+/.copilot/
 .gradle/
 build/
 out/
-upstream/**/work/
+/work/
 run/
 *.log
 .DS_Store
