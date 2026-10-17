@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Leijurv <leijurv@gmail.com>
+Date: Sat, 17 Oct 2026 16:03:02 +0700
+Subject: [PATCH 27/43] Isolate world-generation RNG to prevent Randar leakage
+ - Preserve the seeded world-generation sequence without reseeding the shared
+ gameplay RNG - Backport Dionysus server/0166 by Leijurv;
+ https://github.com/nopjmp/Dionysus at
+ b5c71b62f6f1f555b22bd52f5751e33be4690b6e
+
+
+diff --git a/main/java/net/minecraft/server/World.java b/main/java/net/minecraft/server/World.java
+index e823177..9fd7ca1 100644
+--- a/main/java/net/minecraft/server/World.java
++++ b/main/java/net/minecraft/server/World.java
+@@ -89,6 +89,8 @@ public abstract class World implements IBlockAccess {
+     protected float q;
+     private int M;
+     public final Random random = new Random();
++    // Leijurv / Dionysus 0166: never reseed the observable gameplay RNG for world generation.
++    private final Random separateRandOnlyForWorldGen = new Random();
+     public WorldProvider worldProvider;
+     protected NavigationListener t = new NavigationListener();
+     protected List<IWorldAccess> u;
+@@ -3168,8 +3170,8 @@ public abstract class World implements IBlockAccess {
+     public Random a(int i, int j, int k) {
+         long l = (long) i * 341873128712L + (long) j * 132897987541L + this.getWorldData().getSeed() + (long) k;
+ 
+-        this.random.setSeed(l);
+-        return this.random;
++        this.separateRandOnlyForWorldGen.setSeed(l);
++        return this.separateRandOnlyForWorldGen;
+     }
+ 
+     public CrashReportSystemDetails a(CrashReport crashreport) {
