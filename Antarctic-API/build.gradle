@@ -20,3 +20,17 @@ dependencies {
     testImplementation 'junit:junit:4.12'
     testImplementation 'org.hamcrest:hamcrest-library:1.3'
 }
+
+jar {
+    archiveBaseName = 'Antarctic-API'
+    manifest {
+        attributes(
+            'Implementation-Title': 'Antarctic-API',
+            'Implementation-Version': project.version,
+            'Specification-Title': 'Bukkit',
+            'Specification-Version': project.version,
+            'Specification-Vendor': 'PaperMC / Antarctic',
+            'Implementation-Vendor': 'Antarctic'
+        )
+    }
+}

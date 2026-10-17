@@ -51,3 +51,49 @@ def bash = providers.gradleProperty('bashExecutable').getOrElse(System.getenv('B
         }
     }
 }
+
+tasks.register('buildApi') {
+    group = 'build'
+    description = 'Builds the Antarctic API JAR archive.'
+    dependsOn ':Antarctic-API:jar'
+}
+
+tasks.register('buildServer') {
+    group = 'build'
+    description = 'Builds the Antarctic Server module JAR.'
+    dependsOn ':Antarctic-Server:jar'
+}
+
+tasks.register('buildServerJar') {
+    group = 'build'
+    description = 'Builds the complete runnable Antarctic server JAR archive.'
+    dependsOn ':Antarctic-Server:serverJar'
+}
+
+tasks.register('paperclip', Exec) {
+    group = 'build'
+    description = 'Builds the upstream Paperclip executable JAR wrapper.'
+    workingDir rootDir
+    commandLine bash, 'scripts/upstream/paperclip.sh', rootDir.absolutePath
+}
+
+tasks.register('testServer', Exec) {
+    group = 'verification'
+    description = 'Runs or prepares the local test server environment.'
+    workingDir rootDir
+    commandLine bash, 'scripts/upstream/testServer.sh', rootDir.absolutePath
+}
+
+tasks.register('applyUpstreamPatches', Exec) {
+    group = 'patching'
+    description = 'Applies upstream Spigot patches to CraftBukkit/NMS.'
+    workingDir rootDir
+    commandLine bash, 'scripts/upstream/applyPatches.sh', rootDir.absolutePath
+}
+
+tasks.register('rebuildUpstreamPatches', Exec) {
+    group = 'patching'
+    description = 'Rebuilds upstream Spigot patches from work/CraftBukkit.'
+    workingDir rootDir
+    commandLine bash, 'scripts/upstream/rebuildPatches.sh', rootDir.absolutePath
+}
