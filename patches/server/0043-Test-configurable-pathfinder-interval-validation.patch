@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Sat, 17 Oct 2026 16:06:58 +0700
+Subject: [PATCH 43/43] Test configurable pathfinder interval validation -
+ Cover valid custom values and zero rejection without overwriting the settings
+ file - Assert rejected reloads preserve the effective interval and
+ successful-load count
+
+
+diff --git a/test/java/com/destroystokyo/paper/AntarcticConfigTest.java b/test/java/com/destroystokyo/paper/AntarcticConfigTest.java
+index 2694d83..f0dd77c 100644
+--- a/test/java/com/destroystokyo/paper/AntarcticConfigTest.java
++++ b/test/java/com/destroystokyo/paper/AntarcticConfigTest.java
+@@ -39,4 +39,23 @@ public class AntarcticConfigTest {
+         assertEquals(invalid, new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8));
+         assertEquals(before, AntarcticConfig.getUpdates());
+     }
++
++    @Test public void validatesPathfinderIntervalAndPreservesInvalidFile() throws Exception {
++        File file = temporary.newFile("pathfinder.yml");
++        Files.write(file.toPath(), "pathfinder:\n  goal-selection-delay: 7\n".getBytes(StandardCharsets.UTF_8));
++        AntarcticConfig.load(file);
++        assertEquals(7, AntarcticConfig.pathfinderGoalSelectionDelay);
++        String invalid = "pathfinder:\n  goal-selection-delay: 0\n";
++        Files.write(file.toPath(), invalid.getBytes(StandardCharsets.UTF_8));
++        int before = AntarcticConfig.getUpdates();
++        try {
++            AntarcticConfig.load(file);
++            fail("Zero interval must be rejected");
++        } catch (IOException expected) {
++            assertNotNull(expected.getCause());
++        }
++        assertEquals(7, AntarcticConfig.pathfinderGoalSelectionDelay);
++        assertEquals(before, AntarcticConfig.getUpdates());
++        assertEquals(invalid, new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8));
++    }
+ }
