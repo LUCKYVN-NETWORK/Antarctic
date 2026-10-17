@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ruViolence <78062896+ruViolence@users.noreply.github.com>
+Date: Wed, 1 Jun 2022 09:05:15 +0500
+Subject: [PATCH 14/43] (Reaper) fix: MC-103516 - Backport Dionysus
+ server/0089-Reaper-fix-MC-103516.patch - Source:
+ https://github.com/nopjmp/Dionysus at
+ b5c71b62f6f1f555b22bd52f5751e33be4690b6e
+
+https://bugs.mojang.com/browse/MC-103516
+
+Original code from https://github.com/ruViolence/Reaper
+Licensed under GPL-3.0
+
+diff --git a/main/java/net/minecraft/server/World.java b/main/java/net/minecraft/server/World.java
+index bc231c7..e823177 100644
+--- a/main/java/net/minecraft/server/World.java
++++ b/main/java/net/minecraft/server/World.java
+@@ -1889,7 +1889,7 @@ public abstract class World implements IBlockAccess {
+         for (int i = 0; i < list.size(); ++i) {
+             Entity entity1 = (Entity) list.get(i);
+ 
+-            if (!entity1.dead && entity1.i && entity1 != entity && (entity == null || entity1.x(entity))) {
++            if (!entity1.dead && entity1.i && entity1 != entity && (entity == null || !entity1.x(entity))) { // Reaper - Fix MC-103516
+                 return false;
+             }
+         }
