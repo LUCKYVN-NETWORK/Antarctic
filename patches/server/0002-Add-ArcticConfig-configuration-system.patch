@@ -1,0 +1,351 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Sat, 17 Oct 2026 15:39:36 +0700
+Subject: [PATCH 02/43] Add ArcticConfig configuration system - Add
+ com.destroystokyo.paper.AntarcticConfig backed by antarctic.yml with
+ reflective option loading and comment rendering - Add /antarctic command with
+ reload and version subcommands - Load the config and register the command
+ during dedicated server startup - Register the --antarctic-settings command
+ line option - Expose getAntarcticConfig() on the internal Spigot server
+ implementation - Adapted from the Dionysus configuration system
+ (dev.pomf.dionysus) by nopjmp, original notices retained; see
+ licenses/Dionysus-MIT.md
+
+
+diff --git a/main/java/com/destroystokyo/paper/AntarcticCommand.java b/main/java/com/destroystokyo/paper/AntarcticCommand.java
+new file mode 100644
+index 0000000..1a4f39b
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/AntarcticCommand.java
+@@ -0,0 +1,76 @@
++package com.destroystokyo.paper;
++
++import net.minecraft.server.MinecraftServer;
++import org.bukkit.Bukkit;
++import org.bukkit.ChatColor;
++import org.bukkit.Location;
++import org.bukkit.command.Command;
++import org.bukkit.command.CommandSender;
++import org.bukkit.util.StringUtil;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.List;
++
++/**
++ * Command for managing the Antarctic fork at runtime.
++ *
++ * <p>Adapted from the Dionysus command (dev.pomf.dionysus.DionysusCommand) by nopjmp,
++ * licensed under the MIT license. Relicensed under the Arctic project license
++ * (GPL-3.0) with permission of the original author.</p>
++ */
++public class AntarcticCommand extends Command {
++    private static final List<String> SUBCOMMANDS = Arrays.asList("reload", "version");
++
++    public AntarcticCommand() {
++        super("antarctic");
++        this.description = "Antarctic related commands";
++        this.usageMessage = "/antarctic [reload | version]";
++        this.setPermission("bukkit.command.antarctic");
++    }
++
++    public static void init() {
++        MinecraftServer.getServer().server.getCommandMap().register("antarctic", "Antarctic", new AntarcticCommand());
++    }
++
++    @Override
++    public List<String> tabComplete(CommandSender sender, String alias, String[] args, Location location) throws IllegalArgumentException {
++        if (args.length == 1) {
++            return StringUtil.copyPartialMatches(args[0], SUBCOMMANDS,
++                    new ArrayList<>(SUBCOMMANDS.size()));
++        }
++        return java.util.Collections.emptyList();
++    }
++
++    @Override
++    public boolean execute(CommandSender sender, String commandLabel, String[] args) {
++        if (!testPermission(sender)) return true;
++
++        if (args.length != 1) {
++            sender.sendMessage(ChatColor.RED + "Usage: " + usageMessage);
++            return true;
++        }
++
++        if (args[0].equalsIgnoreCase("reload")) {
++            Command.broadcastCommandMessage(sender, ChatColor.RED + "Please note that this command is not supported and may cause issues.");
++            Command.broadcastCommandMessage(sender, ChatColor.RED + "If you encounter any issues please use the /stop command to restart your server.");
++
++            MinecraftServer console = MinecraftServer.getServer();
++            try {
++                AntarcticConfig.load();
++            } catch (IOException e) {
++                sender.sendMessage(ChatColor.RED + "Failed to reload.");
++                e.printStackTrace();
++                return true;
++            }
++            console.server.reloadCount++;
++
++            Command.broadcastCommandMessage(sender, ChatColor.GREEN + "Antarctic config reload complete.");
++        } else if (args[0].equalsIgnoreCase("version")) {
++            Command.broadcastCommandMessage(sender, "This server is running " + Bukkit.getName() + " version " + Bukkit.getVersion() + " (Implementing API version " + Bukkit.getBukkitVersion() + ")");
++        }
++
++        return true;
++    }
++}
+diff --git a/main/java/com/destroystokyo/paper/AntarcticConfig.java b/main/java/com/destroystokyo/paper/AntarcticConfig.java
+new file mode 100644
+index 0000000..c5f4c01
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/AntarcticConfig.java
+@@ -0,0 +1,198 @@
++package com.destroystokyo.paper;
++
++import net.minecraft.server.MinecraftServer;
++import org.bukkit.Bukkit;
++import org.bukkit.configuration.file.YamlConfiguration;
++import org.jetbrains.annotations.Nullable;
++
++import java.io.File;
++import java.io.IOException;
++import java.lang.reflect.Method;
++import java.lang.reflect.Modifier;
++import java.util.List;
++
++/**
++ * Main configuration file for the Antarctic fork, backed by antarctic.yml.
++ *
++ * <p>Configuration options are declared as private static void methods; they are
++ * discovered and applied reflectively on load, in declaration order. Defaults are
++ * written to the file on first load, and comments registered through
++ * {@link #setComment(String, String...)} are rendered above their keys when the
++ * file is saved.</p>
++ *
++ * <p>Adapted from the Dionysus configuration system (dev.pomf.dionysus.DionysusConfig)
++ * by nopjmp, which is licensed under the MIT license. Relicensed under the Arctic
++ * project license (GPL-3.0) with permission of the original author.</p>
++ */
++public class AntarcticConfig {
++
++    private static final YamlConfiguration config = new YamlConfiguration();
++    private static final java.util.Map<String, String[]> comments = new java.util.LinkedHashMap<>();
++    private static File configFile = new File("antarctic.yml");
++    private static int updates = 0;
++    private static boolean verbose;
++
++    protected static void logError(String s) {
++        Bukkit.getLogger().severe(s);
++    }
++
++    protected static void log(String s) {
++        if (verbose) {
++            Bukkit.getLogger().info(s);
++        }
++    }
++
++    public static YamlConfiguration getConfig() {
++        return config;
++    }
++
++    public static int getUpdates() {
++        return updates;
++    }
++
++    public static void load() throws IOException {
++        if (!configFile.exists()) {
++            // Write an empty file so save() can render comments for defaults below.
++            if (!configFile.getParentFile().isEmpty() && !configFile.getParentFile().exists()) {
++                //noinspection ResultOfMethodCallIgnored
++                configFile.getParentFile().mkdirs();
++            }
++            //noinspection ResultOfMethodCallIgnored
++            configFile.createNewFile();
++        }
++
++        config.load(configFile);
++
++        getString("config-version", "1");
++        setComment("config-version",
++                "This is the main configuration file for Antarctic.",
++                "As you can see, there's tons to configure. Some options may impact gameplay, so use",
++                "with caution, and make sure you know what each option does before configuring.");
++        verbose = getBoolean("verbose", false);
++
++        for (Method method : AntarcticConfig.class.getDeclaredMethods()) {
++            if (Modifier.isStatic(method.getModifiers()) && Modifier.isPrivate(method.getModifiers()) && method.getParameterCount() == 0 &&
++                    method.getReturnType() == Void.TYPE && !method.getName().startsWith("lambda")) {
++                method.setAccessible(true);
++                try {
++                    method.invoke(null);
++                } catch (Throwable t) {
++                    MinecraftServer.LOGGER.warn("Failed to load configuration option from " + method.getName(), t);
++                }
++            }
++        }
++
++        updates++;
++
++        save();
++    }
++
++    public static void load(File file) throws IOException {
++        configFile = file;
++        load();
++    }
++
++    private static void save() throws IOException {
++        // Render the config with comments above their keys, then write it out.
++        config.save(configFile);
++        if (comments.isEmpty()) {
++            return;
++        }
++
++        List<String> lines = new java.util.ArrayList<>(java.nio.file.Files.readAllLines(configFile.toPath()));
++        java.util.ArrayDeque<String> path = new java.util.ArrayDeque<>();
++        int indent = 0;
++        for (int i = 0; i < lines.size(); i++) {
++            String line = lines.get(i);
++            if (line.trim().isEmpty() || line.trim().startsWith("#")) {
++                continue;
++            }
++            int lineIndent = line.indexOf(line.trim().charAt(0));
++            if (lineIndent > indent) {
++                path.addLast(line.trim().split(":")[0]);
++                indent = lineIndent;
++            } else {
++                while (lineIndent < indent && !path.isEmpty()) {
++                    path.removeLast();
++                    indent -= 2;
++                }
++                if (!path.isEmpty()) {
++                    path.removeLast();
++                }
++                path.addLast(line.trim().split(":")[0]);
++                indent = lineIndent;
++            }
++            String key = String.join(".", path);
++            String[] comment = comments.get(key);
++            if (comment != null) {
++                String pad = line.substring(0, lineIndent);
++                for (int c = comment.length - 1; c >= 0; c--) {
++                    lines.add(i, pad + "# " + comment[c]);
++                }
++                comments.remove(key);
++            }
++        }
++        java.nio.file.Files.write(configFile.toPath(), lines);
++    }
++
++    private static void setComment(String key, String... comment) {
++        comments.put(key, comment);
++    }
++
++    private static void ensureDefault(String key, Object defaultValue, String... comment) {
++        if (!config.contains(key)) {
++            config.set(key, defaultValue);
++        }
++        setComment(key, comment);
++    }
++
++    private static boolean getBoolean(String key, boolean defaultValue, String... comment) {
++        return getBoolean(key, null, defaultValue, comment);
++    }
++
++    private static boolean getBoolean(String key, @Nullable String oldKey, boolean defaultValue, String... comment) {
++        ensureDefault(key, defaultValue, comment);
++        return config.getBoolean(key, defaultValue);
++    }
++
++    private static int getInt(String key, int defaultValue, String... comment) {
++        return getInt(key, null, defaultValue, comment);
++    }
++
++    private static int getInt(String key, @Nullable String oldKey, int defaultValue, String... comment) {
++        ensureDefault(key, defaultValue, comment);
++        return config.getInt(key, defaultValue);
++    }
++
++    private static double getDouble(String key, double defaultValue, String... comment) {
++        return getDouble(key, null, defaultValue, comment);
++    }
++
++    private static double getDouble(String key, @Nullable String oldKey, double defaultValue, String... comment) {
++        ensureDefault(key, defaultValue, comment);
++        return config.getDouble(key, defaultValue);
++    }
++
++    private static long getLong(String key, long defaultValue, String... comment) {
++        return getLong(key, null, defaultValue, comment);
++    }
++
++    private static long getLong(String key, @Nullable String oldKey, long defaultValue, String... comment) {
++        ensureDefault(key, defaultValue, comment);
++        return config.getLong(key, defaultValue);
++    }
++
++    private static String getString(String key, String defaultValue, String... comment) {
++        return getString(key, null, defaultValue, comment);
++    }
++
++    private static String getString(String key, @Nullable String oldKey, String defaultValue, String... comment) {
++        ensureDefault(key, defaultValue, comment);
++        return config.getString(key, defaultValue);
++    }
++
++    private static List<String> getStringList(String key, List<String> defaultValue, String... comment) {
++        ensureDefault(key, defaultValue, comment);
++        return config.getStringList(key);
++    }
++}
+diff --git a/main/java/net/minecraft/server/DedicatedServer.java b/main/java/net/minecraft/server/DedicatedServer.java
+index 6a8292c..598d954 100644
+--- a/main/java/net/minecraft/server/DedicatedServer.java
++++ b/main/java/net/minecraft/server/DedicatedServer.java
+@@ -200,6 +200,10 @@ public class DedicatedServer extends MinecraftServer implements IMinecraftServer
+             com.destroystokyo.paper.PaperConfig.init((File) options.valueOf("paper-settings"));
+             com.destroystokyo.paper.PaperConfig.registerCommands();
+             com.destroystokyo.paper.VersionHistoryManager.INSTANCE.getClass(); // load version history now
++            // Arctic start
++            com.destroystokyo.paper.AntarcticConfig.load((File) options.valueOf("antarctic-settings"));
++            com.destroystokyo.paper.AntarcticCommand.init();
++            // Arctic end
+             // Paper end
+ 
+             DedicatedServer.LOGGER.info("Generating keypair");
+diff --git a/main/java/org/bukkit/craftbukkit/CraftServer.java b/main/java/org/bukkit/craftbukkit/CraftServer.java
+index 7c82e18..432a863 100644
+--- a/main/java/org/bukkit/craftbukkit/CraftServer.java
++++ b/main/java/org/bukkit/craftbukkit/CraftServer.java
+@@ -1871,6 +1871,12 @@ public final class CraftServer implements Server {
+             return com.destroystokyo.paper.PaperConfig.config;
+         }
+ 
++        @Override
++        public YamlConfiguration getAntarcticConfig()
++        {
++            return com.destroystokyo.paper.AntarcticConfig.getConfig();
++        }
++
+         @Override
+         public void restart() {
+             org.spigotmc.RestartCommand.restart();
+diff --git a/main/java/org/bukkit/craftbukkit/Main.java b/main/java/org/bukkit/craftbukkit/Main.java
+index ae2c51f..9df1b73 100644
+--- a/main/java/org/bukkit/craftbukkit/Main.java
++++ b/main/java/org/bukkit/craftbukkit/Main.java
+@@ -135,6 +135,14 @@ public class Main {
+                         .describedAs("Yml file");
+                 // Paper end
+ 
++                // Arctic start
++                acceptsAll(asList("antarctic", "antarctic-settings"), "File for antarctic settings")
++                        .withRequiredArg()
++                        .ofType(File.class)
++                        .defaultsTo(new File("antarctic.yml"))
++                        .describedAs("Yml file");
++                // Arctic end
++
+                 // Paper start
+                 acceptsAll(asList("server-name"), "Name of the server")
+                         .withRequiredArg()
