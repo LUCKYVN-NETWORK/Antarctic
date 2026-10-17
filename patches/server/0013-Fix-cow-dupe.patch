@@ -1,0 +1,20 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 2HG <admin@2hg.pw>
+Date: Sat, 16 Jul 2022 14:18:52 +0700
+Subject: [PATCH 13/43] Fix cow dupe - Backport Dionysus
+ server/0087-Fix-cow-dupe.patch - Source: https://github.com/nopjmp/Dionysus
+ at b5c71b62f6f1f555b22bd52f5751e33be4690b6e
+
+
+diff --git a/main/java/net/minecraft/server/EntityMushroomCow.java b/main/java/net/minecraft/server/EntityMushroomCow.java
+index 5b0f8a9..acffbdc 100644
+--- a/main/java/net/minecraft/server/EntityMushroomCow.java
++++ b/main/java/net/minecraft/server/EntityMushroomCow.java
+@@ -28,6 +28,7 @@ public class EntityMushroomCow extends EntityCow {
+ 
+             return true;
+         } else if (itemstack.getItem() == Items.SHEARS && this.getAge() >= 0) {
++            if (this.dead) return false; // Reaper - Fix cow dupe
+             // CraftBukkit start
+             PlayerShearEntityEvent event = new PlayerShearEntityEvent((org.bukkit.entity.Player) entityhuman.getBukkitEntity(), this.getBukkitEntity());
+             this.world.getServer().getPluginManager().callEvent(event);
