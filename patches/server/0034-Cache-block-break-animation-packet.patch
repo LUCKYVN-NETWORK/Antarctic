@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Softik Lord <dimap9986@gmail.com>
+Date: Sat, 9 Jul 2022 06:40:26 +0500
+Subject: [PATCH 34/43] Cache-block-break-animation-packet - Backport Dionysus
+ server/0078-Cache-block-break-animation-packet.patch - Source:
+ https://github.com/nopjmp/Dionysus at
+ b5c71b62f6f1f555b22bd52f5751e33be4690b6e
+
+
+diff --git a/main/java/net/minecraft/server/WorldManager.java b/main/java/net/minecraft/server/WorldManager.java
+index bfe003f..678685d 100644
+--- a/main/java/net/minecraft/server/WorldManager.java
++++ b/main/java/net/minecraft/server/WorldManager.java
+@@ -70,6 +70,7 @@ public class WorldManager implements IWorldAccess {
+         // Paper start
+         java.util.List<? extends EntityHuman> list = entity != null ? entity.world.players : this.a.getPlayerList().v();
+         Iterator<? extends EntityHuman> iterator = list.iterator();
++        PacketPlayOutBlockBreakAnimation packet = null; // NeonPaper - cache packet
+         while (iterator.hasNext()) {
+             EntityHuman human = iterator.next();
+             if (!(human instanceof EntityPlayer)) continue;
+@@ -88,7 +89,10 @@ public class WorldManager implements IWorldAccess {
+                 // CraftBukkit end
+ 
+                 if (d0 * d0 + d1 * d1 + d2 * d2 < 1024.0D) {
+-                    entityplayer.playerConnection.sendPacket(new PacketPlayOutBlockBreakAnimation(i, blockposition, j));
++                // NeonPaper start
++                if (packet == null) packet = new PacketPlayOutBlockBreakAnimation(i, blockposition, j);
++                    entityplayer.playerConnection.sendPacket(packet);
++                // NeonPaper end
+                 }
+             }
+         }
