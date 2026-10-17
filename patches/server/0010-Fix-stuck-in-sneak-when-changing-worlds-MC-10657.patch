@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Softik Lord <dimap9986@gmail.com>
+Date: Wed, 13 Jul 2022 21:17:41 +0500
+Subject: [PATCH 10/43] Fix-stuck-in-sneak-when-changing-worlds-MC-10657 -
+ Backport Dionysus
+ server/0065-Fix-stuck-in-sneak-when-changing-worlds-MC-10657.patch - Source:
+ https://github.com/nopjmp/Dionysus at
+ b5c71b62f6f1f555b22bd52f5751e33be4690b6e
+
+twersytaytggfdscx
+
+diff --git a/main/java/net/minecraft/server/EntityPlayer.java b/main/java/net/minecraft/server/EntityPlayer.java
+index cb2c459..c399ce5 100644
+--- a/main/java/net/minecraft/server/EntityPlayer.java
++++ b/main/java/net/minecraft/server/EntityPlayer.java
+@@ -1155,6 +1155,7 @@ public class EntityPlayer extends EntityHuman implements ICrafting {
+         this.getDataWatcher().set(EntityPlayer.br, entityplayer.getDataWatcher().get(EntityPlayer.br));
+         this.lastSentExp = -1;
+         this.lastHealthSent = -1.0F;
++        setSneaking(false); // NeonPaper - fix MC-10657
+         this.ch = -1;
+         // this.cr.a((RecipeBook) entityplayer.cr); // CraftBukkit
+         // Paper start - Optimize remove queue
+diff --git a/main/java/net/minecraft/server/PlayerList.java b/main/java/net/minecraft/server/PlayerList.java
+index 59c90f9..c35aa97 100644
+--- a/main/java/net/minecraft/server/PlayerList.java
++++ b/main/java/net/minecraft/server/PlayerList.java
+@@ -743,6 +743,8 @@ public abstract class PlayerList {
+             entityplayer.playerConnection.sendPacket(new PacketPlayOutEntityEffect(entityplayer.getId(), mobEffect));
+         }
+ 
++        entityplayer.setSneaking(false); // NeonPaper - fix MC-10657
++
+         // Fire advancement trigger
+         CriterionTriggers.u.a(entityplayer, ((CraftWorld) fromWorld).getHandle().worldProvider.getDimensionManager(), worldserver.worldProvider.getDimensionManager());
+         if (((CraftWorld) fromWorld).getHandle().worldProvider.getDimensionManager() == DimensionManager.NETHER && worldserver.worldProvider.getDimensionManager() == DimensionManager.OVERWORLD && entityplayer.Q() != null) {
