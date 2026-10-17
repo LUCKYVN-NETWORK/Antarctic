@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ruViolence <78062896+ruViolence@users.noreply.github.com>
+Date: Fri, 3 Jun 2022 23:37:07 +0500
+Subject: [PATCH 25/43] fix: clientside entity desynchronization - Backport
+ Dionysus server/0138-fix-clientside-entity-desynchronization.patch - Source:
+ https://github.com/nopjmp/Dionysus at
+ b5c71b62f6f1f555b22bd52f5751e33be4690b6e
+
+Ported from 1.8 to prevent recreating entities that are still within view distance of the player.
+
+diff --git a/main/java/net/minecraft/server/EntityTrackerEntry.java b/main/java/net/minecraft/server/EntityTrackerEntry.java
+index 01f2aa0..9087368 100644
+--- a/main/java/net/minecraft/server/EntityTrackerEntry.java
++++ b/main/java/net/minecraft/server/EntityTrackerEntry.java
+@@ -502,8 +502,10 @@ public class EntityTrackerEntry {
+     }
+     private boolean isInRangeOfPlayer(EntityPlayer entityplayer) {
+         // Paper end
+-        double d0 = entityplayer.locX - (double) this.xLoc / 4096.0D;
+-        double d1 = entityplayer.locZ - (double) this.zLoc / 4096.0D;
++        // Reaper start - Fix clientside entity desynchronization
++        double d0 = entityplayer.locX - this.tracker.locX;
++        double d1 = entityplayer.locZ - this.tracker.locZ;
++        // Reaper end
+         int i = Math.min(this.e, this.f);
+ 
+         return d0 >= (double) (-i) && d0 <= (double) i && d1 >= (double) (-i) && d1 <= (double) i && this.tracker.a(entityplayer);
