@@ -1,0 +1,21 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Softik Lord <dimap9986@gmail.com>
+Date: Mon, 11 Jul 2022 18:24:54 +0500
+Subject: [PATCH 11/43] Reset-players-airTicks-on-respawn - Backport Dionysus
+ server/0067-Reset-players-airTicks-on-respawn.patch - Source:
+ https://github.com/nopjmp/Dionysus at
+ b5c71b62f6f1f555b22bd52f5751e33be4690b6e
+
+
+diff --git a/main/java/net/minecraft/server/EntityPlayer.java b/main/java/net/minecraft/server/EntityPlayer.java
+index c399ce5..15e2dae 100644
+--- a/main/java/net/minecraft/server/EntityPlayer.java
++++ b/main/java/net/minecraft/server/EntityPlayer.java
+@@ -1557,6 +1557,7 @@ public class EntityPlayer extends EntityHuman implements ICrafting {
+ 
+         this.setHealth(this.getMaxHealth());
+         this.fireTicks = 0;
++        this.setAirTicks(300); // Reaper - Reset airTicks on respawn
+         this.fallDistance = 0;
+         this.foodData = new FoodMetaData(this);
+         this.expLevel = this.newLevel;
