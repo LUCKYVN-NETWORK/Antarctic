@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Sat, 17 Oct 2026 16:06:10 +0700
+Subject: [PATCH 40/43] Preserve actual-sleeper safeguard in sleep optimization
+ - Adapt Dionysus 0012 without allowing faux sleepers or spectators alone to
+ skip night - Keep a single allocation-free pass instead of a stream
+
+
+diff --git a/main/java/net/minecraft/server/WorldServer.java b/main/java/net/minecraft/server/WorldServer.java
+index a53f54c..9406379 100644
+--- a/main/java/net/minecraft/server/WorldServer.java
++++ b/main/java/net/minecraft/server/WorldServer.java
+@@ -427,7 +427,12 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+         if (this.players.size() == 0 || this.isClientSide || !this.Q) {
+             return false;
+         } else {
+-            return this.players.stream().allMatch(p -> p.isSpectator() || p.isDeeplySleeping() || p.fauxSleeping);
++            boolean actualSleeper = false;
++            for (EntityHuman player : this.players) {
++                if (player.isDeeplySleeping()) actualSleeper = true;
++                else if (!player.isSpectator() && !player.fauxSleeping) return false;
++            }
++            return actualSleeper; // Paper: faux sleepers alone must not advance the night.
+         }
+     }
+ 
