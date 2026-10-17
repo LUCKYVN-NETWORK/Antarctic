@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Softik Lord <dimap9986@gmail.com>
+Date: Mon, 8 Aug 2022 21:19:01 +0500
+Subject: [PATCH 26/43] 
+ fix-prevent-vehicle-move-while-awaiting-teleport-confirm - Backport Dionysus
+ server/0149-fix-prevent-vehicle-move-while-awaiting-teleport-con.patch -
+ Source: https://github.com/nopjmp/Dionysus at
+ b5c71b62f6f1f555b22bd52f5751e33be4690b6e
+
+
+diff --git a/main/java/net/minecraft/server/PlayerConnection.java b/main/java/net/minecraft/server/PlayerConnection.java
+index 0406b46..40daaaf 100644
+--- a/main/java/net/minecraft/server/PlayerConnection.java
++++ b/main/java/net/minecraft/server/PlayerConnection.java
+@@ -298,6 +298,17 @@ public class PlayerConnection implements PacketListenerPlayIn, ITickable {
+             Entity entity = this.player.getVehicle();
+ 
+             if (entity != this.player && entity.bE() == this.player && entity == this.r) {
++                // Reaper start - Prevent vehicle move while awaiting teleport confirm
++                if (this.teleportPos != null) {
++                    if (this.e - this.A > 20) {
++                        this.A = this.e;
++                        this.syncPosition();
++                        this.a(this.teleportPos.x, this.teleportPos.y, this.teleportPos.z, this.player.yaw, this.player.pitch);
++                    }
++                    this.allowedPlayerTicks = 20; // CraftBukkit
++                    return;
++                }
++               // Reaper end
+                 WorldServer worldserver = this.player.x();
+                 double d0 = entity.locX;
+                 double d1 = entity.locY;
