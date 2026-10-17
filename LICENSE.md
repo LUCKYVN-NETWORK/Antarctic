@@ -3,41 +3,32 @@ Antarctic is a fork of Paper 1.12.2 and inherits its licensing from upstream.
 Paper inherits its licensing from upstream projects.
 
 As such, Paper is licensed under the
-[GNU General Public License version 3](licenses/GPL.md); as it inherits it from Spigot,
+[GNU General Public License version 3](https://www.gnu.org/licenses/gpl-3.0.html); as it inherits it from Spigot,
 who in turn inherits it from the original Bukkit and Craftbukkit projects.
 
-Any author who is _not_ listed below should be presumed to have released their work
-under the original [GPL](licenses/GPL.md) license.
-
 In the interest of promoting a better Minecraft platform for everyone, contributors
-may choose to release their code under the more permissive [MIT License](licenses/MIT.md).
+may choose to release their code under the more permissive [MIT License](#the-mit-license-mit).
 
-The authors listed below have chosen to release their code under that more permissive
-[MIT License](licenses/MIT.md). Any contributor who wants their name added below
-should submit a pull request to this project to add their name.
+The MIT License (MIT)
+=====================
 
-```text
-Zach Brown <zach.brown@destroystokyo.com>
-Daniel Ennis <aikar@aikar.co>
-Kyle Wood <demonwav@gmail.com>
-kashike <kashike@vq.lc>
-Black Hole <black-hole@live.com>
-Mark Vainomaa <mikroskeem@mikroskeem.eu>
-Mystiflow <mystiflow@gmail.com>
-Shane Freeder <theboyetronic@gmail.com>
-Gabscap <git@gabscap.de>
-Jadon Fowler <jadonflower@gmail.com>
-chickeneer <emcchickeneer@gmail.com>
-Minecrell <minecrell@minecrell.net>
-Techcable <Techcable@outlook.com>
-BillyGalbreath <blake.galbreath@gmail.com>
-MiniDigger <admin@minidigger.me>
-Brokkonaut <hannos17@gmx.de>
-vemacs <d@nkmem.es>
-stonar96 <minecraft.stonar96@gmail.com>
-Hugo Manrique <hugmanrique@gmail.com>
-Andrew Steinborn <git@steinborn.me>
-willies952002 <admin@domnian.com>
-MicleBrick <miclebrick@outlook.com>
-Trigary <trigary0@gmail.com>
-```
+Permission is hereby granted, free of charge, to any person
+obtaining a copy of this software and associated documentation
+files (the “Software”), to deal in the Software without
+restriction, including without limitation the rights to use,
+copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the
+Software is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
+OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+OTHER DEALINGS IN THE SOFTWARE.

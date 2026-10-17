@@ -37,4 +37,4 @@ Use `./gradlew applyPatches` to reset local sources and reapply saved patches. *
 
 ## License
 
-Inherited **GPL-3.0**, with **MIT** contributions where specified. See [LICENSE.md](LICENSE.md) and [licenses/](licenses/).
+Inherited **GPL-3.0**, with **MIT** contributions where specified. See [LICENSE.md](LICENSE.md).
