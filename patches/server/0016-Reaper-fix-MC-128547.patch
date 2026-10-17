@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ruViolence <78062896+ruViolence@users.noreply.github.com>
+Date: Fri, 27 May 2022 21:22:05 +0500
+Subject: [PATCH 16/43] (Reaper) fix: MC-128547 - Backport Dionysus
+ server/0091-Reaper-fix-MC-128547.patch - Source:
+ https://github.com/nopjmp/Dionysus at
+ b5c71b62f6f1f555b22bd52f5751e33be4690b6e
+
+https://bugs.mojang.com/browse/MC-128547
+
+Original code from https://github.com/ruViolence/Reaper
+Licensed under GPL-3.0
+
+diff --git a/main/java/net/minecraft/server/EnchantmentManager.java b/main/java/net/minecraft/server/EnchantmentManager.java
+index f714dc3..c74d00b 100644
+--- a/main/java/net/minecraft/server/EnchantmentManager.java
++++ b/main/java/net/minecraft/server/EnchantmentManager.java
+@@ -114,6 +114,7 @@ public class EnchantmentManager {
+         EnchantmentManager.a.a = 0;
+         EnchantmentManager.a.b = damagesource;
+         a((EnchantmentManager.EnchantmentModifier) EnchantmentManager.a, iterable);
++        EnchantmentManager.a.b = null; // Reaper - Fix MC-128547
+         return EnchantmentManager.a.a;
+     }
+ 
+@@ -141,6 +142,10 @@ public class EnchantmentManager {
+             a((EnchantmentManager.EnchantmentModifier) EnchantmentManager.c, entityliving.getItemInMainHand());
+         }
+ 
++        // Reaper start - Fix MC-128547
++        EnchantmentManager.c.b = null;
++        EnchantmentManager.c.a = null;
++        // Reaper end
+     }
+ 
+     public static void b(EntityLiving entityliving, Entity entity) {
+@@ -154,6 +159,10 @@ public class EnchantmentManager {
+             a((EnchantmentManager.EnchantmentModifier) EnchantmentManager.d, entityliving.getItemInMainHand());
+         }
+ 
++        // Reaper start - Fix MC-128547
++        EnchantmentManager.d.b = null;
++        EnchantmentManager.d.a = null;
++        // Reaper end
+     }
+ 
+     public static int a(Enchantment enchantment, EntityLiving entityliving) {
