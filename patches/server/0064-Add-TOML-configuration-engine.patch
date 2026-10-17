@@ -1,0 +1,1549 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dreeam <61569423+Dreeam-qwq@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 02:31:59 +0700
+Subject: [PATCH 64/64] Add TOML configuration engine
+
+- Ported from Leaf Config v2 and the Leaf legacy converter (Winds-Studio/Leaf, GPL-3.0-only)
+- Add com.destroystokyo.paper.config.toml engine on Night-Config 3.8.0 with comment-preserving antarctic.toml
+- Add @ConfigInfo, @HotReloadUnsupported, @DoNotLoad, @Experimental annotations, EnumConfigCategory and IConfigModule
+- Port all existing settings to category modules (misc, network, optimizations, gameplay, fixes)
+- Migrate antarctic.yml to antarctic.toml automatically on first start; rename legacy file to antarctic.yml.migrated
+- Keep Server.Spigot#getAntarcticConfig YAML facade for plugins and timings; add getAntarcticTomlConfig
+- Repoint NMS consumers to module fields; rewrite config tests for TOML semantics
+- Use builder().sync() instead of ofConcurrent(): Night-Config 3.8.0 debounces async saves to a background executor
+
+diff --git a/main/java/com/destroystokyo/paper/AntarcticCommand.java b/main/java/com/destroystokyo/paper/AntarcticCommand.java
+index e873b05..f332597 100644
+--- a/main/java/com/destroystokyo/paper/AntarcticCommand.java
++++ b/main/java/com/destroystokyo/paper/AntarcticCommand.java
+@@ -1,5 +1,6 @@
+ package com.destroystokyo.paper;
+ 
++import com.destroystokyo.paper.config.toml.AntarcticTomlConfig;
+ import net.minecraft.server.MinecraftServer;
+ import org.bukkit.Bukkit;
+ import org.bukkit.ChatColor;
+@@ -52,7 +53,8 @@ public class AntarcticCommand extends Command {
+ 
+             MinecraftServer console = MinecraftServer.getServer();
+             try {
+-                AntarcticConfig.load();
++                // Reload stays on the main thread: module statics are read lock-free by the tick loop.
++                AntarcticTomlConfig.load();
+             } catch (IOException e) {
+                 sender.sendMessage(ChatColor.RED + "Failed to reload.");
+                 e.printStackTrace();
+diff --git a/main/java/com/destroystokyo/paper/AntarcticConfig.java b/main/java/com/destroystokyo/paper/AntarcticConfig.java
+deleted file mode 100644
+index e33272f..0000000
+--- a/main/java/com/destroystokyo/paper/AntarcticConfig.java
++++ /dev/null
+@@ -1,268 +0,0 @@
+-package com.destroystokyo.paper;
+-
+-import org.bukkit.Bukkit;
+-import org.bukkit.configuration.file.YamlConfiguration;
+-import javax.annotation.Nullable;
+-
+-import java.io.File;
+-import java.io.IOException;
+-import java.lang.reflect.Method;
+-import java.lang.reflect.Modifier;
+-import java.util.List;
+-
+-/**
+- * Antarctic settings. Adapted from Dionysus by nopjmp and the Pufferfish
+- * configuration system (Copyright (C) 2022 Pufferfish Studios LLC, GPL-3.0-or-later).
+- * Source: https://github.com/nopjmp/Dionysus, server patches 0006 and 0160.
+- */
+-public class AntarcticConfig {
+-
+-    private static final YamlConfiguration config = new YamlConfiguration();
+-    private static final java.util.Map<String, String[]> comments = new java.util.LinkedHashMap<>();
+-    private static File configFile = new File("antarctic.yml");
+-    private static int updates = 0;
+-    private static boolean verbose;
+-
+-    protected static void logError(String s) {
+-        Bukkit.getLogger().severe(s);
+-    }
+-
+-    protected static void log(String s) {
+-        if (verbose) {
+-            Bukkit.getLogger().info(s);
+-        }
+-    }
+-
+-    public static YamlConfiguration getConfig() {
+-        return config;
+-    }
+-
+-    public static int getUpdates() {
+-        return updates;
+-    }
+-
+-    public static void load() throws IOException {
+-        comments.clear();
+-        try {
+-            if (configFile.exists()) {
+-                config.load(configFile);
+-            } else {
+-                for (String key : new java.util.ArrayList<>(config.getKeys(false))) {
+-                    config.set(key, null);
+-                }
+-            }
+-        } catch (org.bukkit.configuration.InvalidConfigurationException e) {
+-            throw new IOException("Invalid Antarctic configuration", e);
+-        }
+-
+-        getString("config-version", "1");
+-        setComment("config-version",
+-                "This is the main configuration file for Antarctic.",
+-                "As you can see, there's tons to configure. Some options may impact gameplay, so use",
+-                "with caution, and make sure you know what each option does before configuring.");
+-        verbose = getBoolean("verbose", false);
+-
+-        for (Method method : AntarcticConfig.class.getDeclaredMethods()) {
+-            if (Modifier.isStatic(method.getModifiers()) && Modifier.isPrivate(method.getModifiers()) && method.getParameterCount() == 0 &&
+-                    method.getReturnType() == Void.TYPE && !method.getName().startsWith("lambda") && !method.getName().equals("save")) {
+-                method.setAccessible(true);
+-                try {
+-                    method.invoke(null);
+-                } catch (Throwable t) {
+-                    throw new IOException("Failed to load configuration option from " + method.getName(), t);
+-                }
+-            }
+-        }
+-
+-        save();
+-        updates++;
+-    }
+-
+-    public static void load(File file) throws IOException {
+-        configFile = file;
+-        load();
+-    }
+-
+-    private static void save() throws IOException {
+-        // Bukkit 1.12 has header-only comments; avoid parsing YAML ourselves.
+-        StringBuilder header = new StringBuilder("Antarctic configuration\n");
+-        for (java.util.Map.Entry<String, String[]> entry : comments.entrySet()) {
+-            if (entry.getValue().length != 0) {
+-                header.append("\n").append(entry.getKey()).append(":\n");
+-                for (String line : entry.getValue()) header.append(line).append("\n");
+-            }
+-        }
+-        config.options().header(header.toString());
+-        config.save(configFile);
+-    }
+-
+-    private static void setComment(String key, String... comment) {
+-        if (comment.length != 0) comments.put(key, comment);
+-    }
+-
+-    private static void ensureDefault(String key, Object defaultValue, String... comment) {
+-        if (!config.contains(key)) {
+-            config.set(key, defaultValue);
+-        }
+-        setComment(key, comment);
+-    }
+-
+-    private static boolean getBoolean(String key, boolean defaultValue, String... comment) {
+-        return getBoolean(key, null, defaultValue, comment);
+-    }
+-
+-    private static boolean getBoolean(String key, @Nullable String oldKey, boolean defaultValue, String... comment) {
+-        ensureDefault(key, defaultValue, comment);
+-        return config.getBoolean(key, defaultValue);
+-    }
+-
+-    private static int getInt(String key, int defaultValue, String... comment) {
+-        return getInt(key, null, defaultValue, comment);
+-    }
+-
+-    private static int getInt(String key, @Nullable String oldKey, int defaultValue, String... comment) {
+-        ensureDefault(key, defaultValue, comment);
+-        return config.getInt(key, defaultValue);
+-    }
+-
+-    private static double getDouble(String key, double defaultValue, String... comment) {
+-        return getDouble(key, null, defaultValue, comment);
+-    }
+-
+-    private static double getDouble(String key, @Nullable String oldKey, double defaultValue, String... comment) {
+-        ensureDefault(key, defaultValue, comment);
+-        return config.getDouble(key, defaultValue);
+-    }
+-
+-    private static long getLong(String key, long defaultValue, String... comment) {
+-        return getLong(key, null, defaultValue, comment);
+-    }
+-
+-    private static long getLong(String key, @Nullable String oldKey, long defaultValue, String... comment) {
+-        ensureDefault(key, defaultValue, comment);
+-        return config.getLong(key, defaultValue);
+-    }
+-
+-    private static String getString(String key, String defaultValue, String... comment) {
+-        return getString(key, null, defaultValue, comment);
+-    }
+-
+-    private static String getString(String key, @Nullable String oldKey, String defaultValue, String... comment) {
+-        ensureDefault(key, defaultValue, comment);
+-        return config.getString(key, defaultValue);
+-    }
+-
+-    private static List<String> getStringList(String key, List<String> defaultValue, String... comment) {
+-        ensureDefault(key, defaultValue, comment);
+-        return config.getStringList(key);
+-    }
+-    // Papaya / moom0o via Dionysus 0098; retain the vanilla interval by default.
+-    public static int pathfinderGoalSelectionDelay = 3;
+-    private static void pathfinderGoalSelectionDelay() {
+-        int delay = getInt("pathfinder.goal-selection-delay", 3,
+-                "Ticks between goal-selection passes. Vanilla: 3. Higher values reduce AI responsiveness.",
+-                "Must be positive. Changes affect newly created selectors; restart to apply everywhere.");
+-        if (delay < 1) throw new IllegalArgumentException("pathfinder.goal-selection-delay must be positive");
+-        pathfinderGoalSelectionDelay = delay;
+-    }
+-    public static int compressionLevel = -1;
+-    private static void compressionLevel() {
+-        setComment("compression-level",
+-            "Deflate compression level used for packets and chunk/NBT saving.",
+-            "Valid values: -1 (default), 0 (none), 1 (fastest) through 9 (maximum).");
+-        compressionLevel = getInt("compression-level", -1);
+-        if (compressionLevel < -1 || compressionLevel > 9) {
+-            logError("Compression level is invalid resetting to default. Valid compression levels are -1 (Default), 0 (None), 1 (Fast) through 9 (Best)");
+-            compressionLevel = -1;
+-        }
+-    }
+-
+-    public static String serverModName = "Antarctic";
+-    private static void serverModName() {
+-        setComment("server-mod-name", "The server brand name sent to clients in the F3 debug screen.");
+-        serverModName = getString("server-mod-name", serverModName);
+-    }
+-
+-    public static boolean redactPlayerData = false;
+-    private static void redactPlayerData() {
+-        setComment("redact-player-data",
+-            "When enabled, removes player IP addresses and exact coordinates from console logs.",
+-            "Useful for privacy compliance and anarchy server environments.");
+-        redactPlayerData = getBoolean("redact-player-data", redactPlayerData);
+-    }
+-
+-    public static boolean improveMergeChecks = true;
+-    private static void improveMergeChecks() {
+-        setComment("improve-merge-checks",
+-            "Optimize inventory merge checks by testing stackability and counts before expensive NBT comparison.");
+-        improveMergeChecks = getBoolean("improve-merge-checks", improveMergeChecks);
+-    }
+-
+-    public static boolean enableSuffocationOptimization = true;
+-    private static void suffocationOptimization() {
+-        setComment("suffocation-optimization",
+-            "Optimize suffocation damage checks by throttling voxel collision tests for invulnerable entities.");
+-        enableSuffocationOptimization = getBoolean("suffocation-optimization", enableSuffocationOptimization);
+-    }
+-
+-    public static int maxProjectileLoadsPerTick = 10;
+-    public static int maxProjectileLoadsPerProjectile = 10;
+-    private static void projectileLoading() {
+-        setComment("projectile.max-loads-per-tick",
+-            "Maximum number of unloaded chunks that projectiles may trigger to load per server tick.",
+-            "Helps mitigate lag machines that fire projectiles into distant unloaded chunks.");
+-        maxProjectileLoadsPerTick = getInt("projectile.max-loads-per-tick", 10);
+-        setComment("projectile.max-loads-per-projectile",
+-            "Maximum number of unloaded chunks a single projectile can load before being removed.");
+-        maxProjectileLoadsPerProjectile = getInt("projectile.max-loads-per-projectile", 10);
+-    }
+-
+-    public static boolean optimizeArmourStands = false;
+-    private static void optimizeArmourStands() {
+-        setComment("optimize-armourstands",
+-            "When enabled, skips movement processing on armor stands to save CPU.",
+-            "Defaults to false to preserve vanilla physics and piston interactions.");
+-        optimizeArmourStands = getBoolean("optimize-armourstands", optimizeArmourStands);
+-    }
+-
+-    public static boolean chunkOverloadDupe = false;
+-    public static boolean chunkOverloadDupeLog = false;
+-    private static void chunkOverloadDupe() {
+-        setComment("chunk-overload-dupe.allow",
+-            "When enabled, allows chunk-overload rollback behavior where oversized chunks (>1MB) are not saved to disk.",
+-            "Useful for anarchy servers wishing to preserve authentic vanilla 1.12.2 book-dupe mechanics.",
+-            "Defaults to false to prevent chunk rollback and item duplication.");
+-        chunkOverloadDupe = getBoolean("chunk-overload-dupe.allow", false);
+-        setComment("chunk-overload-dupe.log",
+-            "Whether to log chunk overload dupe attempts when triggered.");
+-        chunkOverloadDupeLog = getBoolean("chunk-overload-dupe.log", false);
+-        if (chunkOverloadDupe) Bukkit.getLogger().info("Chunk overload dupe activated.");
+-        if (chunkOverloadDupeLog) Bukkit.getLogger().info("Chunk overload dupes will be logged.");
+-    }
+-
+-    public static int mapDecorationsLimit = 25;
+-    private static void mapDecorationsLimit() {
+-        setComment("map-decorations-limit",
+-            "Maximum number of custom decorations (banners, frames, etc.) allowed on a WorldMap.",
+-            "Helps mitigate lag and crash exploits caused by packing thousands of markers into a single map.",
+-            "Player, monument, and mansion icons are exempted.");
+-        mapDecorationsLimit = getInt("map-decorations-limit", 25);
+-    }
+-
+-    public static boolean noChunksPastWorldBorder = false;
+-    private static void noChunksPastWorldBorder() {
+-        setComment("no-chunks-past-world-border",
+-            "When enabled, prevents players from loading or generating chunks past the world border edge.",
+-            "Defaults to false to preserve vanilla border visibility.");
+-        noChunksPastWorldBorder = getBoolean("no-chunks-past-world-border", false);
+-    }
+-
+-    public static boolean enableBooks = true;
+-    private static void enableBooks() {
+-        setComment("enable-books",
+-            "When disabled, book editing and signing packets are rejected unless the player has the 'antarctic.usebooks' permission.",
+-            "Defaults to true. Set to false to prevent book-based exploit vectors completely.");
+-        enableBooks = getBoolean("enable-books", true);
+-    }
+-
+-}
+diff --git a/main/java/com/destroystokyo/paper/config/toml/AntarcticLegacyConverter.java b/main/java/com/destroystokyo/paper/config/toml/AntarcticLegacyConverter.java
+new file mode 100644
+index 0000000..e39f92e
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/AntarcticLegacyConverter.java
+@@ -0,0 +1,80 @@
++package com.destroystokyo.paper.config.toml;
++
++import com.electronwill.nightconfig.core.file.CommentedFileConfig;
++import org.apache.logging.log4j.LogManager;
++import org.apache.logging.log4j.Logger;
++import org.bukkit.configuration.ConfigurationSection;
++import org.bukkit.configuration.file.YamlConfiguration;
++import org.bukkit.configuration.InvalidConfigurationException;
++
++import java.io.File;
++import java.io.IOException;
++import java.nio.file.Files;
++import java.util.LinkedHashMap;
++import java.util.Map;
++
++/**
++ * One-shot antarctic.yml -> antarctic.toml migrator, run when the TOML file
++ * does not exist yet. The legacy file is renamed to antarctic.yml.migrated
++ * only after the TOML was written, so no setting can be lost.
++ * Adapted from the Leaf legacy converter (Winds-Studio/Leaf, GPL-3.0-only),
++ * org.dreeam.leaf.config.legacy.upgrader.V1ToV200.
++ */
++final class AntarcticLegacyConverter {
++
++    private static final Logger LOGGER = LogManager.getLogger();
++    private static final Map<String, String> KEY_MIGRATIONS = new LinkedHashMap<>();
++
++    static {
++        KEY_MIGRATIONS.put("server-mod-name", "misc.rebrand.server-mod-name");
++        KEY_MIGRATIONS.put("redact-player-data", "misc.privacy.redact-player-data");
++        KEY_MIGRATIONS.put("compression-level", "network.deflate.compression-level");
++        KEY_MIGRATIONS.put("pathfinder.goal-selection-delay", "optimizations.pathfinder.goal-selection-delay");
++        KEY_MIGRATIONS.put("suffocation-optimization", "optimizations.suffocation.enable-suffocation-optimization");
++        KEY_MIGRATIONS.put("projectile.max-loads-per-tick", "optimizations.projectiles.max-loads-per-tick");
++        KEY_MIGRATIONS.put("projectile.max-loads-per-projectile", "optimizations.projectiles.max-loads-per-projectile");
++        KEY_MIGRATIONS.put("optimize-armourstands", "optimizations.armour-stands.enabled");
++        KEY_MIGRATIONS.put("no-chunks-past-world-border", "optimizations.world-border.no-chunks-past-world-border");
++        KEY_MIGRATIONS.put("improve-merge-checks", "gameplay.merge-checks.enabled");
++        KEY_MIGRATIONS.put("chunk-overload-dupe.allow", "gameplay.chunk-overload-dupe.allow");
++        KEY_MIGRATIONS.put("chunk-overload-dupe.log", "gameplay.chunk-overload-dupe.log");
++        KEY_MIGRATIONS.put("map-decorations-limit", "fixes.map-decorations.limit");
++        KEY_MIGRATIONS.put("enable-books", "fixes.books.enable-books");
++    }
++
++    private AntarcticLegacyConverter() {
++    }
++
++    static void convert(File legacyYaml, File tomlFile) throws IOException {
++        YamlConfiguration yaml = new YamlConfiguration();
++        try {
++            yaml.load(legacyYaml);
++        } catch (InvalidConfigurationException e) {
++            throw new IOException("Invalid legacy antarctic.yml", e);
++        }
++
++        File parent = tomlFile.getParentFile();
++        if (parent != null) parent.mkdirs();
++        tomlFile.createNewFile();
++        CommentedFileConfig toml = CommentedFileConfig.builder(tomlFile).sync().build();
++        toml.load();
++        for (Map.Entry<String, String> entry : KEY_MIGRATIONS.entrySet()) {
++            if (yaml.contains(entry.getKey())) {
++                toml.set(entry.getValue(), yaml.get(entry.getKey()));
++            }
++        }
++        toml.save();
++
++        for (String key : yaml.getKeys(true)) {
++            if (!KEY_MIGRATIONS.containsKey(key) && !(yaml.get(key) instanceof ConfigurationSection)) {
++                LOGGER.warn("Legacy config key {} has no antarctic.toml equivalent and was dropped", key);
++            }
++        }
++
++        try {
++            Files.move(legacyYaml.toPath(), legacyYaml.toPath().resolveSibling(legacyYaml.getName() + ".migrated"));
++        } catch (IOException e) {
++            LOGGER.error("Failed to rename {} after migration; it was already converted and will be ignored", legacyYaml.getName(), e);
++        }
++    }
++}
+diff --git a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+new file mode 100644
+index 0000000..a3a5888
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+@@ -0,0 +1,183 @@
++package com.destroystokyo.paper.config.toml;
++
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++import com.destroystokyo.paper.config.toml.annotations.DoNotLoad;
++import com.destroystokyo.paper.config.toml.annotations.HotReloadUnsupported;
++import com.destroystokyo.paper.config.toml.modules.fixes.Books;
++import com.destroystokyo.paper.config.toml.modules.fixes.MapDecorations;
++import com.destroystokyo.paper.config.toml.modules.gameplay.ChunkOverloadDupe;
++import com.destroystokyo.paper.config.toml.modules.gameplay.MergeChecks;
++import com.destroystokyo.paper.config.toml.modules.misc.Privacy;
++import com.destroystokyo.paper.config.toml.modules.misc.Rebrand;
++import com.destroystokyo.paper.config.toml.modules.network.Deflate;
++import com.destroystokyo.paper.config.toml.modules.optimizations.ArmourStands;
++import com.destroystokyo.paper.config.toml.modules.optimizations.Pathfinder;
++import com.destroystokyo.paper.config.toml.modules.optimizations.Projectiles;
++import com.destroystokyo.paper.config.toml.modules.optimizations.Suffocation;
++import com.destroystokyo.paper.config.toml.modules.optimizations.WorldBorder;
++import com.electronwill.nightconfig.core.file.CommentedFileConfig;
++import org.apache.logging.log4j.LogManager;
++import org.apache.logging.log4j.Logger;
++import org.bukkit.configuration.file.YamlConfiguration;
++
++import java.io.File;
++import java.io.IOException;
++import java.lang.reflect.Field;
++import java.lang.reflect.Modifier;
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Objects;
++
++/**
++ * antarctic.toml engine. Thread-safe reads via a synchronized CommentedFileConfig;
++ * loads, saves and reloads run on the main server thread. Night-Config 3.8.0's
++ * ofConcurrent() builds an AsyncFileConfig whose save() is debounced to a background
++ * executor, which would lose writes on crash; builder().sync() keeps them durable.
++ * Adapted from Leaf Config v2 and the Leaf legacy converter
++ * (Winds-Studio/Leaf, GPL-3.0-only), org.dreeam.leaf.config.LeafConfig.
++ */
++public final class AntarcticTomlConfig {
++
++    private static final Logger LOGGER = LogManager.getLogger();
++    private static final List<IConfigModule> MODULES = List.of(
++            new Rebrand(), new Privacy(),
++            new Deflate(),
++            new Pathfinder(), new Suffocation(), new Projectiles(), new ArmourStands(), new WorldBorder(),
++            new MergeChecks(), new ChunkOverloadDupe(),
++            new MapDecorations(), new Books());
++    private static final YamlConfiguration yamlFacade = new YamlConfiguration();
++    private static File configFile = new File("antarctic.toml");
++    private static CommentedFileConfig configFileInstance;
++    private static int updates;
++    private static boolean initialized;
++
++    private AntarcticTomlConfig() {
++    }
++
++    public static void load(File file) throws IOException {
++        configFile = file;
++        load();
++    }
++
++    public static void load() throws IOException {
++        if (!configFile.exists()) {
++            File legacy = new File(configFile.getParentFile(), "antarctic.yml");
++            if (legacy.isFile()) {
++                AntarcticLegacyConverter.convert(legacy, configFile);
++                LOGGER.info("Migrated legacy antarctic.yml to {}", configFile.getName());
++            } else {
++                File parent = configFile.getParentFile();
++                if (parent != null) parent.mkdirs();
++                configFile.createNewFile();
++            }
++        }
++
++        CommentedFileConfig previous = configFileInstance;
++        configFileInstance = CommentedFileConfig.builder(configFile).sync().build();
++        try {
++            configFileInstance.load();
++        } catch (RuntimeException e) {
++            configFileInstance = previous;
++            throw new IOException("Invalid Antarctic configuration", e);
++        }
++
++        configFileInstance.setComment("", "Antarctic configuration\nGenerated from antarctic.toml; comments are preserved on save.");
++
++        Map<Field, Object> snapshot = new HashMap<>();
++        try {
++            for (IConfigModule module : MODULES) {
++                loadModule(module, snapshot);
++            }
++        } catch (IllegalAccessException | RuntimeException e) {
++            restore(snapshot);
++            configFileInstance = previous;
++            throw new IOException("Failed to load Antarctic configuration", e);
++        }
++
++        configFileInstance.save();
++        rebuildYamlFacade();
++        updates++;
++        initialized = true;
++    }
++
++    public static CommentedFileConfig getTomlConfig() {
++        return Objects.requireNonNull(configFileInstance, "antarctic.toml has not been loaded yet");
++    }
++
++    /** Binary-compat facade for plugins and TimingsExport, mirroring the TOML values. */
++    public static YamlConfiguration getYamlFacade() {
++        return yamlFacade;
++    }
++
++    public static int getUpdates() {
++        return updates;
++    }
++
++    private static void loadModule(IConfigModule module, Map<Field, Object> snapshot) throws IllegalAccessException {
++        for (Field field : module.getClass().getDeclaredFields()) {
++            if (!Modifier.isStatic(field.getModifiers()) || Modifier.isFinal(field.getModifiers())) continue;
++            if (field.isAnnotationPresent(DoNotLoad.class)) continue;
++            ConfigInfo info = field.getAnnotation(ConfigInfo.class);
++            if (info == null) continue;
++            if (initialized && field.isAnnotationPresent(HotReloadUnsupported.class)) continue;
++
++            String key = configKey(module, info);
++            field.setAccessible(true);
++            snapshot.put(field, field.get(null));
++
++            Object value;
++            if (configFileInstance.contains(key)) {
++                value = coerce(configFileInstance.get(key), field.getType());
++            } else {
++                value = field.get(null);
++                if (value == null) throw new IllegalStateException("Config default for " + key + " must not be null");
++                if (!info.comments().isBlank()) configFileInstance.setComment(key, info.comments());
++                configFileInstance.set(key, value);
++            }
++            field.set(null, value);
++        }
++        module.onLoaded(configFileInstance);
++    }
++
++    private static String configKey(IConfigModule module, ConfigInfo info) {
++        return module.getCategory().getBaseKeyName() + "." + module.getBaseName() + "." + info.baseName();
++    }
++
++    /** TOML integers may parse as Long; unbox to the field's primitive type. */
++    private static Object coerce(Object value, Class<?> type) {
++        if (value instanceof Number) {
++            if (type == int.class) return ((Number) value).intValue();
++            if (type == long.class) return ((Number) value).longValue();
++            if (type == double.class) return ((Number) value).doubleValue();
++            if (type == float.class) return ((Number) value).floatValue();
++        }
++        return value;
++    }
++
++    private static void restore(Map<Field, Object> snapshot) {
++        for (Map.Entry<Field, Object> entry : snapshot.entrySet()) {
++            try {
++                entry.getKey().set(null, entry.getValue());
++            } catch (IllegalAccessException ignored) {
++            }
++        }
++    }
++
++    private static void rebuildYamlFacade() {
++        for (String key : new ArrayList<>(yamlFacade.getKeys(false))) {
++            yamlFacade.set(key, null);
++        }
++        for (IConfigModule module : MODULES) {
++            for (Field field : module.getClass().getDeclaredFields()) {
++                ConfigInfo info = field.getAnnotation(ConfigInfo.class);
++                if (info == null) continue;
++                try {
++                    yamlFacade.set(configKey(module, info), field.get(null));
++                } catch (IllegalAccessException ignored) {
++                }
++            }
++        }
++    }
++}
+diff --git a/main/java/com/destroystokyo/paper/config/toml/EnumConfigCategory.java b/main/java/com/destroystokyo/paper/config/toml/EnumConfigCategory.java
+new file mode 100644
+index 0000000..95b0e1b
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/EnumConfigCategory.java
+@@ -0,0 +1,25 @@
++package com.destroystokyo.paper.config.toml;
++
++/**
++ * Top-level sections of antarctic.toml.
++ * Adapted from Leaf Config v2 (Winds-Studio/Leaf), org.dreeam.leaf.config.EnumConfigCategory.
++ */
++public enum EnumConfigCategory {
++
++    NETWORK("network"),
++    OPTIMIZATIONS("optimizations"),
++    GAMEPLAY("gameplay"),
++    CONCURRENCY("concurrency"),
++    FIXES("fixes"),
++    MISC("misc");
++
++    private final String baseKeyName;
++
++    EnumConfigCategory(String baseKeyName) {
++        this.baseKeyName = baseKeyName;
++    }
++
++    public String getBaseKeyName() {
++        return this.baseKeyName;
++    }
++}
+diff --git a/main/java/com/destroystokyo/paper/config/toml/IConfigModule.java b/main/java/com/destroystokyo/paper/config/toml/IConfigModule.java
+new file mode 100644
+index 0000000..cbd553d
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/IConfigModule.java
+@@ -0,0 +1,23 @@
++package com.destroystokyo.paper.config.toml;
++
++import com.electronwill.nightconfig.core.file.CommentedFileConfig;
++
++/**
++ * A category module of antarctic.toml. The loader assigns every static
++ * non-final field annotated with {@link annotations.ConfigInfo} from the
++ * TOML key {@code category.baseName.fieldBaseName}.
++ * Adapted from Leaf Config v2 (Winds-Studio/Leaf), org.dreeam.leaf.config.IConfigModule.
++ */
++public interface IConfigModule {
++
++    EnumConfigCategory getCategory();
++
++    String getBaseName();
++
++    /**
++     * Runs after the module's fields were assigned. Throwing from here
++     * rolls the whole load back (previous values are restored, file untouched).
++     */
++    default void onLoaded(CommentedFileConfig config) {
++    }
++}
+diff --git a/main/java/com/destroystokyo/paper/config/toml/annotations/ConfigInfo.java b/main/java/com/destroystokyo/paper/config/toml/annotations/ConfigInfo.java
+new file mode 100644
+index 0000000..03c8f8d
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/annotations/ConfigInfo.java
+@@ -0,0 +1,19 @@
++package com.destroystokyo.paper.config.toml.annotations;
++
++import java.lang.annotation.ElementType;
++import java.lang.annotation.Retention;
++import java.lang.annotation.RetentionPolicy;
++import java.lang.annotation.Target;
++
++/**
++ * Marks a module field as a TOML config entry. Adapted from Leaf Config v2
++ * (Winds-Studio/Leaf), org.dreeam.leaf.config.ConfigInfo.
++ */
++@Retention(RetentionPolicy.RUNTIME)
++@Target(ElementType.FIELD)
++public @interface ConfigInfo {
++
++    String baseName();
++
++    String comments() default "";
++}
+diff --git a/main/java/com/destroystokyo/paper/config/toml/annotations/DoNotLoad.java b/main/java/com/destroystokyo/paper/config/toml/annotations/DoNotLoad.java
+new file mode 100644
+index 0000000..f4fa939
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/annotations/DoNotLoad.java
+@@ -0,0 +1,15 @@
++package com.destroystokyo.paper.config.toml.annotations;
++
++import java.lang.annotation.ElementType;
++import java.lang.annotation.Retention;
++import java.lang.annotation.RetentionPolicy;
++import java.lang.annotation.Target;
++
++/**
++ * Loader ignores this field entirely. Adapted from Leaf Config v2
++ * (Winds-Studio/Leaf), org.dreeam.leaf.config.DoNotLoad.
++ */
++@Retention(RetentionPolicy.RUNTIME)
++@Target(ElementType.FIELD)
++public @interface DoNotLoad {
++}
+diff --git a/main/java/com/destroystokyo/paper/config/toml/annotations/Experimental.java b/main/java/com/destroystokyo/paper/config/toml/annotations/Experimental.java
+new file mode 100644
+index 0000000..62c4333
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/annotations/Experimental.java
+@@ -0,0 +1,15 @@
++package com.destroystokyo.paper.config.toml.annotations;
++
++import java.lang.annotation.ElementType;
++import java.lang.annotation.Retention;
++import java.lang.annotation.RetentionPolicy;
++import java.lang.annotation.Target;
++
++/**
++ * Bleeding-edge feature flag; the entry is expected to stay disabled by
++ * default until fully validated. Adapted from Leaf Config v2 (Winds-Studio/Leaf).
++ */
++@Retention(RetentionPolicy.RUNTIME)
++@Target(ElementType.FIELD)
++public @interface Experimental {
++}
+diff --git a/main/java/com/destroystokyo/paper/config/toml/annotations/HotReloadUnsupported.java b/main/java/com/destroystokyo/paper/config/toml/annotations/HotReloadUnsupported.java
+new file mode 100644
+index 0000000..91f9920
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/annotations/HotReloadUnsupported.java
+@@ -0,0 +1,15 @@
++package com.destroystokyo.paper.config.toml.annotations;
++
++import java.lang.annotation.ElementType;
++import java.lang.annotation.Retention;
++import java.lang.annotation.RetentionPolicy;
++import java.lang.annotation.Target;
++
++/**
++ * Field keeps its current value on /antarctic reload; a restart is required
++ * to apply file changes. Adapted from Leaf Config v2 (Winds-Studio/Leaf).
++ */
++@Retention(RetentionPolicy.RUNTIME)
++@Target(ElementType.FIELD)
++public @interface HotReloadUnsupported {
++}
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/fixes/Books.java b/main/java/com/destroystokyo/paper/config/toml/modules/fixes/Books.java
+new file mode 100644
+index 0000000..562704c
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/fixes/Books.java
+@@ -0,0 +1,21 @@
++package com.destroystokyo.paper.config.toml.modules.fixes;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++
++public class Books implements IConfigModule {
++
++    @ConfigInfo(baseName = "enable-books", comments = "When disabled, book editing and signing packets are rejected unless the player has the 'antarctic.usebooks' permission.\nDefaults to true. Set to false to prevent book-based exploit vectors completely.")
++    public static boolean enableBooks = true;
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.FIXES;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "books";
++    }
++}
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/fixes/MapDecorations.java b/main/java/com/destroystokyo/paper/config/toml/modules/fixes/MapDecorations.java
+new file mode 100644
+index 0000000..c890f2c
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/fixes/MapDecorations.java
+@@ -0,0 +1,21 @@
++package com.destroystokyo.paper.config.toml.modules.fixes;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++
++public class MapDecorations implements IConfigModule {
++
++    @ConfigInfo(baseName = "limit", comments = "Maximum number of custom decorations (banners, frames, etc.) allowed on a WorldMap.\nHelps mitigate lag and crash exploits caused by packing thousands of markers into a single map.\nPlayer, monument, and mansion icons are exempted.")
++    public static int limit = 25;
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.FIXES;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "map-decorations";
++    }
++}
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/gameplay/ChunkOverloadDupe.java b/main/java/com/destroystokyo/paper/config/toml/modules/gameplay/ChunkOverloadDupe.java
+new file mode 100644
+index 0000000..b68062d
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/gameplay/ChunkOverloadDupe.java
+@@ -0,0 +1,34 @@
++package com.destroystokyo.paper.config.toml.modules.gameplay;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++import org.apache.logging.log4j.LogManager;
++import org.apache.logging.log4j.Logger;
++
++public class ChunkOverloadDupe implements IConfigModule {
++
++    private static final Logger LOGGER = LogManager.getLogger();
++
++    @ConfigInfo(baseName = "allow", comments = "When enabled, allows chunk-overload rollback behavior where oversized chunks (>1MB) are not saved to disk.\nUseful for anarchy servers wishing to preserve authentic vanilla 1.12.2 book-dupe mechanics.\nDefaults to false to prevent chunk rollback and item duplication.")
++    public static boolean allow = false;
++
++    @ConfigInfo(baseName = "log", comments = "Whether to log chunk overload dupe attempts when triggered.")
++    public static boolean log = false;
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.GAMEPLAY;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "chunk-overload-dupe";
++    }
++
++    @Override
++    public void onLoaded(com.electronwill.nightconfig.core.file.CommentedFileConfig config) {
++        if (allow) LOGGER.info("Chunk overload dupe activated.");
++        if (log) LOGGER.info("Chunk overload dupes will be logged.");
++    }
++}
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/gameplay/MergeChecks.java b/main/java/com/destroystokyo/paper/config/toml/modules/gameplay/MergeChecks.java
+new file mode 100644
+index 0000000..9c2729b
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/gameplay/MergeChecks.java
+@@ -0,0 +1,21 @@
++package com.destroystokyo.paper.config.toml.modules.gameplay;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++
++public class MergeChecks implements IConfigModule {
++
++    @ConfigInfo(baseName = "enabled", comments = "Optimize inventory merge checks by testing stackability and counts before expensive NBT comparison.")
++    public static boolean enabled = true;
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.GAMEPLAY;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "merge-checks";
++    }
++}
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/misc/Privacy.java b/main/java/com/destroystokyo/paper/config/toml/modules/misc/Privacy.java
+new file mode 100644
+index 0000000..2c70a15
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/misc/Privacy.java
+@@ -0,0 +1,21 @@
++package com.destroystokyo.paper.config.toml.modules.misc;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++
++public class Privacy implements IConfigModule {
++
++    @ConfigInfo(baseName = "redact-player-data", comments = "When enabled, removes player IP addresses and exact coordinates from console logs.\nUseful for privacy compliance and anarchy server environments.")
++    public static boolean redactPlayerData = false;
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.MISC;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "privacy";
++    }
++}
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/misc/Rebrand.java b/main/java/com/destroystokyo/paper/config/toml/modules/misc/Rebrand.java
+new file mode 100644
+index 0000000..56458cc
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/misc/Rebrand.java
+@@ -0,0 +1,21 @@
++package com.destroystokyo.paper.config.toml.modules.misc;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++
++public class Rebrand implements IConfigModule {
++
++    @ConfigInfo(baseName = "server-mod-name", comments = "The server brand name sent to clients in the F3 debug screen.")
++    public static String serverModName = "Antarctic";
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.MISC;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "rebrand";
++    }
++}
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/network/Deflate.java b/main/java/com/destroystokyo/paper/config/toml/modules/network/Deflate.java
+new file mode 100644
+index 0000000..2ea48fa
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/network/Deflate.java
+@@ -0,0 +1,33 @@
++package com.destroystokyo.paper.config.toml.modules.network;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++import org.apache.logging.log4j.LogManager;
++import org.apache.logging.log4j.Logger;
++
++public class Deflate implements IConfigModule {
++
++    private static final Logger LOGGER = LogManager.getLogger();
++
++    @ConfigInfo(baseName = "compression-level", comments = "Deflate compression level used for packets and chunk/NBT saving.\nValid values: -1 (default), 0 (none), 1 (fastest) through 9 (maximum).")
++    public static int compressionLevel = -1;
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.NETWORK;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "deflate";
++    }
++
++    @Override
++    public void onLoaded(com.electronwill.nightconfig.core.file.CommentedFileConfig config) {
++        if (compressionLevel < -1 || compressionLevel > 9) {
++            LOGGER.error("Compression level is invalid resetting to default. Valid compression levels are -1 (Default), 0 (None), 1 (Fast) through 9 (Best)");
++            compressionLevel = -1;
++        }
++    }
++}
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/ArmourStands.java b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/ArmourStands.java
+new file mode 100644
+index 0000000..a9a1fdc
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/ArmourStands.java
+@@ -0,0 +1,21 @@
++package com.destroystokyo.paper.config.toml.modules.optimizations;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++
++public class ArmourStands implements IConfigModule {
++
++    @ConfigInfo(baseName = "enabled", comments = "When enabled, skips movement processing on armor stands to save CPU.\nDefaults to false to preserve vanilla physics and piston interactions.")
++    public static boolean enabled = false;
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.OPTIMIZATIONS;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "armour-stands";
++    }
++}
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/Pathfinder.java b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/Pathfinder.java
+new file mode 100644
+index 0000000..919a7ad
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/Pathfinder.java
+@@ -0,0 +1,29 @@
++package com.destroystokyo.paper.config.toml.modules.optimizations;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++
++public class Pathfinder implements IConfigModule {
++
++    // Papaya / moom0o via Dionysus 0098; retain the vanilla interval by default.
++    @ConfigInfo(baseName = "goal-selection-delay", comments = "Ticks between goal-selection passes. Vanilla: 3. Higher values reduce AI responsiveness.\nMust be positive. Changes affect newly created selectors; restart to apply everywhere.")
++    public static int goalSelectionDelay = 3;
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.OPTIMIZATIONS;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "pathfinder";
++    }
++
++    @Override
++    public void onLoaded(com.electronwill.nightconfig.core.file.CommentedFileConfig config) {
++        if (goalSelectionDelay < 1) {
++            throw new IllegalArgumentException("optimizations.pathfinder.goal-selection-delay must be positive");
++        }
++    }
++}
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/Projectiles.java b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/Projectiles.java
+new file mode 100644
+index 0000000..62ff5a1
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/Projectiles.java
+@@ -0,0 +1,24 @@
++package com.destroystokyo.paper.config.toml.modules.optimizations;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++
++public class Projectiles implements IConfigModule {
++
++    @ConfigInfo(baseName = "max-loads-per-tick", comments = "Maximum number of unloaded chunks that projectiles may trigger to load per server tick.\nHelps mitigate lag machines that fire projectiles into distant unloaded chunks.")
++    public static int maxLoadsPerTick = 10;
++
++    @ConfigInfo(baseName = "max-loads-per-projectile", comments = "Maximum number of unloaded chunks a single projectile can load before being removed.")
++    public static int maxLoadsPerProjectile = 10;
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.OPTIMIZATIONS;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "projectiles";
++    }
++}
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/Suffocation.java b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/Suffocation.java
+new file mode 100644
+index 0000000..2dbec93
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/Suffocation.java
+@@ -0,0 +1,21 @@
++package com.destroystokyo.paper.config.toml.modules.optimizations;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++
++public class Suffocation implements IConfigModule {
++
++    @ConfigInfo(baseName = "enable-suffocation-optimization", comments = "Optimize suffocation damage checks by throttling voxel collision tests for invulnerable entities.")
++    public static boolean enableSuffocationOptimization = true;
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.OPTIMIZATIONS;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "suffocation";
++    }
++}
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/WorldBorder.java b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/WorldBorder.java
+new file mode 100644
+index 0000000..10cad4c
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/WorldBorder.java
+@@ -0,0 +1,21 @@
++package com.destroystokyo.paper.config.toml.modules.optimizations;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++
++public class WorldBorder implements IConfigModule {
++
++    @ConfigInfo(baseName = "no-chunks-past-world-border", comments = "When enabled, prevents players from loading or generating chunks past the world border edge.\nDefaults to false to preserve vanilla border visibility.")
++    public static boolean noChunksPastWorldBorder = false;
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.OPTIMIZATIONS;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "world-border";
++    }
++}
+diff --git a/main/java/net/minecraft/server/DedicatedServer.java b/main/java/net/minecraft/server/DedicatedServer.java
+index 598d954..f39a13a 100644
+--- a/main/java/net/minecraft/server/DedicatedServer.java
++++ b/main/java/net/minecraft/server/DedicatedServer.java
+@@ -201,7 +201,7 @@ public class DedicatedServer extends MinecraftServer implements IMinecraftServer
+             com.destroystokyo.paper.PaperConfig.registerCommands();
+             com.destroystokyo.paper.VersionHistoryManager.INSTANCE.getClass(); // load version history now
+             // Arctic start
+-            com.destroystokyo.paper.AntarcticConfig.load((File) options.valueOf("antarctic-settings"));
++            com.destroystokyo.paper.config.toml.AntarcticTomlConfig.load((File) options.valueOf("antarctic-settings"));
+             com.destroystokyo.paper.AntarcticCommand.init();
+             // Arctic end
+             // Paper end
+diff --git a/main/java/net/minecraft/server/EntityArmorStand.java b/main/java/net/minecraft/server/EntityArmorStand.java
+index cfd50e1..de83e8f 100644
+--- a/main/java/net/minecraft/server/EntityArmorStand.java
++++ b/main/java/net/minecraft/server/EntityArmorStand.java
+@@ -784,7 +784,7 @@ public class EntityArmorStand extends EntityLiving {
+     // Paper start
+     @Override
+     public void move(EnumMoveType moveType, double x, double y, double z) {
+-        if (com.destroystokyo.paper.AntarcticConfig.optimizeArmourStands) return; // Antarctic - optimize armor stands
++        if (com.destroystokyo.paper.config.toml.modules.optimizations.ArmourStands.enabled) return; // Antarctic - optimize armor stands
+         if (this.canMove) {
+             super.move(moveType, x, y, z);
+         }
+diff --git a/main/java/net/minecraft/server/EntityLiving.java b/main/java/net/minecraft/server/EntityLiving.java
+index 4be93f6..3355bef 100644
+--- a/main/java/net/minecraft/server/EntityLiving.java
++++ b/main/java/net/minecraft/server/EntityLiving.java
+@@ -209,7 +209,7 @@ public abstract class EntityLiving extends Entity {
+         boolean flag = this instanceof EntityHuman;
+ 
+         if (this.isAlive()) {
+-            if ((!com.destroystokyo.paper.AntarcticConfig.enableSuffocationOptimization || (ticksLived % 10 == 0 && couldPossiblyBeHurt(1.0F))) && this.inBlock()) {
++            if ((!com.destroystokyo.paper.config.toml.modules.optimizations.Suffocation.enableSuffocationOptimization || (ticksLived % 10 == 0 && couldPossiblyBeHurt(1.0F))) && this.inBlock()) {
+                 this.damageEntity(DamageSource.STUCK, 1.0F);
+             } else if (flag && !this.world.getWorldBorder().a(this.getBoundingBox())) {
+                 double d0 = this.world.getWorldBorder().a((Entity) this) + this.world.getWorldBorder().getDamageBuffer();
+diff --git a/main/java/net/minecraft/server/EntityProjectile.java b/main/java/net/minecraft/server/EntityProjectile.java
+index 1b8338e..cff7d12 100644
+--- a/main/java/net/minecraft/server/EntityProjectile.java
++++ b/main/java/net/minecraft/server/EntityProjectile.java
+@@ -313,8 +313,8 @@ public abstract class EntityProjectile extends Entity implements IProjectile {
+         if (previousX != newX || previousZ != newZ) {
+             boolean isLoaded = ((net.minecraft.server.ChunkProviderServer) this.world.getChunkProvider()).isLoaded(newX, newZ);
+             if (!isLoaded) {
+-                if (EntityProjectile.loadedThisTick > com.destroystokyo.paper.AntarcticConfig.maxProjectileLoadsPerTick) {
+-                    if (++this.loadedLifetime > com.destroystokyo.paper.AntarcticConfig.maxProjectileLoadsPerProjectile) {
++                if (EntityProjectile.loadedThisTick > com.destroystokyo.paper.config.toml.modules.optimizations.Projectiles.maxLoadsPerTick) {
++                    if (++this.loadedLifetime > com.destroystokyo.paper.config.toml.modules.optimizations.Projectiles.maxLoadsPerProjectile) {
+                         this.die();
+                     }
+                     return;
+diff --git a/main/java/net/minecraft/server/LoginListener.java b/main/java/net/minecraft/server/LoginListener.java
+index 8cab659..795ae75 100644
+--- a/main/java/net/minecraft/server/LoginListener.java
++++ b/main/java/net/minecraft/server/LoginListener.java
+@@ -187,7 +187,7 @@ public class LoginListener implements PacketLoginInListener, ITickable {
+ 
+     public String c() {
+         String address = this.networkManager.getSocketAddress().toString();
+-        if (com.destroystokyo.paper.AntarcticConfig.redactPlayerData) {
++        if (com.destroystokyo.paper.config.toml.modules.misc.Privacy.redactPlayerData) {
+             address = "/0.0.0.0:0";
+         }
+         return this.i != null ? this.i + " (" + address + ")" : address;
+diff --git a/main/java/net/minecraft/server/MinecraftServer.java b/main/java/net/minecraft/server/MinecraftServer.java
+index 9ece4a6..6b9154a 100644
+--- a/main/java/net/minecraft/server/MinecraftServer.java
++++ b/main/java/net/minecraft/server/MinecraftServer.java
+@@ -1,6 +1,6 @@
+ package net.minecraft.server;
+ 
+-import com.destroystokyo.paper.AntarcticConfig;
++import com.destroystokyo.paper.config.toml.modules.misc.Rebrand;
+ 
+ import com.google.common.collect.Lists;
+ import com.google.common.collect.Queues;
+@@ -1170,7 +1170,7 @@ public abstract class MinecraftServer implements ICommandListener, Runnable, IAs
+     }
+ 
+     public String getServerModName() {
+-        return AntarcticConfig.serverModName;
++        return Rebrand.serverModName;
+     }
+ 
+     public CrashReport b(CrashReport crashreport) {
+diff --git a/main/java/net/minecraft/server/NBTCompressedStreamTools.java b/main/java/net/minecraft/server/NBTCompressedStreamTools.java
+index 1229e0a..63d6d7e 100644
+--- a/main/java/net/minecraft/server/NBTCompressedStreamTools.java
++++ b/main/java/net/minecraft/server/NBTCompressedStreamTools.java
+@@ -1,6 +1,6 @@
+ package net.minecraft.server;
+ 
+-import com.destroystokyo.paper.AntarcticConfig;
++import com.destroystokyo.paper.config.toml.modules.network.Deflate;
+ 
+ import java.io.BufferedInputStream;
+ import java.io.BufferedOutputStream;
+@@ -31,7 +31,7 @@ public class NBTCompressedStreamTools {
+     }
+ 
+     public static void a(NBTTagCompound nbttagcompound, OutputStream outputstream) throws IOException {
+-        DataOutputStream dataoutputstream = new DataOutputStream(new BufferedOutputStream(new GZIPOutputStream(outputstream) {{ def.setLevel(AntarcticConfig.compressionLevel);}})); // Antarctic - NBT Compression Level
++        DataOutputStream dataoutputstream = new DataOutputStream(new BufferedOutputStream(new GZIPOutputStream(outputstream) {{ def.setLevel(Deflate.compressionLevel);}})); // Antarctic - NBT Compression Level
+ 
+         try {
+             a(nbttagcompound, (DataOutput) dataoutputstream);
+diff --git a/main/java/net/minecraft/server/PacketCompressor.java b/main/java/net/minecraft/server/PacketCompressor.java
+index cad960a..2053ad9 100644
+--- a/main/java/net/minecraft/server/PacketCompressor.java
++++ b/main/java/net/minecraft/server/PacketCompressor.java
+@@ -1,6 +1,6 @@
+ package net.minecraft.server;
+ 
+-import com.destroystokyo.paper.AntarcticConfig;
++import com.destroystokyo.paper.config.toml.modules.network.Deflate;
+ 
+ import io.netty.buffer.ByteBuf;
+ import io.netty.channel.ChannelHandlerContext;
+@@ -16,7 +16,7 @@ public class PacketCompressor extends MessageToByteEncoder<ByteBuf> {
+     public PacketCompressor(int i) {
+         this.c = i;
+         this.b = new Deflater();
+-        this.b.setLevel(AntarcticConfig.compressionLevel); // Antarctic - Packet Compression Level
++        this.b.setLevel(Deflate.compressionLevel); // Antarctic - Packet Compression Level
+     }
+ 
+     protected void a(ChannelHandlerContext channelhandlercontext, ByteBuf bytebuf, ByteBuf bytebuf1) throws Exception {
+diff --git a/main/java/net/minecraft/server/PathfinderGoalSelector.java b/main/java/net/minecraft/server/PathfinderGoalSelector.java
+index a07ea37..b180fe4 100644
+--- a/main/java/net/minecraft/server/PathfinderGoalSelector.java
++++ b/main/java/net/minecraft/server/PathfinderGoalSelector.java
+@@ -14,7 +14,7 @@ public class PathfinderGoalSelector {
+     private final Set<PathfinderGoalSelector.PathfinderGoalSelectorItem> c = Sets.newLinkedHashSet();
+     private final MethodProfiler d;
+     private int e;
+-    private int f = com.destroystokyo.paper.AntarcticConfig.pathfinderGoalSelectionDelay; // Papaya via Dionysus
++    private int f = com.destroystokyo.paper.config.toml.modules.optimizations.Pathfinder.goalSelectionDelay; // Papaya via Dionysus
+     private int g;
+ 
+     public PathfinderGoalSelector(MethodProfiler methodprofiler) {
+diff --git a/main/java/net/minecraft/server/PlayerChunk.java b/main/java/net/minecraft/server/PlayerChunk.java
+index dfffda2..3523777 100644
+--- a/main/java/net/minecraft/server/PlayerChunk.java
++++ b/main/java/net/minecraft/server/PlayerChunk.java
+@@ -64,7 +64,7 @@ public class PlayerChunk {
+         if (this.c.contains(entityplayer)) {
+             PlayerChunk.a.debug("Failed to add player. {} already is in chunk {}, {}", entityplayer, Integer.valueOf(this.location.x), Integer.valueOf(this.location.z));
+         } else {
+-            if (!com.destroystokyo.paper.AntarcticConfig.noChunksPastWorldBorder || playerChunkMap.getWorld().getWorldBorder().isChunkInBounds(location.x, location.z)) { // Dionysus
++            if (!com.destroystokyo.paper.config.toml.modules.optimizations.WorldBorder.noChunksPastWorldBorder || playerChunkMap.getWorld().getWorldBorder().isChunkInBounds(location.x, location.z)) { // Dionysus
+             if (this.c.isEmpty()) {
+                 this.i = this.playerChunkMap.getWorld().getTime();
+             }
+diff --git a/main/java/net/minecraft/server/PlayerConnection.java b/main/java/net/minecraft/server/PlayerConnection.java
+index b790e98..cb4410a 100644
+--- a/main/java/net/minecraft/server/PlayerConnection.java
++++ b/main/java/net/minecraft/server/PlayerConnection.java
+@@ -359,7 +359,7 @@ public class PlayerConnection implements PacketListenerPlayIn, ITickable {
+ 
+                 if (d10 - d9 > Math.max(100.0D, Math.pow((double) (org.spigotmc.SpigotConfig.movedTooQuicklyMultiplier * (float) i * speed), 2)) && (!this.minecraftServer.R() || !this.minecraftServer.Q().equals(entity.getName()))) { // Spigot
+                 // CraftBukkit end
+-                    if (com.destroystokyo.paper.AntarcticConfig.redactPlayerData) {
++                    if (com.destroystokyo.paper.config.toml.modules.misc.Privacy.redactPlayerData) {
+                         PlayerConnection.LOGGER.warn("{} (vehicle of {}) moved too quickly!", entity.getName(), this.player.getName());
+                     } else {
+                         PlayerConnection.LOGGER.warn("{} (vehicle of {}) moved too quickly! {},{},{}", entity.getName(), this.player.getName(), Double.valueOf(d6), Double.valueOf(d7), Double.valueOf(d8));
+@@ -613,7 +613,7 @@ public class PlayerConnection implements PacketListenerPlayIn, ITickable {
+ 
+                                 if (d11 - d10 > Math.max(f2, Math.pow((double) (org.spigotmc.SpigotConfig.movedTooQuicklyMultiplier * (float) i * speed), 2)) && (!this.minecraftServer.R() || !this.minecraftServer.Q().equals(this.player.getName()))) { // Spigot
+                                 // CraftBukkit end
+-                                    if (com.destroystokyo.paper.AntarcticConfig.redactPlayerData) {
++                                    if (com.destroystokyo.paper.config.toml.modules.misc.Privacy.redactPlayerData) {
+                                         PlayerConnection.LOGGER.warn("{} moved too quickly!", this.player.getName());
+                                     } else {
+                                         PlayerConnection.LOGGER.warn("{} moved too quickly! {},{},{}", this.player.getName(), Double.valueOf(d7), Double.valueOf(d8), Double.valueOf(d9));
+@@ -2385,7 +2385,7 @@ public class PlayerConnection implements PacketListenerPlayIn, ITickable {
+ 
+     // Paper start
+     private boolean validateBook(ItemStack testStack, boolean kick) {
+-        if (!com.destroystokyo.paper.AntarcticConfig.enableBooks && !this.player.getBukkitEntity().hasPermission("antarctic.usebooks")) return false; // Dionysus
++        if (!com.destroystokyo.paper.config.toml.modules.fixes.Books.enableBooks && !this.player.getBukkitEntity().hasPermission("antarctic.usebooks")) return false; // Dionysus
+         NBTTagList pageList = testStack.getTag().getList("pages", 8);
+         long byteTotal = 0;
+         int maxBookPageSize = com.destroystokyo.paper.PaperConfig.maxBookPageSize;
+diff --git a/main/java/net/minecraft/server/PlayerInventory.java b/main/java/net/minecraft/server/PlayerInventory.java
+index 91fa588..50418f6 100644
+--- a/main/java/net/minecraft/server/PlayerInventory.java
++++ b/main/java/net/minecraft/server/PlayerInventory.java
+@@ -87,7 +87,7 @@ public class PlayerInventory implements IInventory {
+ 
+     private boolean a(ItemStack itemstack, ItemStack itemstack1) {
+         // Antarctic start - fast merge checks
+-        if (com.destroystokyo.paper.AntarcticConfig.improveMergeChecks) {
++        if (com.destroystokyo.paper.config.toml.modules.gameplay.MergeChecks.enabled) {
+             return !itemstack.isEmpty() && itemstack.isStackable() && itemstack.getCount() < itemstack.getMaxStackSize() && itemstack.getCount() < this.getMaxStackSize() && this.b(itemstack, itemstack1);
+         }
+         // Antarctic end
+@@ -271,7 +271,7 @@ public class PlayerInventory implements IInventory {
+ 
+     public int firstPartial(ItemStack itemstack) {
+         // Antarctic start - fast merge checks
+-        if (com.destroystokyo.paper.AntarcticConfig.improveMergeChecks && !itemstack.isStackable()) {
++        if (com.destroystokyo.paper.config.toml.modules.gameplay.MergeChecks.enabled && !itemstack.isStackable()) {
+             return -1;
+         }
+         // Antarctic end
+diff --git a/main/java/net/minecraft/server/PlayerList.java b/main/java/net/minecraft/server/PlayerList.java
+index 42fdc6c..b1efd69 100644
+--- a/main/java/net/minecraft/server/PlayerList.java
++++ b/main/java/net/minecraft/server/PlayerList.java
+@@ -253,7 +253,7 @@ public abstract class PlayerList {
+         }
+         // Paper end
+         // CraftBukkit - Moved from above, added world
+-        if (com.destroystokyo.paper.AntarcticConfig.redactPlayerData) {
++        if (com.destroystokyo.paper.config.toml.modules.misc.Privacy.redactPlayerData) {
+             PlayerList.f.info(entityplayer.getName() + "[/0.0.0.0:0] logged in with entity id " + entityplayer.getId() + " at ([REDACTED] 0.0, 0.0, 0.0)");
+         } else {
+             PlayerList.f.info(entityplayer.getName() + "[" + s1 + "] logged in with entity id " + entityplayer.getId() + " at ([" + entityplayer.world.worldData.getName() + "]" + entityplayer.locX + ", " + entityplayer.locY + ", " + entityplayer.locZ + ")");
+diff --git a/main/java/net/minecraft/server/RegionFile.java b/main/java/net/minecraft/server/RegionFile.java
+index e18b868..320903a 100644
+--- a/main/java/net/minecraft/server/RegionFile.java
++++ b/main/java/net/minecraft/server/RegionFile.java
+@@ -199,8 +199,8 @@ public class RegionFile {
+ 
+             if (k1 >= 256) {
+                 // Dionysus start - chunk overload dupe
+-                if (com.destroystokyo.paper.AntarcticConfig.chunkOverloadDupe) {
+-                    if (com.destroystokyo.paper.AntarcticConfig.chunkOverloadDupeLog) {
++                if (com.destroystokyo.paper.config.toml.modules.gameplay.ChunkOverloadDupe.allow) {
++                    if (com.destroystokyo.paper.config.toml.modules.gameplay.ChunkOverloadDupe.log) {
+                         org.bukkit.Bukkit.getLogger().log(java.util.logging.Level.INFO, "Chunk dupe detected: ({0}, {1}) {2}", new Object[]{i, j, this.b});
+                     }
+                     return;
+diff --git a/main/java/net/minecraft/server/ServerConnection.java b/main/java/net/minecraft/server/ServerConnection.java
+index ceb16b4..8ef701e 100644
+--- a/main/java/net/minecraft/server/ServerConnection.java
++++ b/main/java/net/minecraft/server/ServerConnection.java
+@@ -166,7 +166,7 @@ public class ServerConnection {
+                             }
+ 
+                             String address = networkmanager.getSocketAddress().toString();
+-                            if (com.destroystokyo.paper.AntarcticConfig.redactPlayerData) {
++                            if (com.destroystokyo.paper.config.toml.modules.misc.Privacy.redactPlayerData) {
+                                 address = "/0.0.0.0:0";
+                             }
+                             ServerConnection.e.warn("Failed to handle packet for {}", address, exception);
+diff --git a/main/java/net/minecraft/server/WorldMap.java b/main/java/net/minecraft/server/WorldMap.java
+index edbf9af..d348d39 100644
+--- a/main/java/net/minecraft/server/WorldMap.java
++++ b/main/java/net/minecraft/server/WorldMap.java
+@@ -283,7 +283,7 @@ public class WorldMap extends PersistentBase {
+         }
+ 
+         // Dionysus start - limit decorations
+-        if (countMapIcon(this.decorations) >= com.destroystokyo.paper.AntarcticConfig.mapDecorationsLimit) {
++        if (countMapIcon(this.decorations) >= com.destroystokyo.paper.config.toml.modules.fixes.MapDecorations.limit) {
+             return;
+         }
+         // Dionysus end
+diff --git a/main/java/org/bukkit/craftbukkit/CraftServer.java b/main/java/org/bukkit/craftbukkit/CraftServer.java
+index 8a58018..aebe298 100644
+--- a/main/java/org/bukkit/craftbukkit/CraftServer.java
++++ b/main/java/org/bukkit/craftbukkit/CraftServer.java
+@@ -1903,7 +1903,13 @@ public final class CraftServer implements Server {
+         @Override
+         public YamlConfiguration getAntarcticConfig()
+         {
+-            return com.destroystokyo.paper.AntarcticConfig.getConfig();
++            return com.destroystokyo.paper.config.toml.AntarcticTomlConfig.getYamlFacade();
++        }
++
++        @Override
++        public com.electronwill.nightconfig.core.file.CommentedFileConfig getAntarcticTomlConfig()
++        {
++            return com.destroystokyo.paper.config.toml.AntarcticTomlConfig.getTomlConfig();
+         }
+ 
+         @Override
+diff --git a/main/java/org/bukkit/craftbukkit/Main.java b/main/java/org/bukkit/craftbukkit/Main.java
+index efee7d9..e76df95 100644
+--- a/main/java/org/bukkit/craftbukkit/Main.java
++++ b/main/java/org/bukkit/craftbukkit/Main.java
+@@ -140,8 +140,8 @@ public class Main {
+                 acceptsAll(asList("antarctic", "antarctic-settings"), "File for antarctic settings")
+                         .withRequiredArg()
+                         .ofType(File.class)
+-                        .defaultsTo(new File("antarctic.yml"))
+-                        .describedAs("Yml file");
++                        .defaultsTo(new File("antarctic.toml"))
++                        .describedAs("Toml file");
+                 // Arctic end
+ 
+                 // Paper start
+diff --git a/test/java/com/destroystokyo/paper/AntarcticConfigTest.java b/test/java/com/destroystokyo/paper/AntarcticConfigTest.java
+deleted file mode 100644
+index f0dd77c..0000000
+--- a/test/java/com/destroystokyo/paper/AntarcticConfigTest.java
++++ /dev/null
+@@ -1,61 +0,0 @@
+-package com.destroystokyo.paper;
+-
+-import java.io.File;
+-import java.io.IOException;
+-import java.nio.charset.StandardCharsets;
+-import java.nio.file.Files;
+-import org.junit.Rule;
+-import org.junit.Test;
+-import org.junit.rules.TemporaryFolder;
+-import static org.junit.Assert.*;
+-
+-public class AntarcticConfigTest {
+-    @Rule public TemporaryFolder temporary = new TemporaryFolder();
+-
+-    @Test public void createsNestedFileAndReloadsWithoutRecursiveSave() throws Exception {
+-        File file = new File(temporary.getRoot(), "nested/antarctic.yml");
+-        int before = AntarcticConfig.getUpdates();
+-        AntarcticConfig.load(file);
+-        assertTrue(file.isFile());
+-        assertEquals("1", AntarcticConfig.getConfig().getString("config-version"));
+-        assertEquals(before + 1, AntarcticConfig.getUpdates());
+-        Files.write(file.toPath(), "config-version: '2'\nverbose: false\n".getBytes(StandardCharsets.UTF_8));
+-        AntarcticConfig.load();
+-        assertEquals("2", AntarcticConfig.getConfig().getString("config-version"));
+-        assertEquals(before + 2, AntarcticConfig.getUpdates());
+-    }
+-
+-    @Test public void rejectsMalformedYamlWithoutOverwritingIt() throws Exception {
+-        File file = temporary.newFile("invalid.yml");
+-        String invalid = "broken: [unterminated\n";
+-        Files.write(file.toPath(), invalid.getBytes(StandardCharsets.UTF_8));
+-        int before = AntarcticConfig.getUpdates();
+-        try {
+-            AntarcticConfig.load(file);
+-            fail("Malformed YAML must fail to load");
+-        } catch (IOException expected) {
+-            assertNotNull(expected.getCause());
+-        }
+-        assertEquals(invalid, new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8));
+-        assertEquals(before, AntarcticConfig.getUpdates());
+-    }
+-
+-    @Test public void validatesPathfinderIntervalAndPreservesInvalidFile() throws Exception {
+-        File file = temporary.newFile("pathfinder.yml");
+-        Files.write(file.toPath(), "pathfinder:\n  goal-selection-delay: 7\n".getBytes(StandardCharsets.UTF_8));
+-        AntarcticConfig.load(file);
+-        assertEquals(7, AntarcticConfig.pathfinderGoalSelectionDelay);
+-        String invalid = "pathfinder:\n  goal-selection-delay: 0\n";
+-        Files.write(file.toPath(), invalid.getBytes(StandardCharsets.UTF_8));
+-        int before = AntarcticConfig.getUpdates();
+-        try {
+-            AntarcticConfig.load(file);
+-            fail("Zero interval must be rejected");
+-        } catch (IOException expected) {
+-            assertNotNull(expected.getCause());
+-        }
+-        assertEquals(7, AntarcticConfig.pathfinderGoalSelectionDelay);
+-        assertEquals(before, AntarcticConfig.getUpdates());
+-        assertEquals(invalid, new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8));
+-    }
+-}
+diff --git a/test/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfigTest.java b/test/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfigTest.java
+new file mode 100644
+index 0000000..52e4dbb
+--- /dev/null
++++ b/test/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfigTest.java
+@@ -0,0 +1,87 @@
++package com.destroystokyo.paper.config.toml;
++
++import com.destroystokyo.paper.config.toml.modules.fixes.Books;
++import com.destroystokyo.paper.config.toml.modules.misc.Rebrand;
++import com.destroystokyo.paper.config.toml.modules.network.Deflate;
++import com.destroystokyo.paper.config.toml.modules.optimizations.Pathfinder;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.rules.TemporaryFolder;
++
++import java.io.File;
++import java.io.IOException;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++
++import static org.junit.Assert.*;
++
++public class AntarcticTomlConfigTest {
++    @Rule public TemporaryFolder temporary = new TemporaryFolder();
++
++    @Test public void createsNestedFileAndReloadsWithoutRecursiveSave() throws Exception {
++        File file = new File(temporary.getRoot(), "nested/antarctic.toml");
++        int before = AntarcticTomlConfig.getUpdates();
++        AntarcticTomlConfig.load(file);
++        assertTrue(file.isFile());
++        assertEquals(-1, Deflate.compressionLevel);
++        assertEquals("Antarctic", Rebrand.serverModName);
++        assertEquals(before + 1, AntarcticTomlConfig.getUpdates());
++        assertEquals(-1, (int) AntarcticTomlConfig.getYamlFacade().getInt("network.deflate.compression-level"));
++
++        Files.write(file.toPath(), "[network.deflate]\ncompression-level = 6\n".getBytes(StandardCharsets.UTF_8));
++        AntarcticTomlConfig.load();
++        assertEquals(6, Deflate.compressionLevel);
++        assertEquals(before + 2, AntarcticTomlConfig.getUpdates());
++        assertEquals(6, (int) AntarcticTomlConfig.getYamlFacade().getInt("network.deflate.compression-level"));
++    }
++
++    @Test public void rejectsMalformedTomlWithoutOverwritingIt() throws Exception {
++        File file = temporary.newFile("invalid.toml");
++        String invalid = "broken = [unterminated\n";
++        Files.write(file.toPath(), invalid.getBytes(StandardCharsets.UTF_8));
++        int before = AntarcticTomlConfig.getUpdates();
++        try {
++            AntarcticTomlConfig.load(file);
++            fail("Malformed TOML must fail to load");
++        } catch (IOException expected) {
++            assertNotNull(expected.getCause());
++        }
++        assertEquals(invalid, new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8));
++        assertEquals(before, AntarcticTomlConfig.getUpdates());
++    }
++
++    @Test public void validatesPathfinderIntervalAndPreservesInvalidFile() throws Exception {
++        File file = temporary.newFile("pathfinder.toml");
++        Files.write(file.toPath(), "[optimizations.pathfinder]\ngoal-selection-delay = 7\n".getBytes(StandardCharsets.UTF_8));
++        AntarcticTomlConfig.load(file);
++        assertEquals(7, Pathfinder.goalSelectionDelay);
++        String invalid = "[optimizations.pathfinder]\ngoal-selection-delay = 0\n";
++        Files.write(file.toPath(), invalid.getBytes(StandardCharsets.UTF_8));
++        int before = AntarcticTomlConfig.getUpdates();
++        try {
++            AntarcticTomlConfig.load(file);
++            fail("Zero interval must be rejected");
++        } catch (IOException expected) {
++            assertNotNull(expected.getCause());
++        }
++        assertEquals(7, Pathfinder.goalSelectionDelay);
++        assertEquals(before, AntarcticTomlConfig.getUpdates());
++        assertEquals(invalid, new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8));
++    }
++
++    @Test public void migratesLegacyYamlToToml() throws Exception {
++        File dir = temporary.newFolder("migrate");
++        File legacy = new File(dir, "antarctic.yml");
++        Files.write(legacy.toPath(), "server-mod-name: TestServer\ncompression-level: 6\nenable-books: false\n"
++                .getBytes(StandardCharsets.UTF_8));
++        File toml = new File(dir, "antarctic.toml");
++        AntarcticTomlConfig.load(toml);
++        assertTrue(toml.isFile());
++        assertFalse(legacy.isFile());
++        assertTrue(new File(dir, "antarctic.yml.migrated").isFile());
++        assertEquals("TestServer", Rebrand.serverModName);
++        assertEquals(6, Deflate.compressionLevel);
++        assertFalse(Books.enableBooks);
++        assertEquals("TestServer", AntarcticTomlConfig.getYamlFacade().getString("misc.rebrand.server-mod-name"));
++    }
++}

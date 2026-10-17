@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dreeam <61569423+Dreeam-qwq@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 02:31:59 +0700
+Subject: [PATCH 6/6] Expose Antarctic TOML config on Server.Spigot
+
+- Add Server.Spigot#getAntarcticTomlConfig returning the Night-Config CommentedFileConfig
+- Ported from Leaf Config v2 (Winds-Studio/Leaf, GPL-3.0-only)
+
+diff --git a/main/java/org/bukkit/Server.java b/main/java/org/bukkit/Server.java
+index 1c62db9..55c30fd 100644
+--- a/main/java/org/bukkit/Server.java
++++ b/main/java/org/bukkit/Server.java
+@@ -1025,6 +1025,16 @@ public interface Server extends PluginMessageRecipient {
+             throw new UnsupportedOperationException("Not supported yet.");
+         }
+ 
++        /**
++         * Returns the Antarctic TOML configuration.
++         *
++         * @return the antarctic.toml configuration
++         */
++        public com.electronwill.nightconfig.core.file.CommentedFileConfig getAntarcticTomlConfig()
++        {
++            throw new UnsupportedOperationException("Not supported yet.");
++        }
++
+         /**
+          * Sends the component to the player
+          *

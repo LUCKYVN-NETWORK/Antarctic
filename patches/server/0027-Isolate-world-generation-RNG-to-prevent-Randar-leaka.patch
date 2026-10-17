@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Leijurv <leijurv@gmail.com>
 Date: Sat, 17 Oct 2026 16:03:02 +0700
-Subject: [PATCH 27/59] Isolate world-generation RNG to prevent Randar leakage
+Subject: [PATCH 27/64] Isolate world-generation RNG to prevent Randar leakage
 
 - Preserve the seeded world-generation sequence without reseeding the shared gameplay RNG
 - Backport Dionysus server/0166 by Leijurv; https://github.com/nopjmp/Dionysus at b5c71b62f6f1f555b22bd52f5751e33be4690b6e
