@@ -1,14 +1,12 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Sat, 17 Oct 2026 16:05:02 +0700
-Subject: [PATCH 38/43] Make pathfinder selection interval configurable -
- Preserve vanilla interval 3 and reject nonpositive intervals before
- modulo-by-zero failures - Import unpatched vanilla selector from mc-dev;
- restart to apply changes to existing entities - Adapt Dionysus server/0098 by
- nothub, originally moom0o/Papaya (GPLv3) - Source:
- https://github.com/nopjmp/Dionysus at
- b5c71b62f6f1f555b22bd52f5751e33be4690b6e
+Subject: [PATCH 38/44] Make pathfinder selection interval configurable
 
+- Preserve vanilla interval 3 and reject nonpositive intervals before modulo-by-zero failures
+- Import unpatched vanilla selector from mc-dev; restart to apply changes to existing entities
+- Adapt Dionysus server/0098 by nothub, originally moom0o/Papaya (GPLv3)
+- Source: https://github.com/nopjmp/Dionysus at b5c71b62f6f1f555b22bd52f5751e33be4690b6e
 
 diff --git a/main/java/com/destroystokyo/paper/AntarcticConfig.java b/main/java/com/destroystokyo/paper/AntarcticConfig.java
 index 18a6740..cc8ce09 100644

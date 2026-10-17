@@ -1,16 +1,14 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Sat, 17 Oct 2026 15:39:36 +0700
-Subject: [PATCH 02/43] Add ArcticConfig configuration system - Add
- com.destroystokyo.paper.AntarcticConfig backed by antarctic.yml with
- reflective option loading and comment rendering - Add /antarctic command with
- reload and version subcommands - Load the config and register the command
- during dedicated server startup - Register the --antarctic-settings command
- line option - Expose getAntarcticConfig() on the internal Spigot server
- implementation - Adapted from the Dionysus configuration system
- (dev.pomf.dionysus) by nopjmp, original notices retained; see
- licenses/Dionysus-MIT.md
+Subject: [PATCH 02/44] Add ArcticConfig configuration system
 
+- Add com.destroystokyo.paper.AntarcticConfig backed by antarctic.yml with reflective option loading and comment rendering
+- Add /antarctic command with reload and version subcommands
+- Load the config and register the command during dedicated server startup
+- Register the --antarctic-settings command line option
+- Expose getAntarcticConfig() on the internal Spigot server implementation
+- Adapted from the Dionysus configuration system (dev.pomf.dionysus) by nopjmp, original notices retained; see licenses/Dionysus-MIT.md
 
 diff --git a/main/java/com/destroystokyo/paper/AntarcticCommand.java b/main/java/com/destroystokyo/paper/AntarcticCommand.java
 new file mode 100644

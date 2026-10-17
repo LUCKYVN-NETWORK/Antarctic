@@ -1,10 +1,9 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Sat, 17 Oct 2026 16:06:10 +0700
-Subject: [PATCH 5/5] Publish plugin classloader closure across threads -
- Preserve the Dionysus/Pufferfish closed-loader guard when lookups run
- off-thread
+Subject: [PATCH 5/5] Publish plugin classloader closure across threads
 
+- Preserve the Dionysus/Pufferfish closed-loader guard when lookups run off-thread
 
 diff --git a/main/java/org/bukkit/plugin/java/PluginClassLoader.java b/main/java/org/bukkit/plugin/java/PluginClassLoader.java
 index b3ed98b..740b231 100644

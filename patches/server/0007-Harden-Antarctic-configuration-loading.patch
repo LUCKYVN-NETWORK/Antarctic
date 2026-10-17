@@ -1,13 +1,12 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Sat, 17 Oct 2026 16:02:09 +0700
-Subject: [PATCH 07/43] Harden Antarctic configuration loading - Reject invalid
- YAML without overwriting it and create missing parent directories through
- Bukkit - Exclude persistence from reflective option loading and keep comments
- in a standard YAML header - Add creation, reload and invalid-file regression
- tests - Correct attribution to Dionysus and Pufferfish without asserting
- undocumented author permission
+Subject: [PATCH 07/44] Harden Antarctic configuration loading
 
+- Reject invalid YAML without overwriting it and create missing parent directories through Bukkit
+- Exclude persistence from reflective option loading and keep comments in a standard YAML header
+- Add creation, reload and invalid-file regression tests
+- Correct attribution to Dionysus and Pufferfish without asserting undocumented author permission
 
 diff --git a/main/java/com/destroystokyo/paper/AntarcticCommand.java b/main/java/com/destroystokyo/paper/AntarcticCommand.java
 index 1a4f39b..e873b05 100644

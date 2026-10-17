@@ -1,10 +1,10 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Sat, 17 Oct 2026 16:06:10 +0700
-Subject: [PATCH 42/43] Reject absorption amounts overflowing NMS storage -
- Validate the float range before narrowing a finite double to absorption
- hearts - Follow up Dionysus 0165 / SPIGOT-5317
+Subject: [PATCH 42/44] Reject absorption amounts overflowing NMS storage
 
+- Validate the float range before narrowing a finite double to absorption hearts
+- Follow up Dionysus 0165 / SPIGOT-5317
 
 diff --git a/main/java/org/bukkit/craftbukkit/entity/CraftLivingEntity.java b/main/java/org/bukkit/craftbukkit/entity/CraftLivingEntity.java
 index 3343724..5121e38 100644

@@ -1,10 +1,10 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: 2HG <admin@2hg.pw>
 Date: Sat, 16 Jul 2022 14:18:52 +0700
-Subject: [PATCH 13/43] Fix cow dupe - Backport Dionysus
- server/0087-Fix-cow-dupe.patch - Source: https://github.com/nopjmp/Dionysus
- at b5c71b62f6f1f555b22bd52f5751e33be4690b6e
+Subject: [PATCH 13/44] Fix cow dupe
 
+- Backport Dionysus server/0087-Fix-cow-dupe.patch
+- Source: https://github.com/nopjmp/Dionysus at b5c71b62f6f1f555b22bd52f5751e33be4690b6e
 
 diff --git a/main/java/net/minecraft/server/EntityMushroomCow.java b/main/java/net/minecraft/server/EntityMushroomCow.java
 index 5b0f8a9..acffbdc 100644

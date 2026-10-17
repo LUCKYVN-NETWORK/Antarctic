@@ -1,12 +1,11 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Aviana Cruz <gwencroft@proton.me>
 Date: Wed, 4 Jan 2023 15:54:08 +0800
-Subject: [PATCH 39/43] backport SPIGOT-5317: Create accessors for player
- absorption hearts - Backport Dionysus
- server/0165-backport-SPIGOT-5317-Create-accessors-for-player-abs.patch -
- Source: https://github.com/nopjmp/Dionysus at
- b5c71b62f6f1f555b22bd52f5751e33be4690b6e
+Subject: [PATCH 39/44] backport SPIGOT-5317: Create accessors for player
+ absorption hearts
 
+- Backport Dionysus server/0165-backport-SPIGOT-5317-Create-accessors-for-player-abs.patch
+- Source: https://github.com/nopjmp/Dionysus at b5c71b62f6f1f555b22bd52f5751e33be4690b6e
 
 diff --git a/main/java/org/bukkit/craftbukkit/entity/CraftEnderDragonPart.java b/main/java/org/bukkit/craftbukkit/entity/CraftEnderDragonPart.java
 index c333871..a6e61ad 100644

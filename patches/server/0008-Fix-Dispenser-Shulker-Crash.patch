@@ -1,11 +1,10 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: nopjmp <kthompson@hey.com>
 Date: Wed, 10 Feb 2021 14:37:35 -0600
-Subject: [PATCH 08/43] Fix Dispenser Shulker Crash - Backport Dionysus
- server/0025-Fix-Dispenser-Shulker-Crash.patch - Source:
- https://github.com/nopjmp/Dionysus at
- b5c71b62f6f1f555b22bd52f5751e33be4690b6e
+Subject: [PATCH 08/44] Fix Dispenser Shulker Crash
 
+- Backport Dionysus server/0025-Fix-Dispenser-Shulker-Crash.patch
+- Source: https://github.com/nopjmp/Dionysus at b5c71b62f6f1f555b22bd52f5751e33be4690b6e
 This will now check to make sure the shulker box was actually placed before interacting with it.
 
 diff --git a/main/java/net/minecraft/server/DispenserRegistry.java b/main/java/net/minecraft/server/DispenserRegistry.java
