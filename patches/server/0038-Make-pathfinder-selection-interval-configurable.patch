@@ -1,0 +1,212 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Sat, 17 Oct 2026 16:05:02 +0700
+Subject: [PATCH 38/43] Make pathfinder selection interval configurable -
+ Preserve vanilla interval 3 and reject nonpositive intervals before
+ modulo-by-zero failures - Import unpatched vanilla selector from mc-dev;
+ restart to apply changes to existing entities - Adapt Dionysus server/0098 by
+ nothub, originally moom0o/Papaya (GPLv3) - Source:
+ https://github.com/nopjmp/Dionysus at
+ b5c71b62f6f1f555b22bd52f5751e33be4690b6e
+
+
+diff --git a/main/java/com/destroystokyo/paper/AntarcticConfig.java b/main/java/com/destroystokyo/paper/AntarcticConfig.java
+index 18a6740..cc8ce09 100644
+--- a/main/java/com/destroystokyo/paper/AntarcticConfig.java
++++ b/main/java/com/destroystokyo/paper/AntarcticConfig.java
+@@ -156,4 +156,13 @@ public class AntarcticConfig {
+         ensureDefault(key, defaultValue, comment);
+         return config.getStringList(key);
+     }
++    // Papaya / moom0o via Dionysus 0098; retain the vanilla interval by default.
++    public static int pathfinderGoalSelectionDelay = 3;
++    private static void pathfinderGoalSelectionDelay() {
++        int delay = getInt("pathfinder.goal-selection-delay", 3,
++                "Ticks between goal-selection passes. Vanilla: 3. Higher values reduce AI responsiveness.",
++                "Must be positive. Changes affect newly created selectors; restart to apply everywhere.");
++        if (delay < 1) throw new IllegalArgumentException("pathfinder.goal-selection-delay must be positive");
++        pathfinderGoalSelectionDelay = delay;
++    }
+ }
+diff --git a/main/java/net/minecraft/server/PathfinderGoalSelector.java b/main/java/net/minecraft/server/PathfinderGoalSelector.java
+new file mode 100644
+index 0000000..a07ea37
+--- /dev/null
++++ b/main/java/net/minecraft/server/PathfinderGoalSelector.java
+@@ -0,0 +1,176 @@
++package net.minecraft.server;
++
++import com.google.common.collect.Sets;
++import java.util.Iterator;
++import java.util.Set;
++import javax.annotation.Nullable;
++import org.apache.logging.log4j.LogManager;
++import org.apache.logging.log4j.Logger;
++
++public class PathfinderGoalSelector {
++
++    private static final Logger a = LogManager.getLogger();
++    private final Set<PathfinderGoalSelector.PathfinderGoalSelectorItem> b = Sets.newLinkedHashSet();
++    private final Set<PathfinderGoalSelector.PathfinderGoalSelectorItem> c = Sets.newLinkedHashSet();
++    private final MethodProfiler d;
++    private int e;
++    private int f = com.destroystokyo.paper.AntarcticConfig.pathfinderGoalSelectionDelay; // Papaya via Dionysus
++    private int g;
++
++    public PathfinderGoalSelector(MethodProfiler methodprofiler) {
++        this.d = methodprofiler;
++    }
++
++    public void a(int i, PathfinderGoal pathfindergoal) {
++        this.b.add(new PathfinderGoalSelector.PathfinderGoalSelectorItem(i, pathfindergoal));
++    }
++
++    public void a(PathfinderGoal pathfindergoal) {
++        Iterator iterator = this.b.iterator();
++
++        PathfinderGoalSelector.PathfinderGoalSelectorItem pathfindergoalselector_pathfindergoalselectoritem;
++        PathfinderGoal pathfindergoal1;
++
++        do {
++            if (!iterator.hasNext()) {
++                return;
++            }
++
++            pathfindergoalselector_pathfindergoalselectoritem = (PathfinderGoalSelector.PathfinderGoalSelectorItem) iterator.next();
++            pathfindergoal1 = pathfindergoalselector_pathfindergoalselectoritem.a;
++        } while (pathfindergoal1 != pathfindergoal);
++
++        if (pathfindergoalselector_pathfindergoalselectoritem.c) {
++            pathfindergoalselector_pathfindergoalselectoritem.c = false;
++            pathfindergoalselector_pathfindergoalselectoritem.a.d();
++            this.c.remove(pathfindergoalselector_pathfindergoalselectoritem);
++        }
++
++        iterator.remove();
++    }
++
++    public void a() {
++        this.d.a("goalSetup");
++        Iterator iterator;
++        PathfinderGoalSelector.PathfinderGoalSelectorItem pathfindergoalselector_pathfindergoalselectoritem;
++
++        if (this.e++ % this.f == 0) {
++            iterator = this.b.iterator();
++
++            while (iterator.hasNext()) {
++                pathfindergoalselector_pathfindergoalselectoritem = (PathfinderGoalSelector.PathfinderGoalSelectorItem) iterator.next();
++                if (pathfindergoalselector_pathfindergoalselectoritem.c) {
++                    if (!this.b(pathfindergoalselector_pathfindergoalselectoritem) || !this.a(pathfindergoalselector_pathfindergoalselectoritem)) {
++                        pathfindergoalselector_pathfindergoalselectoritem.c = false;
++                        pathfindergoalselector_pathfindergoalselectoritem.a.d();
++                        this.c.remove(pathfindergoalselector_pathfindergoalselectoritem);
++                    }
++                } else if (this.b(pathfindergoalselector_pathfindergoalselectoritem) && pathfindergoalselector_pathfindergoalselectoritem.a.a()) {
++                    pathfindergoalselector_pathfindergoalselectoritem.c = true;
++                    pathfindergoalselector_pathfindergoalselectoritem.a.c();
++                    this.c.add(pathfindergoalselector_pathfindergoalselectoritem);
++                }
++            }
++        } else {
++            iterator = this.c.iterator();
++
++            while (iterator.hasNext()) {
++                pathfindergoalselector_pathfindergoalselectoritem = (PathfinderGoalSelector.PathfinderGoalSelectorItem) iterator.next();
++                if (!this.a(pathfindergoalselector_pathfindergoalselectoritem)) {
++                    pathfindergoalselector_pathfindergoalselectoritem.c = false;
++                    pathfindergoalselector_pathfindergoalselectoritem.a.d();
++                    iterator.remove();
++                }
++            }
++        }
++
++        this.d.b();
++        if (!this.c.isEmpty()) {
++            this.d.a("goalTick");
++            iterator = this.c.iterator();
++
++            while (iterator.hasNext()) {
++                pathfindergoalselector_pathfindergoalselectoritem = (PathfinderGoalSelector.PathfinderGoalSelectorItem) iterator.next();
++                pathfindergoalselector_pathfindergoalselectoritem.a.e();
++            }
++
++            this.d.b();
++        }
++
++    }
++
++    private boolean a(PathfinderGoalSelector.PathfinderGoalSelectorItem pathfindergoalselector_pathfindergoalselectoritem) {
++        return pathfindergoalselector_pathfindergoalselectoritem.a.b();
++    }
++
++    private boolean b(PathfinderGoalSelector.PathfinderGoalSelectorItem pathfindergoalselector_pathfindergoalselectoritem) {
++        if (this.c.isEmpty()) {
++            return true;
++        } else if (this.b(pathfindergoalselector_pathfindergoalselectoritem.a.h())) {
++            return false;
++        } else {
++            Iterator iterator = this.c.iterator();
++
++            while (iterator.hasNext()) {
++                PathfinderGoalSelector.PathfinderGoalSelectorItem pathfindergoalselector_pathfindergoalselectoritem1 = (PathfinderGoalSelector.PathfinderGoalSelectorItem) iterator.next();
++
++                if (pathfindergoalselector_pathfindergoalselectoritem1 != pathfindergoalselector_pathfindergoalselectoritem) {
++                    if (pathfindergoalselector_pathfindergoalselectoritem.b >= pathfindergoalselector_pathfindergoalselectoritem1.b) {
++                        if (!this.a(pathfindergoalselector_pathfindergoalselectoritem, pathfindergoalselector_pathfindergoalselectoritem1)) {
++                            return false;
++                        }
++                    } else if (!pathfindergoalselector_pathfindergoalselectoritem1.a.g()) {
++                        return false;
++                    }
++                }
++            }
++
++            return true;
++        }
++    }
++
++    private boolean a(PathfinderGoalSelector.PathfinderGoalSelectorItem pathfindergoalselector_pathfindergoalselectoritem, PathfinderGoalSelector.PathfinderGoalSelectorItem pathfindergoalselector_pathfindergoalselectoritem1) {
++        return (pathfindergoalselector_pathfindergoalselectoritem.a.h() & pathfindergoalselector_pathfindergoalselectoritem1.a.h()) == 0;
++    }
++
++    public boolean b(int i) {
++        return (this.g & i) > 0;
++    }
++
++    public void c(int i) {
++        this.g |= i;
++    }
++
++    public void d(int i) {
++        this.g &= ~i;
++    }
++
++    public void a(int i, boolean flag) {
++        if (flag) {
++            this.d(i);
++        } else {
++            this.c(i);
++        }
++
++    }
++
++    class PathfinderGoalSelectorItem {
++
++        public final PathfinderGoal a;
++        public final int b;
++        public boolean c;
++
++        public PathfinderGoalSelectorItem(int i, PathfinderGoal pathfindergoal) {
++            this.b = i;
++            this.a = pathfindergoal;
++        }
++
++        public boolean equals(@Nullable Object object) {
++            return this == object ? true : (object != null && this.getClass() == object.getClass() ? this.a.equals(((PathfinderGoalSelector.PathfinderGoalSelectorItem) object).a) : false);
++        }
++
++        public int hashCode() {
++            return this.a.hashCode();
++        }
++    }
++}
