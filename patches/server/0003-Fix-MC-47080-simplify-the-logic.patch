@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nopjmp <kthompson@hey.com>
+Date: Fri, 5 Feb 2021 00:08:31 -0600
+Subject: [PATCH 03/43] Fix MC-47080 simplify the logic - Simplify
+ everyoneDeeplySleeping into a single pass that only counts actual sleepers -
+ Backported from Dionysus 0012 by nopjmp, original notices retained; see
+ licenses/Dionysus-MIT.md
+
+
+diff --git a/main/java/net/minecraft/server/WorldServer.java b/main/java/net/minecraft/server/WorldServer.java
+index e545e97..a53f54c 100644
+--- a/main/java/net/minecraft/server/WorldServer.java
++++ b/main/java/net/minecraft/server/WorldServer.java
+@@ -421,32 +421,13 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+         // CraftBukkit end
+     }
+ 
++    // Dionysus
++    // Fixes MC-47080 and simplifies the logic
+     public boolean everyoneDeeplySleeping() {
+-        if (this.Q && !this.isClientSide) {
+-            Iterator iterator = this.players.iterator();
+-
+-            // CraftBukkit - This allows us to assume that some people are in bed but not really, allowing time to pass in spite of AFKers
+-            boolean foundActualSleepers = false;
+-
+-            EntityHuman entityhuman;
+-
+-            do {
+-                if (!iterator.hasNext()) {
+-                    return foundActualSleepers;
+-                }
+-
+-                entityhuman = (EntityHuman) iterator.next();
+-
+-                // CraftBukkit start
+-                if (entityhuman.isDeeplySleeping()) {
+-                    foundActualSleepers = true;
+-                }
+-            } while (!entityhuman.isSpectator() || entityhuman.isDeeplySleeping() || entityhuman.fauxSleeping);
+-            // CraftBukkit end
+-
++        if (this.players.size() == 0 || this.isClientSide || !this.Q) {
+             return false;
+         } else {
+-            return false;
++            return this.players.stream().allMatch(p -> p.isSpectator() || p.isDeeplySleeping() || p.fauxSleeping);
+         }
+     }
+ 
