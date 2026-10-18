@@ -1,0 +1,17 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Sun, 18 Oct 2026 09:11:30 +0700
+Subject: [PATCH 65/65] Fix log4j plugin resolution in shaded server jar
+
+
+diff --git a/main/resources/log4j2.xml b/main/resources/log4j2.xml
+index 6711e6d..9e4ae7c 100644
+--- a/main/resources/log4j2.xml
++++ b/main/resources/log4j2.xml
+@@ -1,5 +1,5 @@
+ <?xml version="1.0" encoding="UTF-8"?>
+-<Configuration status="WARN">
++<Configuration status="WARN" packages="com.mojang.util,net.minecrell.terminalconsole,net.minecrell.terminalconsole.util">
+     <Appenders>
+         <TerminalConsole name="TerminalConsole">
+             <PatternLayout>

@@ -59,6 +59,9 @@ tasks.register('serverJar', Jar) {
     archiveClassifier = ''
     manifest {
         attributes(
+            // log4j-api is a multi-release jar; Gradle's fat jar drops the flag,
+            // which makes JDK 9+ pick the Java-8 StackLocator and crash at startup.
+            'Multi-Release': 'true',
             'Main-Class': 'org.bukkit.craftbukkit.Main',
             'Implementation-Title': 'Antarctic-Server',
             'Implementation-Version': project.version,
@@ -73,11 +76,31 @@ tasks.register('serverJar', Jar) {
     dependsOn ':Antarctic-API:classes', 'classes'
 
     from {
-        configurations.runtimeClasspath.collect { it.isDirectory() ? it : zipTree(it) }
+        configurations.runtimeClasspath.collect { f ->
+            if (f.isDirectory()) {
+                return f
+            }
+            if (f.name.contains('fastutil-lite')) {
+                // Stripped fastutil subset; the mapped vanilla server jar merged below
+                // already bundles the full library. Letting the subset shadow it crashes
+                // at runtime (its ObjectOpenHashSet has no remove(Object) override).
+                return files()
+            }
+            if (f.name.contains('terminalconsoleappender')) {
+                // Keep log4j-core's plugin index: this jar's minimal Log4j2Plugins.dat
+                // would shadow it and unregister every core pattern converter. Its own
+                // plugins are registered via the packages attribute in log4j2.xml.
+                return zipTree(f).matching { exclude 'META-INF/org/apache/logging/log4j/core/config/plugins/Log4j2Plugins.dat' }
+            }
+            return zipTree(f)
+        }
     }
     def mappedJar = file('libs/minecraft-server-1.12.2-mapped.jar')
     if (mappedJar.exists()) {
-        from zipTree(mappedJar)
+        // Exclude the vanilla jar's minimal Log4j2Plugins.dat so log4j-core's full
+        // plugin index (merged from runtimeClasspath) stays authoritative; the
+        // vanilla QueueLogAppender is registered via the packages attribute below.
+        from(zipTree(mappedJar).matching { exclude 'META-INF/org/apache/logging/log4j/core/config/plugins/Log4j2Plugins.dat' })
     }
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
     exclude 'META-INF/*.SF', 'META-INF/*.DSA', 'META-INF/*.RSA'
