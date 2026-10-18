@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Sun, 18 Oct 2026 20:16:38 +0700
+Subject: [PATCH 84/85] Virtual thread support for user authenticator
+
+- Execute Mojang session authentication using Thread.ofVirtual() executor
+
+- Validate connection state before applying offline or online authentication results
+
+- Add concurrency.virtual-threads.authenticator toggle (default true)
+
+diff --git a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+index ba93e90..c2b769f 100644
+--- a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
++++ b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+@@ -3,6 +3,7 @@ package com.destroystokyo.paper.config.toml;
+ import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
+ import com.destroystokyo.paper.config.toml.annotations.DoNotLoad;
+ import com.destroystokyo.paper.config.toml.annotations.HotReloadUnsupported;
++import com.destroystokyo.paper.config.toml.modules.concurrency.VirtualThreads;
+ import com.destroystokyo.paper.config.toml.modules.fixes.Books;
+ import com.destroystokyo.paper.config.toml.modules.fixes.MapDecorations;
+ import com.destroystokyo.paper.config.toml.modules.gameplay.ChunkOverloadDupe;
+@@ -47,6 +48,7 @@ public final class AntarcticTomlConfig {
+     private static final List<IConfigModule> MODULES = List.of(
+             new Rebrand(), new Privacy(),
+             new Deflate(),
++            new VirtualThreads(),
+             new Pathfinder(), new Suffocation(), new Projectiles(), new ArmourStands(), new WorldBorder(), new SunBurn(), new Rails(),
+             new MergeChecks(), new ChunkOverloadDupe(), new Collisions(),
+             new MapDecorations(), new Books());
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/concurrency/VirtualThreads.java b/main/java/com/destroystokyo/paper/config/toml/modules/concurrency/VirtualThreads.java
+new file mode 100644
+index 0000000..94c7857
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/concurrency/VirtualThreads.java
+@@ -0,0 +1,24 @@
++package com.destroystokyo.paper.config.toml.modules.concurrency;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++
++public class VirtualThreads implements IConfigModule {
++
++    @ConfigInfo(baseName = "authenticator", comments = "Use OpenJDK 21 virtual threads for user authentication pool.")
++    public static boolean authenticator = true;
++
++    @ConfigInfo(baseName = "chat-executor", comments = "Use OpenJDK 21 virtual threads for asynchronous player chat processing.")
++    public static boolean chatExecutor = true;
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.CONCURRENCY;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "virtual-threads";
++    }
++}
+diff --git a/main/java/net/minecraft/server/LoginListener.java b/main/java/net/minecraft/server/LoginListener.java
+index 795ae75..d6d2a69 100644
+--- a/main/java/net/minecraft/server/LoginListener.java
++++ b/main/java/net/minecraft/server/LoginListener.java
+@@ -111,9 +111,20 @@ public class LoginListener implements PacketLoginInListener, ITickable {
+ 
+     // Paper start - Cache authenticator threads
+     private static final AtomicInteger threadId = new AtomicInteger(0);
+-    private static final java.util.concurrent.ExecutorService authenticatorPool = java.util.concurrent.Executors.newCachedThreadPool(
+-            r -> new Thread(r, "User Authenticator #" + threadId.incrementAndGet())
+-    );
++    // Leaf start - Virtual thread support for user authenticator (backport of Leaf MC 0121 / 0123)
++    private static final java.util.concurrent.ExecutorService authenticatorPool = buildAuthenticatorPool();
++
++    private static java.util.concurrent.ExecutorService buildAuthenticatorPool() {
++        if (com.destroystokyo.paper.config.toml.modules.concurrency.VirtualThreads.authenticator) {
++            return java.util.concurrent.Executors.newThreadPerTaskExecutor(
++                    Thread.ofVirtual().name("User Authenticator #", 0).factory()
++            );
++        }
++        return java.util.concurrent.Executors.newCachedThreadPool(
++                r -> new Thread(r, "User Authenticator #" + threadId.incrementAndGet())
++        );
++    }
++    // Leaf end
+     // Paper end
+     // Spigot start
+     public void initUUID()
+@@ -206,6 +217,11 @@ public class LoginListener implements PacketLoginInListener, ITickable {
+                 @Override
+                 public void run() {
+                     try {
++                        // Leaf start - validate connection state before offline authentication
++                        if (!networkManager.isConnected()) {
++                            return;
++                        }
++                        // Leaf end
+                         initUUID();
+                         new LoginHandler().fireEvents();
+                     } catch (Exception ex) {

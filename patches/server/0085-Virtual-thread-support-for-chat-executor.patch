@@ -1,0 +1,129 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Sun, 18 Oct 2026 20:21:59 +0700
+Subject: [PATCH 85/85] Virtual thread support for chat executor
+
+- Execute asynchronous player chat processing on OpenJDK 21 virtual threads
+
+- Enforce bounded submission queue to prevent memory exhaustion during chat floods
+
+- Expose getChatExecutor on PlayerConnection and CraftServer
+
+- Add concurrency.virtual-threads.chat-executor toggle (default true)
+
+diff --git a/main/java/net/minecraft/server/PlayerConnection.java b/main/java/net/minecraft/server/PlayerConnection.java
+index cb4410a..e5d7a6f 100644
+--- a/main/java/net/minecraft/server/PlayerConnection.java
++++ b/main/java/net/minecraft/server/PlayerConnection.java
+@@ -68,6 +68,27 @@ public class PlayerConnection implements PacketListenerPlayIn, ITickable {
+     private long f = getCurrentMillis(); private void setLastPing(long lastPing) { this.f = lastPing;}; private long getLastPing() { return this.f;}; // Paper - OBFHELPER - set ping to delay initial
+     private boolean g; private void setPendingPing(boolean isPending) { this.g = isPending;}; private boolean isPendingPing() { return this.g;}; // Paper - OBFHELPER
+     private long h; private void setKeepAliveID(long keepAliveID) { this.h = keepAliveID;}; private long getKeepAliveID() {return this.h; };  // Paper - OBFHELPER
++    // Leaf start - Virtual thread support for chat executor (backport of Leaf MC 0120 / Server-Paper 0025)
++    private static final java.util.concurrent.atomic.AtomicInteger chatThreadId = new java.util.concurrent.atomic.AtomicInteger(0);
++    private static final java.util.concurrent.atomic.AtomicInteger pendingChats = new java.util.concurrent.atomic.AtomicInteger(0);
++    private static final int MAX_PENDING_CHATS = 2048;
++    private static final java.util.concurrent.ExecutorService chatExecutor = buildChatExecutor();
++
++    private static java.util.concurrent.ExecutorService buildChatExecutor() {
++        if (com.destroystokyo.paper.config.toml.modules.concurrency.VirtualThreads.chatExecutor) {
++            return java.util.concurrent.Executors.newThreadPerTaskExecutor(
++                    Thread.ofVirtual().name("Async Chat Thread - #", 0).factory()
++            );
++        }
++        return java.util.concurrent.Executors.newCachedThreadPool(
++                r -> new Thread(r, "Async Chat Thread - #" + chatThreadId.incrementAndGet())
++        );
++    }
++
++    public static java.util.concurrent.ExecutorService getChatExecutor() {
++        return chatExecutor;
++    }
++    // Leaf end
+     // CraftBukkit start - multithreaded fields
+     private volatile int chatThrottle;
+     private static final AtomicIntegerFieldUpdater chatSpamField = AtomicIntegerFieldUpdater.newUpdater(PlayerConnection.class, "chatThrottle");
+@@ -1344,7 +1365,21 @@ public class PlayerConnection implements PacketListenerPlayIn, ITickable {
+                 chatmessage.getChatModifier().setColor(EnumChatFormat.RED);
+                 this.sendPacket(new PacketPlayOutChat(chatmessage));
+             } else if (true) {
+-                this.chat(s, true);
++                // Leaf start - Virtual thread support for chat executor (backport of Leaf MC 0120 / Server-Paper 0025)
++                if (pendingChats.get() >= MAX_PENDING_CHATS) {
++                    LOGGER.warn("Chat queue overloaded ({} pending), dropping message from {}", pendingChats.get(), this.player.getName());
++                } else {
++                    final String message = s;
++                    pendingChats.incrementAndGet();
++                    chatExecutor.execute(() -> {
++                        try {
++                            this.chat(message, true);
++                        } finally {
++                            pendingChats.decrementAndGet();
++                        }
++                    });
++                }
++                // Leaf end
+                 // CraftBukkit end - the below is for reference. :)
+             } else {
+                 ChatMessage chatmessage1 = new ChatMessage("chat.type.text", new Object[] { this.player.getScoreboardDisplayName(), s});
+diff --git a/main/java/org/bukkit/craftbukkit/CraftServer.java b/main/java/org/bukkit/craftbukkit/CraftServer.java
+index cb0ab74..22120f4 100644
+--- a/main/java/org/bukkit/craftbukkit/CraftServer.java
++++ b/main/java/org/bukkit/craftbukkit/CraftServer.java
+@@ -628,6 +628,12 @@ public final class CraftServer implements Server {
+         return servicesManager;
+     }
+ 
++    // Leaf start - Virtual thread support for chat executor (backport of Leaf MC 0120 / Server-Paper 0025)
++    public java.util.concurrent.ExecutorService getChatExecutor() {
++        return net.minecraft.server.PlayerConnection.getChatExecutor();
++    }
++    // Leaf end
++
+     @Override
+     public List<World> getWorlds() {
+         return this.worldsView; // Leaf - return unmodifiable snapshot view (backport of Leaf Server-Paper 0045)
+diff --git a/test/java/com/destroystokyo/paper/config/toml/VirtualThreadsTest.java b/test/java/com/destroystokyo/paper/config/toml/VirtualThreadsTest.java
+new file mode 100644
+index 0000000..2da1063
+--- /dev/null
++++ b/test/java/com/destroystokyo/paper/config/toml/VirtualThreadsTest.java
+@@ -0,0 +1,38 @@
++package com.destroystokyo.paper.config.toml;
++
++import com.destroystokyo.paper.config.toml.modules.concurrency.VirtualThreads;
++import net.minecraft.server.PlayerConnection;
++import org.junit.Assert;
++import org.junit.Test;
++
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicBoolean;
++
++public class VirtualThreadsTest {
++
++    @Test
++    public void testVirtualThreadsConfigDefaults() {
++        Assert.assertTrue("VirtualThreads.authenticator should default to true", VirtualThreads.authenticator);
++        Assert.assertTrue("VirtualThreads.chatExecutor should default to true", VirtualThreads.chatExecutor);
++    }
++
++    @Test
++    public void testChatExecutorExecution() throws InterruptedException {
++        ExecutorService executor = PlayerConnection.getChatExecutor();
++        Assert.assertNotNull("Chat executor should not be null", executor);
++
++        CountDownLatch latch = new CountDownLatch(1);
++        AtomicBoolean ran = new AtomicBoolean(false);
++
++        executor.execute(() -> {
++            ran.set(true);
++            latch.countDown();
++        });
++
++        boolean completed = latch.await(5, TimeUnit.SECONDS);
++        Assert.assertTrue("Chat executor task should complete promptly", completed);
++        Assert.assertTrue("Chat executor task should have run", ran.get());
++    }
++}
