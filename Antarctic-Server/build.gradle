@@ -86,13 +86,16 @@ tasks.register('serverJar', Jar) {
                 // at runtime (its ObjectOpenHashSet has no remove(Object) override).
                 return files()
             }
-            if (f.name.contains('terminalconsoleappender')) {
-                // Keep log4j-core's plugin index: this jar's minimal Log4j2Plugins.dat
-                // would shadow it and unregister every core pattern converter. Its own
-                // plugins are registered via the packages attribute in log4j2.xml.
-                return zipTree(f).matching { exclude 'META-INF/org/apache/logging/log4j/core/config/plugins/Log4j2Plugins.dat' }
+            if (f.name.startsWith('log4j-core')) {
+                // The only authoritative Log4j2Plugins.dat: log4j-core's plugin index
+                // must survive the merge or every core pattern converter unregisters.
+                return zipTree(f)
             }
-            return zipTree(f)
+            // Every other bundled jar may carry a stub Log4j2Plugins.dat (authlib ships
+            // a 67-byte one) that would shadow log4j-core's index under the duplicate-
+            // exclusion merge order. tca and com.mojang.util plugins register through
+            // the packages attribute in log4j2.xml instead.
+            return zipTree(f).matching { exclude 'META-INF/org/apache/logging/log4j/core/config/plugins/Log4j2Plugins.dat' }
         }
     }
     def mappedJar = file('libs/minecraft-server-1.12.2-mapped.jar')
