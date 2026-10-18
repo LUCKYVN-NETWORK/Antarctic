@@ -1,0 +1,246 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Sun, 18 Oct 2026 14:51:42 +0700
+Subject: [PATCH 70/72] Skip BlockPhysicsEvent work when no listeners are
+ registered
+
+- Hoist a BlockPhysicsEvent.getHandlerList().getRegisteredListeners().length != 0 check into World neighborChanged so the event, its CraftBlock snapshot and the dispatch are skipped entirely when no plugin listens (backport of Leaf MC 0256; BlockPhysicsEvent can fire 50k+/sec during redstone, liquid and sand activity)
+- Return null early from CraftEventFactory.callBlockPhysicsEvent when the handler list is empty and null-guard the BlockPlant and BlockTallPlant callers
+- Add EventShortCircuitTest pinning the HandlerList and SimplePluginManager semantics the hoist relies on: fresh lists report zero listeners, zero-listener dispatch never cancels, and register/unregister flips the check live with no staleness
+
+diff --git a/main/java/net/minecraft/server/BlockPlant.java b/main/java/net/minecraft/server/BlockPlant.java
+index 16c8156..6f30323 100644
+--- a/main/java/net/minecraft/server/BlockPlant.java
++++ b/main/java/net/minecraft/server/BlockPlant.java
+@@ -41,7 +41,8 @@ public class BlockPlant extends Block {
+     protected void e(World world, BlockPosition blockposition, IBlockData iblockdata) {
+         if (!this.f(world, blockposition, iblockdata)) {
+             // CraftBukkit start
+-            if (org.bukkit.craftbukkit.event.CraftEventFactory.callBlockPhysicsEvent(world, blockposition).isCancelled()) {
++            org.bukkit.event.block.BlockPhysicsEvent event = org.bukkit.craftbukkit.event.CraftEventFactory.callBlockPhysicsEvent(world, blockposition); // Leaf - null when no listeners (backport of Leaf MC 0256)
++            if (event != null && event.isCancelled()) {
+                 return;
+             }
+             // CraftBukkit end
+diff --git a/main/java/net/minecraft/server/BlockTallPlant.java b/main/java/net/minecraft/server/BlockTallPlant.java
+index e3ebf6f..4517717 100644
+--- a/main/java/net/minecraft/server/BlockTallPlant.java
++++ b/main/java/net/minecraft/server/BlockTallPlant.java
+@@ -49,7 +49,8 @@ public class BlockTallPlant extends BlockPlant implements IBlockFragilePlantElem
+     protected void e(World world, BlockPosition blockposition, IBlockData iblockdata) {
+         if (!this.f(world, blockposition, iblockdata)) {
+             // CraftBukkit start
+-            if (org.bukkit.craftbukkit.event.CraftEventFactory.callBlockPhysicsEvent(world, blockposition).isCancelled()) {
++            org.bukkit.event.block.BlockPhysicsEvent event = org.bukkit.craftbukkit.event.CraftEventFactory.callBlockPhysicsEvent(world, blockposition); // Leaf - null when no listeners (backport of Leaf MC 0256)
++            if (event != null && event.isCancelled()) {
+                 return;
+             }
+             // CraftBukkit end
+diff --git a/main/java/net/minecraft/server/World.java b/main/java/net/minecraft/server/World.java
+index fbe16eb..589bb8a 100644
+--- a/main/java/net/minecraft/server/World.java
++++ b/main/java/net/minecraft/server/World.java
+@@ -594,7 +594,7 @@ public abstract class World implements IBlockAccess {
+             try {
+                 // CraftBukkit start
+                 CraftWorld world = ((WorldServer) this).getWorld();
+-                if (world != null && !((WorldServer)this).stopPhysicsEvent) { // Paper
++                if (world != null && !((WorldServer)this).stopPhysicsEvent && BlockPhysicsEvent.getHandlerList().getRegisteredListeners().length != 0) { // Paper // Leaf - skip event creation and dispatch when no listeners are registered (backport of Leaf MC 0256); BlockPhysicsEvent can fire 50k+/sec during redstone/liquid/sand activity
+                     BlockPhysicsEvent event = new BlockPhysicsEvent(world.getBlockAt(blockposition.getX(), blockposition.getY(), blockposition.getZ()), CraftMagicNumbers.getId(block), blockposition1.getX(), blockposition1.getY(), blockposition1.getZ()); // Paper - add source block
+                     this.getServer().getPluginManager().callEvent(event);
+ 
+diff --git a/main/java/org/bukkit/craftbukkit/event/CraftEventFactory.java b/main/java/org/bukkit/craftbukkit/event/CraftEventFactory.java
+index f1a3ca9..835f143 100644
+--- a/main/java/org/bukkit/craftbukkit/event/CraftEventFactory.java
++++ b/main/java/org/bukkit/craftbukkit/event/CraftEventFactory.java
+@@ -1148,6 +1148,10 @@ public class CraftEventFactory {
+     }
+ 
+     public static BlockPhysicsEvent callBlockPhysicsEvent(World world, BlockPosition blockposition) {
++        // Leaf - skip event creation and dispatch when no listeners are registered (backport of Leaf MC 0256); returns null, callers must null-check
++        if (BlockPhysicsEvent.getHandlerList().getRegisteredListeners().length == 0) {
++            return null;
++        }
+         org.bukkit.block.Block block = world.getWorld().getBlockAt(blockposition.getX(), blockposition.getY(), blockposition.getZ());
+         BlockPhysicsEvent event = new BlockPhysicsEvent(block, block.getTypeId());
+         world.getServer().getPluginManager().callEvent(event);
+diff --git a/test/java/org/bukkit/event/EventShortCircuitTest.java b/test/java/org/bukkit/event/EventShortCircuitTest.java
+new file mode 100644
+index 0000000..7413846
+--- /dev/null
++++ b/test/java/org/bukkit/event/EventShortCircuitTest.java
+@@ -0,0 +1,174 @@
++package org.bukkit.event;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++
++import java.io.File;
++import java.io.InputStream;
++import java.util.List;
++import java.util.logging.Logger;
++
++import org.bukkit.Server;
++import org.bukkit.command.Command;
++import org.bukkit.command.CommandSender;
++import org.bukkit.configuration.file.FileConfiguration;
++import org.bukkit.generator.ChunkGenerator;
++import org.bukkit.plugin.EventExecutor;
++import org.bukkit.plugin.Plugin;
++import org.bukkit.plugin.PluginDescriptionFile;
++import org.bukkit.plugin.PluginLoader;
++import org.bukkit.plugin.PluginManager;
++import org.bukkit.plugin.RegisteredListener;
++import org.bukkit.plugin.SimplePluginManager;
++import org.junit.Test;
++
++/**
++ * Wave 3 (backport of Leaf MC 0256 / 0264 / 0311) hoists zero-listener checks to
++ * Bukkit event firing sites:
++ *
++ * <pre>
++ * if (EventClass.getHandlerList().getRegisteredListeners().length == 0) {
++ *     // skip event creation and dispatch entirely
++ * }
++ * </pre>
++ *
++ * <p>These tests pin the {@link HandlerList}/{@link SimplePluginManager} semantics that
++ * make the hoist observationally safe:
++ * <ol>
++ * <li>fresh handler lists report zero registered listeners (the baseline assumption),</li>
++ * <li>dispatching an event with zero listeners never cancels it (so skipping the dispatch
++ * is semantically identical to performing it), and</li>
++ * <li>the hoisted check reads live registration state: a listener registered at any time
++ * immediately un-short-circuits dispatch, and unregistering re-bakes back to zero.</li>
++ * </ol>
++ */
++public class EventShortCircuitTest {
++
++    private static final PluginManager PLUGIN_MANAGER = new SimplePluginManager(null, null);
++
++    private static final EventExecutor CANCELLING_EXECUTOR = new EventExecutor() {
++        @Override
++        public void execute(Listener listener, Event event) throws EventException {
++            ((Cancellable) event).setCancelled(true);
++        }
++    };
++
++    private static final Plugin DUMMY_PLUGIN = new Plugin() {
++        @Override
++        public File getDataFolder() { throw new UnsupportedOperationException(); }
++        @Override
++        public PluginDescriptionFile getDescription() { throw new UnsupportedOperationException(); }
++        @Override
++        public FileConfiguration getConfig() { throw new UnsupportedOperationException(); }
++        @Override
++        public InputStream getResource(String filename) { throw new UnsupportedOperationException(); }
++        @Override
++        public void saveConfig() { throw new UnsupportedOperationException(); }
++        @Override
++        public void saveDefaultConfig() { throw new UnsupportedOperationException(); }
++        @Override
++        public void saveResource(String resourcePath, boolean replace) { throw new UnsupportedOperationException(); }
++        @Override
++        public void reloadConfig() { throw new UnsupportedOperationException(); }
++        @Override
++        public PluginLoader getPluginLoader() { throw new UnsupportedOperationException(); }
++        @Override
++        public Server getServer() { throw new UnsupportedOperationException(); }
++        @Override
++        public boolean isEnabled() { return true; }
++        @Override
++        public void onDisable() { }
++        @Override
++        public void onLoad() { }
++        @Override
++        public void onEnable() { }
++        @Override
++        public boolean isNaggable() { return true; }
++        @Override
++        public void setNaggable(boolean canNag) { }
++        @Override
++        public ChunkGenerator getDefaultWorldGenerator(String worldName, String id) { throw new UnsupportedOperationException(); }
++        @Override
++        public Logger getLogger() { throw new UnsupportedOperationException(); }
++        @Override
++        public String getName() { return "event-short-circuit-test"; }
++        @Override
++        public boolean onCommand(CommandSender sender, Command command, String label, String[] args) { throw new UnsupportedOperationException(); }
++        @Override
++        public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) { throw new UnsupportedOperationException(); }
++    };
++
++    private static final class TestEvent extends Event implements Cancellable {
++        private static final HandlerList HANDLER_LIST = new HandlerList();
++        private boolean cancelled;
++
++        @Override
++        public HandlerList getHandlers() {
++            return HANDLER_LIST;
++        }
++
++        public static HandlerList getHandlerList() {
++            return HANDLER_LIST;
++        }
++
++        @Override
++        public boolean isCancelled() {
++            return cancelled;
++        }
++
++        @Override
++        public void setCancelled(boolean cancel) {
++            this.cancelled = cancel;
++        }
++    }
++
++    @Test
++    public void shortCircuitedEventTypesReportZeroListeners() {
++        // Baseline assumption of every hoisted check: fresh handler lists are empty, so the
++        // events can never be cancelled and skipping creation/dispatch is unobservable.
++        assertEquals(0, org.bukkit.event.block.BlockPhysicsEvent.getHandlerList().getRegisteredListeners().length);
++        assertEquals(0, com.destroystokyo.paper.event.entity.PreCreatureSpawnEvent.getHandlerList().getRegisteredListeners().length);
++        assertEquals(0, org.bukkit.event.vehicle.VehicleEntityCollisionEvent.getHandlerList().getRegisteredListeners().length);
++    }
++
++    @Test
++    public void dispatchWithZeroListenersNeverCancels() {
++        // Semantic equivalence of the short-circuit: a dispatched event with zero registered
++        // listeners is left uncancelled, exactly like skipping creation and dispatch entirely.
++        TestEvent event = new TestEvent();
++        PLUGIN_MANAGER.callEvent(event);
++        assertFalse("zero-listener dispatch must not cancel", event.isCancelled());
++    }
++
++    @Test
++    public void listenerRegistrationFlipsTheHoistedCheck() throws Exception {
++        HandlerList handlers = TestEvent.getHandlerList();
++        RegisteredListener listener = new RegisteredListener(
++                new Listener() {},
++                CANCELLING_EXECUTOR,
++                org.bukkit.event.EventPriority.NORMAL,
++                DUMMY_PLUGIN,
++                false);
++        try {
++            assertEquals(0, handlers.getRegisteredListeners().length);
++
++            // Registering must immediately un-short-circuit: length flips to 1 and the
++            // listener receives the event (cancelling it), proving no staleness in the check.
++            handlers.register(listener);
++            assertEquals(1, handlers.getRegisteredListeners().length);
++
++            TestEvent event = new TestEvent();
++            PLUGIN_MANAGER.callEvent(event);
++            assertTrue("registered listener must receive and cancel the event", event.isCancelled());
++        } finally {
++            handlers.unregister(listener);
++        }
++
++        // Unregistering must re-bake back to zero: dispatch is short-circuitable again.
++        assertEquals(0, handlers.getRegisteredListeners().length);
++        TestEvent afterUnregister = new TestEvent();
++        PLUGIN_MANAGER.callEvent(afterUnregister);
++        assertFalse("unregistered handler list must not cancel", afterUnregister.isCancelled());
++    }
++}

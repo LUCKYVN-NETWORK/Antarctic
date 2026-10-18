@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Sun, 18 Oct 2026 14:52:19 +0700
+Subject: [PATCH 71/72] Skip PreCreatureSpawnEvent work when no listeners are
+ registered
+
+- Hoist a PreCreatureSpawnEvent.getHandlerList().getRegisteredListeners().length != 0 check into the natural spawn loop in SpawnerCreature so the event, its Location snapshot and the dispatch are skipped entirely when no plugin listens (backport of Leaf MC 0264)
+- Apply the same check to the mob spawner block spawn attempts in MobSpawnerAbstract, the other firing site of PreCreatureSpawnEvent
+- Both checks read live registration state, so a plugin registering a listener at any time immediately un-short-circuits the spawn event path
+
+diff --git a/main/java/net/minecraft/server/MobSpawnerAbstract.java b/main/java/net/minecraft/server/MobSpawnerAbstract.java
+index 94d0b8a..2a32351 100644
+--- a/main/java/net/minecraft/server/MobSpawnerAbstract.java
++++ b/main/java/net/minecraft/server/MobSpawnerAbstract.java
+@@ -94,7 +94,7 @@ public abstract class MobSpawnerAbstract {
+                     }
+                     String key = this.getMobName().getKey();
+                     org.bukkit.entity.EntityType type = org.bukkit.entity.EntityType.fromName(key);
+-                    if (type != null) {
++                    if (type != null && com.destroystokyo.paper.event.entity.PreCreatureSpawnEvent.getHandlerList().getRegisteredListeners().length != 0) { // Leaf - skip event creation and dispatch when no listeners are registered (backport of Leaf MC 0264)
+                         com.destroystokyo.paper.event.entity.PreCreatureSpawnEvent event;
+                         event = new com.destroystokyo.paper.event.entity.PreCreatureSpawnEvent(
+                                 MCUtil.toLocation(world, d3, d4, d5),
+diff --git a/main/java/net/minecraft/server/SpawnerCreature.java b/main/java/net/minecraft/server/SpawnerCreature.java
+index 5c5bed0..8741629 100644
+--- a/main/java/net/minecraft/server/SpawnerCreature.java
++++ b/main/java/net/minecraft/server/SpawnerCreature.java
+@@ -197,7 +197,7 @@ public final class SpawnerCreature {
+                                                         com.destroystokyo.paper.event.entity.PreCreatureSpawnEvent event;
+                                                         Class<? extends EntityInsentient> cls = biomebase_biomemeta.b;
+                                                         org.bukkit.entity.EntityType type = EntityTypes.clsToTypeMap.get(cls);
+-                                                        if (type != null) {
++                                                        if (type != null && com.destroystokyo.paper.event.entity.PreCreatureSpawnEvent.getHandlerList().getRegisteredListeners().length != 0) { // Leaf - skip event creation and dispatch when no listeners are registered (backport of Leaf MC 0264)
+                                                             event = new com.destroystokyo.paper.event.entity.PreCreatureSpawnEvent(
+                                                                     MCUtil.toLocation(worldserver, blockposition_mutableblockposition),
+                                                                     type, SpawnReason.NATURAL

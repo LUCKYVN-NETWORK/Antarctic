@@ -1,0 +1,123 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Sun, 18 Oct 2026 14:53:24 +0700
+Subject: [PATCH 72/72] Skip VehicleEntityCollisionEvent work when no listeners
+ are registered
+
+- Hoist a VehicleEntityCollisionEvent.getHandlerList().getRegisteredListeners().length != 0 check around both collision event firing sites in EntityBoat collide so the event, its entity snapshots and the dispatch are skipped entirely when no plugin listens (backport of Leaf MC 0311)
+- Apply the same check to all four firing sites in EntityMinecartAbstract: the rideable-minecart pickup loop, the entity collide branch, the minecart-vs-minecart branch and the collide(Entity) physics push
+- Dense minecart or boat traffic no longer allocates collision events per entity pair per tick when no vehicle listeners are registered
+
+diff --git a/main/java/net/minecraft/server/EntityBoat.java b/main/java/net/minecraft/server/EntityBoat.java
+index 164e21f..7e7a889 100644
+--- a/main/java/net/minecraft/server/EntityBoat.java
++++ b/main/java/net/minecraft/server/EntityBoat.java
+@@ -159,22 +159,26 @@ public class EntityBoat extends Entity {
+         if (entity instanceof EntityBoat) {
+             if (entity.getBoundingBox().b < this.getBoundingBox().e) {
+                 // CraftBukkit start
+-                VehicleEntityCollisionEvent event = new VehicleEntityCollisionEvent((Vehicle) this.getBukkitEntity(), entity.getBukkitEntity());
+-                this.world.getServer().getPluginManager().callEvent(event);
++                if (VehicleEntityCollisionEvent.getHandlerList().getRegisteredListeners().length != 0) { // Leaf - skip event creation and dispatch when no listeners are registered (backport of Leaf MC 0311)
++                    VehicleEntityCollisionEvent event = new VehicleEntityCollisionEvent((Vehicle) this.getBukkitEntity(), entity.getBukkitEntity());
++                    this.world.getServer().getPluginManager().callEvent(event);
+ 
+-                if (event.isCancelled()) {
+-                    return;
++                    if (event.isCancelled()) {
++                        return;
++                    }
+                 }
+                 // CraftBukkit end
+                 super.collide(entity);
+             }
+         } else if (entity.getBoundingBox().b <= this.getBoundingBox().b) {
+             // CraftBukkit start
+-            VehicleEntityCollisionEvent event = new VehicleEntityCollisionEvent((Vehicle) this.getBukkitEntity(), entity.getBukkitEntity());
+-            this.world.getServer().getPluginManager().callEvent(event);
++            if (VehicleEntityCollisionEvent.getHandlerList().getRegisteredListeners().length != 0) { // Leaf - skip event creation and dispatch when no listeners are registered (backport of Leaf MC 0311)
++                VehicleEntityCollisionEvent event = new VehicleEntityCollisionEvent((Vehicle) this.getBukkitEntity(), entity.getBukkitEntity());
++                this.world.getServer().getPluginManager().callEvent(event);
+ 
+-            if (event.isCancelled()) {
+-                return;
++                if (event.isCancelled()) {
++                    return;
++                }
+             }
+             // CraftBukkit end
+             super.collide(entity);
+diff --git a/main/java/net/minecraft/server/EntityMinecartAbstract.java b/main/java/net/minecraft/server/EntityMinecartAbstract.java
+index 1f40254..8ac1232 100644
+--- a/main/java/net/minecraft/server/EntityMinecartAbstract.java
++++ b/main/java/net/minecraft/server/EntityMinecartAbstract.java
+@@ -346,21 +346,25 @@ public abstract class EntityMinecartAbstract extends Entity implements INamableT
+ 
+                         if (!(entity instanceof EntityHuman) && !(entity instanceof EntityIronGolem) && !(entity instanceof EntityMinecartAbstract) && !this.isVehicle() && !entity.isPassenger()) {
+                             // CraftBukkit start
+-                            VehicleEntityCollisionEvent collisionEvent = new VehicleEntityCollisionEvent(vehicle, entity.getBukkitEntity());
+-                            this.world.getServer().getPluginManager().callEvent(collisionEvent);
++                            if (VehicleEntityCollisionEvent.getHandlerList().getRegisteredListeners().length != 0) { // Leaf - skip event creation and dispatch when no listeners are registered (backport of Leaf MC 0311)
++                                VehicleEntityCollisionEvent collisionEvent = new VehicleEntityCollisionEvent(vehicle, entity.getBukkitEntity());
++                                this.world.getServer().getPluginManager().callEvent(collisionEvent);
+ 
+-                            if (collisionEvent.isCancelled()) {
+-                                continue;
++                                if (collisionEvent.isCancelled()) {
++                                    continue;
++                                }
+                             }
+                             // CraftBukkit end
+                             entity.startRiding(this);
+                         } else {
+                             // CraftBukkit start
+-                            VehicleEntityCollisionEvent collisionEvent = new VehicleEntityCollisionEvent(vehicle, entity.getBukkitEntity());
+-                            this.world.getServer().getPluginManager().callEvent(collisionEvent);
++                            if (VehicleEntityCollisionEvent.getHandlerList().getRegisteredListeners().length != 0) { // Leaf - skip event creation and dispatch when no listeners are registered (backport of Leaf MC 0311)
++                                VehicleEntityCollisionEvent collisionEvent = new VehicleEntityCollisionEvent(vehicle, entity.getBukkitEntity());
++                                this.world.getServer().getPluginManager().callEvent(collisionEvent);
+ 
+-                            if (collisionEvent.isCancelled()) {
+-                                continue;
++                                if (collisionEvent.isCancelled()) {
++                                    continue;
++                                }
+                             }
+                             // CraftBukkit end
+                             entity.collide(this);
+@@ -375,11 +379,13 @@ public abstract class EntityMinecartAbstract extends Entity implements INamableT
+ 
+                     if (!this.w(entity1) && entity1.isCollidable() && entity1 instanceof EntityMinecartAbstract) {
+                         // CraftBukkit start
+-                        VehicleEntityCollisionEvent collisionEvent = new VehicleEntityCollisionEvent(vehicle, entity1.getBukkitEntity());
+-                        this.world.getServer().getPluginManager().callEvent(collisionEvent);
++                        if (VehicleEntityCollisionEvent.getHandlerList().getRegisteredListeners().length != 0) { // Leaf - skip event creation and dispatch when no listeners are registered (backport of Leaf MC 0311)
++                            VehicleEntityCollisionEvent collisionEvent = new VehicleEntityCollisionEvent(vehicle, entity1.getBukkitEntity());
++                            this.world.getServer().getPluginManager().callEvent(collisionEvent);
+ 
+-                        if (collisionEvent.isCancelled()) {
+-                            continue;
++                            if (collisionEvent.isCancelled()) {
++                                continue;
++                            }
+                         }
+                         // CraftBukkit end
+                         entity1.collide(this);
+@@ -718,11 +724,13 @@ public abstract class EntityMinecartAbstract extends Entity implements INamableT
+             if (!entity.noclip && !this.noclip) {
+                 if (!this.w(entity)) {
+                     // CraftBukkit start
+-                    VehicleEntityCollisionEvent collisionEvent = new VehicleEntityCollisionEvent((Vehicle) this.getBukkitEntity(), entity.getBukkitEntity());
+-                    this.world.getServer().getPluginManager().callEvent(collisionEvent);
++                    if (VehicleEntityCollisionEvent.getHandlerList().getRegisteredListeners().length != 0) { // Leaf - skip event creation and dispatch when no listeners are registered (backport of Leaf MC 0311)
++                        VehicleEntityCollisionEvent collisionEvent = new VehicleEntityCollisionEvent((Vehicle) this.getBukkitEntity(), entity.getBukkitEntity());
++                        this.world.getServer().getPluginManager().callEvent(collisionEvent);
+ 
+-                    if (collisionEvent.isCancelled()) {
+-                        return;
++                        if (collisionEvent.isCancelled()) {
++                            return;
++                        }
+                     }
+                     // CraftBukkit end
+                     double d0 = entity.locX - this.locX;
