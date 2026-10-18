@@ -1,0 +1,554 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Sun, 18 Oct 2026 23:49:00 +0700
+Subject: [PATCH 87/87] Add low-level optimization data structures and spatial
+ primitives
+
+- Introduce me.stella.antarctic package for high-performance primitives
+
+- Add FastMath for branchless floor/ceil and bitwise coordinate packing
+
+- Add CollisionBox for allocation-free AABB intersection and axis offset math
+
+- Add FastVoxelCache for fast collision shape classification
+
+- Add PrimitiveEntityList for zero-allocation entity buffer queries
+
+- Add unit test coverage for math, collision, and voxel caching
+
+diff --git a/main/java/me/stella/antarctic/collection/PrimitiveEntityList.java b/main/java/me/stella/antarctic/collection/PrimitiveEntityList.java
+new file mode 100644
+index 0000000..cc77b59
+--- /dev/null
++++ b/main/java/me/stella/antarctic/collection/PrimitiveEntityList.java
+@@ -0,0 +1,59 @@
++package me.stella.antarctic.collection;
++
++import java.util.Arrays;
++import net.minecraft.server.Entity;
++
++/**
++ * Primitive-backed, low-allocation entity buffer inferred from Leaf / Gale.
++ * Eliminates Iterator and ArrayList allocation overhead during high-frequency spatial queries.
++ */
++public final class PrimitiveEntityList {
++
++    private Entity[] elements;
++    private int size;
++
++    public PrimitiveEntityList(int initialCapacity) {
++        this.elements = new Entity[Math.max(initialCapacity, 16)];
++        this.size = 0;
++    }
++
++    public PrimitiveEntityList() {
++        this(32);
++    }
++
++    public void add(Entity entity) {
++        if (this.size >= this.elements.length) {
++            grow();
++        }
++        this.elements[this.size++] = entity;
++    }
++
++    public Entity get(int index) {
++        if (index < 0 || index >= this.size) {
++            throw new IndexOutOfBoundsException("Index " + index + " out of bounds for length " + this.size);
++        }
++        return this.elements[index];
++    }
++
++    public int size() {
++        return this.size;
++    }
++
++    public boolean isEmpty() {
++        return this.size == 0;
++    }
++
++    public void clear() {
++        Arrays.fill(this.elements, 0, this.size, null);
++        this.size = 0;
++    }
++
++    public Entity[] rawArray() {
++        return this.elements;
++    }
++
++    private void grow() {
++        int newCapacity = this.elements.length + (this.elements.length >> 1);
++        this.elements = Arrays.copyOf(this.elements, newCapacity);
++    }
++}
+diff --git a/main/java/me/stella/antarctic/math/FastMath.java b/main/java/me/stella/antarctic/math/FastMath.java
+new file mode 100644
+index 0000000..6f1a109
+--- /dev/null
++++ b/main/java/me/stella/antarctic/math/FastMath.java
+@@ -0,0 +1,100 @@
++package me.stella.antarctic.math;
++
++/**
++ * High-performance bitwise and arithmetic operations inferred from Leaf/Lithium.
++ * Eliminates boxing, branching, and intermediate allocations in hot physics/tick paths.
++ */
++public final class FastMath {
++
++    private FastMath() {
++    }
++
++    /**
++     * Packs chunk coordinates (chunkX, chunkZ) into a single 64-bit primitive long.
++     */
++    public static long packChunkPos(int x, int z) {
++        return (((long) x) << 32) | (((long) z) & 0xFFFFFFFFL);
++    }
++
++    public static int unpackChunkX(long key) {
++        return (int) (key >> 32);
++    }
++
++    public static int unpackChunkZ(long key) {
++        return (int) key;
++    }
++
++    /**
++     * Packs block coordinates into a single 64-bit long matching NMS 1.12.2 BlockPosition packing:
++     * 26 bits for X, 12 bits for Y, 26 bits for Z.
++     */
++    public static long packBlockPos(int x, int y, int z) {
++        return (((long) x & 0x3FFFFFFL) << 38) | (((long) y & 0xFFFL) << 26) | ((long) z & 0x3FFFFFFL);
++    }
++
++    public static int unpackBlockX(long key) {
++        return (int) (key >> 38);
++    }
++
++    public static int unpackBlockY(long key) {
++        return (int) (key << 26 >> 52);
++    }
++
++    public static int unpackBlockZ(long key) {
++        return (int) (key << 38 >> 38);
++    }
++
++    /**
++     * Fast branchless floor for double coordinates.
++     */
++    public static int floor(double d) {
++        int i = (int) d;
++        return d < (double) i ? i - 1 : i;
++    }
++
++    /**
++     * Fast branchless ceil for double coordinates.
++     */
++    public static int ceil(double d) {
++        int i = (int) d;
++        return d > (double) i ? i + 1 : i;
++    }
++
++    /**
++     * Fast primitive clamp.
++     */
++    public static double clamp(double value, double min, double max) {
++        return value < min ? min : (value > max ? max : value);
++    }
++
++    public static int clamp(int value, int min, int max) {
++        return value < min ? min : (value > max ? max : value);
++    }
++
++    /**
++     * Euclidean squared distance between two 3D points.
++     */
++    public static double distanceSq(double x1, double y1, double z1, double x2, double y2, double z2) {
++        double dx = x1 - x2;
++        double dy = y1 - y2;
++        double dz = z1 - z2;
++        return dx * dx + dy * dy + dz * dz;
++    }
++
++    /**
++     * Check if two points are within a given radius without computing square roots.
++     */
++    public static boolean isWithinDistance(double x1, double y1, double z1, double x2, double y2, double z2, double radius) {
++        return distanceSq(x1, y1, z1, x2, y2, z2) <= (radius * radius);
++    }
++
++    /**
++     * Fast Chebyshev distance (maximum coordinate delta) useful for bounding box and chunk reach checks.
++     */
++    public static double chebyshevDistance(double x1, double y1, double z1, double x2, double y2, double z2) {
++        double dx = Math.abs(x1 - x2);
++        double dy = Math.abs(y1 - y2);
++        double dz = Math.abs(z1 - z2);
++        return Math.max(dx, Math.max(dy, dz));
++    }
++}
+diff --git a/main/java/me/stella/antarctic/spatial/CollisionBox.java b/main/java/me/stella/antarctic/spatial/CollisionBox.java
+new file mode 100644
+index 0000000..8c4128c
+--- /dev/null
++++ b/main/java/me/stella/antarctic/spatial/CollisionBox.java
+@@ -0,0 +1,140 @@
++package me.stella.antarctic.spatial;
++
++import net.minecraft.server.AxisAlignedBB;
++
++/**
++ * Low-level allocation-free collision and bounding box structure inferred from Lithium/Leaf.
++ * Performs ray/box clipping and axis collision offset calculations without allocating
++ * immutable AxisAlignedBB heap objects during tick sweeps.
++ */
++public final class CollisionBox {
++
++    public double minX;
++    public double minY;
++    public double minZ;
++    public double maxX;
++    public double maxY;
++    public double maxZ;
++
++    public CollisionBox() {
++    }
++
++    public CollisionBox(double minX, double minY, double minZ, double maxX, double maxY, double maxZ) {
++        set(minX, minY, minZ, maxX, maxY, maxZ);
++    }
++
++    public CollisionBox set(double minX, double minY, double minZ, double maxX, double maxY, double maxZ) {
++        this.minX = minX;
++        this.minY = minY;
++        this.minZ = minZ;
++        this.maxX = maxX;
++        this.maxY = maxY;
++        this.maxZ = maxZ;
++        return this;
++    }
++
++    public CollisionBox copyFrom(AxisAlignedBB bb) {
++        this.minX = bb.a;
++        this.minY = bb.b;
++        this.minZ = bb.c;
++        this.maxX = bb.d;
++        this.maxY = bb.e;
++        this.maxZ = bb.f;
++        return this;
++    }
++
++    public CollisionBox copyFrom(CollisionBox other) {
++        this.minX = other.minX;
++        this.minY = other.minY;
++        this.minZ = other.minZ;
++        this.maxX = other.maxX;
++        this.maxY = other.maxY;
++        this.maxZ = other.maxZ;
++        return this;
++    }
++
++    public boolean intersects(double otherMinX, double otherMinY, double otherMinZ,
++                              double otherMaxX, double otherMaxY, double otherMaxZ) {
++        return this.minX < otherMaxX && this.maxX > otherMinX
++            && this.minY < otherMaxY && this.maxY > otherMinY
++            && this.minZ < otherMaxZ && this.maxZ > otherMinZ;
++    }
++
++    public boolean intersects(CollisionBox other) {
++        return intersects(other.minX, other.minY, other.minZ, other.maxX, other.maxY, other.maxZ);
++    }
++
++    public boolean intersects(AxisAlignedBB bb) {
++        return intersects(bb.a, bb.b, bb.c, bb.d, bb.e, bb.f);
++    }
++
++    /**
++     * Calculates the collision offset along the X axis between this box and a target bounding box.
++     */
++    public double calculateXOffset(double targetMinX, double targetMinY, double targetMinZ,
++                                   double targetMaxX, double targetMaxY, double targetMaxZ,
++                                   double offsetX) {
++        if (targetMaxY > this.minY && targetMinY < this.maxY && targetMaxZ > this.minZ && targetMinZ < this.maxZ) {
++            if (offsetX > 0.0D && targetMaxX <= this.minX) {
++                double delta = this.minX - targetMaxX;
++                if (delta < offsetX) {
++                    offsetX = delta;
++                }
++            } else if (offsetX < 0.0D && targetMinX >= this.maxX) {
++                double delta = this.maxX - targetMinX;
++                if (delta > offsetX) {
++                    offsetX = delta;
++                }
++            }
++        }
++        return offsetX;
++    }
++
++    /**
++     * Calculates the collision offset along the Y axis between this box and a target bounding box.
++     */
++    public double calculateYOffset(double targetMinX, double targetMinY, double targetMinZ,
++                                   double targetMaxX, double targetMaxY, double targetMaxZ,
++                                   double offsetY) {
++        if (targetMaxX > this.minX && targetMinX < this.maxX && targetMaxZ > this.minZ && targetMinZ < this.maxZ) {
++            if (offsetY > 0.0D && targetMaxY <= this.minY) {
++                double delta = this.minY - targetMaxY;
++                if (delta < offsetY) {
++                    offsetY = delta;
++                }
++            } else if (offsetY < 0.0D && targetMinY >= this.maxY) {
++                double delta = this.maxY - targetMinY;
++                if (delta > offsetY) {
++                    offsetY = delta;
++                }
++            }
++        }
++        return offsetY;
++    }
++
++    /**
++     * Calculates the collision offset along the Z axis between this box and a target bounding box.
++     */
++    public double calculateZOffset(double targetMinX, double targetMinY, double targetMinZ,
++                                   double targetMaxX, double targetMaxY, double targetMaxZ,
++                                   double offsetZ) {
++        if (targetMaxX > this.minX && targetMinX < this.maxX && targetMaxY > this.minY && targetMinY < this.maxY) {
++            if (offsetZ > 0.0D && targetMaxZ <= this.minZ) {
++                double delta = this.minZ - targetMaxZ;
++                if (delta < offsetZ) {
++                    offsetZ = delta;
++                }
++            } else if (offsetZ < 0.0D && targetMinZ >= this.maxZ) {
++                double delta = this.maxZ - targetMinZ;
++                if (delta > offsetZ) {
++                    offsetZ = delta;
++                }
++            }
++        }
++        return offsetZ;
++    }
++
++    public AxisAlignedBB toAxisAlignedBB() {
++        return new AxisAlignedBB(this.minX, this.minY, this.minZ, this.maxX, this.maxY, this.maxZ);
++    }
++}
+diff --git a/main/java/me/stella/antarctic/spatial/FastVoxelCache.java b/main/java/me/stella/antarctic/spatial/FastVoxelCache.java
+new file mode 100644
+index 0000000..8b0378d
+--- /dev/null
++++ b/main/java/me/stella/antarctic/spatial/FastVoxelCache.java
+@@ -0,0 +1,60 @@
++package me.stella.antarctic.spatial;
++
++import net.minecraft.server.Block;
++import net.minecraft.server.Blocks;
++import net.minecraft.server.IBlockData;
++import net.minecraft.server.Material;
++
++/**
++ * Fast collision shape classification inferred from Lithium / Leaf.
++ * Categorizes blocks into non-colliding (air/passable), full-cube, or complex shapes
++ * to bypass heavy NMS virtual dispatch during collision queries.
++ */
++public final class FastVoxelCache {
++
++    public enum ShapeType {
++        EMPTY,
++        FULL_CUBE,
++        CUSTOM
++    }
++
++    private FastVoxelCache() {
++    }
++
++    /**
++     * Classifies an IBlockData instance into an optimization category.
++     */
++    public static ShapeType classify(IBlockData data) {
++        if (data == null) {
++            return ShapeType.EMPTY;
++        }
++        Block block = data.getBlock();
++        if (block == Blocks.AIR) {
++            return ShapeType.EMPTY;
++        }
++        Material material = data.getMaterial();
++        if (material == Material.AIR || !material.isSolid()) {
++            if (!material.isLiquid() && !material.isBuildable()) {
++                return ShapeType.EMPTY;
++            }
++        }
++        if (block.isOccluding(data) && block.l(data)) {
++            return ShapeType.FULL_CUBE;
++        }
++        return ShapeType.CUSTOM;
++    }
++
++    /**
++     * Fast check if a block is guaranteed to have no collision box.
++     */
++    public static boolean isEmpty(IBlockData data) {
++        return classify(data) == ShapeType.EMPTY;
++    }
++
++    /**
++     * Fast check if a block is a standard 1x1x1 solid cube.
++     */
++    public static boolean isFullCube(IBlockData data) {
++        return classify(data) == ShapeType.FULL_CUBE;
++    }
++}
+diff --git a/test/java/me/stella/antarctic/collection/PrimitiveEntityListTest.java b/test/java/me/stella/antarctic/collection/PrimitiveEntityListTest.java
+new file mode 100644
+index 0000000..da10193
+--- /dev/null
++++ b/test/java/me/stella/antarctic/collection/PrimitiveEntityListTest.java
+@@ -0,0 +1,24 @@
++package me.stella.antarctic.collection;
++
++import org.junit.Test;
++import static org.junit.Assert.*;
++
++public class PrimitiveEntityListTest {
++
++    @Test
++    public void testAddAndSize() {
++        PrimitiveEntityList list = new PrimitiveEntityList(2);
++        assertTrue(list.isEmpty());
++        assertEquals(0, list.size());
++        list.add(null);
++        assertEquals(1, list.size());
++        assertFalse(list.isEmpty());
++        assertNull(list.get(0));
++        list.add(null);
++        list.add(null); // tests grow
++        assertEquals(3, list.size());
++        list.clear();
++        assertEquals(0, list.size());
++        assertTrue(list.isEmpty());
++    }
++}
+diff --git a/test/java/me/stella/antarctic/math/FastMathTest.java b/test/java/me/stella/antarctic/math/FastMathTest.java
+new file mode 100644
+index 0000000..d14670c
+--- /dev/null
++++ b/test/java/me/stella/antarctic/math/FastMathTest.java
+@@ -0,0 +1,47 @@
++package me.stella.antarctic.math;
++
++import org.junit.Test;
++import static org.junit.Assert.*;
++
++public class FastMathTest {
++
++    @Test
++    public void testChunkPacking() {
++        int x = -42;
++        int z = 105;
++        long packed = FastMath.packChunkPos(x, z);
++        assertEquals(x, FastMath.unpackChunkX(packed));
++        assertEquals(z, FastMath.unpackChunkZ(packed));
++    }
++
++    @Test
++    public void testBlockPosPacking() {
++        int x = 12345;
++        int y = 64;
++        int z = -6789;
++        long packed = FastMath.packBlockPos(x, y, z);
++        assertEquals(x, FastMath.unpackBlockX(packed));
++        assertEquals(y, FastMath.unpackBlockY(packed));
++        assertEquals(z, FastMath.unpackBlockZ(packed));
++    }
++
++    @Test
++    public void testBranchlessFloorCeil() {
++        assertEquals(-2, FastMath.floor(-1.2D));
++        assertEquals(-1, FastMath.floor(-1.0D));
++        assertEquals(0, FastMath.floor(0.0D));
++        assertEquals(1, FastMath.floor(1.9D));
++
++        assertEquals(-1, FastMath.ceil(-1.2D));
++        assertEquals(-1, FastMath.ceil(-1.0D));
++        assertEquals(0, FastMath.ceil(0.0D));
++        assertEquals(2, FastMath.ceil(1.2D));
++    }
++
++    @Test
++    public void testDistanceChecks() {
++        assertTrue(FastMath.isWithinDistance(0, 0, 0, 3, 4, 0, 5.0D));
++        assertFalse(FastMath.isWithinDistance(0, 0, 0, 3, 4, 0, 4.9D));
++        assertEquals(4.0D, FastMath.chebyshevDistance(0, 0, 0, 3, 4, 1), 1e-9);
++    }
++}
+diff --git a/test/java/me/stella/antarctic/spatial/CollisionBoxTest.java b/test/java/me/stella/antarctic/spatial/CollisionBoxTest.java
+new file mode 100644
+index 0000000..bf66cf5
+--- /dev/null
++++ b/test/java/me/stella/antarctic/spatial/CollisionBoxTest.java
+@@ -0,0 +1,30 @@
++package me.stella.antarctic.spatial;
++
++import net.minecraft.server.AxisAlignedBB;
++import org.junit.Test;
++import static org.junit.Assert.*;
++
++public class CollisionBoxTest {
++
++    @Test
++    public void testIntersection() {
++        CollisionBox box1 = new CollisionBox(0, 0, 0, 1, 1, 1);
++        CollisionBox box2 = new CollisionBox(0.5, 0.5, 0.5, 1.5, 1.5, 1.5);
++        CollisionBox box3 = new CollisionBox(2, 2, 2, 3, 3, 3);
++
++        assertTrue(box1.intersects(box2));
++        assertFalse(box1.intersects(box3));
++
++        AxisAlignedBB aabb = new AxisAlignedBB(0.5, 0.5, 0.5, 1.5, 1.5, 1.5);
++        assertTrue(box1.intersects(aabb));
++    }
++
++    @Test
++    public void testAxisOffsetCalculation() {
++        CollisionBox box = new CollisionBox(0, 0, 0, 1, 1, 1);
++        // Target moving into box from positive X: [2, 0, 0] moving left by -1.5
++        double offsetX = box.calculateXOffset(2.0, 0.0, 0.0, 3.0, 1.0, 1.0, -1.5);
++        // Distance between targetMinX (2.0) and box.maxX (1.0) is -1.0
++        assertEquals(-1.0D, offsetX, 1e-9);
++    }
++}
+diff --git a/test/java/me/stella/antarctic/spatial/FastVoxelCacheTest.java b/test/java/me/stella/antarctic/spatial/FastVoxelCacheTest.java
+new file mode 100644
+index 0000000..f832c33
+--- /dev/null
++++ b/test/java/me/stella/antarctic/spatial/FastVoxelCacheTest.java
+@@ -0,0 +1,28 @@
++package me.stella.antarctic.spatial;
++
++import net.minecraft.server.Blocks;
++import net.minecraft.server.DispenserRegistry;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import static org.junit.Assert.*;
++
++public class FastVoxelCacheTest {
++
++    @BeforeClass
++    public static void setUp() {
++        DispenserRegistry.c();
++    }
++
++    @Test
++    public void testEmptyBlock() {
++        assertTrue(FastVoxelCache.isEmpty(null));
++        assertTrue(FastVoxelCache.isEmpty(Blocks.AIR.getBlockData()));
++    }
++
++    @Test
++    public void testFullCube() {
++        assertTrue(FastVoxelCache.isFullCube(Blocks.STONE.getBlockData()));
++        assertTrue(FastVoxelCache.isFullCube(Blocks.DIRT.getBlockData()));
++        assertFalse(FastVoxelCache.isFullCube(Blocks.AIR.getBlockData()));
++    }
++}
