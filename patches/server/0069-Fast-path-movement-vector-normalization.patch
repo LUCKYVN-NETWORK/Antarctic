@@ -1,0 +1,304 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Sun, 18 Oct 2026 12:33:14 +0700
+Subject: [PATCH 69/69] Fast-path movement vector normalization
+
+- Backport Leaf MC 0298 (skip sqrt in vector normalization) to Vec3D
+- Import Vec3D from the mapped 1.12.2 reference sources into the patched source tree
+- Return the zero vector for near-zero magnitudes and the same instance for exact unit vectors without calling sqrt
+- Component-exact parity with the legacy implementation verified across special values and 1.5M randomized vectors
+
+diff --git a/main/java/net/minecraft/server/Vec3D.java b/main/java/net/minecraft/server/Vec3D.java
+new file mode 100644
+index 0000000..04418af
+--- /dev/null
++++ b/main/java/net/minecraft/server/Vec3D.java
+@@ -0,0 +1,196 @@
++package net.minecraft.server;
++
++import javax.annotation.Nullable;
++
++public class Vec3D {
++
++    public static final Vec3D a = new Vec3D(0.0D, 0.0D, 0.0D);
++    public final double x;
++    public final double y;
++    public final double z;
++
++    public Vec3D(double d0, double d1, double d2) {
++        if (d0 == -0.0D) {
++            d0 = 0.0D;
++        }
++
++        if (d1 == -0.0D) {
++            d1 = 0.0D;
++        }
++
++        if (d2 == -0.0D) {
++            d2 = 0.0D;
++        }
++
++        this.x = d0;
++        this.y = d1;
++        this.z = d2;
++    }
++
++    public Vec3D(BaseBlockPosition baseblockposition) {
++        this((double) baseblockposition.getX(), (double) baseblockposition.getY(), (double) baseblockposition.getZ());
++    }
++
++    public Vec3D a(Vec3D vec3d) {
++        return new Vec3D(vec3d.x - this.x, vec3d.y - this.y, vec3d.z - this.z);
++    }
++
++    public Vec3D a() {
++        // Leaf - Fast-path normalization (backport of Leaf MC 0298): skip the sqrt for near-zero and unit vectors
++        double d0 = this.x * this.x + this.y * this.y + this.z * this.z;
++
++        if (d0 < 1.0E-8D) {
++            return Vec3D.a;
++        } else if (d0 == 1.0D) {
++            return this;
++        }
++
++        double d1 = (double) MathHelper.sqrt(d0);
++
++        return d1 < 1.0E-4D ? Vec3D.a : new Vec3D(this.x / d1, this.y / d1, this.z / d1);
++    }
++
++    public double b(Vec3D vec3d) {
++        return this.x * vec3d.x + this.y * vec3d.y + this.z * vec3d.z;
++    }
++
++    public Vec3D d(Vec3D vec3d) {
++        return this.a(vec3d.x, vec3d.y, vec3d.z);
++    }
++
++    public Vec3D a(double d0, double d1, double d2) {
++        return this.add(-d0, -d1, -d2);
++    }
++
++    public Vec3D e(Vec3D vec3d) {
++        return this.add(vec3d.x, vec3d.y, vec3d.z);
++    }
++
++    public Vec3D add(double d0, double d1, double d2) {
++        return new Vec3D(this.x + d0, this.y + d1, this.z + d2);
++    }
++
++    public double f(Vec3D vec3d) {
++        double d0 = vec3d.x - this.x;
++        double d1 = vec3d.y - this.y;
++        double d2 = vec3d.z - this.z;
++
++        return (double) MathHelper.sqrt(d0 * d0 + d1 * d1 + d2 * d2);
++    }
++
++    public double distanceSquared(Vec3D vec3d) {
++        double d0 = vec3d.x - this.x;
++        double d1 = vec3d.y - this.y;
++        double d2 = vec3d.z - this.z;
++
++        return d0 * d0 + d1 * d1 + d2 * d2;
++    }
++
++    public double c(double d0, double d1, double d2) {
++        double d3 = d0 - this.x;
++        double d4 = d1 - this.y;
++        double d5 = d2 - this.z;
++
++        return d3 * d3 + d4 * d4 + d5 * d5;
++    }
++
++    public Vec3D a(double d0) {
++        return new Vec3D(this.x * d0, this.y * d0, this.z * d0);
++    }
++
++    public double b() {
++        return (double) MathHelper.sqrt(this.x * this.x + this.y * this.y + this.z * this.z);
++    }
++
++    @Nullable
++    public Vec3D a(Vec3D vec3d, double d0) {
++        double d1 = vec3d.x - this.x;
++        double d2 = vec3d.y - this.y;
++        double d3 = vec3d.z - this.z;
++
++        if (d1 * d1 < 1.0000000116860974E-7D) {
++            return null;
++        } else {
++            double d4 = (d0 - this.x) / d1;
++
++            return d4 >= 0.0D && d4 <= 1.0D ? new Vec3D(this.x + d1 * d4, this.y + d2 * d4, this.z + d3 * d4) : null;
++        }
++    }
++
++    @Nullable
++    public Vec3D b(Vec3D vec3d, double d0) {
++        double d1 = vec3d.x - this.x;
++        double d2 = vec3d.y - this.y;
++        double d3 = vec3d.z - this.z;
++
++        if (d2 * d2 < 1.0000000116860974E-7D) {
++            return null;
++        } else {
++            double d4 = (d0 - this.y) / d2;
++
++            return d4 >= 0.0D && d4 <= 1.0D ? new Vec3D(this.x + d1 * d4, this.y + d2 * d4, this.z + d3 * d4) : null;
++        }
++    }
++
++    @Nullable
++    public Vec3D c(Vec3D vec3d, double d0) {
++        double d1 = vec3d.x - this.x;
++        double d2 = vec3d.y - this.y;
++        double d3 = vec3d.z - this.z;
++
++        if (d3 * d3 < 1.0000000116860974E-7D) {
++            return null;
++        } else {
++            double d4 = (d0 - this.z) / d3;
++
++            return d4 >= 0.0D && d4 <= 1.0D ? new Vec3D(this.x + d1 * d4, this.y + d2 * d4, this.z + d3 * d4) : null;
++        }
++    }
++
++    public boolean equals(Object object) {
++        if (this == object) {
++            return true;
++        } else if (!(object instanceof Vec3D)) {
++            return false;
++        } else {
++            Vec3D vec3d = (Vec3D) object;
++
++            return Double.compare(vec3d.x, this.x) != 0 ? false : (Double.compare(vec3d.y, this.y) != 0 ? false : Double.compare(vec3d.z, this.z) == 0);
++        }
++    }
++
++    public int hashCode() {
++        long i = Double.doubleToLongBits(this.x);
++        int j = (int) (i ^ i >>> 32);
++
++        i = Double.doubleToLongBits(this.y);
++        j = 31 * j + (int) (i ^ i >>> 32);
++        i = Double.doubleToLongBits(this.z);
++        j = 31 * j + (int) (i ^ i >>> 32);
++        return j;
++    }
++
++    public String toString() {
++        return "(" + this.x + ", " + this.y + ", " + this.z + ")";
++    }
++
++    public Vec3D a(float f) {
++        float f1 = MathHelper.cos(f);
++        float f2 = MathHelper.sin(f);
++        double d0 = this.x;
++        double d1 = this.y * (double) f1 + this.z * (double) f2;
++        double d2 = this.z * (double) f1 - this.y * (double) f2;
++
++        return new Vec3D(d0, d1, d2);
++    }
++
++    public Vec3D b(float f) {
++        float f1 = MathHelper.cos(f);
++        float f2 = MathHelper.sin(f);
++        double d0 = this.x * (double) f1 + this.z * (double) f2;
++        double d1 = this.y;
++        double d2 = this.z * (double) f1 - this.x * (double) f2;
++
++        return new Vec3D(d0, d1, d2);
++    }
++}
+diff --git a/test/java/net/minecraft/server/Vec3DNormalizeTest.java b/test/java/net/minecraft/server/Vec3DNormalizeTest.java
+new file mode 100644
+index 0000000..27261ef
+--- /dev/null
++++ b/test/java/net/minecraft/server/Vec3DNormalizeTest.java
+@@ -0,0 +1,86 @@
++package net.minecraft.server;
++
++import org.junit.Test;
++
++import java.util.Random;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertSame;
++
++public class Vec3DNormalizeTest {
++
++    private static double[] referenceNormalize(double x, double y, double z) {
++        double d0 = (double) MathHelper.sqrt(x * x + y * y + z * z);
++        if (d0 < 1.0E-4D) {
++            return new double[] {0.0D, 0.0D, 0.0D};
++        }
++        return new double[] {x / d0, y / d0, z / d0};
++    }
++
++    private static void assertParity(Vec3D vector) {
++        Vec3D result = vector.a();
++        double[] reference = referenceNormalize(vector.x, vector.y, vector.z);
++        assertEquals("x diverges at " + vector, reference[0], result.x, 0.0D);
++        assertEquals("y diverges at " + vector, reference[1], result.y, 0.0D);
++        assertEquals("z diverges at " + vector, reference[2], result.z, 0.0D);
++    }
++
++    @Test
++    public void normalizationMatchesLegacyOnSpecialVectors() {
++        assertParity(new Vec3D(0.0D, 0.0D, 0.0D));
++        assertParity(new Vec3D(1.0D, 0.0D, 0.0D));
++        assertParity(new Vec3D(0.0D, 1.0D, 0.0D));
++        assertParity(new Vec3D(0.0D, 0.0D, 1.0D));
++        assertParity(new Vec3D(-1.0D, 0.0D, 0.0D));
++        assertParity(new Vec3D(0.0D, -1.0D, 0.0D));
++        assertParity(new Vec3D(0.0D, 0.0D, -1.0D));
++        assertParity(new Vec3D(1.0D, 1.0D, 1.0D));
++        assertParity(new Vec3D(-3.0D, 4.0D, 0.0D));
++        assertParity(new Vec3D(0.6D, 0.8D, 0.0D));
++        assertParity(new Vec3D(Double.NaN, 1.0D, 1.0D));
++        assertParity(new Vec3D(Double.POSITIVE_INFINITY, 1.0D, 1.0D));
++        assertParity(new Vec3D(Double.NEGATIVE_INFINITY, 0.0D, 0.0D));
++        assertParity(new Vec3D(Double.MIN_VALUE, 0.0D, 0.0D));
++        assertParity(new Vec3D(1.0E-5D, 0.0D, 0.0D));
++        assertParity(new Vec3D(9.9999E-5D, 0.0D, 0.0D));
++        assertParity(new Vec3D(1.0001E-4D, 0.0D, 0.0D));
++        assertParity(new Vec3D(1.0E-4D, 0.0D, 0.0D));
++        assertParity(new Vec3D(1.0E-7D, 1.0E-7D, 1.0E-7D));
++        assertParity(new Vec3D(1e300D, 1e300D, 1e300D));
++        assertParity(new Vec3D(-0.0D, -0.0D, -0.0D));
++    }
++
++    @Test
++    public void normalizationMatchesLegacyOnRandomVectors() {
++        Random random = new Random(0xEC3DCL);
++        for (int i = 0; i < 1000000; i++) {
++            double scale = Math.pow(10.0D, (random.nextDouble() - 0.5) * 18.0D);
++            assertParity(new Vec3D((random.nextDouble() - 0.5) * 2.0D * scale,
++                                    (random.nextDouble() - 0.5) * 2.0D * scale,
++                                    (random.nextDouble() - 0.5) * 2.0D * scale));
++        }
++        for (int i = 0; i < 500000; i++) {
++            assertParity(new Vec3D(Double.longBitsToDouble(random.nextLong()),
++                                    Double.longBitsToDouble(random.nextLong()),
++                                    Double.longBitsToDouble(random.nextLong())));
++        }
++    }
++
++    @Test
++    public void unitVectorsSkipDivisionAndReturnSelf() {
++        // The fast path must return the same immutable instance for exact unit vectors.
++        assertSame(Vec3D.a, new Vec3D(0.0D, 0.0D, 0.0D).a());
++        Vec3D unit = new Vec3D(0.0D, 0.0D, -1.0D);
++        assertSame(unit, unit.a());
++        Vec3D unit2 = new Vec3D(1.0D, 0.0D, 0.0D);
++        assertSame(unit2, unit2.a());
++    }
++
++    @Test
++    public void nearZeroVectorsCollapseToZeroVector() {
++        Vec3D tiny = new Vec3D(1.0E-5D, 0.0D, 0.0D);
++        assertSame(Vec3D.a, tiny.a());
++        Vec3D zero = new Vec3D(0.0D, 0.0D, 0.0D);
++        assertSame(Vec3D.a, zero.a());
++    }
++}

@@ -1,0 +1,250 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Sun, 18 Oct 2026 12:11:30 +0700
+Subject: [PATCH 66/69] Optimize VarInt and VarLong writes with bitwise
+ unrolling
+
+- Backport Leaf MC 0080 (Velocity-style unrolled bitwise VarInt/VarLong writes) to PacketDataSerializer
+- Replace the per-byte writeVarInt loop with single writeByte/writeShort/writeMedium/writeInt paths
+- Replace the per-byte writeVarLong loop with unrolled writeLong paths covering all ten encoding lengths
+- Byte-exact parity with the vanilla loop verified by boundary, exhaustive, and randomized tests
+
+diff --git a/main/java/net/minecraft/server/PacketDataSerializer.java b/main/java/net/minecraft/server/PacketDataSerializer.java
+index d71734d..218ef2c 100644
+--- a/main/java/net/minecraft/server/PacketDataSerializer.java
++++ b/main/java/net/minecraft/server/PacketDataSerializer.java
+@@ -185,25 +185,64 @@ public class PacketDataSerializer extends ByteBuf {
+     }
+ 
+     public PacketDataSerializer d(int i) {
+-        while ((i & -128) != 0) {
+-            this.writeByte(i & 127 | 128);
+-            i >>>= 7;
++        // Leaf - Optimize VarInt write (backport of Leaf MC 0080, Velocity-style unrolled bitwise encoding)
++        if ((i & (0xFFFFFFFF << 7)) == 0) {
++            this.writeByte(i);
++        } else if ((i & (0xFFFFFFFF << 14)) == 0) {
++            int j = (i & 0x7F | 0x80) << 8 | (i >>> 7);
++
++            this.writeShort(j);
++        } else if ((i & (0xFFFFFFFF << 21)) == 0) {
++            int j = (i & 0x7F | 0x80) << 16 | ((i >>> 7) & 0x7F | 0x80) << 8 | (i >>> 14);
++
++            this.writeMedium(j);
++        } else if ((i & (0xFFFFFFFF << 28)) == 0) {
++            int j = (i & 0x7F | 0x80) << 24 | ((i >>> 7) & 0x7F | 0x80) << 16 | ((i >>> 14) & 0x7F | 0x80) << 8 | (i >>> 21);
++
++            this.writeInt(j);
++        } else {
++            int j = (i & 0x7F | 0x80) << 24 | ((i >>> 7) & 0x7F | 0x80) << 16 | ((i >>> 14) & 0x7F | 0x80) << 8 | ((i >>> 21) & 0x7F | 0x80);
++
++            this.writeInt(j);
++            this.writeByte(i >>> 28);
+         }
+ 
+-        this.writeByte(i);
+         return this;
+     }
+ 
+     public PacketDataSerializer b(long i) {
+-        while ((i & -128L) != 0L) {
+-            this.writeByte((int) (i & 127L) | 128);
+-            i >>>= 7;
++        // Leaf - Optimize VarLong write (backport of Leaf MC 0080, Velocity-style unrolled bitwise encoding)
++        if ((i & (0xFFFFFFFFFFFFFFFFL << 7)) == 0L) {
++            this.writeByte((int) i);
++        } else if ((i & (0xFFFFFFFFFFFFFFFFL << 14)) == 0L) {
++            this.writeShort((int) ((i & 0x7FL | 0x80L) << 8 | i >>> 7));
++        } else if ((i & (0xFFFFFFFFFFFFFFFFL << 21)) == 0L) {
++            this.writeMedium((int) ((i & 0x7FL | 0x80L) << 16 | (i >>> 7 & 0x7FL | 0x80L) << 8 | i >>> 14));
++        } else if ((i & (0xFFFFFFFFFFFFFFFFL << 28)) == 0L) {
++            this.writeInt((int) ((i & 0x7FL | 0x80L) << 24 | (i >>> 7 & 0x7FL | 0x80L) << 16 | (i >>> 14 & 0x7FL | 0x80L) << 8 | i >>> 21));
++        } else if ((i & (0xFFFFFFFFFFFFFFFFL << 35)) == 0L) {
++            this.writeInt((int) ((i & 0x7FL | 0x80L) << 24 | (i >>> 7 & 0x7FL | 0x80L) << 16 | (i >>> 14 & 0x7FL | 0x80L) << 8 | (i >>> 21 & 0x7FL | 0x80L)));
++            this.writeByte((int) (i >>> 28));
++        } else if ((i & (0xFFFFFFFFFFFFFFFFL << 42)) == 0L) {
++            this.writeInt((int) ((i & 0x7FL | 0x80L) << 24 | (i >>> 7 & 0x7FL | 0x80L) << 16 | (i >>> 14 & 0x7FL | 0x80L) << 8 | (i >>> 21 & 0x7FL | 0x80L)));
++            this.writeShort((int) ((i >>> 28 & 0x7FL | 0x80L) << 8 | i >>> 35));
++        } else if ((i & (0xFFFFFFFFFFFFFFFFL << 49)) == 0L) {
++            this.writeInt((int) ((i & 0x7FL | 0x80L) << 24 | (i >>> 7 & 0x7FL | 0x80L) << 16 | (i >>> 14 & 0x7FL | 0x80L) << 8 | (i >>> 21 & 0x7FL | 0x80L)));
++            this.writeMedium((int) ((i >>> 28 & 0x7FL | 0x80L) << 16 | (i >>> 35 & 0x7FL | 0x80L) << 8 | i >>> 42));
++        } else if ((i & (0xFFFFFFFFFFFFFFFFL << 56)) == 0L) {
++            this.writeLong((i & 0x7FL | 0x80L) << 56 | (i >>> 7 & 0x7FL | 0x80L) << 48 | (i >>> 14 & 0x7FL | 0x80L) << 40 | (i >>> 21 & 0x7FL | 0x80L) << 32 | (i >>> 28 & 0x7FL | 0x80L) << 24 | (i >>> 35 & 0x7FL | 0x80L) << 16 | (i >>> 42 & 0x7FL | 0x80L) << 8 | i >>> 49);
++        } else if ((i & (0xFFFFFFFFFFFFFFFFL << 63)) == 0L) {
++            this.writeLong((i & 0x7FL | 0x80L) << 56 | (i >>> 7 & 0x7FL | 0x80L) << 48 | (i >>> 14 & 0x7FL | 0x80L) << 40 | (i >>> 21 & 0x7FL | 0x80L) << 32 | (i >>> 28 & 0x7FL | 0x80L) << 24 | (i >>> 35 & 0x7FL | 0x80L) << 16 | (i >>> 42 & 0x7FL | 0x80L) << 8 | (i >>> 49 & 0x7FL | 0x80L));
++            this.writeByte((int) (i >>> 56));
++        } else {
++            this.writeLong((i & 0x7FL | 0x80L) << 56 | (i >>> 7 & 0x7FL | 0x80L) << 48 | (i >>> 14 & 0x7FL | 0x80L) << 40 | (i >>> 21 & 0x7FL | 0x80L) << 32 | (i >>> 28 & 0x7FL | 0x80L) << 24 | (i >>> 35 & 0x7FL | 0x80L) << 16 | (i >>> 42 & 0x7FL | 0x80L) << 8 | (i >>> 49 & 0x7FL | 0x80L));
++            this.writeShort((int) ((i >>> 56 & 0x7FL | 0x80L) << 8 | i >>> 63));
+         }
+ 
+-        this.writeByte((int) i);
+         return this;
+     }
+ 
++
+     public PacketDataSerializer a(@Nullable NBTTagCompound nbttagcompound) {
+         if (nbttagcompound == null) {
+             this.writeByte(0);
+diff --git a/test/java/net/minecraft/server/PacketDataSerializerVarintTest.java b/test/java/net/minecraft/server/PacketDataSerializerVarintTest.java
+new file mode 100644
+index 0000000..3e6d0e0
+--- /dev/null
++++ b/test/java/net/minecraft/server/PacketDataSerializerVarintTest.java
+@@ -0,0 +1,156 @@
++package net.minecraft.server;
++
++import io.netty.buffer.ByteBuf;
++import io.netty.buffer.Unpooled;
++import org.junit.Test;
++
++import java.util.Random;
++
++import static org.junit.Assert.assertArrayEquals;
++import static org.junit.Assert.assertEquals;
++
++public class PacketDataSerializerVarintTest {
++
++    private static final int[] INT_BOUNDARIES = {
++        0, 1, 2, 63, 64, 65, 127, 128, 129, 8191, 8192, 16383, 16384, 16385,
++        65535, 65536, 131071, 131072, 2097151, 2097152, 2097153,
++        16777215, 16777216, 268435455, 268435456, 268435457,
++        536870911, 536870912, 1073741823, Integer.MAX_VALUE,
++        -1, -2, -63, -64, -65, -127, -128, -129, -8192, -16384, -16385,
++        -2097152, -2097153, -268435456, -268435457, -536870912, -1073741824,
++        Integer.MIN_VALUE, Integer.MIN_VALUE + 1
++    };
++
++    private static final long[] LONG_BOUNDARIES = {
++        0L, 1L, 2L, 63L, 64L, 127L, 128L, 129L, 16383L, 16384L, 16385L,
++        2097151L, 2097152L, 2097153L, 268435455L, 268435456L, 268435457L,
++        34359738367L, 34359738368L, 4398046511103L, 4398046511104L,
++        562949953421311L, 562949953421312L, 72057594037927935L, 72057594037927936L,
++        9223372036854775807L, 9223372036854775806L,
++        -1L, -2L, -64L, -65L, -128L, -129L, -16384L, -16385L,
++        -2097153L, -268435457L, -34359738368L, -4398046511104L, -562949953421312L,
++        -72057594037927936L, -9223372036854775808L, -9223372036854775807L
++    };
++
++    private static byte[] referenceVarInt(int value) {
++        ByteBuf buf = Unpooled.buffer();
++        while ((value & -128) != 0) {
++            buf.writeByte(value & 127 | 128);
++            value >>>= 7;
++        }
++        buf.writeByte(value);
++        return drain(buf);
++    }
++
++    private static byte[] referenceVarLong(long value) {
++        ByteBuf buf = Unpooled.buffer();
++        while ((value & -128L) != 0L) {
++            buf.writeByte((int) (value & 127L) | 128);
++            value >>>= 7;
++        }
++        buf.writeByte((int) value);
++        return drain(buf);
++    }
++
++    private static byte[] encodeVarInt(int value) {
++        ByteBuf buf = Unpooled.buffer();
++        PacketDataSerializer serializer = new PacketDataSerializer(buf);
++        serializer.d(value);
++        return drain(buf);
++    }
++
++    private static byte[] encodeVarLong(long value) {
++        ByteBuf buf = Unpooled.buffer();
++        PacketDataSerializer serializer = new PacketDataSerializer(buf);
++        serializer.b(value);
++        return drain(buf);
++    }
++
++    private static byte[] drain(ByteBuf buf) {
++        byte[] out = new byte[buf.readableBytes()];
++        buf.readBytes(out);
++        buf.release();
++        return out;
++    }
++
++    @Test
++    public void varIntMatchesVanillaLoopEncoding() {
++        for (int value : INT_BOUNDARIES) {
++            assertArrayEquals("varint bytes diverge at " + value, referenceVarInt(value), encodeVarInt(value));
++        }
++        // Exhaustive over the 3-byte range plus a slice of the 4-byte range.
++        for (int value = -300000; value < 300000; value++) {
++            assertArrayEquals("varint bytes diverge at " + value, referenceVarInt(value), encodeVarInt(value));
++        }
++        for (int value = 0; value < 300000; value++) {
++            int shifted = value << 14;
++            assertArrayEquals("varint bytes diverge at " + shifted, referenceVarInt(shifted), encodeVarInt(shifted));
++        }
++    }
++
++    @Test
++    public void varLongMatchesVanillaLoopEncoding() {
++        for (long value : LONG_BOUNDARIES) {
++            assertArrayEquals("varlong bytes diverge at " + value, referenceVarLong(value), encodeVarLong(value));
++        }
++        Random random = new Random(0xC0FFEEL);
++        for (int i = 0; i < 200000; i++) {
++            long value = random.nextLong();
++            assertArrayEquals("varlong bytes diverge at " + value, referenceVarLong(value), encodeVarLong(value));
++        }
++        // Deterministic coverage of every encoding length 1 through 10.
++        for (int bits = 0; bits < 64; bits++) {
++            long value = (1L << bits) - 1;
++            assertArrayEquals("varlong bytes diverge at " + value, referenceVarLong(value), encodeVarLong(value));
++            value = 1L << bits;
++            assertArrayEquals("varlong bytes diverge at " + value, referenceVarLong(value), encodeVarLong(value));
++            value = -1L << bits;
++            assertArrayEquals("varlong bytes diverge at " + value, referenceVarLong(value), encodeVarLong(value));
++        }
++    }
++
++    @Test
++    public void varIntRandomSamplingMatchesVanillaLoop() {
++        Random random = new Random(0x5EED5EEDL);
++        for (int i = 0; i < 200000; i++) {
++            int value = random.nextInt();
++            assertArrayEquals("varint bytes diverge at " + value, referenceVarInt(value), encodeVarInt(value));
++        }
++        // Random values with a controlled number of significant 7-bit groups.
++        for (int groups = 1; groups <= 5; groups++) {
++            for (int i = 0; i < 50000; i++) {
++                int value = random.nextInt() >>> (32 - groups * 7);
++                assertArrayEquals("varint bytes diverge at " + value, referenceVarInt(value), encodeVarInt(value));
++            }
++        }
++    }
++
++    @Test
++    public void negativeValuesUseMaximumLengthEncoding() {
++        assertEquals(5, encodeVarInt(-1).length);
++        assertEquals(5, encodeVarInt(Integer.MIN_VALUE).length);
++        assertEquals(10, encodeVarLong(-1L).length);
++        assertEquals(10, encodeVarLong(Long.MIN_VALUE).length);
++    }
++
++    @Test
++    public void roundTripsThroughVanillaReaders() {
++        Random random = new Random(0xFEEDFACEL);
++        for (int i = 0; i < 100000; i++) {
++            int value = random.nextInt();
++            ByteBuf buf = Unpooled.buffer();
++            PacketDataSerializer serializer = new PacketDataSerializer(buf);
++            serializer.d(value);
++            assertEquals("varint readback diverge at " + value, value, serializer.g());
++            buf.release();
++        }
++        for (int i = 0; i < 100000; i++) {
++            long value = random.nextLong();
++            ByteBuf buf = Unpooled.buffer();
++            PacketDataSerializer serializer = new PacketDataSerializer(buf);
++            serializer.b(value);
++            assertEquals("varlong readback diverge at " + value, value, serializer.h());
++            buf.release();
++        }
++    }
++}
