@@ -10,10 +10,10 @@ Subject: [PATCH 73/88] Cache MinecraftKey hashCode and string representation
 
 diff --git a/main/java/net/minecraft/server/MinecraftKey.java b/main/java/net/minecraft/server/MinecraftKey.java
 new file mode 100644
-index 0000000..a045f9a
+index 0000000..294f756
 --- /dev/null
 +++ b/main/java/net/minecraft/server/MinecraftKey.java
-@@ -0,0 +1,119 @@
+@@ -0,0 +1,118 @@
 +package net.minecraft.server;
 +
 +import com.google.gson.JsonDeserializationContext;
@@ -132,8 +132,6 @@ index 0000000..a045f9a
 +        }
 +    }
 +}
-+
-\ No newline at end of file
 diff --git a/test/java/net/minecraft/server/MinecraftKeyTest.java b/test/java/net/minecraft/server/MinecraftKeyTest.java
 new file mode 100644
 index 0000000..b079534

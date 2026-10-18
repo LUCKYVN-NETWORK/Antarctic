@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Sun, 18 Oct 2026 17:35:12 +0700
+Subject: [PATCH 7/7] Cache NamespacedKey hashCode and string representation
+
+- Backport Leaf API 0021 (Cache NamespacedKey hash code and toString)
+- Cache string representation and hashCode during construction
+- Eliminate redundant string allocations on repeated toString calls
+- Pin caching behavior with NamespacedKeyTest
+
+diff --git a/main/java/org/bukkit/NamespacedKey.java b/main/java/org/bukkit/NamespacedKey.java
+index bd5238c..7d5b49e 100644
+--- a/main/java/org/bukkit/NamespacedKey.java
++++ b/main/java/org/bukkit/NamespacedKey.java
+@@ -34,6 +34,9 @@ public final class NamespacedKey {
+     //
+     private final String namespace;
+     private final String key;
++    // Leaf - Cache hash code and string representation (backport of Leaf API 0021)
++    private final String string;
++    private final int hashCode;
+ 
+     /**
+      * Create a key in a specific namespace.
+@@ -49,9 +52,11 @@ public final class NamespacedKey {
+ 
+         this.namespace = namespace;
+         this.key = key;
+-
+-        String string = toString();
+-        Preconditions.checkArgument(string.length() < 256, "NamespacedKey must be less than 256 characters", string);
++        // Leaf start - Cache hash code and string representation (backport of Leaf API 0021)
++        this.string = namespace + ":" + key;
++        this.hashCode = 47 * (47 * 5 + this.namespace.hashCode()) + this.key.hashCode();
++        Preconditions.checkArgument(this.string.length() < 256, "NamespacedKey must be less than 256 characters", this.string);
++        // Leaf end
+     }
+ 
+     /**
+@@ -71,8 +76,11 @@ public final class NamespacedKey {
+         Preconditions.checkArgument(VALID_NAMESPACE.matcher(this.namespace).matches(), "namespace");
+         Preconditions.checkArgument(VALID_KEY.matcher(this.key).matches(), "key");
+ 
+-        String string = toString();
+-        Preconditions.checkArgument(string.length() < 256, "NamespacedKey must be less than 256 characters (%s)", string);
++        // Leaf start - Cache hash code and string representation (backport of Leaf API 0021)
++        this.string = this.namespace + ":" + this.key;
++        this.hashCode = 47 * (47 * 5 + this.namespace.hashCode()) + this.key.hashCode();
++        Preconditions.checkArgument(this.string.length() < 256, "NamespacedKey must be less than 256 characters (%s)", this.string);
++        // Leaf end
+     }
+ 
+     public String getNamespace() {
+@@ -85,10 +93,7 @@ public final class NamespacedKey {
+ 
+     @Override
+     public int hashCode() {
+-        int hash = 5;
+-        hash = 47 * hash + this.namespace.hashCode();
+-        hash = 47 * hash + this.key.hashCode();
+-        return hash;
++        return this.hashCode; // Leaf - return cached hash code
+     }
+ 
+     @Override
+@@ -105,7 +110,7 @@ public final class NamespacedKey {
+ 
+     @Override
+     public String toString() {
+-        return this.namespace + ":" + this.key;
++        return this.string; // Leaf - return cached string
+     }
+ 
+     /**
+diff --git a/test/java/org/bukkit/NamespacedKeyTest.java b/test/java/org/bukkit/NamespacedKeyTest.java
+index 7c71aab..323c925 100644
+--- a/test/java/org/bukkit/NamespacedKeyTest.java
++++ b/test/java/org/bukkit/NamespacedKeyTest.java
+@@ -46,4 +46,13 @@ public class NamespacedKeyTest {
+                 "loremipsumdolorsitametconsecteturadipiscingelitduisvolutpatvelitsitametmaximusscelerisquemorbiullamcorperexacconsequategestas/"
+                 + "loremipsumdolorsitametconsecteturadipiscingelitduisvolutpatvelitsitametmaximusscelerisquemorbiullamcorperexacconsequategestas").toString();
+     }
+-}
++    @Test
++    public void testCachedHashAndToString() {
++        NamespacedKey key = new NamespacedKey("minecraft", "dirt");
++        int expectedHash = 47 * (47 * 5 + "minecraft".hashCode()) + "dirt".hashCode();
++        Assert.assertEquals(expectedHash, key.hashCode());
++        Assert.assertEquals("minecraft:dirt", key.toString());
++        // Verify multiple invocations return exact same cached String reference
++        Assert.assertSame(key.toString(), key.toString());
++    }
++}
+\ No newline at end of file
