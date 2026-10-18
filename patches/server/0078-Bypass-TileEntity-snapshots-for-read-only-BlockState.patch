@@ -1,0 +1,132 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Sun, 18 Oct 2026 17:40:11 +0700
+Subject: [PATCH 78/78] Bypass TileEntity snapshots for read-only BlockState
+ queries
+
+- Backport Leaf MC 0171 & Server-Paper 0044 (EMC TileEntity snapshot bypass)
+- Defer TileEntity snapshot instantiation in CraftBlockEntityState until explicitly accessed via getSnapshot() or mutating operations
+- Populate initial blockstate state directly from the existing live TileEntity to eliminate duplicate NBT serialization on construction
+- Provide getTileEntities(boolean useSnapshot) on CraftChunk and use getState(false) for read-only lootable inventory queries
+
+diff --git a/main/java/net/minecraft/server/TileEntityLootable.java b/main/java/net/minecraft/server/TileEntityLootable.java
+index 6185213..b90ca27 100644
+--- a/main/java/net/minecraft/server/TileEntityLootable.java
++++ b/main/java/net/minecraft/server/TileEntityLootable.java
+@@ -153,7 +153,7 @@ public abstract class TileEntityLootable extends TileEntityContainer implements
+ 
+     @Override
+     public LootableInventory getAPILootableInventory() {
+-        return (LootableInventory) getBukkitWorld().getBlockAt(MCUtil.toLocation(world, getPosition())).getState();
++        return (LootableInventory) ((org.bukkit.craftbukkit.block.CraftBlock) getBukkitWorld().getBlockAt(MCUtil.toLocation(world, getPosition()))).getState(false); // Leaf - read-only lootable check does not need snapshot
+     }
+ 
+     @Override
+diff --git a/main/java/org/bukkit/craftbukkit/CraftChunk.java b/main/java/org/bukkit/craftbukkit/CraftChunk.java
+index ba3676b..28a46dd 100644
+--- a/main/java/org/bukkit/craftbukkit/CraftChunk.java
++++ b/main/java/org/bukkit/craftbukkit/CraftChunk.java
+@@ -97,6 +97,12 @@ public class CraftChunk implements Chunk {
+     }
+ 
+     public BlockState[] getTileEntities() {
++        // Leaf - default to snapshot for backwards compatibility
++        return getTileEntities(true);
++    }
++
++    public BlockState[] getTileEntities(boolean useSnapshot) {
++        // Leaf start - allow avoiding defensive snapshots on chunk tile entities (backport of Leaf MC 0171 & Server-Paper 0044)
+         int index = 0;
+         net.minecraft.server.Chunk chunk = getHandle();
+ 
+@@ -108,10 +114,11 @@ public class CraftChunk implements Chunk {
+             }
+ 
+             BlockPosition position = (BlockPosition) obj;
+-            entities[index++] = worldServer.getWorld().getBlockAt(position.getX(), position.getY(), position.getZ()).getState();
++            entities[index++] = ((org.bukkit.craftbukkit.block.CraftBlock) worldServer.getWorld().getBlockAt(position.getX(), position.getY(), position.getZ())).getState(useSnapshot);
+         }
+ 
+         return entities;
++        // Leaf end
+     }
+ 
+     public boolean isLoaded() {
+diff --git a/main/java/org/bukkit/craftbukkit/block/CraftBlockEntityState.java b/main/java/org/bukkit/craftbukkit/block/CraftBlockEntityState.java
+index fe11281..287d101 100644
+--- a/main/java/org/bukkit/craftbukkit/block/CraftBlockEntityState.java
++++ b/main/java/org/bukkit/craftbukkit/block/CraftBlockEntityState.java
+@@ -11,7 +11,7 @@ public class CraftBlockEntityState<T extends TileEntity> extends CraftBlockState
+ 
+     private final Class<T> tileEntityClass;
+     private final T tileEntity;
+-    private final T snapshot;
++    private T snapshot; // Leaf - non-final for lazy instantiation (backport of Leaf MC 0171 & Server-Paper 0044)
+ 
+     public CraftBlockEntityState(Block block, Class<T> tileEntityClass) {
+         super(block);
+@@ -46,15 +46,11 @@ public class CraftBlockEntityState<T extends TileEntity> extends CraftBlockState
+         this.tileEntity = tileEntity;
+         // Paper start
+         this.snapshotDisabled = DISABLE_SNAPSHOT;
+-        if (DISABLE_SNAPSHOT) {
+-            this.snapshot = this.tileEntity;
+-        } else {
+-            this.snapshot = this.createSnapshot(this.tileEntity);
+-        }
+-        // copy tile entity data:
+-        if(this.snapshot != null) {
+-            this.load(this.snapshot);
++        // Leaf start - Lazy TileEntity snapshot creation (backport of Leaf MC 0171 & Server-Paper 0044)
++        if (this.tileEntity != null) {
++            this.load(this.tileEntity);
+         }
++        // Leaf end
+         // Paper end
+     }
+ 
+@@ -86,7 +82,12 @@ public class CraftBlockEntityState<T extends TileEntity> extends CraftBlockState
+ 
+     // gets the cloned TileEntity which is used to store the captured data
+     protected T getSnapshot() {
+-        return snapshot;
++        // Leaf start - create snapshot lazily when requested (backport of Leaf MC 0171 & Server-Paper 0044)
++        if (this.snapshot == null) {
++            this.snapshot = this.snapshotDisabled ? this.tileEntity : this.createSnapshot(this.tileEntity);
++        }
++        return this.snapshot;
++        // Leaf end
+     }
+ 
+     // gets the current TileEntity from the world at this position
+@@ -99,22 +100,24 @@ public class CraftBlockEntityState<T extends TileEntity> extends CraftBlockState
+     // gets the NBT data of the TileEntity represented by this block state
+     public NBTTagCompound getSnapshotNBT() {
+         // update snapshot
+-        applyTo(snapshot);
++        T snap = getSnapshot();
++        applyTo(snap);
+ 
+-        return snapshot.save(new NBTTagCompound());
++        return snap == null ? new NBTTagCompound() : snap.save(new NBTTagCompound());
+     }
+ 
+     // copies the data of the given tile entity to this block state
+     protected void load(T tileEntity) {
+-        if (tileEntity != null && tileEntity != snapshot) {
+-            copyData(tileEntity, snapshot);
++        if (tileEntity != null && this.snapshot != null && tileEntity != this.snapshot) {
++            copyData(tileEntity, this.snapshot);
+         }
+     }
+ 
+     // applies the TileEntity data of this block state to the given TileEntity
+     protected void applyTo(T tileEntity) {
+-        if (tileEntity != null && tileEntity != snapshot) {
+-            copyData(snapshot, tileEntity);
++        T snap = getSnapshot();
++        if (tileEntity != null && tileEntity != snap) {
++            copyData(snap, tileEntity);
+         }
+     }
+ 

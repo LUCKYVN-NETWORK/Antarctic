@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Sun, 18 Oct 2026 17:36:22 +0700
+Subject: [PATCH 74/78] Optimize CraftServer worlds lookup with Fastutil maps
+
+- Backport Leaf Server-Paper 0016 & 0041 (Fastutil worlds and UUID lookup)
+- Replace LinkedHashMap worlds with Fastutil Object2ObjectLinkedOpenHashMap
+- Maintain worldsByUUID with Object2ObjectOpenHashMap to turn O(N) UUID linear scans into O(1) lookups
+- Update addWorld and unloadWorld to maintain both maps synchronously
+
+diff --git a/main/java/org/bukkit/craftbukkit/CraftServer.java b/main/java/org/bukkit/craftbukkit/CraftServer.java
+index aebe298..f90ab0f 100644
+--- a/main/java/org/bukkit/craftbukkit/CraftServer.java
++++ b/main/java/org/bukkit/craftbukkit/CraftServer.java
+@@ -152,7 +152,10 @@ public final class CraftServer implements Server {
+     private final SimplePluginManager pluginManager = new SimplePluginManager(this, commandMap);
+     protected final MinecraftServer console;
+     protected final DedicatedPlayerList playerList;
+-    private final Map<String, World> worlds = new LinkedHashMap<String, World>();
++    // Leaf start - Fastutil worlds map and UUID lookup (backport of Leaf Server-Paper 0016 & 0041)
++    private final Map<String, World> worlds = new it.unimi.dsi.fastutil.objects.Object2ObjectLinkedOpenHashMap<String, World>();
++    private final Map<UUID, World> worldsByUUID = new it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap<UUID, World>();
++    // Leaf end
+     private YamlConfiguration configuration;
+     private YamlConfiguration commandsConfiguration;
+     private final Yaml yaml = new Yaml(new SafeConstructor());
+@@ -1077,6 +1080,7 @@ public final class CraftServer implements Server {
+         }
+ 
+         worlds.remove(world.getName().toLowerCase(java.util.Locale.ENGLISH));
++        worldsByUUID.remove(world.getUID()); // Leaf - remove from UUID map
+         console.worlds.remove(console.worlds.indexOf(handle));
+ 
+         File parentFolder = world.getWorldFolder().getAbsoluteFile();
+@@ -1119,12 +1123,9 @@ public final class CraftServer implements Server {
+ 
+     @Override
+     public World getWorld(UUID uid) {
+-        for (World world : worlds.values()) {
+-            if (world.getUID().equals(uid)) {
+-                return world;
+-            }
+-        }
+-        return null;
++        // Leaf start - O(1) UUID lookup (backport of Leaf Server-Paper 0016 & 0041)
++        return uid == null ? null : worldsByUUID.get(uid);
++        // Leaf end
+     }
+ 
+     public void addWorld(World world) {
+@@ -1134,6 +1135,7 @@ public final class CraftServer implements Server {
+             return;
+         }
+         worlds.put(world.getName().toLowerCase(java.util.Locale.ENGLISH), world);
++        worldsByUUID.put(world.getUID(), world); // Leaf - track by UUID
+     }
+ 
+     @Override

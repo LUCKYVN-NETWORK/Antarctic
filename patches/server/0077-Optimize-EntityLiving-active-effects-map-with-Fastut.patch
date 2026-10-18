@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Sun, 18 Oct 2026 17:38:35 +0700
+Subject: [PATCH 77/78] Optimize EntityLiving active effects map with Fastutil
+
+- Backport Leaf MC 0148 (Replace Entity active effects map with optimized collection)
+- Replace HashMap effects with Fastutil Reference2ObjectOpenHashMap to eliminate hashing and Entry node overhead using identity comparison for MobEffectList keys
+- Retain Map<MobEffectList, MobEffect> field descriptor and return types for 100% plugin ABI compatibility
+- Streamline tickPotionEffects to iterate values directly, eliminating secondary map lookups during potion ticking
+
+diff --git a/main/java/net/minecraft/server/EntityLiving.java b/main/java/net/minecraft/server/EntityLiving.java
+index 3355bef..e150150 100644
+--- a/main/java/net/minecraft/server/EntityLiving.java
++++ b/main/java/net/minecraft/server/EntityLiving.java
+@@ -46,7 +46,9 @@ public abstract class EntityLiving extends Entity {
+     private static final DataWatcherObject<Integer> br = DataWatcher.a(EntityLiving.class, DataWatcherRegistry.b);
+     private AttributeMapBase attributeMap;
+     public CombatTracker combatTracker = new CombatTracker(this);
+-    public final Map<MobEffectList, MobEffect> effects = Maps.newHashMap();
++    // Leaf start - Fastutil Reference2ObjectOpenHashMap for effects (backport of Leaf MC 0148)
++    public final Map<MobEffectList, MobEffect> effects = new it.unimi.dsi.fastutil.objects.Reference2ObjectOpenHashMap<MobEffectList, MobEffect>();
++    // Leaf end
+     private final NonNullList<ItemStack> bv;
+     private final NonNullList<ItemStack> bw;
+     public boolean au;
+@@ -563,13 +565,13 @@ public abstract class EntityLiving extends Entity {
+     // CraftBukkit end
+ 
+     protected void tickPotionEffects() {
+-        Iterator iterator = this.effects.keySet().iterator();
++        // Leaf start - Optimize potion effect ticking (backport of Leaf MC 0148)
++        Iterator<MobEffect> iterator = this.effects.values().iterator();
+ 
+         isTickingEffects = true; // CraftBukkit
+         try {
+             while (iterator.hasNext()) {
+-                MobEffectList mobeffectlist = (MobEffectList) iterator.next();
+-                MobEffect mobeffect = (MobEffect) this.effects.get(mobeffectlist);
++                MobEffect mobeffect = iterator.next();
+ 
+                 if (!mobeffect.tick(this)) {
+                     if (!this.world.isClientSide) {
+@@ -583,6 +585,7 @@ public abstract class EntityLiving extends Entity {
+         } catch (ConcurrentModificationException concurrentmodificationexception) {
+             ;
+         }
++        // Leaf end
+         // CraftBukkit start
+         isTickingEffects = false;
+         for (Object e : effectsToProcess) {

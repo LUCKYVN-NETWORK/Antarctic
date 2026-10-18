@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Sun, 18 Oct 2026 17:37:02 +0700
+Subject: [PATCH 75/78] Return unmodifiable safe view for
+ CraftServer.getWorlds()
+
+- Backport Leaf Server-Paper 0045 (Safe view for CraftServer.getWorlds)
+- Cache an unmodifiable snapshot view of the loaded worlds list in CraftServer
+- Update the snapshot on addWorld and unloadWorld
+- Eliminate ArrayList heap allocation on every Bukkit.getWorlds() call
+- Prevent external callers from mutating internal world tracking structures
+
+diff --git a/main/java/org/bukkit/craftbukkit/CraftServer.java b/main/java/org/bukkit/craftbukkit/CraftServer.java
+index f90ab0f..cb0ab74 100644
+--- a/main/java/org/bukkit/craftbukkit/CraftServer.java
++++ b/main/java/org/bukkit/craftbukkit/CraftServer.java
+@@ -155,6 +155,7 @@ public final class CraftServer implements Server {
+     // Leaf start - Fastutil worlds map and UUID lookup (backport of Leaf Server-Paper 0016 & 0041)
+     private final Map<String, World> worlds = new it.unimi.dsi.fastutil.objects.Object2ObjectLinkedOpenHashMap<String, World>();
+     private final Map<UUID, World> worldsByUUID = new it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap<UUID, World>();
++    private List<World> worldsView = Collections.emptyList(); // Leaf - Safe view for getWorlds (backport of Leaf Server-Paper 0045)
+     // Leaf end
+     private YamlConfiguration configuration;
+     private YamlConfiguration commandsConfiguration;
+@@ -629,7 +630,7 @@ public final class CraftServer implements Server {
+ 
+     @Override
+     public List<World> getWorlds() {
+-        return new ArrayList<World>(worlds.values());
++        return this.worldsView; // Leaf - return unmodifiable snapshot view (backport of Leaf Server-Paper 0045)
+     }
+ 
+     public DedicatedPlayerList getHandle() {
+@@ -1081,6 +1082,7 @@ public final class CraftServer implements Server {
+ 
+         worlds.remove(world.getName().toLowerCase(java.util.Locale.ENGLISH));
+         worldsByUUID.remove(world.getUID()); // Leaf - remove from UUID map
++        this.worldsView = Collections.unmodifiableList(new ArrayList<World>(this.worlds.values())); // Leaf - update safe view
+         console.worlds.remove(console.worlds.indexOf(handle));
+ 
+         File parentFolder = world.getWorldFolder().getAbsoluteFile();
+@@ -1136,6 +1138,7 @@ public final class CraftServer implements Server {
+         }
+         worlds.put(world.getName().toLowerCase(java.util.Locale.ENGLISH), world);
+         worldsByUUID.put(world.getUID(), world); // Leaf - track by UUID
++        this.worldsView = Collections.unmodifiableList(new ArrayList<World>(this.worlds.values())); // Leaf - update safe view
+     }
+ 
+     @Override

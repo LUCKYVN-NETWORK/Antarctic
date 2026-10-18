@@ -1,0 +1,414 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Sun, 18 Oct 2026 17:37:53 +0700
+Subject: [PATCH 76/78] Remove iterators from Inventory containers
+
+- Backport Leaf MC 0191 (Remove iterators from Inventory)
+- Replace iterator allocations with indexed loops in isEmpty (x_) checks across TileEntityChest, TileEntityHopper, TileEntityDispenser, TileEntityFurnace, TileEntityBrewingStand, InventorySubcontainer, EntityMinecartContainer, InventoryCrafting, InventoryCraftResult, and PlayerInventory
+- Replace iterator allocations in hopper isFull check (r) and recipe manager feeding loops (a)
+- Eliminate iterator garbage during hopper ticking and container inventory inspections
+
+diff --git a/main/java/net/minecraft/server/EntityMinecartContainer.java b/main/java/net/minecraft/server/EntityMinecartContainer.java
+index 15f392d..decf483 100644
+--- a/main/java/net/minecraft/server/EntityMinecartContainer.java
++++ b/main/java/net/minecraft/server/EntityMinecartContainer.java
+@@ -98,19 +98,14 @@ public abstract class EntityMinecartContainer extends EntityMinecartAbstract imp
+     }
+ 
+     public boolean x_() {
+-        Iterator iterator = this.items.iterator();
+-
+-        ItemStack itemstack;
+-
+-        do {
+-            if (!iterator.hasNext()) {
+-                return true;
++        // Leaf start - Remove iterators from inventory (backport of Leaf MC 0191)
++        for (int i = 0; i < this.items.size(); ++i) {
++            if (!this.items.get(i).isEmpty()) {
++                return false;
+             }
+-
+-            itemstack = (ItemStack) iterator.next();
+-        } while (itemstack.isEmpty());
+-
+-        return false;
++        }
++        return true;
++        // Leaf end
+     }
+ 
+     public ItemStack getItem(int i) {
+diff --git a/main/java/net/minecraft/server/InventoryCraftResult.java b/main/java/net/minecraft/server/InventoryCraftResult.java
+index 1e3b3b1..1bf8217 100644
+--- a/main/java/net/minecraft/server/InventoryCraftResult.java
++++ b/main/java/net/minecraft/server/InventoryCraftResult.java
+@@ -50,19 +50,14 @@ public class InventoryCraftResult implements IInventory {
+     }
+ 
+     public boolean x_() {
+-        Iterator iterator = this.items.iterator();
+-
+-        ItemStack itemstack;
+-
+-        do {
+-            if (!iterator.hasNext()) {
+-                return true;
++        // Leaf start - Remove iterators from inventory (backport of Leaf MC 0191)
++        for (int i = 0; i < this.items.size(); ++i) {
++            if (!this.items.get(i).isEmpty()) {
++                return false;
+             }
+-
+-            itemstack = (ItemStack) iterator.next();
+-        } while (itemstack.isEmpty());
+-
+-        return false;
++        }
++        return true;
++        // Leaf end
+     }
+ 
+     public ItemStack getItem(int i) {
+diff --git a/main/java/net/minecraft/server/InventoryCrafting.java b/main/java/net/minecraft/server/InventoryCrafting.java
+index 14721ad..d1d0cdd 100644
+--- a/main/java/net/minecraft/server/InventoryCrafting.java
++++ b/main/java/net/minecraft/server/InventoryCrafting.java
+@@ -76,19 +76,14 @@ public class InventoryCrafting implements IInventory {
+     }
+ 
+     public boolean x_() {
+-        Iterator iterator = this.items.iterator();
+-
+-        ItemStack itemstack;
+-
+-        do {
+-            if (!iterator.hasNext()) {
+-                return true;
++        // Leaf start - Remove iterators from inventory (backport of Leaf MC 0191)
++        for (int i = 0; i < this.items.size(); ++i) {
++            if (!this.items.get(i).isEmpty()) {
++                return false;
+             }
+-
+-            itemstack = (ItemStack) iterator.next();
+-        } while (itemstack.isEmpty());
+-
+-        return false;
++        }
++        return true;
++        // Leaf end
+     }
+ 
+     public ItemStack getItem(int i) {
+@@ -171,13 +166,10 @@ public class InventoryCrafting implements IInventory {
+     }
+ 
+     public void a(AutoRecipeStackManager autorecipestackmanager) {
+-        Iterator iterator = this.items.iterator();
+-
+-        while (iterator.hasNext()) {
+-            ItemStack itemstack = (ItemStack) iterator.next();
+-
+-            autorecipestackmanager.a(itemstack);
++        // Leaf start - Remove iterators from inventory (backport of Leaf MC 0191)
++        for (int i = 0; i < this.items.size(); ++i) {
++            autorecipestackmanager.a(this.items.get(i));
+         }
+-
++        // Leaf end
+     }
+ }
+diff --git a/main/java/net/minecraft/server/InventorySubcontainer.java b/main/java/net/minecraft/server/InventorySubcontainer.java
+index 1609e63..5f3a685 100644
+--- a/main/java/net/minecraft/server/InventorySubcontainer.java
++++ b/main/java/net/minecraft/server/InventorySubcontainer.java
+@@ -151,19 +151,14 @@ public class InventorySubcontainer implements IInventory {
+     }
+ 
+     public boolean x_() {
+-        Iterator iterator = this.items.iterator();
+-
+-        ItemStack itemstack;
+-
+-        do {
+-            if (!iterator.hasNext()) {
+-                return true;
++        // Leaf start - Remove iterators from inventory (backport of Leaf MC 0191)
++        for (int i = 0; i < this.items.size(); ++i) {
++            if (!this.items.get(i).isEmpty()) {
++                return false;
+             }
+-
+-            itemstack = (ItemStack) iterator.next();
+-        } while (itemstack.isEmpty());
+-
+-        return false;
++        }
++        return true;
++        // Leaf end
+     }
+ 
+     public String getName() {
+diff --git a/main/java/net/minecraft/server/PlayerInventory.java b/main/java/net/minecraft/server/PlayerInventory.java
+index 50418f6..fd25796 100644
+--- a/main/java/net/minecraft/server/PlayerInventory.java
++++ b/main/java/net/minecraft/server/PlayerInventory.java
+@@ -539,39 +539,24 @@ public class PlayerInventory implements IInventory {
+     }
+ 
+     public boolean x_() {
+-        Iterator iterator = this.items.iterator();
+-
+-        ItemStack itemstack;
+-
+-        do {
+-            if (!iterator.hasNext()) {
+-                iterator = this.armor.iterator();
+-
+-                do {
+-                    if (!iterator.hasNext()) {
+-                        iterator = this.extraSlots.iterator();
+-
+-                        do {
+-                            if (!iterator.hasNext()) {
+-                                return true;
+-                            }
+-
+-                            itemstack = (ItemStack) iterator.next();
+-                        } while (itemstack.isEmpty());
+-
+-                        return false;
+-                    }
+-
+-                    itemstack = (ItemStack) iterator.next();
+-                } while (itemstack.isEmpty());
+-
++        // Leaf start - Remove iterators from inventory (backport of Leaf MC 0191)
++        for (int i = 0; i < this.items.size(); ++i) {
++            if (!this.items.get(i).isEmpty()) {
+                 return false;
+             }
+-
+-            itemstack = (ItemStack) iterator.next();
+-        } while (itemstack.isEmpty());
+-
+-        return false;
++        }
++        for (int i = 0; i < this.armor.size(); ++i) {
++            if (!this.armor.get(i).isEmpty()) {
++                return false;
++            }
++        }
++        for (int i = 0; i < this.extraSlots.size(); ++i) {
++            if (!this.extraSlots.get(i).isEmpty()) {
++                return false;
++            }
++        }
++        return true;
++        // Leaf end
+     }
+ 
+     public ItemStack getItem(int i) {
+@@ -742,14 +727,11 @@ public class PlayerInventory implements IInventory {
+     }
+ 
+     public void a(AutoRecipeStackManager autorecipestackmanager, boolean flag) {
+-        Iterator iterator = this.items.iterator();
+-
+-        while (iterator.hasNext()) {
+-            ItemStack itemstack = (ItemStack) iterator.next();
+-
+-            autorecipestackmanager.a(itemstack);
++        // Leaf start - Remove iterators from inventory (backport of Leaf MC 0191)
++        for (int i = 0; i < this.items.size(); ++i) {
++            autorecipestackmanager.a(this.items.get(i));
+         }
+-
++        // Leaf end
+         if (flag) {
+             autorecipestackmanager.a((ItemStack) this.extraSlots.get(0));
+         }
+diff --git a/main/java/net/minecraft/server/TileEntityBrewingStand.java b/main/java/net/minecraft/server/TileEntityBrewingStand.java
+index 872c42c..7ee6602 100644
+--- a/main/java/net/minecraft/server/TileEntityBrewingStand.java
++++ b/main/java/net/minecraft/server/TileEntityBrewingStand.java
+@@ -71,19 +71,14 @@ public class TileEntityBrewingStand extends TileEntityContainer implements ITick
+     }
+ 
+     public boolean x_() {
+-        Iterator iterator = this.items.iterator();
+-
+-        ItemStack itemstack;
+-
+-        do {
+-            if (!iterator.hasNext()) {
+-                return true;
++        // Leaf start - Remove iterators from inventory (backport of Leaf MC 0191)
++        for (int i = 0; i < this.items.size(); ++i) {
++            if (!this.items.get(i).isEmpty()) {
++                return false;
+             }
+-
+-            itemstack = (ItemStack) iterator.next();
+-        } while (itemstack.isEmpty());
+-
+-        return false;
++        }
++        return true;
++        // Leaf end
+     }
+ 
+     public void e() {
+diff --git a/main/java/net/minecraft/server/TileEntityChest.java b/main/java/net/minecraft/server/TileEntityChest.java
+index 6313041..52568db 100644
+--- a/main/java/net/minecraft/server/TileEntityChest.java
++++ b/main/java/net/minecraft/server/TileEntityChest.java
+@@ -61,19 +61,14 @@ public class TileEntityChest extends TileEntityLootable { // Paper - Remove ITic
+     }
+ 
+     public boolean x_() {
+-        Iterator iterator = this.items.iterator();
+-
+-        ItemStack itemstack;
+-
+-        do {
+-            if (!iterator.hasNext()) {
+-                return true;
++        // Leaf start - Remove iterators from inventory (backport of Leaf MC 0191)
++        for (int i = 0; i < this.items.size(); ++i) {
++            if (!this.items.get(i).isEmpty()) {
++                return false;
+             }
+-
+-            itemstack = (ItemStack) iterator.next();
+-        } while (itemstack.isEmpty());
+-
+-        return false;
++        }
++        return true;
++        // Leaf end
+     }
+ 
+     public String getName() {
+diff --git a/main/java/net/minecraft/server/TileEntityDispenser.java b/main/java/net/minecraft/server/TileEntityDispenser.java
+index fc0b231..5c53dfd 100644
+--- a/main/java/net/minecraft/server/TileEntityDispenser.java
++++ b/main/java/net/minecraft/server/TileEntityDispenser.java
+@@ -48,19 +48,14 @@ public class TileEntityDispenser extends TileEntityLootable {
+     }
+ 
+     public boolean x_() {
+-        Iterator iterator = this.items.iterator();
+-
+-        ItemStack itemstack;
+-
+-        do {
+-            if (!iterator.hasNext()) {
+-                return true;
++        // Leaf start - Remove iterators from inventory (backport of Leaf MC 0191)
++        for (int i = 0; i < this.items.size(); ++i) {
++            if (!this.items.get(i).isEmpty()) {
++                return false;
+             }
+-
+-            itemstack = (ItemStack) iterator.next();
+-        } while (itemstack.isEmpty());
+-
+-        return false;
++        }
++        return true;
++        // Leaf end
+     }
+ 
+     public int o() {
+diff --git a/main/java/net/minecraft/server/TileEntityFurnace.java b/main/java/net/minecraft/server/TileEntityFurnace.java
+index 7a14281..42b94ee 100644
+--- a/main/java/net/minecraft/server/TileEntityFurnace.java
++++ b/main/java/net/minecraft/server/TileEntityFurnace.java
+@@ -58,19 +58,14 @@ public class TileEntityFurnace extends TileEntityContainer implements ITickable,
+     }
+ 
+     public boolean x_() {
+-        Iterator iterator = this.items.iterator();
+-
+-        ItemStack itemstack;
+-
+-        do {
+-            if (!iterator.hasNext()) {
+-                return true;
++        // Leaf start - Remove iterators from inventory (backport of Leaf MC 0191)
++        for (int i = 0; i < this.items.size(); ++i) {
++            if (!this.items.get(i).isEmpty()) {
++                return false;
+             }
+-
+-            itemstack = (ItemStack) iterator.next();
+-        } while (itemstack.isEmpty());
+-
+-        return false;
++        }
++        return true;
++        // Leaf end
+     }
+ 
+     public ItemStack getItem(int i) {
+diff --git a/main/java/net/minecraft/server/TileEntityHopper.java b/main/java/net/minecraft/server/TileEntityHopper.java
+index 5198a59..0368ae2 100644
+--- a/main/java/net/minecraft/server/TileEntityHopper.java
++++ b/main/java/net/minecraft/server/TileEntityHopper.java
+@@ -161,19 +161,14 @@ public class TileEntityHopper extends TileEntityLootable implements IHopper, ITi
+     // Paper end
+ 
+     private boolean p() {
+-        Iterator iterator = this.items.iterator();
+-
+-        ItemStack itemstack;
+-
+-        do {
+-            if (!iterator.hasNext()) {
+-                return true;
++        // Leaf start - Remove iterators from inventory (backport of Leaf MC 0191)
++        for (int i = 0; i < this.items.size(); ++i) {
++            if (!this.items.get(i).isEmpty()) {
++                return false;
+             }
+-
+-            itemstack = (ItemStack) iterator.next();
+-        } while (itemstack.isEmpty());
+-
+-        return false;
++        }
++        return true;
++        // Leaf end
+     }
+ 
+     public boolean x_() {
+@@ -181,19 +176,15 @@ public class TileEntityHopper extends TileEntityLootable implements IHopper, ITi
+     }
+ 
+     private boolean r() {
+-        Iterator iterator = this.items.iterator();
+-
+-        ItemStack itemstack;
+-
+-        do {
+-            if (!iterator.hasNext()) {
+-                return true;
++        // Leaf start - Remove iterators from inventory (backport of Leaf MC 0191)
++        for (int i = 0; i < this.items.size(); ++i) {
++            ItemStack itemstack = this.items.get(i);
++            if (itemstack.isEmpty() || itemstack.getCount() != itemstack.getMaxStackSize()) {
++                return false;
+             }
+-
+-            itemstack = (ItemStack) iterator.next();
+-        } while (!itemstack.isEmpty() && itemstack.getCount() == itemstack.getMaxStackSize());
+-
+-        return false;
++        }
++        return true;
++        // Leaf end
+     }
+ 
+     // Paper start - Optimize Hoppers
