@@ -1,0 +1,223 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Mon, 19 Oct 2026 00:17:20 +0700
+Subject: [PATCH 88/88] Optimize World getCubes block collision loop
+
+- Cache chunk references across coordinate sweeps to reduce getChunkIfLoaded lookups
+
+- Bypass empty blocks using FastVoxelCache to eliminate virtual method calls
+
+- Fast-path standard full-cube AABB intersections without NMS block dispatch
+
+- Add optimize-voxel-collisions TOML configuration setting in optimizations.physics
+
+- Add unit test coverage for voxel collision and caching
+
+diff --git a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+index b5d018d..c6b9501 100644
+--- a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
++++ b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+@@ -17,6 +17,7 @@ import com.destroystokyo.paper.config.toml.modules.optimizations.ArmourStands;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Pathfinder;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Projectiles;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Suffocation;
++import com.destroystokyo.paper.config.toml.modules.optimizations.Physics;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Rails;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.SunBurn;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.WorldBorder;
+@@ -50,7 +51,7 @@ public final class AntarcticTomlConfig {
+             new Rebrand(), new Privacy(),
+             new Deflate(),
+             new VirtualThreads(), new AsyncPlayerDataSaving(),
+-            new Pathfinder(), new Suffocation(), new Projectiles(), new ArmourStands(), new WorldBorder(), new SunBurn(), new Rails(),
++            new Pathfinder(), new Suffocation(), new Projectiles(), new ArmourStands(), new WorldBorder(), new SunBurn(), new Rails(), new Physics(),
+             new MergeChecks(), new ChunkOverloadDupe(), new Collisions(),
+             new MapDecorations(), new Books());
+     private static final YamlConfiguration yamlFacade = new YamlConfiguration();
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/Physics.java b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/Physics.java
+new file mode 100644
+index 0000000..3457038
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/Physics.java
+@@ -0,0 +1,21 @@
++package com.destroystokyo.paper.config.toml.modules.optimizations;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++
++public class Physics implements IConfigModule {
++
++    @ConfigInfo(baseName = "optimize-voxel-collisions", comments = "Optimizes World.getCubes block collision loop with chunk caching, empty block skipping, and full cube fast-path. Default true.")
++    public static boolean optimizeVoxelCollisions = true;
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.OPTIMIZATIONS;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "physics";
++    }
++}
+diff --git a/main/java/net/minecraft/server/World.java b/main/java/net/minecraft/server/World.java
+index 589bb8a..aaa052a 100644
+--- a/main/java/net/minecraft/server/World.java
++++ b/main/java/net/minecraft/server/World.java
+@@ -1324,39 +1324,80 @@ public abstract class World implements IBlockAccess {
+         BlockPosition.PooledBlockPosition blockposition_pooledblockposition = BlockPosition.PooledBlockPosition.s();
+ 
+         try {
++            boolean optimizeVoxel = com.destroystokyo.paper.config.toml.modules.optimizations.Physics.optimizeVoxelCollisions;
++            int cachedChunkX = Integer.MIN_VALUE;
++            int cachedChunkZ = Integer.MIN_VALUE;
++            Chunk cachedChunk = null;
++
+             for (int k1 = i; k1 < j; ++k1) {
+                 for (int l1 = i1; l1 < j1; ++l1) {
+                     boolean flag3 = k1 == i || k1 == j - 1;
+                     boolean flag4 = l1 == i1 || l1 == j1 - 1;
+ 
+-                    if ((!flag3 || !flag4) && this.isLoaded(blockposition_pooledblockposition.f(k1, 64, l1))) {
+-                        for (int i2 = k; i2 < l; ++i2) {
+-                            if (!flag3 && !flag4 || i2 != l - 1) {
+-                                if (flag) {
+-                                    if (k1 < -30000000 || k1 >= 30000000 || l1 < -30000000 || l1 >= 30000000) {
+-                                        boolean flag5 = true;
++                    if (flag3 && flag4) {
++                        continue;
++                    }
+ 
+-                                        return flag5;
+-                                    }
+-                                } else if (entity != null && flag1 == flag2) {
+-                                    entity.k(!flag2);
+-                                }
++                    if (optimizeVoxel) {
++                        int chunkX = k1 >> 4;
++                        int chunkZ = l1 >> 4;
++                        if (chunkX != cachedChunkX || chunkZ != cachedChunkZ) {
++                            cachedChunkX = chunkX;
++                            cachedChunkZ = chunkZ;
++                            cachedChunk = this.getChunkIfLoaded(chunkX, chunkZ);
++                        }
++                        if (cachedChunk == null) {
++                            continue;
++                        }
++                    } else if (!this.isLoaded(blockposition_pooledblockposition.f(k1, 64, l1))) {
++                        continue;
++                    }
+ 
+-                                blockposition_pooledblockposition.f(k1, i2, l1);
+-                                IBlockData iblockdata1;
++                    for (int i2 = k; i2 < l; ++i2) {
++                        if (!flag3 && !flag4 || i2 != l - 1) {
++                            if (flag) {
++                                if (k1 < -30000000 || k1 >= 30000000 || l1 < -30000000 || l1 >= 30000000) {
++                                    boolean flag5 = true;
+ 
+-                                if (!flag && !worldborder.a((BlockPosition) blockposition_pooledblockposition) && flag2) {
+-                                    iblockdata1 = iblockdata;
+-                                } else {
+-                                    iblockdata1 = this.getType(blockposition_pooledblockposition);
++                                    return flag5;
+                                 }
++                            } else if (entity != null && flag1 == flag2) {
++                                entity.k(!flag2);
++                            }
+ 
+-                                iblockdata1.a(this, blockposition_pooledblockposition, axisalignedbb, list, entity, false);
+-                                if (flag && !list.isEmpty()) {
+-                                    boolean flag6 = true;
++                            blockposition_pooledblockposition.f(k1, i2, l1);
++                            IBlockData iblockdata1;
+ 
+-                                    return flag6;
++                            if (!flag && !worldborder.a((BlockPosition) blockposition_pooledblockposition) && flag2) {
++                                iblockdata1 = iblockdata;
++                            } else if (optimizeVoxel) {
++                                iblockdata1 = cachedChunk.a(k1, i2, l1);
++                            } else {
++                                iblockdata1 = this.getType(blockposition_pooledblockposition);
++                            }
++
++                            if (optimizeVoxel) {
++                                if (me.stella.antarctic.spatial.FastVoxelCache.isEmpty(iblockdata1)) {
++                                    continue;
+                                 }
++                                if (me.stella.antarctic.spatial.FastVoxelCache.isFullCube(iblockdata1)) {
++                                    if (axisalignedbb.a < (double) (k1 + 1) && axisalignedbb.d > (double) k1 &&
++                                        axisalignedbb.b < (double) (i2 + 1) && axisalignedbb.e > (double) i2 &&
++                                        axisalignedbb.c < (double) (l1 + 1) && axisalignedbb.f > (double) l1) {
++                                        if (flag) {
++                                            return true;
++                                        }
++                                        list.add(new AxisAlignedBB(k1, i2, l1, k1 + 1, i2 + 1, l1 + 1));
++                                    }
++                                    continue;
++                                }
++                            }
++
++                            iblockdata1.a(this, blockposition_pooledblockposition, axisalignedbb, list, entity, false);
++                            if (flag && !list.isEmpty()) {
++                                boolean flag6 = true;
++
++                                return flag6;
+                             }
+                         }
+                     }
+diff --git a/test/java/me/stella/antarctic/spatial/FastVoxelCacheTest.java b/test/java/me/stella/antarctic/spatial/FastVoxelCacheTest.java
+index f832c33..7b09a5a 100644
+--- a/test/java/me/stella/antarctic/spatial/FastVoxelCacheTest.java
++++ b/test/java/me/stella/antarctic/spatial/FastVoxelCacheTest.java
+@@ -17,12 +17,17 @@ public class FastVoxelCacheTest {
+     public void testEmptyBlock() {
+         assertTrue(FastVoxelCache.isEmpty(null));
+         assertTrue(FastVoxelCache.isEmpty(Blocks.AIR.getBlockData()));
++        assertTrue(FastVoxelCache.isEmpty(Blocks.TALLGRASS.getBlockData()));
++        assertTrue(FastVoxelCache.isEmpty(Blocks.TORCH.getBlockData()));
+     }
+ 
+     @Test
+     public void testFullCube() {
+         assertTrue(FastVoxelCache.isFullCube(Blocks.STONE.getBlockData()));
+         assertTrue(FastVoxelCache.isFullCube(Blocks.DIRT.getBlockData()));
++        assertTrue(FastVoxelCache.isFullCube(Blocks.COBBLESTONE.getBlockData()));
+         assertFalse(FastVoxelCache.isFullCube(Blocks.AIR.getBlockData()));
++        assertFalse(FastVoxelCache.isFullCube(Blocks.OAK_STAIRS.getBlockData()));
++        assertFalse(FastVoxelCache.isFullCube(Blocks.WOODEN_SLAB.getBlockData()));
+     }
+ }
+diff --git a/test/java/net/minecraft/server/VoxelCollisionTest.java b/test/java/net/minecraft/server/VoxelCollisionTest.java
+new file mode 100644
+index 0000000..d551834
+--- /dev/null
++++ b/test/java/net/minecraft/server/VoxelCollisionTest.java
+@@ -0,0 +1,26 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.config.toml.modules.optimizations.Physics;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import static org.junit.Assert.*;
++
++public class VoxelCollisionTest {
++
++    @BeforeClass
++    public static void setUp() {
++        DispenserRegistry.c();
++    }
++
++    @Test
++    public void testPhysicsConfigDefault() {
++        assertTrue(Physics.optimizeVoxelCollisions);
++    }
++
++    @Test
++    public void testVoxelFastCacheClassification() {
++        assertTrue(me.stella.antarctic.spatial.FastVoxelCache.isEmpty(Blocks.AIR.getBlockData()));
++        assertTrue(me.stella.antarctic.spatial.FastVoxelCache.isFullCube(Blocks.STONE.getBlockData()));
++        assertFalse(me.stella.antarctic.spatial.FastVoxelCache.isFullCube(Blocks.OAK_STAIRS.getBlockData()));
++    }
++}
