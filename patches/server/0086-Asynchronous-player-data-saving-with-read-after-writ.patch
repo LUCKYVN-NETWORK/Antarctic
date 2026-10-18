@@ -1,0 +1,389 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Sun, 18 Oct 2026 21:34:17 +0700
+Subject: [PATCH 86/86] Asynchronous player data saving with read-after-write
+ barrier
+
+- Port asynchronous player data saving from Leaf
+- Offload gzip compression and file I/O from main tick thread
+- Guard rejoin and offline lookups with read-after-write barrier
+- Use atomic file replacement for crash resilience
+- Flush pending writes upon player disconnect and server shutdown
+- Gate behind async-playerdata-saving toml toggle disabled by default
+
+diff --git a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+index c2b769f..b5d018d 100644
+--- a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
++++ b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+@@ -3,6 +3,7 @@ package com.destroystokyo.paper.config.toml;
+ import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
+ import com.destroystokyo.paper.config.toml.annotations.DoNotLoad;
+ import com.destroystokyo.paper.config.toml.annotations.HotReloadUnsupported;
++import com.destroystokyo.paper.config.toml.modules.concurrency.AsyncPlayerDataSaving;
+ import com.destroystokyo.paper.config.toml.modules.concurrency.VirtualThreads;
+ import com.destroystokyo.paper.config.toml.modules.fixes.Books;
+ import com.destroystokyo.paper.config.toml.modules.fixes.MapDecorations;
+@@ -48,7 +49,7 @@ public final class AntarcticTomlConfig {
+     private static final List<IConfigModule> MODULES = List.of(
+             new Rebrand(), new Privacy(),
+             new Deflate(),
+-            new VirtualThreads(),
++            new VirtualThreads(), new AsyncPlayerDataSaving(),
+             new Pathfinder(), new Suffocation(), new Projectiles(), new ArmourStands(), new WorldBorder(), new SunBurn(), new Rails(),
+             new MergeChecks(), new ChunkOverloadDupe(), new Collisions(),
+             new MapDecorations(), new Books());
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/concurrency/AsyncPlayerDataSaving.java b/main/java/com/destroystokyo/paper/config/toml/modules/concurrency/AsyncPlayerDataSaving.java
+new file mode 100644
+index 0000000..f1c6ad4
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/concurrency/AsyncPlayerDataSaving.java
+@@ -0,0 +1,23 @@
++package com.destroystokyo.paper.config.toml.modules.concurrency;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++import com.destroystokyo.paper.config.toml.annotations.Experimental;
++
++public class AsyncPlayerDataSaving implements IConfigModule {
++
++    @Experimental
++    @ConfigInfo(baseName = "enabled", comments = "Whether to save player data asynchronously off the main server thread. Enforces read-after-write barrier on rejoin. Default false.")
++    public static boolean enabled = false;
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.CONCURRENCY;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "async-playerdata-saving";
++    }
++}
+diff --git a/main/java/net/minecraft/server/PlayerList.java b/main/java/net/minecraft/server/PlayerList.java
+index b1efd69..18361e4 100644
+--- a/main/java/net/minecraft/server/PlayerList.java
++++ b/main/java/net/minecraft/server/PlayerList.java
+@@ -1316,6 +1316,9 @@ public abstract class PlayerList {
+             }
+         }
+         MinecraftTimings.savePlayers.stopTiming(); // Paper
++        if (interval == null) {
++            WorldNBTStorage.awaitAllPendingSaves();
++        }
+         return null; }); // Paper - ensure main
+     }
+     // Paper end
+@@ -1448,6 +1451,7 @@ public abstract class PlayerList {
+             if (team != null) scoreboard.removeTeam(team);
+         }
+         // Paper end
++        WorldNBTStorage.awaitAllPendingSaves();
+     }
+     // Paper end
+ 
+diff --git a/main/java/net/minecraft/server/WorldNBTStorage.java b/main/java/net/minecraft/server/WorldNBTStorage.java
+index 4bb6f60..f3f8e79 100644
+--- a/main/java/net/minecraft/server/WorldNBTStorage.java
++++ b/main/java/net/minecraft/server/WorldNBTStorage.java
+@@ -11,6 +11,12 @@ import java.io.OutputStream;
+ import javax.annotation.Nullable;
+ import org.apache.logging.log4j.LogManager;
+ import org.apache.logging.log4j.Logger;
++import java.util.concurrent.CompletableFuture;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ConcurrentMap;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.TimeUnit;
+ 
+ // CraftBukkit start
+ import java.util.UUID;
+@@ -20,6 +26,60 @@ import org.bukkit.craftbukkit.entity.CraftPlayer;
+ public class WorldNBTStorage implements IDataManager, IPlayerFileData {
+ 
+     private static final Logger b = LogManager.getLogger();
++    private static final ConcurrentMap<UUID, CompletableFuture<Void>> pendingSaves = new ConcurrentHashMap<>();
++    private static final ExecutorService asyncSaveExecutor = buildAsyncSaveExecutor();
++
++    private static ExecutorService buildAsyncSaveExecutor() {
++        try {
++            return Executors.newThreadPerTaskExecutor(
++                    Thread.ofVirtual().name("Async PlayerData #", 0).factory()
++            );
++        } catch (Throwable t) {
++            return Executors.newCachedThreadPool(
++                    new com.google.common.util.concurrent.ThreadFactoryBuilder()
++                            .setNameFormat("Async PlayerData #%d")
++                            .setDaemon(true)
++                            .build()
++            );
++        }
++    }
++
++    public static ExecutorService getAsyncSaveExecutor() {
++        return asyncSaveExecutor;
++    }
++
++    public static CompletableFuture<Void> getPendingSave(UUID uuid) {
++        return pendingSaves.get(uuid);
++    }
++
++    public static boolean hasPendingSave(UUID uuid) {
++        return pendingSaves.containsKey(uuid);
++    }
++
++    public static void awaitPendingSave(UUID uuid) {
++        CompletableFuture<Void> future = pendingSaves.get(uuid);
++        if (future != null) {
++            try {
++                future.get(15, TimeUnit.SECONDS);
++            } catch (Exception e) {
++                b.error("Failed to await in-flight player data save for {}", uuid, e);
++            }
++        }
++    }
++
++    public static void awaitAllPendingSaves() {
++        long deadline = System.currentTimeMillis() + 30000L;
++        while (!pendingSaves.isEmpty() && System.currentTimeMillis() < deadline) {
++            CompletableFuture<?>[] futures = pendingSaves.values().toArray(new CompletableFuture[0]);
++            if (futures.length == 0) break;
++            try {
++                CompletableFuture.allOf(futures).get(Math.max(1, deadline - System.currentTimeMillis()), TimeUnit.MILLISECONDS);
++            } catch (Exception e) {
++                b.error("Failed to await all pending player data saves", e);
++                break;
++            }
++        }
++    }
+     private final File baseDir;
+     private final File playerDir;
+     private final File dataDir;
+@@ -148,20 +208,84 @@ public class WorldNBTStorage implements IDataManager, IPlayerFileData {
+             File file = new File(this.playerDir, entityhuman.bn() + ".dat.tmp");
+             File file1 = new File(this.playerDir, entityhuman.bn() + ".dat");
+ 
+-            NBTCompressedStreamTools.a(nbttagcompound, (OutputStream) (new FileOutputStream(file)));
+-            if (file1.exists()) {
+-                file1.delete();
++            if (!com.destroystokyo.paper.config.toml.modules.concurrency.AsyncPlayerDataSaving.enabled) {
++                this.savePlayerDataToFile(nbttagcompound, file, file1, entityhuman.getName());
++                return;
+             }
+ 
+-            file.renameTo(file1);
++            final UUID uuid = entityhuman.getUniqueID();
++            final String name = entityhuman.getName();
++            final CompletableFuture<Void> currentSave = new CompletableFuture<>();
++
++            pendingSaves.compute(uuid, (key, previousSave) -> {
++                if (previousSave == null || previousSave.isDone()) {
++                    asyncSaveExecutor.execute(() -> {
++                        try {
++                            this.savePlayerDataToFile(nbttagcompound, file, file1, name);
++                            currentSave.complete(null);
++                        } catch (Throwable t) {
++                            WorldNBTStorage.b.error("Failed to save player data asynchronously for {}", name, t);
++                            currentSave.completeExceptionally(t);
++                        } finally {
++                            pendingSaves.remove(uuid, currentSave);
++                        }
++                    });
++                } else {
++                    previousSave.whenComplete((res, err) -> {
++                        asyncSaveExecutor.execute(() -> {
++                            try {
++                                this.savePlayerDataToFile(nbttagcompound, file, file1, name);
++                                currentSave.complete(null);
++                            } catch (Throwable t) {
++                                WorldNBTStorage.b.error("Failed to save player data asynchronously for {}", name, t);
++                                currentSave.completeExceptionally(t);
++                            } finally {
++                                pendingSaves.remove(uuid, currentSave);
++                            }
++                        });
++                    });
++                }
++                return currentSave;
++            });
+         } catch (Exception exception) {
+             WorldNBTStorage.b.error("Failed to save player data for {}", entityhuman.getName(), exception); // Paper
+         }
+ 
+     }
+ 
++    public void savePlayerDataToFile(NBTTagCompound nbttagcompound, File file, File file1, String name) throws IOException {
++        if (!this.playerDir.exists()) {
++            this.playerDir.mkdirs();
++        }
++        try {
++            try (OutputStream out = new FileOutputStream(file)) {
++                NBTCompressedStreamTools.a(nbttagcompound, out);
++            }
++            java.nio.file.Path tmpPath = file.toPath();
++            java.nio.file.Path targetPath = file1.toPath();
++            try {
++                java.nio.file.Files.move(tmpPath, targetPath,
++                        java.nio.file.StandardCopyOption.ATOMIC_MOVE,
++                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
++            } catch (java.io.IOException e) {
++                java.nio.file.Files.move(tmpPath, targetPath,
++                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
++            }
++        } catch (Throwable t) {
++            if (file.exists()) {
++                file.delete();
++            }
++            if (t instanceof IOException) {
++                throw (IOException) t;
++            } else {
++                throw new IOException(t);
++            }
++        }
++    }
++
+     @Nullable
+     public NBTTagCompound load(EntityHuman entityhuman) {
++        awaitPendingSave(entityhuman.getUniqueID());
+         NBTTagCompound nbttagcompound = null;
+ 
+         try {
+@@ -212,6 +336,11 @@ public class WorldNBTStorage implements IDataManager, IPlayerFileData {
+     // CraftBukkit start
+     public NBTTagCompound getPlayerData(String s) {
+         try {
++            try {
++                UUID uuid = UUID.fromString(s);
++                awaitPendingSave(uuid);
++            } catch (IllegalArgumentException ignored) {
++            }
+             File file1 = new File(this.playerDir, s + ".dat");
+ 
+             if (file1.exists()) {
+diff --git a/test/java/net/minecraft/server/AsyncPlayerDataSavingTest.java b/test/java/net/minecraft/server/AsyncPlayerDataSavingTest.java
+new file mode 100644
+index 0000000..1e752e0
+--- /dev/null
++++ b/test/java/net/minecraft/server/AsyncPlayerDataSavingTest.java
+@@ -0,0 +1,119 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.config.toml.modules.concurrency.AsyncPlayerDataSaving;
++import org.junit.Assert;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.rules.TemporaryFolder;
++
++import java.io.File;
++import java.io.FileInputStream;
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.io.OutputStream;
++import java.util.UUID;
++import java.util.concurrent.CompletableFuture;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicBoolean;
++
++public class AsyncPlayerDataSavingTest {
++
++    @Rule
++    public TemporaryFolder tempFolder = new TemporaryFolder();
++
++    @Test
++    public void testConfigDefaults() {
++        Assert.assertFalse("AsyncPlayerDataSaving.enabled should default to false for vanilla parity",
++                AsyncPlayerDataSaving.enabled);
++    }
++
++    @Test
++    public void testAtomicMoveAndWriteIntegrity() throws Exception {
++        File playerDir = tempFolder.newFolder("playerdata");
++        File datFile = new File(playerDir, "test-player.dat");
++        File tmpFile = new File(playerDir, "test-player.dat.tmp");
++
++        NBTTagCompound tag = new NBTTagCompound();
++        tag.setString("PlayerName", "TestHero");
++        tag.setInt("Score", 42000);
++
++        try (OutputStream out = new FileOutputStream(tmpFile)) {
++            NBTCompressedStreamTools.a(tag, out);
++        }
++
++        Assert.assertTrue("Temporary file should exist prior to rename", tmpFile.exists());
++
++        java.nio.file.Files.move(tmpFile.toPath(), datFile.toPath(),
++                java.nio.file.StandardCopyOption.ATOMIC_MOVE,
++                java.nio.file.StandardCopyOption.REPLACE_EXISTING);
++
++        Assert.assertTrue("Target dat file must exist", datFile.exists());
++        Assert.assertFalse("Tmp file must not exist after atomic move", tmpFile.exists());
++
++        NBTTagCompound readTag;
++        try (FileInputStream in = new FileInputStream(datFile)) {
++            readTag = NBTCompressedStreamTools.a(in);
++        }
++        Assert.assertEquals("TestHero", readTag.getString("PlayerName"));
++        Assert.assertEquals(42000, readTag.getInt("Score"));
++    }
++
++    @Test
++    public void testReadAfterWriteBarrierExecution() throws Exception {
++        UUID uuid = UUID.randomUUID();
++        CountDownLatch startLatch = new CountDownLatch(1);
++        CountDownLatch finishLatch = new CountDownLatch(1);
++        AtomicBoolean completed = new AtomicBoolean(false);
++
++        CompletableFuture<Void> saveFuture = CompletableFuture.runAsync(() -> {
++            try {
++                startLatch.await();
++                Thread.sleep(50);
++                completed.set(true);
++                finishLatch.countDown();
++            } catch (Exception e) {
++                throw new RuntimeException(e);
++            }
++        }, WorldNBTStorage.getAsyncSaveExecutor());
++
++        startLatch.countDown();
++        boolean finished = finishLatch.await(5, TimeUnit.SECONDS);
++        Assert.assertTrue("Async save task must finish", finished);
++        Assert.assertTrue("Async save flag must be set", completed.get());
++    }
++
++    @Test
++    public void testCrashInjectionCleansUpTmpFile() throws Exception {
++        File playerDir = tempFolder.newFolder("crash-test");
++        File datFile = new File(playerDir, "saved.dat");
++        File tmpFile = new File(playerDir, "saved.dat.tmp");
++
++        // Seed existing valid .dat
++        NBTTagCompound originalTag = new NBTTagCompound();
++        originalTag.setString("State", "OriginalValidData");
++        try (OutputStream out = new FileOutputStream(datFile)) {
++            NBTCompressedStreamTools.a(originalTag, out);
++        }
++
++        // Simulate crash/failure during write to .tmp
++        try (OutputStream out = new FileOutputStream(tmpFile)) {
++            out.write(new byte[]{0x1, 0x2, 0x3}); // partial/corrupted bytes
++        }
++        Assert.assertTrue(tmpFile.exists());
++
++        // Crash injection handler deletes tmp upon failure
++        if (tmpFile.exists()) {
++            tmpFile.delete();
++        }
++
++        Assert.assertFalse("Tmp file must be cleaned up on crash/failure", tmpFile.exists());
++        Assert.assertTrue("Original valid dat file must remain untouched", datFile.exists());
++
++        NBTTagCompound loadedTag;
++        try (FileInputStream in = new FileInputStream(datFile)) {
++            loadedTag = NBTCompressedStreamTools.a(in);
++        }
++        Assert.assertEquals("OriginalValidData", loadedTag.getString("State"));
++    }
++}

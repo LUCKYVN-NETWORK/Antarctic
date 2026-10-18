@@ -13,6 +13,8 @@ out/
 /work/
 run/
 *.log
+logs/
+/Antarctic-Server/logs/
 .DS_Store
 Thumbs.db
 *~
