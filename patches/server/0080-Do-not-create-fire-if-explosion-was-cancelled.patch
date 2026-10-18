@@ -1,0 +1,21 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Sun, 18 Oct 2026 18:17:13 +0700
+Subject: [PATCH 80/83] Do not create fire if explosion was cancelled
+
+- Suppress residual fire block placement when explosion is marked cancelled
+
+- Prevent unwanted fire ignition from cancelled explosions
+
+diff --git a/main/java/net/minecraft/server/Explosion.java b/main/java/net/minecraft/server/Explosion.java
+index 61fbdeb..eaeb5e9 100644
+--- a/main/java/net/minecraft/server/Explosion.java
++++ b/main/java/net/minecraft/server/Explosion.java
+@@ -265,6 +265,7 @@ public class Explosion {
+         }
+ 
+         if (this.a) {
++            if (this.wasCanceled) return; // Leaf - Do not create fire if explosion was cancelled (backport of Leaf MC 0255 / 0279)
+             iterator = this.blocks.iterator();
+ 
+             while (iterator.hasNext()) {

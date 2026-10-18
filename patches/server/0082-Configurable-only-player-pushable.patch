@@ -1,0 +1,122 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Sun, 18 Oct 2026 18:18:55 +0700
+Subject: [PATCH 82/83] Configurable only player pushable
+
+- Allow skipping non-player mob-to-mob pushing and cramming scans
+
+- Prevent armor stand entity collision lookups when only-player-pushable is enabled
+
+- Add gameplay.collisions.only-player-pushable toggle (default false for vanilla parity)
+
+diff --git a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+index b897ed8..ba93e90 100644
+--- a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
++++ b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+@@ -6,6 +6,7 @@ import com.destroystokyo.paper.config.toml.annotations.HotReloadUnsupported;
+ import com.destroystokyo.paper.config.toml.modules.fixes.Books;
+ import com.destroystokyo.paper.config.toml.modules.fixes.MapDecorations;
+ import com.destroystokyo.paper.config.toml.modules.gameplay.ChunkOverloadDupe;
++import com.destroystokyo.paper.config.toml.modules.gameplay.Collisions;
+ import com.destroystokyo.paper.config.toml.modules.gameplay.MergeChecks;
+ import com.destroystokyo.paper.config.toml.modules.misc.Privacy;
+ import com.destroystokyo.paper.config.toml.modules.misc.Rebrand;
+@@ -47,7 +48,7 @@ public final class AntarcticTomlConfig {
+             new Rebrand(), new Privacy(),
+             new Deflate(),
+             new Pathfinder(), new Suffocation(), new Projectiles(), new ArmourStands(), new WorldBorder(), new SunBurn(), new Rails(),
+-            new MergeChecks(), new ChunkOverloadDupe(),
++            new MergeChecks(), new ChunkOverloadDupe(), new Collisions(),
+             new MapDecorations(), new Books());
+     private static final YamlConfiguration yamlFacade = new YamlConfiguration();
+     private static File configFile = new File("antarctic.toml");
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/gameplay/Collisions.java b/main/java/com/destroystokyo/paper/config/toml/modules/gameplay/Collisions.java
+new file mode 100644
+index 0000000..6e8f4c8
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/gameplay/Collisions.java
+@@ -0,0 +1,21 @@
++package com.destroystokyo.paper.config.toml.modules.gameplay;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++
++public class Collisions implements IConfigModule {
++
++    @ConfigInfo(baseName = "only-player-pushable", comments = "Whether only players can push entities and be pushed. Prevents quadratic mob-push checks in dense farms. Default false for vanilla parity.")
++    public static boolean onlyPlayerPushable = false;
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.GAMEPLAY;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "collisions";
++    }
++}
+diff --git a/main/java/net/minecraft/server/EntityArmorStand.java b/main/java/net/minecraft/server/EntityArmorStand.java
+index de83e8f..e30dddd 100644
+--- a/main/java/net/minecraft/server/EntityArmorStand.java
++++ b/main/java/net/minecraft/server/EntityArmorStand.java
+@@ -312,6 +312,11 @@ public class EntityArmorStand extends EntityLiving {
+     protected void C(Entity entity) {}
+ 
+     protected void cB() {
++        // Leaf start - Only player pushable (backport of Leaf MC 0190 / 0119)
++        if (com.destroystokyo.paper.config.toml.modules.gameplay.Collisions.onlyPlayerPushable) {
++            return;
++        }
++        // Leaf end
+         List list = this.world.getEntities(this, this.getBoundingBox(), EntityArmorStand.bx);
+ 
+         for (int i = 0; i < list.size(); ++i) {
+diff --git a/main/java/net/minecraft/server/EntityLiving.java b/main/java/net/minecraft/server/EntityLiving.java
+index e150150..2f304bf 100644
+--- a/main/java/net/minecraft/server/EntityLiving.java
++++ b/main/java/net/minecraft/server/EntityLiving.java
+@@ -2240,6 +2240,11 @@ public abstract class EntityLiving extends Entity {
+     protected void doTick() {}
+ 
+     protected void cB() {
++        // Leaf start - Only player pushable (backport of Leaf MC 0190 / 0119)
++        if (com.destroystokyo.paper.config.toml.modules.gameplay.Collisions.onlyPlayerPushable && !(this instanceof EntityHuman)) {
++            return;
++        }
++        // Leaf end
+         List list = this.world.getEntities(this, this.getBoundingBox(), IEntitySelector.a(this));
+ 
+         if (!list.isEmpty()) {
+@@ -2273,6 +2278,11 @@ public abstract class EntityLiving extends Entity {
+     }
+ 
+     protected void C(Entity entity) {
++        // Leaf start - Only player pushable (backport of Leaf MC 0190 / 0119)
++        if (com.destroystokyo.paper.config.toml.modules.gameplay.Collisions.onlyPlayerPushable && !(this instanceof EntityHuman) && !(entity instanceof EntityHuman)) {
++            return;
++        }
++        // Leaf end
+         entity.collide(this);
+     }
+ 
+diff --git a/test/java/net/minecraft/server/OnlyPlayerPushableTest.java b/test/java/net/minecraft/server/OnlyPlayerPushableTest.java
+new file mode 100644
+index 0000000..500b4f3
+--- /dev/null
++++ b/test/java/net/minecraft/server/OnlyPlayerPushableTest.java
+@@ -0,0 +1,13 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.config.toml.modules.gameplay.Collisions;
++import org.junit.Assert;
++import org.junit.Test;
++
++public class OnlyPlayerPushableTest {
++
++    @Test
++    public void testOnlyPlayerPushableDefaultFalse() {
++        Assert.assertFalse("Collisions.onlyPlayerPushable must default to false for strict vanilla parity", Collisions.onlyPlayerPushable);
++    }
++}

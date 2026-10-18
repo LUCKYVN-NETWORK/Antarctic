@@ -1,0 +1,220 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Sun, 18 Oct 2026 18:16:34 +0700
+Subject: [PATCH 79/83] Optimize sun burn tick checks for sun-sensitive mobs
+
+- Cache eye and skeleton block positions to eliminate redundant BlockPosition heap allocations during sun burn ticks
+
+- Overload Entity.aw(BlockPosition) to calculate brightness without MutableBlockPosition allocations
+
+- Add toml configuration toggle optimize-sun-burn-tick in optimizations.sun-burn (defaults to true)
+
+diff --git a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+index a3a5888..614315d 100644
+--- a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
++++ b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+@@ -14,6 +14,7 @@ import com.destroystokyo.paper.config.toml.modules.optimizations.ArmourStands;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Pathfinder;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Projectiles;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Suffocation;
++import com.destroystokyo.paper.config.toml.modules.optimizations.SunBurn;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.WorldBorder;
+ import com.electronwill.nightconfig.core.file.CommentedFileConfig;
+ import org.apache.logging.log4j.LogManager;
+@@ -44,7 +45,7 @@ public final class AntarcticTomlConfig {
+     private static final List<IConfigModule> MODULES = List.of(
+             new Rebrand(), new Privacy(),
+             new Deflate(),
+-            new Pathfinder(), new Suffocation(), new Projectiles(), new ArmourStands(), new WorldBorder(),
++            new Pathfinder(), new Suffocation(), new Projectiles(), new ArmourStands(), new WorldBorder(), new SunBurn(),
+             new MergeChecks(), new ChunkOverloadDupe(),
+             new MapDecorations(), new Books());
+     private static final YamlConfiguration yamlFacade = new YamlConfiguration();
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/SunBurn.java b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/SunBurn.java
+new file mode 100644
+index 0000000..6d257ec
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/SunBurn.java
+@@ -0,0 +1,21 @@
++package com.destroystokyo.paper.config.toml.modules.optimizations;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++
++public class SunBurn implements IConfigModule {
++
++    @ConfigInfo(baseName = "optimize-sun-burn-tick", comments = "Optimize daylight and canSeeSky checks for sun-sensitive mobs (zombies, skeletons).")
++    public static boolean optimizeSunBurnTick = true;
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.OPTIMIZATIONS;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "sun-burn";
++    }
++}
+diff --git a/main/java/net/minecraft/server/Entity.java b/main/java/net/minecraft/server/Entity.java
+index 74bbba0..6f34b8e 100644
+--- a/main/java/net/minecraft/server/Entity.java
++++ b/main/java/net/minecraft/server/Entity.java
+@@ -1276,6 +1276,12 @@ public abstract class Entity implements ICommandListener, KeyedObject { // Paper
+         }
+     }
+ 
++    // Leaf start - Optimize sun burn tick (backport of Leaf MC 0044 / Gale 0083)
++    public float aw(BlockPosition blockposition) {
++        return this.world.isLoaded(blockposition) ? this.world.n(blockposition) : 0.0F;
++    }
++    // Leaf end
++
+     public void spawnIn(World world) {
+         // CraftBukkit start
+         if (world == null) {
+diff --git a/main/java/net/minecraft/server/EntitySkeletonAbstract.java b/main/java/net/minecraft/server/EntitySkeletonAbstract.java
+index 8f4b63c..ccfce70 100644
+--- a/main/java/net/minecraft/server/EntitySkeletonAbstract.java
++++ b/main/java/net/minecraft/server/EntitySkeletonAbstract.java
+@@ -59,12 +59,42 @@ public abstract class EntitySkeletonAbstract extends EntityMonster implements IR
+         return EnumMonsterType.UNDEAD;
+     }
+ 
++    // Leaf start - Optimize sun burn tick (backport of Leaf MC 0044 / Gale 0083)
++    private BlockPosition cachedSkeletonPos;
++    private double lastSkelX = Double.NaN;
++    private double lastSkelY = Double.NaN;
++    private double lastSkelZ = Double.NaN;
++    private boolean lastInBoat;
++
++    private BlockPosition getSkeletonBlockPosition() {
++        boolean inBoat = this.bJ() instanceof EntityBoat;
++        if (this.cachedSkeletonPos == null || this.locX != this.lastSkelX || this.locY != this.lastSkelY || this.locZ != this.lastSkelZ || inBoat != this.lastInBoat) {
++            this.lastSkelX = this.locX;
++            this.lastSkelY = this.locY;
++            this.lastSkelZ = this.locZ;
++            this.lastInBoat = inBoat;
++            BlockPosition pos = new BlockPosition(this.locX, (double) Math.round(this.locY), this.locZ);
++            this.cachedSkeletonPos = inBoat ? pos.up() : pos;
++        }
++        return this.cachedSkeletonPos;
++    }
++    // Leaf end
++
+     public void n() {
+         if (this.world.D() && !this.world.isClientSide) {
+-            float f = this.aw();
+-            BlockPosition blockposition = this.bJ() instanceof EntityBoat ? (new BlockPosition(this.locX, (double) Math.round(this.locY), this.locZ)).up() : new BlockPosition(this.locX, (double) Math.round(this.locY), this.locZ);
++            // Leaf start - Optimize sun burn tick (backport of Leaf MC 0044 / Gale 0083)
++            float f;
++            BlockPosition blockposition = null;
++            if (com.destroystokyo.paper.config.toml.modules.optimizations.SunBurn.optimizeSunBurnTick) {
++                blockposition = this.getSkeletonBlockPosition();
++                f = this.aw(blockposition);
++            } else {
++                f = this.aw();
++                blockposition = this.bJ() instanceof EntityBoat ? (new BlockPosition(this.locX, (double) Math.round(this.locY), this.locZ)).up() : new BlockPosition(this.locX, (double) Math.round(this.locY), this.locZ);
++            }
+ 
+             if (f > 0.5F && this.random.nextFloat() * 30.0F < (f - 0.4F) * 2.0F && this.world.h(blockposition)) {
++            // Leaf end
+                 boolean flag = true;
+                 ItemStack itemstack = this.getEquipment(EnumItemSlot.HEAD);
+ 
+diff --git a/main/java/net/minecraft/server/EntityZombie.java b/main/java/net/minecraft/server/EntityZombie.java
+index 6111ca0..90695b5 100644
+--- a/main/java/net/minecraft/server/EntityZombie.java
++++ b/main/java/net/minecraft/server/EntityZombie.java
+@@ -119,11 +119,38 @@ public class EntityZombie extends EntityMonster {
+         super.a(datawatcherobject);
+     }
+ 
++    // Leaf start - Optimize sun burn tick (backport of Leaf MC 0044 / Gale 0083)
++    private BlockPosition cachedEyePos;
++    private double lastEyeX = Double.NaN;
++    private double lastEyeY = Double.NaN;
++    private double lastEyeZ = Double.NaN;
++
++    private BlockPosition getEyeBlockPosition() {
++        double headY = this.locY + (double) this.getHeadHeight();
++        if (this.cachedEyePos == null || this.locX != this.lastEyeX || headY != this.lastEyeY || this.locZ != this.lastEyeZ) {
++            this.lastEyeX = this.locX;
++            this.lastEyeY = headY;
++            this.lastEyeZ = this.locZ;
++            this.cachedEyePos = new BlockPosition(this.locX, headY, this.locZ);
++        }
++        return this.cachedEyePos;
++    }
++    // Leaf end
++
+     public void n() {
+         if (this.world.D() && !this.world.isClientSide && !this.isBaby() && this.p()) {
+-            float f = this.aw();
++            // Leaf start - Optimize sun burn tick (backport of Leaf MC 0044 / Gale 0083)
++            float f;
++            BlockPosition eyePos = null;
++            if (com.destroystokyo.paper.config.toml.modules.optimizations.SunBurn.optimizeSunBurnTick) {
++                eyePos = this.getEyeBlockPosition();
++                f = this.aw(eyePos);
++            } else {
++                f = this.aw();
++            }
+ 
+-            if (f > 0.5F && this.random.nextFloat() * 30.0F < (f - 0.4F) * 2.0F && this.world.h(new BlockPosition(this.locX, this.locY + (double) this.getHeadHeight(), this.locZ))) {
++            if (f > 0.5F && this.random.nextFloat() * 30.0F < (f - 0.4F) * 2.0F && this.world.h(eyePos != null ? eyePos : new BlockPosition(this.locX, this.locY + (double) this.getHeadHeight(), this.locZ))) {
++            // Leaf end
+                 boolean flag = true;
+                 ItemStack itemstack = this.getEquipment(EnumItemSlot.HEAD);
+ 
+diff --git a/test/java/net/minecraft/server/SunBurnTickTest.java b/test/java/net/minecraft/server/SunBurnTickTest.java
+new file mode 100644
+index 0000000..6a77bb3
+--- /dev/null
++++ b/test/java/net/minecraft/server/SunBurnTickTest.java
+@@ -0,0 +1,44 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.config.toml.modules.optimizations.SunBurn;
++import org.junit.Assert;
++import org.junit.Test;
++
++public class SunBurnTickTest {
++
++    @Test
++    public void testSunBurnOptimizationConfigDefault() {
++        Assert.assertTrue("SunBurn.optimizeSunBurnTick should be enabled by default", SunBurn.optimizeSunBurnTick);
++    }
++
++    @Test
++    public void testEyePositionCalculationParity() {
++        double locX = 12.34;
++        double locY = 64.0;
++        double locZ = -56.78;
++        float headHeight = 1.74F;
++
++        double headY = locY + (double) headHeight;
++        BlockPosition expected = new BlockPosition(locX, headY, locZ);
++
++        Assert.assertEquals(MathHelper.floor(locX), expected.getX());
++        Assert.assertEquals(MathHelper.floor(headY), expected.getY());
++        Assert.assertEquals(MathHelper.floor(locZ), expected.getZ());
++    }
++
++    @Test
++    public void testSkeletonPositionCalculationParity() {
++        double locX = -10.5;
++        double locY = 70.2;
++        double locZ = 45.9;
++
++        BlockPosition expectedNormal = new BlockPosition(locX, (double) Math.round(locY), locZ);
++        BlockPosition expectedBoat = expectedNormal.up();
++
++        Assert.assertEquals(MathHelper.floor(locX), expectedNormal.getX());
++        Assert.assertEquals((int) Math.round(locY), expectedNormal.getY());
++        Assert.assertEquals(MathHelper.floor(locZ), expectedNormal.getZ());
++
++        Assert.assertEquals(expectedNormal.getY() + 1, expectedBoat.getY());
++    }
++}

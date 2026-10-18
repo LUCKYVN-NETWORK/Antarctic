@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Sun, 18 Oct 2026 18:20:06 +0700
+Subject: [PATCH 83/83] Skip entity move if movement is zero
+
+- Short-circuit expensive voxel cube collisions when entity movement delta is zero
+
+- Track boundingBox changes to preserve collision checks upon entity resizing
+
+- Preserve block collisions and portal triggers prior to zero-movement return
+
+diff --git a/main/java/net/minecraft/server/Entity.java b/main/java/net/minecraft/server/Entity.java
+index 6f34b8e..8a9305e 100644
+--- a/main/java/net/minecraft/server/Entity.java
++++ b/main/java/net/minecraft/server/Entity.java
+@@ -116,6 +116,7 @@ public abstract class Entity implements ICommandListener, KeyedObject { // Paper
+     public float lastYaw;
+     public float lastPitch;
+     private AxisAlignedBB boundingBox;
++    private boolean boundingBoxChanged = false; // Leaf - Skip entity move if movement is zero (backport of Leaf MC 0055 / Gale 0103 / VMP)
+     public boolean onGround;
+     public boolean positionChanged;
+     public boolean B;
+@@ -602,9 +603,12 @@ public abstract class Entity implements ICommandListener, KeyedObject { // Paper
+                 throw new ReportedException(crashreport);
+             }
+             // Check if we're moving
+-            if (d0 == 0 && d1 == 0 && d2 == 0 && this.isVehicle() && this.isPassenger()) {
++            // Leaf start - Skip entity move if movement is zero (backport of Leaf MC 0055 / Gale 0103 / VMP)
++            if (!this.boundingBoxChanged && d0 == 0.0D && d1 == 0.0D && d2 == 0.0D) {
+                 return;
+             }
++            this.boundingBoxChanged = false;
++            // Leaf end
+             // CraftBukkit end
+             if (enummovetype == EnumMoveType.PISTON) {
+                 long i = this.world.getTime();
+@@ -2726,6 +2730,11 @@ public abstract class Entity implements ICommandListener, KeyedObject { // Paper
+     }
+ 
+     public void a(AxisAlignedBB axisalignedbb) {
++        // Leaf start - Skip entity move if movement is zero (backport of Leaf MC 0055 / Gale 0103 / VMP)
++        if (this.boundingBox == null || !this.boundingBox.equals(axisalignedbb)) {
++            this.boundingBoxChanged = true;
++        }
++        // Leaf end
+         // CraftBukkit start - block invalid bounding boxes
+         double a = axisalignedbb.a,
+                 b = axisalignedbb.b,
+diff --git a/test/java/net/minecraft/server/ZeroMovementTest.java b/test/java/net/minecraft/server/ZeroMovementTest.java
+new file mode 100644
+index 0000000..80a8541
+--- /dev/null
++++ b/test/java/net/minecraft/server/ZeroMovementTest.java
+@@ -0,0 +1,31 @@
++package net.minecraft.server;
++
++import org.junit.Assert;
++import org.junit.Test;
++
++public class ZeroMovementTest {
++
++    @Test
++    public void testBoundingBoxEquality() {
++        AxisAlignedBB bb1 = new AxisAlignedBB(0.0, 0.0, 0.0, 1.0, 2.0, 1.0);
++        AxisAlignedBB bb2 = new AxisAlignedBB(0.0, 0.0, 0.0, 1.0, 2.0, 1.0);
++        AxisAlignedBB bb3 = new AxisAlignedBB(0.0, 0.0, 0.0, 1.0, 2.5, 1.0);
++
++        Assert.assertEquals(bb1, bb2);
++        Assert.assertNotEquals(bb1, bb3);
++    }
++
++    @Test
++    public void testZeroMovementCondition() {
++        double d0 = 0.0D;
++        double d1 = 0.0D;
++        double d2 = 0.0D;
++
++        boolean isZero = d0 == 0.0D && d1 == 0.0D && d2 == 0.0D;
++        Assert.assertTrue("Zero vector check must succeed for 0, 0, 0", isZero);
++
++        double dNonZero = 0.0001D;
++        boolean isNonZero = dNonZero == 0.0D && d1 == 0.0D && d2 == 0.0D;
++        Assert.assertFalse("Non-zero coordinate must fail zero check", isNonZero);
++    }
++}

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: AlexProgrammerDE <40795980+AlexProgrammerDE@users.noreply.github.com>
 Date: Sat, 7 May 2022 20:09:43 +0200
-Subject: [PATCH 56/78] Improve merge checks
+Subject: [PATCH 56/83] Improve merge checks
 
 - Backport Dionysus server/0044-Improve-merge-checks.patch
 - Source: https://github.com/nopjmp/Dionysus at b5c71b62f6f1f555b22bd52f5751e33be4690b6e

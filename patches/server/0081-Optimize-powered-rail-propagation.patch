@@ -1,0 +1,148 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Sun, 18 Oct 2026 18:18:11 +0700
+Subject: [PATCH 81/83] Optimize powered rail propagation
+
+- Implement iterative straight-lane search using pooled block positions
+
+- Reduce recursive call stack and heap allocations during rail network updates
+
+- Add config toggle optimize-powered-rails in optimizations.rails (default false for vanilla parity)
+
+diff --git a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+index 614315d..b897ed8 100644
+--- a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
++++ b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+@@ -14,6 +14,7 @@ import com.destroystokyo.paper.config.toml.modules.optimizations.ArmourStands;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Pathfinder;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Projectiles;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Suffocation;
++import com.destroystokyo.paper.config.toml.modules.optimizations.Rails;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.SunBurn;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.WorldBorder;
+ import com.electronwill.nightconfig.core.file.CommentedFileConfig;
+@@ -45,7 +46,7 @@ public final class AntarcticTomlConfig {
+     private static final List<IConfigModule> MODULES = List.of(
+             new Rebrand(), new Privacy(),
+             new Deflate(),
+-            new Pathfinder(), new Suffocation(), new Projectiles(), new ArmourStands(), new WorldBorder(), new SunBurn(),
++            new Pathfinder(), new Suffocation(), new Projectiles(), new ArmourStands(), new WorldBorder(), new SunBurn(), new Rails(),
+             new MergeChecks(), new ChunkOverloadDupe(),
+             new MapDecorations(), new Books());
+     private static final YamlConfiguration yamlFacade = new YamlConfiguration();
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/Rails.java b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/Rails.java
+new file mode 100644
+index 0000000..5965950
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/Rails.java
+@@ -0,0 +1,21 @@
++package com.destroystokyo.paper.config.toml.modules.optimizations;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++
++public class Rails implements IConfigModule {
++
++    @ConfigInfo(baseName = "optimize-powered-rails", comments = "Optimizes powered rail signal search propagation. Default false preserves vanilla traversal.")
++    public static boolean optimizePoweredRails = false;
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.OPTIMIZATIONS;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "rails";
++    }
++}
+diff --git a/main/java/net/minecraft/server/BlockPoweredRail.java b/main/java/net/minecraft/server/BlockPoweredRail.java
+index 2c3cc1f..ec616b8 100644
+--- a/main/java/net/minecraft/server/BlockPoweredRail.java
++++ b/main/java/net/minecraft/server/BlockPoweredRail.java
+@@ -114,9 +114,64 @@ public class BlockPoweredRail extends BlockMinecartTrackAbstract {
+         }
+     }
+ 
++    // Leaf start - Rail Optimization (backport of Leaf MC 0233 / Leaf 0025)
++    private boolean findPoweredRailSignalOptimized(World world, BlockPosition pos, IBlockData data, boolean forward) {
++        BlockMinecartTrackAbstract.EnumTrackPosition shape = (BlockMinecartTrackAbstract.EnumTrackPosition) data.get(BlockPoweredRail.SHAPE);
++        if (shape != BlockMinecartTrackAbstract.EnumTrackPosition.NORTH_SOUTH && shape != BlockMinecartTrackAbstract.EnumTrackPosition.EAST_WEST) {
++            return this.a(world, pos, data, forward, 0);
++        }
++        int dx = (shape == BlockMinecartTrackAbstract.EnumTrackPosition.EAST_WEST) ? (forward ? -1 : 1) : 0;
++        int dz = (shape == BlockMinecartTrackAbstract.EnumTrackPosition.NORTH_SOUTH) ? (forward ? 1 : -1) : 0;
++        BlockPosition.PooledBlockPosition pooledPos = BlockPosition.PooledBlockPosition.s();
++        try {
++            int cx = pos.getX();
++            int cy = pos.getY();
++            int cz = pos.getZ();
++            for (int dist = 0; dist < 8; ++dist) {
++                cx += dx;
++                cz += dz;
++                pooledPos.f(cx, cy, cz);
++                IBlockData neighbor = world.getType(pooledPos);
++                if (neighbor.getBlock() != this) {
++                    pooledPos.f(cx, cy - 1, cz);
++                    neighbor = world.getType(pooledPos);
++                    if (neighbor.getBlock() != this) {
++                        return false;
++                    }
++                    cy -= 1;
++                }
++                BlockMinecartTrackAbstract.EnumTrackPosition nShape = (BlockMinecartTrackAbstract.EnumTrackPosition) neighbor.get(BlockPoweredRail.SHAPE);
++                if (shape == BlockMinecartTrackAbstract.EnumTrackPosition.EAST_WEST && (nShape == BlockMinecartTrackAbstract.EnumTrackPosition.NORTH_SOUTH || nShape == BlockMinecartTrackAbstract.EnumTrackPosition.ASCENDING_NORTH || nShape == BlockMinecartTrackAbstract.EnumTrackPosition.ASCENDING_SOUTH)) {
++                    return false;
++                }
++                if (shape == BlockMinecartTrackAbstract.EnumTrackPosition.NORTH_SOUTH && (nShape == BlockMinecartTrackAbstract.EnumTrackPosition.EAST_WEST || nShape == BlockMinecartTrackAbstract.EnumTrackPosition.ASCENDING_EAST || nShape == BlockMinecartTrackAbstract.EnumTrackPosition.ASCENDING_WEST)) {
++                    return false;
++                }
++                if (!((Boolean) neighbor.get(BlockPoweredRail.POWERED)).booleanValue()) {
++                    return false;
++                }
++                if (world.isBlockIndirectlyPowered(pooledPos)) {
++                    return true;
++                }
++                if (nShape.c()) {
++                    return this.a(world, pooledPos.h(), neighbor, forward, dist + 1);
++                }
++            }
++            return false;
++        } finally {
++            pooledPos.t();
++        }
++    }
++    // Leaf end
++
+     protected void a(IBlockData iblockdata, World world, BlockPosition blockposition, Block block) {
+         boolean flag = ((Boolean) iblockdata.get(BlockPoweredRail.POWERED)).booleanValue();
+-        boolean flag1 = world.isBlockIndirectlyPowered(blockposition) || this.a(world, blockposition, iblockdata, true, 0) || this.a(world, blockposition, iblockdata, false, 0);
++        boolean flag1;
++        if (com.destroystokyo.paper.config.toml.modules.optimizations.Rails.optimizePoweredRails) {
++            flag1 = world.isBlockIndirectlyPowered(blockposition) || this.findPoweredRailSignalOptimized(world, blockposition, iblockdata, true) || this.findPoweredRailSignalOptimized(world, blockposition, iblockdata, false);
++        } else {
++            flag1 = world.isBlockIndirectlyPowered(blockposition) || this.a(world, blockposition, iblockdata, true, 0) || this.a(world, blockposition, iblockdata, false, 0);
++        }
+ 
+         if (flag1 != flag) {
+             // CraftBukkit start
+diff --git a/test/java/net/minecraft/server/PoweredRailTest.java b/test/java/net/minecraft/server/PoweredRailTest.java
+new file mode 100644
+index 0000000..65034d7
+--- /dev/null
++++ b/test/java/net/minecraft/server/PoweredRailTest.java
+@@ -0,0 +1,13 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.config.toml.modules.optimizations.Rails;
++import org.junit.Assert;
++import org.junit.Test;
++
++public class PoweredRailTest {
++
++    @Test
++    public void testPoweredRailOptimizationDefaultFalse() {
++        Assert.assertFalse("Rails.optimizePoweredRails must default to false for strict vanilla parity", Rails.optimizePoweredRails);
++    }
++}
