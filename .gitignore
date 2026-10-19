@@ -1,6 +1,13 @@
 # Generated sources, reference sources and vanilla binaries: NEVER publish.
 /Antarctic-API/src/
-/Antarctic-Server/src/
+/Antarctic-Server/src/*
+!/Antarctic-Server/src/main/
+/Antarctic-Server/src/main/*
+!/Antarctic-Server/src/main/java/
+/Antarctic-Server/src/main/java/*
+!/Antarctic-Server/src/main/java/me/
+!/Antarctic-Server/src/main/java/me/**
+**/.git-sources/
 /Antarctic-Server/mc-dev/
 /Antarctic-Server/libs/
 /.upstream/

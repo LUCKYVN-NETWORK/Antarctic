@@ -31,16 +31,17 @@ setup)
     for module in API Server; do
         src="$root/Antarctic-$module/src"
         base="$(git -C "$upstream/Paper-$module" rev-parse HEAD)"
-        if [[ -d "$src/.git" ]]; then
+        gitdir="$root/Antarctic-$module/.git-sources"
+        if [[ -d "$src/.git" || -d "$gitdir" ]]; then
             continue
         fi
         [[ ! -e "$src" ]] || fail "Refusing to overwrite existing sources: $src"
         cp -R "$upstream/Paper-$module/src" "$src"
-        git -C "$src" init
-        git -C "$src" add .
-        git -C "$src" -c user.name='Antarctic upstream' -c user.email=upstream@antarctic.invalid -c commit.gpgsign=false commit -qm 'Pinned Paper source baseline'
-        git -C "$src" tag antarctic-upstream
-        printf '%s\n' "$base" > "$src/.git/antarctic-base"
+        git --git-dir="$gitdir" --work-tree="$src" init
+        git --git-dir="$gitdir" --work-tree="$src" add .
+        git --git-dir="$gitdir" --work-tree="$src" -c user.name='Antarctic upstream' -c user.email=upstream@antarctic.invalid -c commit.gpgsign=false commit -qm 'Pinned Paper source baseline'
+        git --git-dir="$gitdir" --work-tree="$src" tag antarctic-upstream
+        printf '%s\n' "$base" > "$gitdir/antarctic-base"
     done
     mc="$upstream/work/Minecraft/1.12.2"
     reference="$root/Antarctic-Server/mc-dev/src/net/minecraft/server"
