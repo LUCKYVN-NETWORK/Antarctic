@@ -1,0 +1,1045 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 17 Nov 2026 15:18:54 +0700
+Subject: [PATCH 89/89] Index scheduled block ticks by chunk and current-tick
+ membership
+
+WorldServer.a(Chunk, boolean) walked every pending scheduled tick (and the current batch) for each chunk save, and a(BlockPosition, Block) did a linear List.contains over the current tick batch (up to 65,536 entries) on every repeater/comparator neighbor update.
+
+- ChunkIndexedTreeSet replaces HashTreeSet for nextTickList: same equals-based contains, same compareTo order, plus a per-chunk-column index so the save query touches only the 4 columns its [x0-2, x0+16) x [z0-2, z0+16) box can reach. Results, order and half-open bounds are unchanged. add() refuses an equal entry, replacing the contains()+add() pair.
+- MultiplicitySet mirrors the current batch W for O(1) isBlockTickPending checks.
+- No config toggle: behavior is identical (verified against a verbatim copy of the old logic over randomized operations).
+
+Measured (best of 4, JDK 21, ScheduledTickIndexPerfTest):
+- chunk-save query, 100k ticks / 2025 chunks, 64 saves: 466 ms -> 2.8 ms (~170x; 755-917x on quieter runs)
+- isBlockTickPending, 20k batch / 2000 probes: 172 ms -> 0.25 ms (~700x)
+- schedule+drain of 200k ticks: 365 ms -> 496 ms (0.74x). The index costs ~0.6 us per scheduled tick; accepted in exchange for the above.
+
+Credit: per-chunk scheduled tick indexing follows the approach of modern Paper (Spottedleaf / PaperMC); implementation is original for 1.12.2.
+
+diff --git a/main/java/me/stella/antarctic/collection/ChunkIndexedTreeSet.java b/main/java/me/stella/antarctic/collection/ChunkIndexedTreeSet.java
+new file mode 100644
+index 0000000..a54def1
+--- /dev/null
++++ b/main/java/me/stella/antarctic/collection/ChunkIndexedTreeSet.java
+@@ -0,0 +1,179 @@
++package me.stella.antarctic.collection;
++
++import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
++import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
++import it.unimi.dsi.fastutil.objects.ObjectArrayList;
++import it.unimi.dsi.fastutil.objects.ObjectOpenHashSet;
++
++import java.util.ArrayList;
++import java.util.List;
++import java.util.TreeSet;
++
++/**
++ * An ordered, hash-deduplicated set that additionally indexes its elements by the 16x16 chunk column that
++ * contains them, so "everything inside this block-coordinate box" no longer scans the whole set.
++ *
++ * <p>Designed for the world's scheduled block tick list: it replaces a {@code HashTreeSet} (hash set for
++ * {@code contains}, tree set for ordering) whose chunk-save query walked every pending tick in the world.
++ * Not thread safe; callers are main-thread confined.
++ *
++ * <p>Semantics that matter for vanilla parity:
++ * <ul>
++ *   <li>{@link #contains(Object)} uses {@code equals}/{@code hashCode} (as the old hash set did).</li>
++ *   <li>{@link #first()} and the order of {@link #collect} results follow {@code compareTo} (as the old tree set did).</li>
++ *   <li>{@link #add(Comparable)} refuses an element that is {@code equals} to one already present, which is
++ *       exactly what every caller used to enforce with a {@code contains} check before {@code add}.</li>
++ * </ul>
++ *
++ * <p>Antarctic - original work; the per-chunk indexing idea is the same one modern Paper uses for its scheduled
++ * tick lists (Spottedleaf / PaperMC).
++ */
++public final class ChunkIndexedTreeSet<E extends Comparable<? super E>> {
++
++    /** Extracts the block coordinates that decide which chunk column an element belongs to. */
++    public interface Locator<E> {
++        int blockX(E element);
++
++        int blockZ(E element);
++    }
++
++    private final Locator<E> locator;
++    private final ObjectOpenHashSet<E> hash = new ObjectOpenHashSet<E>();
++    private final TreeSet<E> tree = new TreeSet<E>();
++    private final Long2ObjectOpenHashMap<ObjectOpenHashSet<E>> buckets = new Long2ObjectOpenHashMap<ObjectOpenHashSet<E>>();
++    private final ObjectArrayList<E> scratch = new ObjectArrayList<E>();
++
++    public ChunkIndexedTreeSet(Locator<E> locator) {
++        this.locator = locator;
++    }
++
++    public static long chunkKey(int chunkX, int chunkZ) {
++        return (long) chunkX & 0xFFFFFFFFL | ((long) chunkZ & 0xFFFFFFFFL) << 32;
++    }
++
++    public int size() {
++        return this.hash.size();
++    }
++
++    public boolean isEmpty() {
++        return this.hash.isEmpty();
++    }
++
++    public boolean contains(Object element) {
++        return this.hash.contains(element);
++    }
++
++    /** @return false (and no change) when an {@code equals} element is already present */
++    public boolean add(E element) {
++        if (!this.hash.add(element)) {
++            return false;
++        }
++        this.tree.add(element);
++        long key = chunkKey(this.locator.blockX(element) >> 4, this.locator.blockZ(element) >> 4);
++        ObjectOpenHashSet<E> bucket = this.buckets.get(key);
++        if (bucket == null) {
++            bucket = new ObjectOpenHashSet<E>(4);
++            this.buckets.put(key, bucket);
++        }
++        bucket.add(element);
++        return true;
++    }
++
++    /** @return true if an element was removed */
++    public boolean remove(E element) {
++        if (!this.hash.remove(element)) {
++            return false;
++        }
++        this.tree.remove(element);
++        long key = chunkKey(this.locator.blockX(element) >> 4, this.locator.blockZ(element) >> 4);
++        ObjectOpenHashSet<E> bucket = this.buckets.get(key);
++        if (bucket != null) {
++            bucket.remove(element);
++            if (bucket.isEmpty()) {
++                this.buckets.remove(key);
++            }
++        }
++        return true;
++    }
++
++    /** @throws java.util.NoSuchElementException when empty, like the old tree set */
++    public E first() {
++        return this.tree.first();
++    }
++
++    public void clear() {
++        this.hash.clear();
++        this.tree.clear();
++        this.buckets.clear();
++    }
++
++    /**
++     * Collects every element whose block X is in {@code [minX, maxX)} and block Z is in {@code [minZ, maxZ)}, in
++     * {@code compareTo} order, optionally removing them.
++     *
++     * @return the matches in order, or {@code null} when nothing matched (the contract of the old query)
++     */
++    public List<E> collect(int minX, int minZ, int maxX, int maxZ, boolean remove) {
++        if (maxX <= minX || maxZ <= minZ || this.buckets.isEmpty()) {
++            return null;
++        }
++        ObjectArrayList<E> found = this.scratch;
++        found.clear();
++        int chunkMinX = minX >> 4;
++        int chunkMaxX = (maxX - 1) >> 4;
++        int chunkMinZ = minZ >> 4;
++        int chunkMaxZ = (maxZ - 1) >> 4;
++        long span = ((long) chunkMaxX - chunkMinX + 1L) * ((long) chunkMaxZ - chunkMinZ + 1L);
++
++        if (span <= this.buckets.size()) {
++            for (int cx = chunkMinX; cx <= chunkMaxX; ++cx) {
++                for (int cz = chunkMinZ; cz <= chunkMaxZ; ++cz) {
++                    ObjectOpenHashSet<E> bucket = this.buckets.get(chunkKey(cx, cz));
++                    if (bucket != null) {
++                        this.gather(bucket, minX, minZ, maxX, maxZ);
++                    }
++                }
++            }
++        } else {
++            // The box covers more chunk columns than exist; walk the populated buckets instead.
++            for (Long2ObjectMap.Entry<ObjectOpenHashSet<E>> entry : this.buckets.long2ObjectEntrySet()) {
++                long key = entry.getLongKey();
++                int cx = (int) key;
++                int cz = (int) (key >>> 32);
++                if (cx >= chunkMinX && cx <= chunkMaxX && cz >= chunkMinZ && cz <= chunkMaxZ) {
++                    this.gather(entry.getValue(), minX, minZ, maxX, maxZ);
++                }
++            }
++        }
++
++        int count = found.size();
++        if (count == 0) {
++            return null;
++        }
++        if (count > 1) {
++            found.sort(null); // natural order == the old tree set's iteration order
++        }
++        ArrayList<E> result = new ArrayList<E>(count);
++        for (int i = 0; i < count; ++i) {
++            E element = found.get(i);
++            result.add(element);
++            if (remove) {
++                this.remove(element);
++            }
++        }
++        found.clear();
++        return result;
++    }
++
++    private void gather(ObjectOpenHashSet<E> bucket, int minX, int minZ, int maxX, int maxZ) {
++        for (E element : bucket) {
++            int x = this.locator.blockX(element);
++            if (x >= minX && x < maxX) {
++                int z = this.locator.blockZ(element);
++                if (z >= minZ && z < maxZ) {
++                    this.scratch.add(element);
++                }
++            }
++        }
++    }
++}
+diff --git a/main/java/me/stella/antarctic/collection/MultiplicitySet.java b/main/java/me/stella/antarctic/collection/MultiplicitySet.java
+new file mode 100644
+index 0000000..57d7034
+--- /dev/null
++++ b/main/java/me/stella/antarctic/collection/MultiplicitySet.java
+@@ -0,0 +1,44 @@
++package me.stella.antarctic.collection;
++
++import it.unimi.dsi.fastutil.objects.Object2IntOpenHashMap;
++
++/**
++ * A membership index that mirrors a {@code List} which may hold several {@code equals} elements: {@link #contains}
++ * answers what {@code List.contains} answers, in O(1). Every {@link #add} must be paired with one {@link #removeOne}
++ * when the element leaves the list.
++ *
++ * <p>Used by the world to mirror the current scheduled-tick batch so repeaters and comparators stop doing a linear
++ * scan of up to 65,536 entries on every neighbor update. Not thread safe.
++ */
++public final class MultiplicitySet<E> {
++
++    private final Object2IntOpenHashMap<E> counts = new Object2IntOpenHashMap<E>();
++
++    public void add(E element) {
++        this.counts.addTo(element, 1);
++    }
++
++    /** Drops one occurrence; the element stays a member while other equal occurrences remain. */
++    public void removeOne(E element) {
++        int previous = this.counts.addTo(element, -1);
++        if (previous <= 1) {
++            this.counts.removeInt(element);
++        }
++    }
++
++    public boolean contains(Object element) {
++        return this.counts.containsKey(element);
++    }
++
++    public int distinctSize() {
++        return this.counts.size();
++    }
++
++    public boolean isEmpty() {
++        return this.counts.isEmpty();
++    }
++
++    public void clear() {
++        this.counts.clear();
++    }
++}
+diff --git a/main/java/net/minecraft/server/WorldServer.java b/main/java/net/minecraft/server/WorldServer.java
+index 9ccd047..7ce608b 100644
+--- a/main/java/net/minecraft/server/WorldServer.java
++++ b/main/java/net/minecraft/server/WorldServer.java
+@@ -26,7 +26,6 @@ import java.util.logging.Level;
+ 
+ import org.bukkit.WeatherType;
+ import org.bukkit.block.BlockState;
+-import org.bukkit.craftbukkit.util.HashTreeSet;
+ 
+ import org.bukkit.event.block.BlockFormEvent;
+ import org.bukkit.event.entity.CreatureSpawnEvent.SpawnReason;
+@@ -41,7 +40,18 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+     public EntityTracker tracker;
+     private final PlayerChunkMap manager;
+     // private final Set<NextTickListEntry> nextTickListHash = Sets.newHashSet();
+-    private final HashTreeSet<NextTickListEntry> nextTickList = new HashTreeSet<NextTickListEntry>(); // CraftBukkit - HashTreeSet
++    // Antarctic start - scheduled ticks are indexed by chunk column (see ChunkIndexedTreeSet); replaces CraftBukkit's HashTreeSet
++    private static final me.stella.antarctic.collection.ChunkIndexedTreeSet.Locator<NextTickListEntry> NEXT_TICK_LOCATOR = new me.stella.antarctic.collection.ChunkIndexedTreeSet.Locator<NextTickListEntry>() {
++        public int blockX(NextTickListEntry entry) {
++            return entry.a.getX();
++        }
++
++        public int blockZ(NextTickListEntry entry) {
++            return entry.a.getZ();
++        }
++    };
++    private final me.stella.antarctic.collection.ChunkIndexedTreeSet<NextTickListEntry> nextTickList = new me.stella.antarctic.collection.ChunkIndexedTreeSet<NextTickListEntry>(NEXT_TICK_LOCATOR);
++    // Antarctic end
+     public final Map<UUID, Entity> entitiesByUUID = Maps.newHashMap(); // Paper
+     public boolean savingDisabled;
+     private boolean Q;
+@@ -52,6 +62,7 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+     private final WorldServer.BlockActionDataList[] U = new WorldServer.BlockActionDataList[] { new WorldServer.BlockActionDataList(null), new WorldServer.BlockActionDataList(null)};
+     private int V;
+     private final List<NextTickListEntry> W = Lists.newArrayList();
++    private final me.stella.antarctic.collection.MultiplicitySet<NextTickListEntry> currentTickBatch = new me.stella.antarctic.collection.MultiplicitySet<NextTickListEntry>(); // Antarctic - O(1) mirror of W for isBlockTickPending checks
+ 
+     // CraftBukkit start
+     private static Throwable getAddToWorldStackTrace(Entity entity) {
+@@ -593,7 +604,7 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+     public boolean a(BlockPosition blockposition, Block block) {
+         NextTickListEntry nextticklistentry = new NextTickListEntry(blockposition, block);
+ 
+-        return this.W.contains(nextticklistentry);
++        return this.currentTickBatch.contains(nextticklistentry); // Antarctic - was W.contains (linear scan)
+     }
+ 
+     public boolean b(BlockPosition blockposition, Block block) {
+@@ -634,9 +645,7 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+             }
+ 
+             // CraftBukkit - use nextTickList
+-            if (!this.nextTickList.contains(nextticklistentry)) {
+-                this.nextTickList.add(nextticklistentry);
+-            }
++            this.nextTickList.add(nextticklistentry); // Antarctic - add() already refuses an equal entry; was contains() + add()
+         }
+ 
+     }
+@@ -652,9 +661,7 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+         }
+ 
+         // CraftBukkit - use nextTickList
+-        if (!this.nextTickList.contains(nextticklistentry)) {
+-            this.nextTickList.add(nextticklistentry);
+-        }
++        this.nextTickList.add(nextticklistentry); // Antarctic - add() already refuses an equal entry; was contains() + add()
+ 
+     }
+ 
+@@ -758,6 +765,7 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+                     this.nextTickList.remove(nextticklistentry);
+                     // this.nextTickListHash.remove(nextticklistentry);
+                     this.W.add(nextticklistentry);
++                    this.currentTickBatch.add(nextticklistentry); // Antarctic
+                 }
+                 timings.scheduledBlocksCleanup.stopTiming(); // Paper
+ 
+@@ -769,6 +777,7 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+                 while (iterator.hasNext()) {
+                     nextticklistentry = (NextTickListEntry) iterator.next();
+                     iterator.remove();
++                    this.currentTickBatch.removeOne(nextticklistentry); // Antarctic
+                     boolean flag1 = false;
+ 
+                     if (this.areChunksLoadedBetween(nextticklistentry.a.a(0, 0, 0), nextticklistentry.a.a(0, 0, 0))) {
+@@ -797,6 +806,7 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+ 
+                 this.methodProfiler.b();
+                 this.W.clear();
++                this.currentTickBatch.clear(); // Antarctic
+                 return !this.nextTickList.isEmpty();
+             }
+         }
+@@ -815,16 +825,12 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+ 
+     @Nullable
+     public List<NextTickListEntry> a(StructureBoundingBox structureboundingbox, boolean flag) {
+-        ArrayList arraylist = null;
++        // Antarctic start - answer from the per-chunk index instead of walking every pending tick; same matches, same order
++        // (scheduled ticks in compareTo order, then the batch currently being ticked in list order), same half-open bounds.
++        List<NextTickListEntry> arraylist = this.nextTickList.collect(structureboundingbox.a, structureboundingbox.c, structureboundingbox.d, structureboundingbox.f, flag);
+ 
+-        for (int i = 0; i < 2; ++i) {
+-            Iterator iterator;
+-
+-            if (i == 0) {
+-                iterator = this.nextTickList.iterator();
+-            } else {
+-                iterator = this.W.iterator();
+-            }
++        if (!this.W.isEmpty()) { // only non-empty while scheduled ticks are being processed
++            Iterator iterator = this.W.iterator();
+ 
+             while (iterator.hasNext()) {
+                 NextTickListEntry nextticklistentry = (NextTickListEntry) iterator.next();
+@@ -832,11 +838,8 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+ 
+                 if (blockposition.getX() >= structureboundingbox.a && blockposition.getX() < structureboundingbox.d && blockposition.getZ() >= structureboundingbox.c && blockposition.getZ() < structureboundingbox.f) {
+                     if (flag) {
+-                        if (i == 0) {
+-                            // this.nextTickListHash.remove(nextticklistentry); // CraftBukkit - removed
+-                        }
+-
+                         iterator.remove();
++                        this.currentTickBatch.removeOne(nextticklistentry);
+                     }
+ 
+                     if (arraylist == null) {
+@@ -849,6 +852,7 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+         }
+ 
+         return arraylist;
++        // Antarctic end
+     }
+ 
+     /* CraftBukkit start - We prevent spawning in general, so this butchering is not needed
+diff --git a/test/java/me/stella/antarctic/collection/ChunkIndexedTreeSetTest.java b/test/java/me/stella/antarctic/collection/ChunkIndexedTreeSetTest.java
+new file mode 100644
+index 0000000..f5912d4
+--- /dev/null
++++ b/test/java/me/stella/antarctic/collection/ChunkIndexedTreeSetTest.java
+@@ -0,0 +1,196 @@
++package me.stella.antarctic.collection;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertNull;
++import static org.junit.Assert.assertSame;
++import static org.junit.Assert.assertTrue;
++
++import java.util.List;
++import java.util.NoSuchElementException;
++import org.junit.Test;
++
++public class ChunkIndexedTreeSetTest {
++
++    private static final class Entry implements Comparable<Entry> {
++        private static long counter;
++        final int x;
++        final int y;
++        final int z;
++        final String tag;
++        final long time;
++        final long seq = counter++;
++
++        Entry(int x, int y, int z, String tag, long time) {
++            this.x = x;
++            this.y = y;
++            this.z = z;
++            this.tag = tag;
++            this.time = time;
++        }
++
++        @Override
++        public boolean equals(Object o) {
++            if (!(o instanceof Entry)) {
++                return false;
++            }
++            Entry other = (Entry) o;
++            return x == other.x && y == other.y && z == other.z && tag.equals(other.tag);
++        }
++
++        @Override
++        public int hashCode() {
++            return (y + z * 31) * 31 + x;
++        }
++
++        @Override
++        public int compareTo(Entry other) {
++            return time < other.time ? -1 : time > other.time ? 1 : Long.compare(seq, other.seq);
++        }
++    }
++
++    private static final ChunkIndexedTreeSet.Locator<Entry> LOCATOR = new ChunkIndexedTreeSet.Locator<Entry>() {
++        @Override
++        public int blockX(Entry e) {
++            return e.x;
++        }
++
++        @Override
++        public int blockZ(Entry e) {
++            return e.z;
++        }
++    };
++
++    private static ChunkIndexedTreeSet<Entry> newSet() {
++        return new ChunkIndexedTreeSet<Entry>(LOCATOR);
++    }
++
++    @Test
++    public void emptySetBehaves() {
++        ChunkIndexedTreeSet<Entry> set = newSet();
++        assertTrue(set.isEmpty());
++        assertEquals(0, set.size());
++        assertNull(set.collect(0, 0, 16, 16, false));
++        assertNull(set.collect(0, 0, 16, 16, true));
++        try {
++            set.first();
++            throw new AssertionError("first() on an empty set must throw like the old tree set");
++        } catch (NoSuchElementException expected) {
++            // expected
++        }
++    }
++
++    @Test
++    public void addRefusesEqualElementAndRemoveRestores() {
++        ChunkIndexedTreeSet<Entry> set = newSet();
++        Entry a = new Entry(1, 2, 3, "w", 5);
++        Entry duplicate = new Entry(1, 2, 3, "w", 9);
++        assertTrue(set.add(a));
++        assertFalse("an equal element must be refused (old callers checked contains first)", set.add(duplicate));
++        assertEquals(1, set.size());
++        assertTrue(set.contains(duplicate));
++        assertSame(a, set.first());
++        assertTrue(set.remove(a));
++        assertFalse(set.remove(a));
++        assertTrue(set.isEmpty());
++        assertNull(set.collect(-100, -100, 100, 100, false));
++        assertTrue(set.add(duplicate));
++    }
++
++    @Test
++    public void halfOpenBoundsAreExact() {
++        ChunkIndexedTreeSet<Entry> set = newSet();
++        // Box [-2, 16) x [-2, 16): the exact bounds the chunk-save query uses for chunk (0,0).
++        int[] xs = {-3, -2, -1, 0, 15, 16, 17};
++        for (int x : xs) {
++            set.add(new Entry(x, 64, 0, "t", x + 10));
++        }
++        List<Entry> found = set.collect(-2, -2, 16, 16, false);
++        assertEquals("x in [-2, 16) -> -2, -1, 0, 15", 4, found.size());
++        assertEquals(-2, found.get(0).x);
++        assertEquals(15, found.get(3).x);
++        assertEquals("collect without remove must not change the set", 7, set.size());
++    }
++
++    @Test
++    public void resultsFollowCompareToOrderAcrossBuckets() {
++        ChunkIndexedTreeSet<Entry> set = newSet();
++        Entry late = new Entry(1, 0, 1, "a", 90);
++        Entry early = new Entry(-1, 0, -1, "b", 10);
++        Entry mid = new Entry(0, 0, 0, "c", 50);
++        Entry tieFirst = new Entry(5, 0, 5, "d", 50);
++        set.add(late);
++        set.add(early);
++        set.add(mid);
++        set.add(tieFirst);
++        List<Entry> found = set.collect(-16, -16, 16, 16, false);
++        assertEquals(4, found.size());
++        assertSame(early, found.get(0));
++        assertSame(mid, found.get(1));
++        assertSame(tieFirst, found.get(2));
++        assertSame(late, found.get(3));
++    }
++
++    @Test
++    public void removalDropsEntriesFromEveryView() {
++        ChunkIndexedTreeSet<Entry> set = newSet();
++        Entry a = new Entry(2, 0, 2, "a", 1);
++        Entry b = new Entry(40, 0, 40, "b", 2);
++        set.add(a);
++        set.add(b);
++        List<Entry> removed = set.collect(0, 0, 16, 16, true);
++        assertEquals(1, removed.size());
++        assertSame(a, removed.get(0));
++        assertFalse(set.contains(a));
++        assertEquals(1, set.size());
++        assertSame(b, set.first());
++        assertNull(set.collect(0, 0, 16, 16, false));
++    }
++
++    @Test
++    public void negativeCoordinatesAndExtremesDoNotOverflow() {
++        ChunkIndexedTreeSet<Entry> set = newSet();
++        set.add(new Entry(Integer.MIN_VALUE, 0, Integer.MIN_VALUE, "min", 1));
++        set.add(new Entry(Integer.MAX_VALUE, 0, Integer.MAX_VALUE, "max", 2));
++        set.add(new Entry(-1, 0, -1, "neg", 3));
++        List<Entry> all = set.collect(Integer.MIN_VALUE, Integer.MIN_VALUE, Integer.MAX_VALUE, Integer.MAX_VALUE, false);
++        // maxX is exclusive, so an element at Integer.MAX_VALUE is outside the box by definition.
++        assertEquals(2, all.size());
++        assertEquals("min", all.get(0).tag);
++        assertEquals("neg", all.get(1).tag);
++        assertNull("inverted box matches nothing", set.collect(10, 10, 5, 5, false));
++        assertNull("empty box matches nothing", set.collect(3, 3, 3, 3, false));
++    }
++
++    @Test
++    public void largeBoxUsesPopulatedBucketsAndAgreesWithSmallBoxPath() {
++        ChunkIndexedTreeSet<Entry> set = newSet();
++        for (int i = 0; i < 200; ++i) {
++            set.add(new Entry(i * 7 - 300, 0, i * 13 - 500, "e" + i, i));
++        }
++        // Few buckets relative to the box span forces the "walk populated buckets" path.
++        List<Entry> wide = set.collect(-100000, -100000, 100000, 100000, false);
++        assertEquals(200, wide.size());
++        // Narrow box forces the per-chunk lookup path.
++        List<Entry> narrow = set.collect(-300, -500, -280, -480, false);
++        for (Entry e : narrow) {
++            assertTrue(e.x >= -300 && e.x < -280 && e.z >= -500 && e.z < -480);
++        }
++        int expected = 0;
++        for (Entry e : wide) {
++            if (e.x >= -300 && e.x < -280 && e.z >= -500 && e.z < -480) {
++                ++expected;
++            }
++        }
++        assertEquals(expected, narrow.size());
++    }
++
++    @Test
++    public void clearEmptiesEverything() {
++        ChunkIndexedTreeSet<Entry> set = newSet();
++        set.add(new Entry(0, 0, 0, "a", 1));
++        set.clear();
++        assertTrue(set.isEmpty());
++        assertNull(set.collect(-16, -16, 16, 16, false));
++    }
++}
+diff --git a/test/java/me/stella/antarctic/collection/MultiplicitySetTest.java b/test/java/me/stella/antarctic/collection/MultiplicitySetTest.java
+new file mode 100644
+index 0000000..9e3f2ed
+--- /dev/null
++++ b/test/java/me/stella/antarctic/collection/MultiplicitySetTest.java
+@@ -0,0 +1,39 @@
++package me.stella.antarctic.collection;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++
++import org.junit.Test;
++
++public class MultiplicitySetTest {
++
++    @Test
++    public void mirrorsListContainsWithDuplicates() {
++        MultiplicitySet<String> set = new MultiplicitySet<String>();
++        assertTrue(set.isEmpty());
++        assertFalse(set.contains("a"));
++        set.add("a");
++        set.add(new String("a"));
++        set.add("b");
++        assertEquals(2, set.distinctSize());
++        set.removeOne("a");
++        assertTrue("one equal occurrence remains", set.contains("a"));
++        set.removeOne("a");
++        assertFalse(set.contains("a"));
++        assertTrue(set.contains("b"));
++        set.clear();
++        assertTrue(set.isEmpty());
++        assertFalse(set.contains("b"));
++    }
++
++    @Test
++    public void removingAnAbsentElementLeavesNoGhost() {
++        MultiplicitySet<String> set = new MultiplicitySet<String>();
++        set.removeOne("ghost");
++        assertFalse(set.contains("ghost"));
++        assertTrue(set.isEmpty());
++        set.add("ghost");
++        assertTrue(set.contains("ghost"));
++    }
++}
+diff --git a/test/java/net/minecraft/server/ScheduledTickIndexParityTest.java b/test/java/net/minecraft/server/ScheduledTickIndexParityTest.java
+new file mode 100644
+index 0000000..6b0e70a
+--- /dev/null
++++ b/test/java/net/minecraft/server/ScheduledTickIndexParityTest.java
+@@ -0,0 +1,231 @@
++package net.minecraft.server;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertNull;
++import static org.junit.Assert.assertSame;
++import static org.junit.Assert.assertTrue;
++
++import java.util.ArrayList;
++import java.util.Iterator;
++import java.util.List;
++import java.util.Random;
++import me.stella.antarctic.collection.ChunkIndexedTreeSet;
++import me.stella.antarctic.collection.MultiplicitySet;
++import org.bukkit.craftbukkit.util.HashTreeSet;
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++/**
++ * Vanilla/CraftBukkit parity for the indexed scheduled-tick structures. The "old" side is a verbatim copy of the
++ * pre-Antarctic WorldServer logic (HashTreeSet + linear scans); both sides hold the very same entry objects.
++ */
++public class ScheduledTickIndexParityTest {
++
++    static final ChunkIndexedTreeSet.Locator<NextTickListEntry> LOCATOR = new ChunkIndexedTreeSet.Locator<NextTickListEntry>() {
++        @Override
++        public int blockX(NextTickListEntry e) {
++            return e.a.getX();
++        }
++
++        @Override
++        public int blockZ(NextTickListEntry e) {
++            return e.a.getZ();
++        }
++    };
++
++    private static Block[] blocks;
++
++    @BeforeClass
++    public static void bootstrap() {
++        DispenserRegistry.c();
++        blocks = new Block[] {Blocks.FLOWING_WATER, Blocks.REDSTONE_TORCH, Blocks.UNPOWERED_REPEATER};
++    }
++
++    /** Verbatim copy of the old WorldServer.a(StructureBoundingBox, boolean). */
++    static List<NextTickListEntry> oldQuery(HashTreeSet<NextTickListEntry> nextTickList, List<NextTickListEntry> w,
++            StructureBoundingBox structureboundingbox, boolean flag) {
++        ArrayList<NextTickListEntry> arraylist = null;
++
++        for (int i = 0; i < 2; ++i) {
++            Iterator iterator;
++
++            if (i == 0) {
++                iterator = nextTickList.iterator();
++            } else {
++                iterator = w.iterator();
++            }
++
++            while (iterator.hasNext()) {
++                NextTickListEntry nextticklistentry = (NextTickListEntry) iterator.next();
++                BlockPosition blockposition = nextticklistentry.a;
++
++                if (blockposition.getX() >= structureboundingbox.a && blockposition.getX() < structureboundingbox.d && blockposition.getZ() >= structureboundingbox.c && blockposition.getZ() < structureboundingbox.f) {
++                    if (flag) {
++                        iterator.remove();
++                    }
++
++                    if (arraylist == null) {
++                        arraylist = new ArrayList<NextTickListEntry>();
++                    }
++
++                    arraylist.add(nextticklistentry);
++                }
++            }
++        }
++
++        return arraylist;
++    }
++
++    /** The new WorldServer.a(StructureBoundingBox, boolean) logic, over the same structures. */
++    static List<NextTickListEntry> newQuery(ChunkIndexedTreeSet<NextTickListEntry> nextTickList, List<NextTickListEntry> w,
++            MultiplicitySet<NextTickListEntry> batch, StructureBoundingBox bb, boolean flag) {
++        List<NextTickListEntry> arraylist = nextTickList.collect(bb.a, bb.c, bb.d, bb.f, flag);
++
++        if (!w.isEmpty()) {
++            Iterator iterator = w.iterator();
++
++            while (iterator.hasNext()) {
++                NextTickListEntry e = (NextTickListEntry) iterator.next();
++                BlockPosition p = e.a;
++
++                if (p.getX() >= bb.a && p.getX() < bb.d && p.getZ() >= bb.c && p.getZ() < bb.f) {
++                    if (flag) {
++                        iterator.remove();
++                        batch.removeOne(e);
++                    }
++
++                    if (arraylist == null) {
++                        arraylist = new ArrayList<NextTickListEntry>();
++                    }
++
++                    arraylist.add(e);
++                }
++            }
++        }
++
++        return arraylist;
++    }
++
++    private static StructureBoundingBox chunkBox(int cx, int cz) {
++        // Exactly what WorldServer.a(Chunk, boolean) builds.
++        int i = (cx << 4) - 2;
++        int j = i + 16 + 2;
++        int k = (cz << 4) - 2;
++        int l = k + 16 + 2;
++        return new StructureBoundingBox(i, 0, k, j, 256, l);
++    }
++
++    private static void assertSameResult(List<NextTickListEntry> expected, List<NextTickListEntry> actual) {
++        if (expected == null) {
++            assertNull(actual);
++            return;
++        }
++        assertEquals(expected.size(), actual.size());
++        for (int i = 0; i < expected.size(); ++i) {
++            assertSame("order/identity mismatch at " + i, expected.get(i), actual.get(i));
++        }
++    }
++
++    @Test
++    public void chunkBoxIsTheHalfOpenRangeMinusTwoToPlusSixteen() {
++        StructureBoundingBox box = chunkBox(3, -2);
++        assertEquals(46, box.a);
++        assertEquals(64, box.d);
++        assertEquals(-34, box.c);
++        assertEquals(-16, box.f);
++    }
++
++    @Test
++    public void randomizedOperationsMatchTheOldImplementation() {
++        for (long seed = 1; seed <= 25; ++seed) {
++            Random random = new Random(seed);
++            HashTreeSet<NextTickListEntry> oldSet = new HashTreeSet<NextTickListEntry>();
++            List<NextTickListEntry> oldW = new ArrayList<NextTickListEntry>();
++            ChunkIndexedTreeSet<NextTickListEntry> newSet = new ChunkIndexedTreeSet<NextTickListEntry>(LOCATOR);
++            List<NextTickListEntry> newW = new ArrayList<NextTickListEntry>();
++            MultiplicitySet<NextTickListEntry> batch = new MultiplicitySet<NextTickListEntry>();
++
++            for (int op = 0; op < 4000; ++op) {
++                int kind = random.nextInt(10);
++                if (kind < 5) {
++                    // schedule (callers guard with contains, then add)
++                    BlockPosition pos = new BlockPosition(random.nextInt(161) - 80, random.nextInt(256), random.nextInt(161) - 80);
++                    NextTickListEntry entry = new NextTickListEntry(pos, blocks[random.nextInt(blocks.length)]);
++                    entry.a((long) random.nextInt(40));
++                    entry.a(random.nextInt(3) - 1);
++                    boolean oldContains = oldSet.contains(entry);
++                    if (!oldContains) {
++                        oldSet.add(entry);
++                    }
++                    assertEquals(oldContains, newSet.contains(entry));
++                    boolean added = newSet.add(entry);
++                    assertEquals(!oldContains, added);
++                } else if (kind < 6 && !oldSet.isEmpty()) {
++                    // move the earliest entries into the current batch (the cleaning loop)
++                    int n = 1 + random.nextInt(6);
++                    for (int i = 0; i < n && !oldSet.isEmpty(); ++i) {
++                        NextTickListEntry first = oldSet.first();
++                        assertSame(first, newSet.first());
++                        oldSet.remove(first);
++                        oldW.add(first);
++                        newSet.remove(first);
++                        newW.add(first);
++                        batch.add(first);
++                    }
++                } else if (kind < 7 && !oldW.isEmpty()) {
++                    // tick one batch entry
++                    NextTickListEntry e = oldW.remove(0);
++                    assertSame(e, newW.remove(0));
++                    batch.removeOne(e);
++                } else if (kind < 9) {
++                    int cx = random.nextInt(11) - 5;
++                    int cz = random.nextInt(11) - 5;
++                    boolean flag = random.nextInt(4) == 0;
++                    StructureBoundingBox box = chunkBox(cx, cz);
++                    assertSameResult(oldQuery(oldSet, oldW, box, flag), newQuery(newSet, newW, batch, box, flag));
++                } else {
++                    int minX = random.nextInt(200) - 100;
++                    int minZ = random.nextInt(200) - 100;
++                    StructureBoundingBox box = new StructureBoundingBox(minX, 0, minZ, minX + random.nextInt(120) - 10, 256, minZ + random.nextInt(120) - 10);
++                    boolean flag = random.nextInt(6) == 0;
++                    assertSameResult(oldQuery(oldSet, oldW, box, flag), newQuery(newSet, newW, batch, box, flag));
++                }
++
++                assertEquals(oldSet.size(), newSet.size());
++                if (!oldSet.isEmpty()) {
++                    assertSame(oldSet.first(), newSet.first());
++                }
++                // isBlockTickPending probe: a fresh equal entry, as WorldServer.a(BlockPosition, Block) builds it.
++                BlockPosition probePos = new BlockPosition(random.nextInt(161) - 80, random.nextInt(256), random.nextInt(161) - 80);
++                NextTickListEntry probe = new NextTickListEntry(probePos, blocks[random.nextInt(blocks.length)]);
++                assertEquals(oldW.contains(probe), batch.contains(probe));
++                assertEquals(oldSet.contains(probe), newSet.contains(probe));
++            }
++
++            // Probe every batch entry explicitly, then drain and check the mirror is empty.
++            for (NextTickListEntry e : oldW) {
++                assertTrue(batch.contains(new NextTickListEntry(e.a, e.a())));
++            }
++            oldW.clear();
++            newW.clear();
++            batch.clear();
++        }
++    }
++
++    @Test
++    public void chunkEdgeEntriesRespectTheMinusTwoPlusSixteenWindow() {
++        ChunkIndexedTreeSet<NextTickListEntry> set = new ChunkIndexedTreeSet<NextTickListEntry>(LOCATOR);
++        HashTreeSet<NextTickListEntry> oldSet = new HashTreeSet<NextTickListEntry>();
++        int[] xs = {-3, -2, -1, 0, 15, 16, 17, 18};
++        for (int x : xs) {
++            NextTickListEntry e = new NextTickListEntry(new BlockPosition(x, 64, 0), Blocks.FLOWING_WATER);
++            e.a(5L);
++            oldSet.add(e);
++            set.add(e);
++        }
++        StructureBoundingBox box = chunkBox(0, 0);
++        List<NextTickListEntry> expected = oldQuery(oldSet, new ArrayList<NextTickListEntry>(), box, false);
++        assertSameResult(expected, newQuery(set, new ArrayList<NextTickListEntry>(), new MultiplicitySet<NextTickListEntry>(), box, false));
++        assertEquals("x in [-2, 16) -> -2,-1,0,15", 4, expected.size());
++    }
++}
+diff --git a/test/java/net/minecraft/server/ScheduledTickIndexPerfTest.java b/test/java/net/minecraft/server/ScheduledTickIndexPerfTest.java
+new file mode 100644
+index 0000000..b6966bb
+--- /dev/null
++++ b/test/java/net/minecraft/server/ScheduledTickIndexPerfTest.java
+@@ -0,0 +1,163 @@
++package net.minecraft.server;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertTrue;
++
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Random;
++import me.stella.antarctic.collection.ChunkIndexedTreeSet;
++import me.stella.antarctic.collection.MultiplicitySet;
++import org.bukkit.craftbukkit.util.HashTreeSet;
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++/**
++ * Timed comparison of the old linear scans against the indexed structures on a Skyblock-sized workload. The numbers are
++ * printed so they can be pasted into the commit body; the assertions only require a conservative margin so the test is
++ * not flaky on a loaded machine (observed gains are orders of magnitude larger).
++ */
++public class ScheduledTickIndexPerfTest {
++
++    @BeforeClass
++    public static void bootstrap() {
++        DispenserRegistry.c();
++    }
++
++    private static NextTickListEntry entry(Random random, int span) {
++        BlockPosition pos = new BlockPosition(random.nextInt(span * 16), random.nextInt(256), random.nextInt(span * 16));
++        NextTickListEntry e = new NextTickListEntry(pos, random.nextBoolean() ? Blocks.FLOWING_WATER : Blocks.REDSTONE_TORCH);
++        e.a((long) random.nextInt(1000));
++        return e;
++    }
++
++    @Test
++    public void chunkSaveQueryBeatsLinearScan() {
++        Random random = new Random(42);
++        int span = 45; // 45 x 45 = 2025 chunk columns
++        HashTreeSet<NextTickListEntry> oldSet = new HashTreeSet<NextTickListEntry>();
++        ChunkIndexedTreeSet<NextTickListEntry> newSet = new ChunkIndexedTreeSet<NextTickListEntry>(ScheduledTickIndexParityTest.LOCATOR);
++        while (newSet.size() < 100_000) {
++            NextTickListEntry e = entry(random, span);
++            if (!oldSet.contains(e)) {
++                oldSet.add(e);
++                newSet.add(e);
++            }
++        }
++        List<NextTickListEntry> emptyW = new ArrayList<NextTickListEntry>();
++        StructureBoundingBox[] boxes = new StructureBoundingBox[64];
++        for (int i = 0; i < boxes.length; ++i) {
++            int cx = random.nextInt(span);
++            int cz = random.nextInt(span);
++            int a = (cx << 4) - 2;
++            int c = (cz << 4) - 2;
++            boxes[i] = new StructureBoundingBox(a, 0, c, a + 18, 256, c + 18);
++        }
++
++        long checksumOld = 0;
++        long checksumNew = 0;
++        long oldNanos = Long.MAX_VALUE;
++        long newNanos = Long.MAX_VALUE;
++        for (int round = 0; round < 4; ++round) { // first rounds warm up; keep the best
++            long start = System.nanoTime();
++            checksumOld = 0;
++            for (StructureBoundingBox box : boxes) {
++                List<NextTickListEntry> r = ScheduledTickIndexParityTest.oldQuery(oldSet, emptyW, box, false);
++                checksumOld += r == null ? 0 : r.size();
++            }
++            oldNanos = Math.min(oldNanos, System.nanoTime() - start);
++
++            start = System.nanoTime();
++            checksumNew = 0;
++            for (StructureBoundingBox box : boxes) {
++                List<NextTickListEntry> r = newSet.collect(box.a, box.c, box.d, box.f, false);
++                checksumNew += r == null ? 0 : r.size();
++            }
++            newNanos = Math.min(newNanos, System.nanoTime() - start);
++        }
++        assertEquals("both implementations must find the same number of ticks", checksumOld, checksumNew);
++        System.out.println("[perf] chunk-save query, 100k ticks / 2025 chunks, 64 saves: old=" + oldNanos / 1000 + "us new=" + newNanos / 1000
++                + "us ratio=" + (oldNanos / Math.max(1, newNanos)) + "x");
++        assertTrue("indexed query should be at least 5x faster", newNanos * 5 < oldNanos);
++    }
++
++    @Test
++    public void tickPendingProbeBeatsLinearScan() {
++        Random random = new Random(7);
++        List<NextTickListEntry> batch = new ArrayList<NextTickListEntry>();
++        MultiplicitySet<NextTickListEntry> mirror = new MultiplicitySet<NextTickListEntry>();
++        for (int i = 0; i < 20_000; ++i) {
++            NextTickListEntry e = entry(random, 30);
++            batch.add(e);
++            mirror.add(e);
++        }
++        NextTickListEntry[] probes = new NextTickListEntry[2_000];
++        for (int i = 0; i < probes.length; ++i) {
++            probes[i] = entry(random, 30);
++        }
++        long oldNanos = Long.MAX_VALUE;
++        long newNanos = Long.MAX_VALUE;
++        int hitsOld = 0;
++        int hitsNew = 0;
++        for (int round = 0; round < 4; ++round) {
++            long start = System.nanoTime();
++            hitsOld = 0;
++            for (NextTickListEntry probe : probes) {
++                if (batch.contains(probe)) {
++                    ++hitsOld;
++                }
++            }
++            oldNanos = Math.min(oldNanos, System.nanoTime() - start);
++
++            start = System.nanoTime();
++            hitsNew = 0;
++            for (NextTickListEntry probe : probes) {
++                if (mirror.contains(probe)) {
++                    ++hitsNew;
++                }
++            }
++            newNanos = Math.min(newNanos, System.nanoTime() - start);
++        }
++        assertEquals(hitsOld, hitsNew);
++        System.out.println("[perf] isBlockTickPending, 20k batch / 2000 probes: old=" + oldNanos / 1000 + "us new=" + newNanos / 1000
++                + "us ratio=" + (oldNanos / Math.max(1, newNanos)) + "x");
++        assertTrue("O(1) membership should be at least 10x faster than List.contains", newNanos * 10 < oldNanos);
++    }
++
++    @Test
++    public void scheduleAndDrainCostStaysComparable() {
++        Random random = new Random(11);
++        NextTickListEntry[] entries = new NextTickListEntry[200_000];
++        for (int i = 0; i < entries.length; ++i) {
++            entries[i] = entry(random, 45);
++        }
++        long oldNanos = Long.MAX_VALUE;
++        long newNanos = Long.MAX_VALUE;
++        for (int round = 0; round < 5; ++round) {
++            HashTreeSet<NextTickListEntry> oldSet = new HashTreeSet<NextTickListEntry>();
++            long start = System.nanoTime();
++            for (NextTickListEntry e : entries) {
++                if (!oldSet.contains(e)) {
++                    oldSet.add(e);
++                }
++            }
++            while (!oldSet.isEmpty()) {
++                oldSet.remove(oldSet.first());
++            }
++            oldNanos = Math.min(oldNanos, System.nanoTime() - start);
++
++            ChunkIndexedTreeSet<NextTickListEntry> newSet = new ChunkIndexedTreeSet<NextTickListEntry>(ScheduledTickIndexParityTest.LOCATOR);
++            start = System.nanoTime();
++            for (NextTickListEntry e : entries) {
++                newSet.add(e);
++            }
++            while (!newSet.isEmpty()) {
++                newSet.remove(newSet.first());
++            }
++            newNanos = Math.min(newNanos, System.nanoTime() - start);
++        }
++        System.out.println("[perf] schedule+drain 200k ticks: old=" + oldNanos / 1000 + "us new=" + newNanos / 1000
++                + "us ratio=" + String.format("%.2f", (double) oldNanos / Math.max(1, newNanos)) + "x (<1 means the index costs extra)");
++        assertTrue("indexing must not make scheduling more than 3x slower", newNanos < oldNanos * 3);
++    }
++}
