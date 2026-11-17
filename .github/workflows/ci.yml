@@ -70,7 +70,7 @@ jobs:
         run: ./gradlew :Antarctic-API:test
 
       - name: Targeted server regression tests
-        run: ./gradlew :Antarctic-Server:cleanTest :Antarctic-Server:test --tests com.destroystokyo.paper.AntarcticConfigTest
+        run: ./gradlew :Antarctic-Server:cleanTest :Antarctic-Server:test --tests "com.destroystokyo.paper.*" --tests "me.stella.antarctic.*" --tests "net.minecraft.server.*" --tests "org.bukkit.event.EventShortCircuitTest"
 
       - name: Full server suite (diagnostic; known failures tracked)
         run: ./gradlew :Antarctic-Server:cleanTest :Antarctic-Server:test
@@ -79,9 +79,9 @@ jobs:
       - name: Patch integrity
         run: |
           ./gradlew rebuildPatches
-          if [[ -n "$(git status --porcelain patches/)" ]]; then
-            git status --porcelain patches/
-            echo "patches/ is out of sync with the source repositories; run rebuildPatches and commit" >&2
+          if [[ -n "$(git status --porcelain Antarctic-API/ Antarctic-Server/)" ]]; then
+            git status --porcelain Antarctic-API/ Antarctic-Server/
+            echo "Patches are out of sync with the source repositories; run rebuildPatches and commit" >&2
             exit 1
           fi
 
