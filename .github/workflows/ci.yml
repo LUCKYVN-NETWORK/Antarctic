@@ -66,15 +66,14 @@ jobs:
       - name: Compile
         run: ./gradlew compileJava compileTestJava
 
+      - name: Build runnable server jar
+        run: ./gradlew buildServerJar -x test
+
       - name: API test suite
         run: ./gradlew :Antarctic-API:test
 
       - name: Targeted server regression tests
         run: ./gradlew :Antarctic-Server:cleanTest :Antarctic-Server:test --tests "com.destroystokyo.paper.*" --tests "me.stella.antarctic.*" --tests "net.minecraft.server.*" --tests "org.bukkit.event.EventShortCircuitTest"
-
-      - name: Full server suite (diagnostic; known failures tracked)
-        run: ./gradlew :Antarctic-Server:cleanTest :Antarctic-Server:test
-        continue-on-error: true
 
       - name: Patch integrity
         run: |
@@ -84,6 +83,11 @@ jobs:
             echo "Patches are out of sync with the source repositories; run rebuildPatches and commit" >&2
             exit 1
           fi
+
+      - name: Full server suite (diagnostic; known failures tracked)
+        timeout-minutes: 15
+        run: ./gradlew :Antarctic-Server:cleanTest :Antarctic-Server:test
+        continue-on-error: true
 
       - name: Upload test reports
         if: always()

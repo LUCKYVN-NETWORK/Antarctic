@@ -50,6 +50,7 @@ test {
 
 jar {
     archiveBaseName = 'Antarctic-Server'
+    archiveClassifier = 'slim'
 }
 
 tasks.register('serverJar', Jar) {
@@ -73,7 +74,7 @@ tasks.register('serverJar', Jar) {
     }
     from sourceSets.main.output
     from project(':Antarctic-API').sourceSets.main.output
-    dependsOn ':Antarctic-API:classes', 'classes'
+    dependsOn ':Antarctic-API:jar', 'classes', configurations.runtimeClasspath
 
     from {
         configurations.runtimeClasspath.collect { f ->
