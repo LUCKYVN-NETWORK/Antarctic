@@ -1,0 +1,775 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 17 Nov 2026 16:33:41 +0700
+Subject: [PATCH 91/91] Remove per-node allocations from World light
+ propagation
+
+World.c (the sky/block light BFS) allocated a BlockPosition per dequeued node plus six more for the neighbor probes, cloned EnumDirection.values() per node, and every probe did isLoaded + chunk lookup + BlockPosition clamp. Now:
+- new World.getBrightness(EnumSkyBlock, int x, int y, int z) and Chunk.getBrightness(EnumSkyBlock, int, int, int) give the same result as the BlockPosition variants (y clamp, isValidLocation, unloaded-chunk default, height-map light for empty sections), with one chunk lookup; the allow-permanent-chunk-loaders side effect (Chunk.d = false) is preserved.
+- c() reads neighbors by coordinates, reuses one MutableBlockPosition for the read-only per-node work, and only allocates a BlockPosition when a node is actually written (setter semantics unchanged).
+- the private target-light computation uses ints and a cached direction array instead of a pooled position and values().
+Queue encoding, the radius-17 cutoff, the overflow guard and the write order are untouched, so output is bit-identical.
+
+Tests: LightPropagationParityTest runs a verbatim copy of the old World.c/World.a on an identical world against the new code over 6 seeds x 400 random block changes (stone, torch, glowstone, leaves, water, air; floor with pillars; sky light above the height map), a 12x12x12 paste/relight/removal cycle, world-edge positions and a 20k-position getBrightness equivalence sweep (extremes, y<0, y>255, unloaded chunks, empty sections), comparing every sky and block nibble in all 16 sections of 16 chunks. LightPropagationPerfTest (same edits on fresh identical worlds, nibbles re-verified): glowstone cube paste 43 ms -> 31 ms (1.4x, 14x less allocation), torch place/remove 37 -> 20 ms (1.9x, 13.5x), mixed random edits 305 -> 208 ms (1.5x, 13.5x). Not covered: Chunk.n() still clones EnumDirection.values(); the real-world heightMap/skylight maintenance in Chunk.a is untouched and not exercised by the stub world.
+
+diff --git a/main/java/net/minecraft/server/Chunk.java b/main/java/net/minecraft/server/Chunk.java
+index f4233ed..6dc6be4 100644
+--- a/main/java/net/minecraft/server/Chunk.java
++++ b/main/java/net/minecraft/server/Chunk.java
+@@ -617,6 +617,16 @@ public class Chunk {
+         return chunksection == Chunk.a ? (this.c(blockposition) ? enumskyblock.c : 0) : (enumskyblock == EnumSkyBlock.SKY ? (!this.world.worldProvider.m() ? 0 : chunksection.b(i, j & 15, k)) : (enumskyblock == EnumSkyBlock.BLOCK ? chunksection.c(i, j & 15, k) : enumskyblock.c));
+     }
+ 
++    // Antarctic start - same result as getBrightness(EnumSkyBlock, BlockPosition) for (x, y, z), without a BlockPosition
++    public int getBrightness(EnumSkyBlock enumskyblock, int x, int y, int z) {
++        int i = x & 15;
++        int k = z & 15;
++        ChunkSection chunksection = this.sections[y >> 4];
++
++        return chunksection == Chunk.a ? (y >= this.heightMap[k << 4 | i] ? enumskyblock.c : 0) : (enumskyblock == EnumSkyBlock.SKY ? (!this.world.worldProvider.m() ? 0 : chunksection.b(i, y & 15, k)) : (enumskyblock == EnumSkyBlock.BLOCK ? chunksection.c(i, y & 15, k) : enumskyblock.c));
++    }
++    // Antarctic end
++
+     public void a(EnumSkyBlock enumskyblock, BlockPosition blockposition, int i) {
+         int j = blockposition.getX() & 15;
+         int k = blockposition.getY();
+diff --git a/main/java/net/minecraft/server/World.java b/main/java/net/minecraft/server/World.java
+index aaa052a..7be6f61 100644
+--- a/main/java/net/minecraft/server/World.java
++++ b/main/java/net/minecraft/server/World.java
+@@ -822,6 +822,33 @@ public abstract class World implements IBlockAccess {
+         }
+     }
+ 
++    // Antarctic start - light propagation without per-probe allocations (identical results; see World.c)
++    private static final EnumDirection[] LIGHT_DIRECTIONS = EnumDirection.values();
++
++    /** Same result as {@link #getBrightness(EnumSkyBlock, BlockPosition)} for the position (x, y, z), without allocating one. */
++    public int getBrightness(EnumSkyBlock enumskyblock, int x, int y, int z) {
++        if (y < 0) {
++            y = 0;
++        }
++
++        if (y >= 256 || x < -30000000 || z < -30000000 || x >= 30000000 || z >= 30000000) { // !isValidLocation, y already clamped to >= 0
++            return enumskyblock.c;
++        }
++
++        Chunk chunk = this.getChunkIfLoaded(x >> 4, z >> 4);
++
++        if (chunk == null) {
++            return enumskyblock.c;
++        }
++
++        if (this.paperConfig.allowPermaChunkLoaders) {
++            chunk.d = false; // the old path went through ChunkProviderServer.getLoadedChunkAt, which clears this
++        }
++
++        return chunk.getBrightness(enumskyblock, x, y, z);
++    }
++    // Antarctic end
++
+     public int getBrightness(EnumSkyBlock enumskyblock, BlockPosition blockposition) {
+         if (blockposition.getY() < 0) {
+             blockposition = new BlockPosition(blockposition.getX(), 0, blockposition.getZ());
+@@ -2484,33 +2511,28 @@ public abstract class World implements IBlockAccess {
+             } else if (i >= 14) {
+                 return i;
+             } else {
+-                BlockPosition.PooledBlockPosition blockposition_pooledblockposition = BlockPosition.PooledBlockPosition.s();
+-
+-                try {
+-                    EnumDirection[] aenumdirection = EnumDirection.values();
+-                    int k = aenumdirection.length;
+-
+-                    for (int l = 0; l < k; ++l) {
+-                        EnumDirection enumdirection = aenumdirection[l];
+-
+-                        blockposition_pooledblockposition.j(blockposition).d(enumdirection);
+-                        int i1 = this.getBrightness(enumskyblock, blockposition_pooledblockposition) - j;
+-
+-                        if (i1 > i) {
+-                            i = i1;
+-                        }
+-
+-                        if (i >= 14) {
+-                            int j1 = i;
+-
+-                            return j1;
+-                        }
++                // Antarctic start - ints and the cached direction array instead of a pooled position and values()
++                int x = blockposition.getX();
++                int y = blockposition.getY();
++                int z = blockposition.getZ();
++                EnumDirection[] aenumdirection = LIGHT_DIRECTIONS;
++                int k = aenumdirection.length;
++
++                for (int l = 0; l < k; ++l) {
++                    EnumDirection enumdirection = aenumdirection[l];
++                    int i1 = this.getBrightness(enumskyblock, x + enumdirection.getAdjacentX(), y + enumdirection.getAdjacentY(), z + enumdirection.getAdjacentZ()) - j;
++
++                    if (i1 > i) {
++                        i = i1;
+                     }
+ 
+-                    return i;
+-                } finally {
+-                    blockposition_pooledblockposition.t();
++                    if (i >= 14) {
++                        return i;
++                    }
+                 }
++
++                return i;
++                // Antarctic end
+             }
+         }
+     }
+@@ -2539,6 +2561,7 @@ public abstract class World implements IBlockAccess {
+             int i3;
+             int j3;
+             int k3;
++            BlockPosition.MutableBlockPosition antarctic$mutable = new BlockPosition.MutableBlockPosition(); // Antarctic - reused read-only position for the node being examined
+ 
+             if (l > k) {
+                 this.J[j++] = 133152;
+@@ -2551,18 +2574,16 @@ public abstract class World implements IBlockAccess {
+                     j2 = (l1 >> 6 & 63) - 32 + j1;
+                     k2 = (l1 >> 12 & 63) - 32 + k1;
+                     int l3 = l1 >> 18 & 15;
+-                    BlockPosition blockposition1 = new BlockPosition(i2, j2, k2);
+-
+-                    l2 = this.getBrightness(enumskyblock, blockposition1);
++                    l2 = this.getBrightness(enumskyblock, i2, j2, k2); // Antarctic - no BlockPosition per node
+                     if (l2 == l3) {
+-                        this.a(enumskyblock, blockposition1, 0);
++                        this.a(enumskyblock, new BlockPosition(i2, j2, k2), 0); // Antarctic - only allocated when the node is actually written
+                         if (l3 > 0) {
+                             i3 = MathHelper.a(i2 - i1);
+                             j3 = MathHelper.a(j2 - j1);
+                             k3 = MathHelper.a(k2 - k1);
+                             if (i3 + j3 + k3 < 17) {
+                                 BlockPosition.PooledBlockPosition blockposition_pooledblockposition = BlockPosition.PooledBlockPosition.s();
+-                                EnumDirection[] aenumdirection = EnumDirection.values();
++                                EnumDirection[] aenumdirection = LIGHT_DIRECTIONS; // Antarctic - cached, values() clones
+                                 int i4 = aenumdirection.length;
+ 
+                                 for (int j4 = 0; j4 < i4; ++j4) {
+@@ -2574,7 +2595,7 @@ public abstract class World implements IBlockAccess {
+                                     blockposition_pooledblockposition.f(k4, l4, i5);
+                                     int j5 = Math.max(1, this.getType(blockposition_pooledblockposition).c());
+ 
+-                                    l2 = this.getBrightness(enumskyblock, blockposition_pooledblockposition);
++                                    l2 = this.getBrightness(enumskyblock, k4, l4, i5); // Antarctic
+                                     if (l2 == l3 - j5 && j < this.J.length) {
+                                         this.J[j++] = k4 - i1 + 32 | l4 - j1 + 32 << 6 | i5 - k1 + 32 << 12 | l3 - j5 << 18;
+                                     }
+@@ -2597,12 +2618,12 @@ public abstract class World implements IBlockAccess {
+                 i2 = (l1 & 63) - 32 + i1;
+                 j2 = (l1 >> 6 & 63) - 32 + j1;
+                 k2 = (l1 >> 12 & 63) - 32 + k1;
+-                BlockPosition blockposition2 = new BlockPosition(i2, j2, k2);
+-                int k5 = this.getBrightness(enumskyblock, blockposition2);
++                antarctic$mutable.c(i2, j2, k2); // Antarctic - read-only; the old code allocated a BlockPosition (plus six neighbors) per node
++                int k5 = this.getBrightness(enumskyblock, i2, j2, k2);
+ 
+-                l2 = this.a(blockposition2, enumskyblock);
++                l2 = this.a(antarctic$mutable, enumskyblock);
+                 if (l2 != k5) {
+-                    this.a(enumskyblock, blockposition2, l2);
++                    this.a(enumskyblock, new BlockPosition(i2, j2, k2), l2); // Antarctic - only allocated when the node is written
+                     if (l2 > k5) {
+                         i3 = Math.abs(i2 - i1);
+                         j3 = Math.abs(j2 - j1);
+@@ -2610,27 +2631,27 @@ public abstract class World implements IBlockAccess {
+                         boolean flag = j < this.J.length - 6;
+ 
+                         if (i3 + j3 + k3 < 17 && flag) {
+-                            if (this.getBrightness(enumskyblock, blockposition2.west()) < l2) {
++                            if (this.getBrightness(enumskyblock, i2 - 1, j2, k2) < l2) { // Antarctic - coordinates instead of west()
+                                 this.J[j++] = i2 - 1 - i1 + 32 + (j2 - j1 + 32 << 6) + (k2 - k1 + 32 << 12);
+                             }
+ 
+-                            if (this.getBrightness(enumskyblock, blockposition2.east()) < l2) {
++                            if (this.getBrightness(enumskyblock, i2 + 1, j2, k2) < l2) {
+                                 this.J[j++] = i2 + 1 - i1 + 32 + (j2 - j1 + 32 << 6) + (k2 - k1 + 32 << 12);
+                             }
+ 
+-                            if (this.getBrightness(enumskyblock, blockposition2.down()) < l2) {
++                            if (this.getBrightness(enumskyblock, i2, j2 - 1, k2) < l2) {
+                                 this.J[j++] = i2 - i1 + 32 + (j2 - 1 - j1 + 32 << 6) + (k2 - k1 + 32 << 12);
+                             }
+ 
+-                            if (this.getBrightness(enumskyblock, blockposition2.up()) < l2) {
++                            if (this.getBrightness(enumskyblock, i2, j2 + 1, k2) < l2) {
+                                 this.J[j++] = i2 - i1 + 32 + (j2 + 1 - j1 + 32 << 6) + (k2 - k1 + 32 << 12);
+                             }
+ 
+-                            if (this.getBrightness(enumskyblock, blockposition2.north()) < l2) {
++                            if (this.getBrightness(enumskyblock, i2, j2, k2 - 1) < l2) {
+                                 this.J[j++] = i2 - i1 + 32 + (j2 - j1 + 32 << 6) + (k2 - 1 - k1 + 32 << 12);
+                             }
+ 
+-                            if (this.getBrightness(enumskyblock, blockposition2.south()) < l2) {
++                            if (this.getBrightness(enumskyblock, i2, j2, k2 + 1) < l2) {
+                                 this.J[j++] = i2 - i1 + 32 + (j2 - j1 + 32 << 6) + (k2 + 1 - k1 + 32 << 12);
+                             }
+                         }
+diff --git a/test/java/net/minecraft/server/LightPropagationParityTest.java b/test/java/net/minecraft/server/LightPropagationParityTest.java
+new file mode 100644
+index 0000000..628ebee
+--- /dev/null
++++ b/test/java/net/minecraft/server/LightPropagationParityTest.java
+@@ -0,0 +1,451 @@
++package net.minecraft.server;
++
++import static org.junit.Assert.assertArrayEquals;
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.Random;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++/**
++ * The light propagation rewrite must leave every sky and block light nibble exactly as vanilla's did. "Old" is a
++ * verbatim copy of the pre-Antarctic World.c / World.a(BlockPosition, EnumSkyBlock) running on an identical world.
++ */
++public class LightPropagationParityTest {
++
++    private static Unsafe unsafe;
++
++    static final class StubProvider extends ChunkProviderServer {
++        StubProvider(WorldServer world) {
++            super(world, null, null);
++        }
++
++        @Override
++        public Chunk originalGetChunkAt(int x, int z) {
++            throw new AssertionError("light propagation must not load chunks: " + x + "," + z);
++        }
++    }
++
++    static void set(Class<?> owner, Object instance, String name, Object value) throws Exception {
++        Field field = owner.getDeclaredField(name);
++        field.setAccessible(true);
++        field.set(instance, value);
++    }
++
++    @BeforeClass
++    public static void bootstrap() throws Exception {
++        Field field = Unsafe.class.getDeclaredField("theUnsafe");
++        field.setAccessible(true);
++        unsafe = (Unsafe) field.get(null);
++        DispenserRegistry.c();
++    }
++
++    /** A world of chunks -2..1 (blocks -32..31) with all 16 sections, a stone floor with pillars, sky light above the height map. */
++    static WorldServer buildWorld(long seed, StubProvider[] providerOut) throws Exception {
++        WorldServer world = (WorldServer) unsafe.allocateInstance(WorldServer.class);
++        set(World.class, world, "paperConfig", unsafe.allocateInstance(com.destroystokyo.paper.PaperWorldConfig.class));
++        WorldProvider provider = (WorldProvider) unsafe.allocateInstance(WorldProviderNormal.class);
++        set(WorldProvider.class, provider, "f", true); // WorldProvider.m(): has sky light
++        world.worldProvider = provider;
++        set(World.class, world, "methodProfiler", new MethodProfiler());
++        set(World.class, world, "J", new int[0x8000]);
++        set(World.class, world, "u", new ArrayList<IWorldAccess>());
++        StubProvider chunks = new StubProvider(world);
++        set(World.class, world, "chunkProvider", chunks);
++        providerOut[0] = chunks;
++
++        Random random = new Random(seed);
++        for (int cx = -2; cx <= 1; ++cx) {
++            for (int cz = -2; cz <= 1; ++cz) {
++                Chunk chunk = (Chunk) unsafe.allocateInstance(Chunk.class);
++                ChunkSection[] sections = new ChunkSection[16];
++                for (int i = 0; i < 16; ++i) {
++                    sections[i] = new ChunkSection(i << 4, true);
++                }
++                set(Chunk.class, chunk, "sections", sections);
++                set(Chunk.class, chunk, "world", world);
++                set(Chunk.class, chunk, "chunkKey", ChunkCoordIntPair.a(cx, cz));
++                set(Chunk.class, chunk, "neighbors", -1); // every neighbor counts as loaded
++                set(Chunk.class, chunk, "heightMap", new int[256]);
++                for (int x = 0; x < 16; ++x) {
++                    for (int z = 0; z < 16; ++z) {
++                        int top = 4 + random.nextInt(3) + (random.nextInt(9) == 0 ? random.nextInt(20) : 0); // floor with pillars
++                        for (int y = 0; y < top; ++y) {
++                            sections[y >> 4].setType(x, y & 15, z, Blocks.STONE.getBlockData());
++                        }
++                        chunk.heightMap[z << 4 | x] = top;
++                        for (int y = top; y < 256; ++y) {
++                            sections[y >> 4].a(x, y & 15, z, 15); // sky light above the height map
++                        }
++                    }
++                }
++                chunks.chunks.put(ChunkCoordIntPair.a(cx, cz), chunk);
++            }
++        }
++        return world;
++    }
++
++    // ----------------------------------------------------------------- verbatim copy of the old implementation
++
++    static boolean oldW(World w, BlockPosition blockposition) {
++        boolean flag = false;
++
++        if (w.worldProvider.m()) {
++            flag |= oldC(w, EnumSkyBlock.SKY, blockposition);
++        }
++
++        flag |= oldC(w, EnumSkyBlock.BLOCK, blockposition);
++        return flag;
++    }
++
++    private static int oldA(World w, BlockPosition blockposition, EnumSkyBlock enumskyblock) {
++        if (enumskyblock == EnumSkyBlock.SKY && w.h(blockposition)) {
++            return 15;
++        } else {
++            IBlockData iblockdata = w.getType(blockposition);
++            int i = enumskyblock == EnumSkyBlock.SKY ? 0 : iblockdata.d();
++            int j = iblockdata.c();
++
++            if (j >= 15 && iblockdata.d() > 0) {
++                j = 1;
++            }
++
++            if (j < 1) {
++                j = 1;
++            }
++
++            if (j >= 15) {
++                return 0;
++            } else if (i >= 14) {
++                return i;
++            } else {
++                BlockPosition.PooledBlockPosition blockposition_pooledblockposition = BlockPosition.PooledBlockPosition.s();
++
++                try {
++                    EnumDirection[] aenumdirection = EnumDirection.values();
++                    int k = aenumdirection.length;
++
++                    for (int l = 0; l < k; ++l) {
++                        EnumDirection enumdirection = aenumdirection[l];
++
++                        blockposition_pooledblockposition.j(blockposition).d(enumdirection);
++                        int i1 = w.getBrightness(enumskyblock, blockposition_pooledblockposition) - j;
++
++                        if (i1 > i) {
++                            i = i1;
++                        }
++
++                        if (i >= 14) {
++                            int j1 = i;
++
++                            return j1;
++                        }
++                    }
++
++                    return i;
++                } finally {
++                    blockposition_pooledblockposition.t();
++                }
++            }
++        }
++    }
++
++    static boolean oldC(World w, EnumSkyBlock enumskyblock, BlockPosition blockposition) {
++        Chunk chunk = w.getChunkIfLoaded(blockposition.getX() >> 4, blockposition.getZ() >> 4);
++        if (chunk == null || !chunk.areNeighborsLoaded(1)) {
++            return false;
++        } else {
++            int i = 0;
++            int j = 0;
++
++            int k = w.getBrightness(enumskyblock, blockposition);
++            int l = oldA(w, blockposition, enumskyblock);
++            int i1 = blockposition.getX();
++            int j1 = blockposition.getY();
++            int k1 = blockposition.getZ();
++            int l1;
++            int i2;
++            int j2;
++            int k2;
++            int l2;
++            int i3;
++            int j3;
++            int k3;
++
++            if (l > k) {
++                w.J[j++] = 133152;
++            } else if (l < k) {
++                w.J[j++] = 133152 | k << 18;
++
++                while (i < j) {
++                    l1 = w.J[i++];
++                    i2 = (l1 & 63) - 32 + i1;
++                    j2 = (l1 >> 6 & 63) - 32 + j1;
++                    k2 = (l1 >> 12 & 63) - 32 + k1;
++                    int l3 = l1 >> 18 & 15;
++                    BlockPosition blockposition1 = new BlockPosition(i2, j2, k2);
++
++                    l2 = w.getBrightness(enumskyblock, blockposition1);
++                    if (l2 == l3) {
++                        w.a(enumskyblock, blockposition1, 0);
++                        if (l3 > 0) {
++                            i3 = MathHelper.a(i2 - i1);
++                            j3 = MathHelper.a(j2 - j1);
++                            k3 = MathHelper.a(k2 - k1);
++                            if (i3 + j3 + k3 < 17) {
++                                BlockPosition.PooledBlockPosition blockposition_pooledblockposition = BlockPosition.PooledBlockPosition.s();
++                                EnumDirection[] aenumdirection = EnumDirection.values();
++                                int i4 = aenumdirection.length;
++
++                                for (int j4 = 0; j4 < i4; ++j4) {
++                                    EnumDirection enumdirection = aenumdirection[j4];
++                                    int k4 = i2 + enumdirection.getAdjacentX();
++                                    int l4 = j2 + enumdirection.getAdjacentY();
++                                    int i5 = k2 + enumdirection.getAdjacentZ();
++
++                                    blockposition_pooledblockposition.f(k4, l4, i5);
++                                    int j5 = Math.max(1, w.getType(blockposition_pooledblockposition).c());
++
++                                    l2 = w.getBrightness(enumskyblock, blockposition_pooledblockposition);
++                                    if (l2 == l3 - j5 && j < w.J.length) {
++                                        w.J[j++] = k4 - i1 + 32 | l4 - j1 + 32 << 6 | i5 - k1 + 32 << 12 | l3 - j5 << 18;
++                                    }
++                                }
++
++                                blockposition_pooledblockposition.t();
++                            }
++                        }
++                    }
++                }
++
++                i = 0;
++            }
++
++            while (i < j) {
++                l1 = w.J[i++];
++                i2 = (l1 & 63) - 32 + i1;
++                j2 = (l1 >> 6 & 63) - 32 + j1;
++                k2 = (l1 >> 12 & 63) - 32 + k1;
++                BlockPosition blockposition2 = new BlockPosition(i2, j2, k2);
++                int k5 = w.getBrightness(enumskyblock, blockposition2);
++
++                l2 = oldA(w, blockposition2, enumskyblock);
++                if (l2 != k5) {
++                    w.a(enumskyblock, blockposition2, l2);
++                    if (l2 > k5) {
++                        i3 = Math.abs(i2 - i1);
++                        j3 = Math.abs(j2 - j1);
++                        k3 = Math.abs(k2 - k1);
++                        boolean flag = j < w.J.length - 6;
++
++                        if (i3 + j3 + k3 < 17 && flag) {
++                            if (w.getBrightness(enumskyblock, blockposition2.west()) < l2) {
++                                w.J[j++] = i2 - 1 - i1 + 32 + (j2 - j1 + 32 << 6) + (k2 - k1 + 32 << 12);
++                            }
++
++                            if (w.getBrightness(enumskyblock, blockposition2.east()) < l2) {
++                                w.J[j++] = i2 + 1 - i1 + 32 + (j2 - j1 + 32 << 6) + (k2 - k1 + 32 << 12);
++                            }
++
++                            if (w.getBrightness(enumskyblock, blockposition2.down()) < l2) {
++                                w.J[j++] = i2 - i1 + 32 + (j2 - 1 - j1 + 32 << 6) + (k2 - k1 + 32 << 12);
++                            }
++
++                            if (w.getBrightness(enumskyblock, blockposition2.up()) < l2) {
++                                w.J[j++] = i2 - i1 + 32 + (j2 + 1 - j1 + 32 << 6) + (k2 - k1 + 32 << 12);
++                            }
++
++                            if (w.getBrightness(enumskyblock, blockposition2.north()) < l2) {
++                                w.J[j++] = i2 - i1 + 32 + (j2 - j1 + 32 << 6) + (k2 - 1 - k1 + 32 << 12);
++                            }
++
++                            if (w.getBrightness(enumskyblock, blockposition2.south()) < l2) {
++                                w.J[j++] = i2 - i1 + 32 + (j2 - j1 + 32 << 6) + (k2 + 1 - k1 + 32 << 12);
++                            }
++                        }
++                    }
++                }
++            }
++
++            return true;
++        }
++    }
++
++    // ----------------------------------------------------------------- helpers
++
++    static IBlockData block(int kind) {
++        switch (kind) {
++            case 0:
++                return Blocks.AIR.getBlockData();
++            case 1:
++                return Blocks.STONE.getBlockData();
++            case 2:
++                return Blocks.TORCH.getBlockData();
++            case 3:
++                return Blocks.GLOWSTONE.getBlockData();
++            case 4:
++                return Blocks.LEAVES.getBlockData();
++            default:
++                return Blocks.FLOWING_WATER.getBlockData();
++        }
++    }
++
++    static void setBlock(World w, int x, int y, int z, IBlockData state) {
++        Chunk chunk = w.getChunkIfLoaded(x >> 4, z >> 4);
++        chunk.getSections()[y >> 4].setType(x & 15, y & 15, z & 15, state);
++    }
++
++    static void assertSameLight(World a, World b, String message) {
++        for (int cx = -2; cx <= 1; ++cx) {
++            for (int cz = -2; cz <= 1; ++cz) {
++                ChunkSection[] sa = a.getChunkIfLoaded(cx, cz).getSections();
++                ChunkSection[] sb = b.getChunkIfLoaded(cx, cz).getSections();
++                for (int i = 0; i < 16; ++i) {
++                    assertArrayEquals(message + " sky chunk " + cx + "," + cz + " section " + i, sa[i].getSkyLightArray().asBytes(), sb[i].getSkyLightArray().asBytes());
++                    assertArrayEquals(message + " block chunk " + cx + "," + cz + " section " + i, sa[i].getEmittedLightArray().asBytes(), sb[i].getEmittedLightArray().asBytes());
++                }
++            }
++        }
++    }
++
++    // ----------------------------------------------------------------- tests
++
++    @Test
++    public void randomizedBlockChangesLeaveIdenticalLight() throws Exception {
++        for (long seed = 1; seed <= 6; ++seed) {
++            StubProvider[] ha = new StubProvider[1];
++            StubProvider[] hb = new StubProvider[1];
++            WorldServer oldWorld = buildWorld(seed, ha);
++            WorldServer newWorld = buildWorld(seed, hb);
++            assertSameLight(oldWorld, newWorld, "initial");
++            Random random = new Random(seed * 77);
++            int changed = 0;
++            for (int op = 0; op < 400; ++op) {
++                int x = random.nextInt(28) - 14; // the radius-17 search plus its neighbor reads must stay inside the loaded -32..31
++                int z = random.nextInt(28) - 14;
++                int y = 1 + random.nextInt(random.nextInt(4) == 0 ? 80 : 14);
++                IBlockData state = block(random.nextInt(6));
++                setBlock(oldWorld, x, y, z, state);
++                setBlock(newWorld, x, y, z, state);
++                BlockPosition pos = new BlockPosition(x, y, z);
++                boolean oldResult = oldW(oldWorld, pos);
++                boolean newResult = newWorld.w(pos);
++                assertEquals("return value seed=" + seed + " op=" + op, oldResult, newResult);
++                if (op % 25 == 24) {
++                    assertSameLight(oldWorld, newWorld, "seed=" + seed + " after op " + op);
++                }
++                ++changed;
++            }
++            assertSameLight(oldWorld, newWorld, "seed=" + seed + " final");
++            assertTrue(changed > 0);
++        }
++    }
++
++    @Test
++    public void largeCubeAndTorchScenariosMatch() throws Exception {
++        StubProvider[] ha = new StubProvider[1];
++        StubProvider[] hb = new StubProvider[1];
++        WorldServer oldWorld = buildWorld(5, ha);
++        WorldServer newWorld = buildWorld(5, hb);
++        // A 12x12x12 opaque cube placed under open sky, block by block (what a paste does), then a glowstone wall, then removal.
++        for (int pass = 0; pass < 3; ++pass) {
++            for (int x = -6; x < 6; ++x) {
++                for (int y = 20; y < 32; ++y) {
++                    for (int z = -6; z < 6; ++z) {
++                        IBlockData state = pass == 0 ? Blocks.STONE.getBlockData() : (pass == 1 ? ((x + z) % 3 == 0 ? Blocks.GLOWSTONE.getBlockData() : Blocks.AIR.getBlockData()) : Blocks.AIR.getBlockData());
++                        setBlock(oldWorld, x, y, z, state);
++                        setBlock(newWorld, x, y, z, state);
++                        BlockPosition pos = new BlockPosition(x, y, z);
++                        oldW(oldWorld, pos);
++                        newWorld.w(pos);
++                    }
++                }
++            }
++            assertSameLight(oldWorld, newWorld, "cube pass " + pass);
++        }
++    }
++
++    @Test
++    public void edgesOfTheWorldMatch() throws Exception {
++        StubProvider[] ha = new StubProvider[1];
++        StubProvider[] hb = new StubProvider[1];
++        WorldServer oldWorld = buildWorld(9, ha);
++        WorldServer newWorld = buildWorld(9, hb);
++        int[][] positions = {{0, 0, 0}, {-14, 1, -14}, {13, 254, 13}, {0, 255, 0}, {-1, 255, -1}, {15, 0, 15}, {-14, 0, -14}};
++        for (int[] p : positions) {
++            for (int kind : new int[] {2, 3, 1, 0}) {
++                setBlock(oldWorld, p[0], p[1], p[2], block(kind));
++                setBlock(newWorld, p[0], p[1], p[2], block(kind));
++                BlockPosition pos = new BlockPosition(p[0], p[1], p[2]);
++                assertEquals(oldW(oldWorld, pos), newWorld.w(pos));
++            }
++        }
++        assertSameLight(oldWorld, newWorld, "edges");
++    }
++
++    @Test
++    public void intBrightnessMatchesPositionBrightness() throws Exception {
++        StubProvider[] holder = new StubProvider[1];
++        WorldServer world = buildWorld(2, holder);
++        Random random = new Random(1234);
++        int[] extremes = {Integer.MIN_VALUE, -30000001, -30000000, -33, -32, -1, 0, 1, 31, 32, 33, 29999999, 30000000, Integer.MAX_VALUE};
++        int mismatches = 0;
++        for (int n = 0; n < 20000; ++n) {
++            int x = n % 4 == 0 ? extremes[random.nextInt(extremes.length)] : random.nextInt(80) - 40; // beyond -32..31 is unloaded
++            int z = n % 5 == 0 ? extremes[random.nextInt(extremes.length)] : random.nextInt(80) - 40;
++            int y = n % 7 == 0 ? random.nextInt(600) - 200 : random.nextInt(256);
++            for (EnumSkyBlock type : EnumSkyBlock.values()) {
++                int expected = world.getBrightness(type, new BlockPosition(x, y, z));
++                int actual = world.getBrightness(type, x, y, z);
++                if (expected != actual) {
++                    ++mismatches;
++                }
++                assertEquals("x=" + x + " y=" + y + " z=" + z + " " + type, expected, actual);
++            }
++        }
++        assertEquals(0, mismatches);
++    }
++
++    @Test
++    public void emptySectionsFollowTheHeightMap() throws Exception {
++        StubProvider[] holder = new StubProvider[1];
++        WorldServer world = buildWorld(4, holder);
++        Chunk chunk = world.getChunkIfLoaded(0, 0);
++        chunk.getSections()[10] = Chunk.a; // empty section: light comes from the height map
++        for (int x = 0; x < 16; x += 5) {
++            for (int z = 0; z < 16; z += 5) {
++                for (int y = 160; y < 176; ++y) {
++                    for (EnumSkyBlock type : EnumSkyBlock.values()) {
++                        assertEquals(world.getBrightness(type, new BlockPosition(x, y, z)), world.getBrightness(type, x, y, z));
++                    }
++                }
++            }
++        }
++    }
++
++    @Test
++    public void permanentChunkLoaderOptionStillClearsTheUnloadFlag() throws Exception {
++        StubProvider[] holder = new StubProvider[1];
++        WorldServer world = buildWorld(4, holder);
++        Chunk chunk = world.getChunkIfLoaded(0, 0);
++        // allow-permanent-chunk-loaders = false (the default): neither path touches Chunk.d
++        chunk.d = true;
++        world.getBrightness(EnumSkyBlock.BLOCK, 3, 10, 3);
++        assertTrue(chunk.d);
++        world.getBrightness(EnumSkyBlock.BLOCK, new BlockPosition(3, 10, 3));
++        assertTrue(chunk.d);
++        // true: the old path went through getLoadedChunkAt, which clears the flag; the int path must as well
++        world.paperConfig.allowPermaChunkLoaders = true;
++        chunk.d = true;
++        world.getBrightness(EnumSkyBlock.BLOCK, new BlockPosition(3, 10, 3));
++        assertFalse(chunk.d);
++        chunk.d = true;
++        world.getBrightness(EnumSkyBlock.BLOCK, 3, 10, 3);
++        assertFalse(chunk.d);
++    }
++}
+diff --git a/test/java/net/minecraft/server/LightPropagationPerfTest.java b/test/java/net/minecraft/server/LightPropagationPerfTest.java
+new file mode 100644
+index 0000000..6d2d252
+--- /dev/null
++++ b/test/java/net/minecraft/server/LightPropagationPerfTest.java
+@@ -0,0 +1,96 @@
++package net.minecraft.server;
++
++import static org.junit.Assert.assertTrue;
++
++import java.lang.management.ManagementFactory;
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++/** Timed and allocation-counting comparison of old and new light propagation on identical worlds and identical edits. */
++public class LightPropagationPerfTest {
++
++    private static final com.sun.management.ThreadMXBean MX = (com.sun.management.ThreadMXBean) ManagementFactory.getThreadMXBean();
++    private static long sink;
++
++    @BeforeClass
++    public static void bootstrap() throws Exception {
++        LightPropagationParityTest.bootstrap();
++    }
++
++    private static long allocated() {
++        return MX.getThreadAllocatedBytes(Thread.currentThread().getId());
++    }
++
++    /** One scenario = the same list of (position, block) edits applied and relit on a fresh world. */
++    private static void run(String name, int[][] edits, IBlockData[] states) throws Exception {
++        long oldNanos = Long.MAX_VALUE;
++        long newNanos = Long.MAX_VALUE;
++        long oldBytes = 0;
++        long newBytes = 0;
++        for (int round = 0; round < 5; ++round) {
++            LightPropagationParityTest.StubProvider[] ha = new LightPropagationParityTest.StubProvider[1];
++            LightPropagationParityTest.StubProvider[] hb = new LightPropagationParityTest.StubProvider[1];
++            WorldServer oldWorld = LightPropagationParityTest.buildWorld(3, ha);
++            WorldServer newWorld = LightPropagationParityTest.buildWorld(3, hb);
++
++            long b0 = allocated();
++            long t0 = System.nanoTime();
++            for (int i = 0; i < edits.length; ++i) {
++                LightPropagationParityTest.setBlock(oldWorld, edits[i][0], edits[i][1], edits[i][2], states[i]);
++                sink += LightPropagationParityTest.oldW(oldWorld, new BlockPosition(edits[i][0], edits[i][1], edits[i][2])) ? 1 : 0;
++            }
++            oldNanos = Math.min(oldNanos, System.nanoTime() - t0);
++            oldBytes = allocated() - b0;
++
++            b0 = allocated();
++            t0 = System.nanoTime();
++            for (int i = 0; i < edits.length; ++i) {
++                LightPropagationParityTest.setBlock(newWorld, edits[i][0], edits[i][1], edits[i][2], states[i]);
++                sink += newWorld.w(new BlockPosition(edits[i][0], edits[i][1], edits[i][2])) ? 1 : 0;
++            }
++            newNanos = Math.min(newNanos, System.nanoTime() - t0);
++            newBytes = allocated() - b0;
++
++            LightPropagationParityTest.assertSameLight(oldWorld, newWorld, name);
++        }
++        System.out.println("[perf] light " + name + ": old=" + oldNanos / 1000 + "us/" + oldBytes / 1024 + "KiB new=" + newNanos / 1000 + "us/" + newBytes / 1024
++                + "KiB time=" + String.format("%.2f", (double) oldNanos / Math.max(1, newNanos)) + "x alloc=" + String.format("%.1f", (double) oldBytes / Math.max(1, newBytes)) + "x");
++        assertTrue(name + ": the new propagation must allocate clearly less", newBytes * 2 < oldBytes);
++        assertTrue(name + ": the new propagation must not be slower", newNanos <= oldNanos);
++    }
++
++    @Test
++    public void lightEmittingPasteTorchTogglesAndMixedEdits() throws Exception {
++        // A 6x6x6 glowstone cube placed block by block: every placement relights a radius-15 volume (a light-emitting paste).
++        int n = 6 * 6 * 6;
++        int[][] cube = new int[n][];
++        IBlockData[] glow = new IBlockData[n];
++        int i = 0;
++        for (int x = -3; x < 3; ++x) {
++            for (int y = 20; y < 26; ++y) {
++                for (int z = -3; z < 3; ++z) {
++                    cube[i] = new int[] {x, y, z};
++                    glow[i++] = Blocks.GLOWSTONE.getBlockData();
++                }
++            }
++        }
++        run("glowstone cube paste (216 blocks)", cube, glow);
++
++        java.util.Random random = new java.util.Random(8);
++        int[][] torches = new int[400][];
++        IBlockData[] states = new IBlockData[400];
++        for (int k = 0; k < torches.length; ++k) {
++            torches[k] = new int[] {random.nextInt(24) - 12, 5 + random.nextInt(3), random.nextInt(24) - 12};
++            states[k] = k % 2 == 0 ? Blocks.TORCH.getBlockData() : Blocks.AIR.getBlockData();
++        }
++        run("torch place/remove (400)", torches, states);
++
++        int[][] mixed = new int[1500][];
++        IBlockData[] mixedStates = new IBlockData[1500];
++        for (int k = 0; k < mixed.length; ++k) {
++            mixed[k] = new int[] {random.nextInt(28) - 14, 1 + random.nextInt(random.nextInt(4) == 0 ? 80 : 14), random.nextInt(28) - 14};
++            mixedStates[k] = LightPropagationParityTest.block(random.nextInt(6));
++        }
++        run("mixed random edits (1500)", mixed, mixedStates);
++    }
++}
