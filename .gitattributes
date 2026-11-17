@@ -13,3 +13,7 @@ upstream/paper-1.12.2/paper text eol=lf
 *.jar binary
 
 *.patch text eol=lf
+*.java text eol=lf
+*.gradle text eol=lf
+*.md text eol=lf
+*.py text eol=lf
