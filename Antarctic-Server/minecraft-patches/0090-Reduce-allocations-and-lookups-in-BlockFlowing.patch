@@ -1,0 +1,666 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 17 Nov 2026 16:18:18 +0700
+Subject: [PATCH 90/90] Reduce allocations and lookups in BlockFlowing
+
+- Slope search (getFlowDirections/slopeDistance) now uses ints and one MutableBlockPosition, and reads each probed position once (the old g() re-read the position it was just handed). Traversal, results and tie handling are unchanged.
+- The old EnumSet iterated in EnumDirection ordinal order (NORTH, SOUTH, WEST, EAST); flow is still applied in exactly that order (it decides event order and tick sequence ids), searched in NORTH, EAST, SOUTH, WEST as before.
+- Skip the CraftBlock, BlockFromToEvent and dispatch entirely when no plugin listens to BlockFromToEvent (same pattern as the existing no-listener patches).
+- canFlowTo is computed from coordinates against the chunk map (what CraftWorld.isChunkLoaded did); allocation change only, loading behavior of the reads is untouched.
+
+Tests: BlockFlowingParityTest compares the new search with a verbatim copy of the old one over >10k randomized positions (water and lava, overworld and nether depths; doors, signs, ladders, reeds, portals, flowing and falling water), pins the NSWE application order and the canFlowTo equivalence. BlockFlowingPerfTest: 20k searches on open terrain, 373 ms -> 217 ms (1.7x), allocation 154 MiB -> 0.5 MiB (~330x). Not covered: full BlockFlowing.b settling (needs a real WorldServer) and the listener-present event path (unchanged code).
+
+diff --git a/main/java/net/minecraft/server/BlockFlowing.java b/main/java/net/minecraft/server/BlockFlowing.java
+index ff90e08..31b0655 100644
+--- a/main/java/net/minecraft/server/BlockFlowing.java
++++ b/main/java/net/minecraft/server/BlockFlowing.java
+@@ -38,11 +38,11 @@ public class BlockFlowing extends BlockFluids {
+ 
+             this.a = 0;
+ 
+-            EnumDirection enumdirection;
+-
+-            for (Iterator iterator = EnumDirection.EnumDirectionLimit.HORIZONTAL.iterator(); iterator.hasNext(); l = this.a(world, blockposition.shift(enumdirection), l)) {
+-                enumdirection = (EnumDirection) iterator.next();
++            // Antarctic start - indexed loop over the cached horizontal directions (N, E, S, W) instead of an Iterator over a fresh array
++            for (int n = 0; n < 4; ++n) {
++                l = this.a(world, blockposition.shift(HORIZONTAL_DIRECTIONS[n]), l);
+             }
++            // Antarctic end
+ 
+             int i1 = l + b0;
+ 
+@@ -91,18 +91,23 @@ public class BlockFlowing extends BlockFluids {
+         }
+ 
+         if (world.getType(blockposition).getBlock().getBlockData().getMaterial() != material) return; // Paper - Stop updating flowing block if material has changed
+-        org.bukkit.block.Block source = world.getWorld().getBlockAt(blockposition.getX(), blockposition.getY(), blockposition.getZ()); // CraftBukkit
++        // Antarctic start - skip the CraftBlock, the events and the dispatch entirely when no plugin listens to BlockFromToEvent
++        final boolean fromToListeners = BlockFromToEvent.getHandlerList().getRegisteredListeners().length != 0;
++        org.bukkit.block.Block source = fromToListeners ? world.getWorld().getBlockAt(blockposition.getX(), blockposition.getY(), blockposition.getZ()) : null; // CraftBukkit
++        // Antarctic end
+         IBlockData iblockdata2 = world.getType(blockposition.down());
+ 
+         if (this.h(world, blockposition.down(), iblockdata2)) {
+             // CraftBukkit start
+-            if (!canFlowTo(world, source, BlockFace.DOWN)) { return; } // Paper
++            if (!canFlowTo(world, blockposition, EnumDirection.DOWN)) { return; } // Paper // Antarctic - coordinate based, same result as the Bukkit-side check
++            if (fromToListeners) { // Antarctic
+             BlockFromToEvent event = new BlockFromToEvent(source, BlockFace.DOWN);
+             world.getServer().getPluginManager().callEvent(event);
+ 
+             if (event.isCancelled()) {
+                 return;
+             }
++            } // Antarctic
+             // CraftBukkit end
+ 
+             if (this.material == Material.LAVA && world.getType(blockposition.down()).getMaterial() == Material.WATER) {
+@@ -120,7 +125,7 @@ public class BlockFlowing extends BlockFluids {
+                 this.flow(world, blockposition.down(), iblockdata2, i + 8);
+             }
+         } else if (i >= 0 && (i == 0 || this.g(world, blockposition.down(), iblockdata2))) {
+-            Set set = this.c(world, blockposition);
++            int flowMask = this.getFlowDirections(world, blockposition); // Antarctic - bit n set = HORIZONTAL_DIRECTIONS[n]; was an EnumSet
+ 
+             k = i + b0;
+             if (i >= 8) {
+@@ -131,28 +136,38 @@ public class BlockFlowing extends BlockFluids {
+                 return;
+             }
+ 
+-            Iterator iterator1 = set.iterator();
++            // Antarctic start - the old EnumSet iterated in EnumDirection ordinal order (NORTH, SOUTH, WEST, EAST); keep exactly that order
++            for (int n = 0; n < 4; ++n) {
++                int bit = FLOW_ORDER_BITS[n];
++
++                if ((flowMask & (1 << bit)) == 0) {
++                    continue;
++                }
+ 
+-            while (iterator1.hasNext()) {
+-                EnumDirection enumdirection1 = (EnumDirection) iterator1.next();
++                EnumDirection enumdirection1 = HORIZONTAL_DIRECTIONS[bit];
+ 
+                 // CraftBukkit start
+-                if (!canFlowTo(world, source, org.bukkit.craftbukkit.block.CraftBlock.notchToBlockFace(enumdirection1))) { continue; } // Paper
++                if (!canFlowTo(world, blockposition, enumdirection1)) { continue; } // Paper
++                if (fromToListeners) {
+                 BlockFromToEvent event = new BlockFromToEvent(source, org.bukkit.craftbukkit.block.CraftBlock.notchToBlockFace(enumdirection1));
+                 world.getServer().getPluginManager().callEvent(event);
+ 
+-                if (!event.isCancelled()) {
+-                    this.flow(world, blockposition.shift(enumdirection1), world.getType(blockposition.shift(enumdirection1)), k);
++                if (event.isCancelled()) {
++                    continue;
+                 }
++                }
++                this.flow(world, blockposition.shift(enumdirection1), world.getType(blockposition.shift(enumdirection1)), k);
+                 // CraftBukkit end
+             }
++            // Antarctic end
+         }
+ 
+     }
+ 
+     // Paper start
+-    private boolean canFlowTo(World world, org.bukkit.block.Block source, BlockFace face) {
+-        return source.getWorld().isChunkLoaded((source.getX() + face.getModX()) >> 4, (source.getZ() + face.getModZ()) >> 4);
++    // Antarctic - same check as before (CraftWorld.isChunkLoaded -> ChunkProviderServer.isLoaded) without needing a CraftBlock
++    private boolean canFlowTo(World world, BlockPosition source, EnumDirection direction) {
++        return world.getChunkIfLoaded((source.getX() + direction.getAdjacentX()) >> 4, (source.getZ() + direction.getAdjacentZ()) >> 4) != null;
+     }
+     // Paper end
+ 
+@@ -171,72 +186,93 @@ public class BlockFlowing extends BlockFluids {
+ 
+     }
+ 
+-    private int a(World world, BlockPosition blockposition, int i, EnumDirection enumdirection) {
+-        int j = 1000;
+-        Iterator iterator = EnumDirection.EnumDirectionLimit.HORIZONTAL.iterator();
++    // Antarctic start - allocation-free slope search. Same traversal and results as the old a(...)/b(World)/c(...):
++    // one getType per probed position (the old g(...) re-read the position it was just handed), one mutable position
++    // instead of a BlockPosition per probe, ints instead of an EnumSet. Search order stays NORTH, EAST, SOUTH, WEST.
++    private static final EnumDirection[] HORIZONTAL_DIRECTIONS = {EnumDirection.NORTH, EnumDirection.EAST, EnumDirection.SOUTH, EnumDirection.WEST};
++    // Application order = EnumDirection ordinal order (NORTH, SOUTH, WEST, EAST), expressed as indexes into HORIZONTAL_DIRECTIONS.
++    private static final int[] FLOW_ORDER_BITS = {0, 2, 3, 1};
+ 
+-        while (iterator.hasNext()) {
+-            EnumDirection enumdirection1 = (EnumDirection) iterator.next();
++    private int slopeLimit(World world) {
++        return this.material == Material.LAVA && !world.worldProvider.l() ? 2 : 4;
++    }
++
++    private int slopeDistance(World world, BlockPosition.MutableBlockPosition pos, int x, int y, int z, int depth, int limit, EnumDirection from) {
++        int best = 1000;
+ 
+-            if (enumdirection1 != enumdirection) {
+-                BlockPosition blockposition1 = blockposition.shift(enumdirection1);
+-                IBlockData iblockdata = world.getType(blockposition1);
++        for (int n = 0; n < 4; ++n) {
++            EnumDirection direction = HORIZONTAL_DIRECTIONS[n];
+ 
+-                if (!this.g(world, blockposition1, iblockdata) && (iblockdata.getMaterial() != this.material || ((Integer) iblockdata.get(BlockFlowing.LEVEL)).intValue() > 0)) {
+-                    if (!this.g(world, blockposition1.down(), iblockdata)) {
+-                        return i;
++            if (direction != from) {
++                int nx = x + direction.getAdjacentX();
++                int nz = z + direction.getAdjacentZ();
++                IBlockData iblockdata = world.getType(pos.c(nx, y, nz));
++
++                if (!this.blocksFlow(iblockdata) && (iblockdata.getMaterial() != this.material || ((Integer) iblockdata.get(BlockFlowing.LEVEL)).intValue() > 0)) {
++                    if (!this.blocksFlow(world.getType(pos.c(nx, y - 1, nz)))) {
++                        return depth;
+                     }
+ 
+-                    if (i < this.b(world)) {
+-                        int k = this.a(world, blockposition1, i + 1, enumdirection1.opposite());
++                    if (depth < limit) {
++                        int k = this.slopeDistance(world, pos, nx, y, nz, depth + 1, limit, direction.opposite());
+ 
+-                        if (k < j) {
+-                            j = k;
++                        if (k < best) {
++                            best = k;
+                         }
+                     }
+                 }
+             }
+         }
+ 
+-        return j;
++        return best;
+     }
+ 
+-    private int b(World world) {
+-        return this.material == Material.LAVA && !world.worldProvider.l() ? 2 : 4;
+-    }
+-
+-    private Set<EnumDirection> c(World world, BlockPosition blockposition) {
+-        int i = 1000;
+-        EnumSet enumset = EnumSet.noneOf(EnumDirection.class);
+-        Iterator iterator = EnumDirection.EnumDirectionLimit.HORIZONTAL.iterator();
+-
+-        while (iterator.hasNext()) {
+-            EnumDirection enumdirection = (EnumDirection) iterator.next();
+-            BlockPosition blockposition1 = blockposition.shift(enumdirection);
+-            IBlockData iblockdata = world.getType(blockposition1);
+-
+-            if (!this.g(world, blockposition1, iblockdata) && (iblockdata.getMaterial() != this.material || ((Integer) iblockdata.get(BlockFlowing.LEVEL)).intValue() > 0)) {
++    /** @return bit n set when HORIZONTAL_DIRECTIONS[n] is a best flow direction */
++    private int getFlowDirections(World world, BlockPosition blockposition) {
++        int best = 1000;
++        int mask = 0;
++        int limit = this.slopeLimit(world);
++        int x = blockposition.getX();
++        int y = blockposition.getY();
++        int z = blockposition.getZ();
++        BlockPosition.MutableBlockPosition pos = new BlockPosition.MutableBlockPosition();
++
++        for (int n = 0; n < 4; ++n) {
++            EnumDirection direction = HORIZONTAL_DIRECTIONS[n];
++            int nx = x + direction.getAdjacentX();
++            int nz = z + direction.getAdjacentZ();
++            IBlockData iblockdata = world.getType(pos.c(nx, y, nz));
++
++            if (!this.blocksFlow(iblockdata) && (iblockdata.getMaterial() != this.material || ((Integer) iblockdata.get(BlockFlowing.LEVEL)).intValue() > 0)) {
+                 int j;
+ 
+-                if (this.g(world, blockposition1.down(), world.getType(blockposition1.down()))) {
+-                    j = this.a(world, blockposition1, 1, enumdirection.opposite());
++                if (this.blocksFlow(world.getType(pos.c(nx, y - 1, nz)))) {
++                    j = this.slopeDistance(world, pos, nx, y, nz, 1, limit, direction.opposite());
+                 } else {
+                     j = 0;
+                 }
+ 
+-                if (j < i) {
+-                    enumset.clear();
++                if (j < best) {
++                    mask = 0;
+                 }
+ 
+-                if (j <= i) {
+-                    enumset.add(enumdirection);
+-                    i = j;
++                if (j <= best) {
++                    mask |= 1 << n;
++                    best = j;
+                 }
+             }
+         }
+ 
+-        return enumset;
++        return mask;
++    }
++
++    /** The body of {@link #g(World, BlockPosition, IBlockData)} for a state the caller has already read. */
++    private boolean blocksFlow(IBlockData iblockdata) {
++        Block block = iblockdata.getBlock();
++
++        return !(block instanceof BlockDoor) && block != Blocks.STANDING_SIGN && block != Blocks.LADDER && block != Blocks.REEDS ? (block.material != Material.PORTAL && block.material != Material.J ? block.material.isSolid() : true) : true;
+     }
++    // Antarctic end
+ 
+     private boolean g(World world, BlockPosition blockposition, IBlockData iblockdata) {
+         Block block = world.getType(blockposition).getBlock();
+diff --git a/test/java/net/minecraft/server/BlockFlowingParityTest.java b/test/java/net/minecraft/server/BlockFlowingParityTest.java
+new file mode 100644
+index 0000000..c8a082e
+--- /dev/null
++++ b/test/java/net/minecraft/server/BlockFlowingParityTest.java
+@@ -0,0 +1,330 @@
++package net.minecraft.server;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++
++import java.lang.reflect.Field;
++import java.lang.reflect.Method;
++import java.util.ArrayList;
++import java.util.EnumSet;
++import java.util.Iterator;
++import java.util.List;
++import java.util.Random;
++import java.util.Set;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++/**
++ * Parity of the allocation-free slope search in BlockFlowing against a verbatim copy of the old implementation
++ * (EnumSet + Iterator + BlockPosition per probe), over randomized terrain in the overworld and nether, for water and
++ * lava. Also pins the coordinate-based canFlowTo to the old Bukkit-side chunk-loaded check.
++ */
++public class BlockFlowingParityTest {
++
++    private static Unsafe unsafe;
++
++    /** A provider whose chunks are pre-built terrain; anything else is an empty chunk, like a freshly generated void. */
++    static final class TerrainProvider extends ChunkProviderServer {
++        TerrainProvider(WorldServer world) {
++            super(world, null, null);
++        }
++
++        @Override
++        public Chunk originalGetChunkAt(int x, int z) {
++            return install(this, x, z);
++        }
++    }
++
++    static void set(Class<?> owner, Object instance, String name, Object value) throws Exception {
++        Field field = owner.getDeclaredField(name);
++        field.setAccessible(true);
++        field.set(instance, value);
++    }
++
++    static Chunk install(ChunkProviderServer provider, int x, int z) {
++        try {
++            Chunk chunk = (Chunk) unsafe.allocateInstance(Chunk.class);
++            set(Chunk.class, chunk, "sections", new ChunkSection[16]);
++            // ChunkProviderServer.chunks keeps a last-chunk cache keyed on Chunk.chunkKey; it must match the real key.
++            set(Chunk.class, chunk, "chunkKey", ChunkCoordIntPair.a(x, z));
++            provider.chunks.put(ChunkCoordIntPair.a(x, z), chunk);
++            return chunk;
++        } catch (Exception e) {
++            throw new AssertionError(e);
++        }
++    }
++
++    static void put(Chunk chunk, int x, int y, int z, IBlockData state) {
++        ChunkSection[] sections = chunk.getSections();
++        int index = y >> 4;
++        if (sections[index] == null) {
++            sections[index] = new ChunkSection(index << 4, true);
++        }
++        sections[index].setType(x & 15, y & 15, z & 15, state);
++    }
++
++    static WorldServer newWorld(boolean nether, TerrainProvider[] providerOut) throws Exception {
++        WorldServer world = (WorldServer) unsafe.allocateInstance(WorldServer.class);
++        set(World.class, world, "paperConfig", unsafe.allocateInstance(com.destroystokyo.paper.PaperWorldConfig.class));
++        WorldProvider wp = (WorldProvider) unsafe.allocateInstance(WorldProviderNormal.class);
++        set(WorldProvider.class, wp, "d", nether); // WorldProvider.l(): true in the nether
++        world.worldProvider = wp;
++        TerrainProvider provider = new TerrainProvider(world);
++        set(World.class, world, "chunkProvider", provider);
++        providerOut[0] = provider;
++        return world;
++    }
++
++    private static IBlockData randomTerrain(Random random) {
++        int r = random.nextInt(100);
++        if (r < 52) {
++            return Blocks.AIR.getBlockData();
++        } else if (r < 66) {
++            return Blocks.STONE.getBlockData();
++        } else if (r < 72) {
++            return Blocks.FLOWING_WATER.getBlockData().set(BlockFluids.LEVEL, 0);
++        } else if (r < 77) {
++            return Blocks.FLOWING_WATER.getBlockData().set(BlockFluids.LEVEL, 1 + random.nextInt(7));
++        } else if (r < 80) {
++            return Blocks.FLOWING_LAVA.getBlockData().set(BlockFluids.LEVEL, random.nextInt(8));
++        } else if (r < 83) {
++            return Blocks.WOODEN_DOOR.getBlockData();
++        } else if (r < 86) {
++            return Blocks.LADDER.getBlockData();
++        } else if (r < 89) {
++            return Blocks.STANDING_SIGN.getBlockData();
++        } else if (r < 92) {
++            return Blocks.REEDS.getBlockData();
++        } else if (r < 94) {
++            return Blocks.PORTAL.getBlockData();
++        } else {
++            return Blocks.FLOWING_WATER.getBlockData().set(BlockFluids.LEVEL, 8 + random.nextInt(8)); // falling water
++        }
++    }
++
++    /** Fills chunks -2..1 on both axes (blocks -32..31), y = 1..14, then returns the world. */
++    static WorldServer buildTerrain(long seed, boolean nether, TerrainProvider[] providerOut) throws Exception {
++        WorldServer world = newWorld(nether, providerOut);
++        Random random = new Random(seed);
++        for (int cx = -2; cx <= 1; ++cx) {
++            for (int cz = -2; cz <= 1; ++cz) {
++                Chunk chunk = install(providerOut[0], cx, cz);
++                for (int x = 0; x < 16; ++x) {
++                    for (int z = 0; z < 16; ++z) {
++                        for (int y = 1; y <= 14; ++y) {
++                            put(chunk, x, y, z, randomTerrain(random));
++                        }
++                    }
++                }
++            }
++        }
++        return world;
++    }
++
++    @BeforeClass
++    public static void bootstrap() throws Exception {
++        Field field = Unsafe.class.getDeclaredField("theUnsafe");
++        field.setAccessible(true);
++        unsafe = (Unsafe) field.get(null);
++        DispenserRegistry.c();
++    }
++
++    // ----------------------------------------------------------------- verbatim copy of the old implementation
++
++    static boolean oldG(World world, BlockPosition blockposition) {
++        Block block = world.getType(blockposition).getBlock();
++
++        return !(block instanceof BlockDoor) && block != Blocks.STANDING_SIGN && block != Blocks.LADDER && block != Blocks.REEDS ? (block.material != Material.PORTAL && block.material != Material.J ? block.material.isSolid() : true) : true;
++    }
++
++    static int oldB(BlockFlowing fluid, World world) {
++        return fluid.material == Material.LAVA && !world.worldProvider.l() ? 2 : 4;
++    }
++
++    static int oldA(BlockFlowing fluid, World world, BlockPosition blockposition, int i, EnumDirection enumdirection) {
++        int j = 1000;
++        Iterator iterator = EnumDirection.EnumDirectionLimit.HORIZONTAL.iterator();
++
++        while (iterator.hasNext()) {
++            EnumDirection enumdirection1 = (EnumDirection) iterator.next();
++
++            if (enumdirection1 != enumdirection) {
++                BlockPosition blockposition1 = blockposition.shift(enumdirection1);
++                IBlockData iblockdata = world.getType(blockposition1);
++
++                if (!oldG(world, blockposition1) && (iblockdata.getMaterial() != fluid.material || ((Integer) iblockdata.get(BlockFlowing.LEVEL)).intValue() > 0)) {
++                    if (!oldG(world, blockposition1.down())) {
++                        return i;
++                    }
++
++                    if (i < oldB(fluid, world)) {
++                        int k = oldA(fluid, world, blockposition1, i + 1, enumdirection1.opposite());
++
++                        if (k < j) {
++                            j = k;
++                        }
++                    }
++                }
++            }
++        }
++
++        return j;
++    }
++
++    static Set<EnumDirection> oldC(BlockFlowing fluid, World world, BlockPosition blockposition) {
++        int i = 1000;
++        EnumSet enumset = EnumSet.noneOf(EnumDirection.class);
++        Iterator iterator = EnumDirection.EnumDirectionLimit.HORIZONTAL.iterator();
++
++        while (iterator.hasNext()) {
++            EnumDirection enumdirection = (EnumDirection) iterator.next();
++            BlockPosition blockposition1 = blockposition.shift(enumdirection);
++            IBlockData iblockdata = world.getType(blockposition1);
++
++            if (!oldG(world, blockposition1) && (iblockdata.getMaterial() != fluid.material || ((Integer) iblockdata.get(BlockFlowing.LEVEL)).intValue() > 0)) {
++                int j;
++
++                if (oldG(world, blockposition1.down())) {
++                    j = oldA(fluid, world, blockposition1, 1, enumdirection.opposite());
++                } else {
++                    j = 0;
++                }
++
++                if (j < i) {
++                    enumset.clear();
++                }
++
++                if (j <= i) {
++                    enumset.add(enumdirection);
++                    i = j;
++                }
++            }
++        }
++
++        return enumset;
++    }
++
++    // ----------------------------------------------------------------- the new implementation, through reflection
++
++    private static Method flowDirections;
++    private static EnumDirection[] horizontal;
++    private static int[] flowOrderBits;
++
++    @SuppressWarnings("unchecked")
++    private static void reflect() throws Exception {
++        if (flowDirections != null) {
++            return;
++        }
++        flowDirections = BlockFlowing.class.getDeclaredMethod("getFlowDirections", World.class, BlockPosition.class);
++        flowDirections.setAccessible(true);
++        Field h = BlockFlowing.class.getDeclaredField("HORIZONTAL_DIRECTIONS");
++        h.setAccessible(true);
++        horizontal = (EnumDirection[]) h.get(null);
++        Field o = BlockFlowing.class.getDeclaredField("FLOW_ORDER_BITS");
++        o.setAccessible(true);
++        flowOrderBits = (int[]) o.get(null);
++    }
++
++    /** The directions in the exact order BlockFlowing.b applies them. */
++    static List<EnumDirection> newOrder(BlockFlowing fluid, World world, BlockPosition pos) throws Exception {
++        reflect();
++        int mask = (Integer) flowDirections.invoke(fluid, world, pos);
++        List<EnumDirection> order = new ArrayList<EnumDirection>();
++        for (int n = 0; n < 4; ++n) {
++            int bit = flowOrderBits[n];
++            if ((mask & (1 << bit)) != 0) {
++                order.add(horizontal[bit]);
++            }
++        }
++        return order;
++    }
++
++    @Test
++    public void slopeSearchMatchesTheOldImplementation() throws Exception {
++        BlockFlowing[] fluids = {Blocks.FLOWING_WATER, Blocks.FLOWING_LAVA};
++        int compared = 0;
++        int nonTrivial = 0;
++        for (boolean nether : new boolean[] {false, true}) {
++            for (long seed = 1; seed <= 6; ++seed) {
++                TerrainProvider[] holder = new TerrainProvider[1];
++                WorldServer world = buildTerrain(seed, nether, holder);
++                Random random = new Random(seed * 31);
++                for (int n = 0; n < 1500; ++n) {
++                    BlockPosition pos = new BlockPosition(random.nextInt(48) - 24, 2 + random.nextInt(12), random.nextInt(48) - 24);
++                    for (BlockFlowing fluid : fluids) {
++                        List<EnumDirection> expected = new ArrayList<EnumDirection>(oldC(fluid, world, pos)); // EnumSet: ordinal order
++                        List<EnumDirection> actual = newOrder(fluid, world, pos);
++                        assertEquals("fluid=" + fluid.material + " nether=" + nether + " pos=" + pos, expected, actual);
++                        ++compared;
++                        if (expected.size() > 0 && expected.size() < 4) {
++                            ++nonTrivial;
++                        }
++                    }
++                }
++            }
++        }
++        assertTrue("the terrain must exercise real slope decisions, not only all-or-nothing", nonTrivial > 200);
++        assertTrue(compared > 10000);
++    }
++
++    @Test
++    public void enumSetOrderIsNorthSouthWestEast() {
++        // BlockFlowing.b used to iterate an EnumSet, i.e. EnumDirection ordinal order; the rewrite must keep applying
++        // flow in NORTH, SOUTH, WEST, EAST order because it decides event order and which scheduled ticks come first.
++        EnumSet<EnumDirection> all = EnumSet.noneOf(EnumDirection.class);
++        all.add(EnumDirection.EAST);
++        all.add(EnumDirection.WEST);
++        all.add(EnumDirection.SOUTH);
++        all.add(EnumDirection.NORTH);
++        List<EnumDirection> iterated = new ArrayList<EnumDirection>(all);
++        assertEquals(EnumDirection.NORTH, iterated.get(0));
++        assertEquals(EnumDirection.SOUTH, iterated.get(1));
++        assertEquals(EnumDirection.WEST, iterated.get(2));
++        assertEquals(EnumDirection.EAST, iterated.get(3));
++    }
++
++    @Test
++    public void canFlowToMatchesTheOldChunkLoadedCheck() throws Exception {
++        TerrainProvider[] holder = new TerrainProvider[1];
++        WorldServer world = buildTerrain(3, false, holder);
++        Method canFlowTo = BlockFlowing.class.getDeclaredMethod("canFlowTo", World.class, BlockPosition.class, EnumDirection.class);
++        canFlowTo.setAccessible(true);
++        EnumDirection[] directions = {EnumDirection.DOWN, EnumDirection.NORTH, EnumDirection.SOUTH, EnumDirection.WEST, EnumDirection.EAST};
++        int unloaded = 0;
++        // Chunks -2..1 are loaded; probe across and beyond the loaded border, including negative coordinates.
++        for (int x = -40; x <= 40; x += 3) {
++            for (int z = -40; z <= 40; z += 3) {
++                for (EnumDirection direction : directions) {
++                    BlockPosition pos = new BlockPosition(x, 5, z);
++                    // Old: source.getWorld().isChunkLoaded((x + face.modX) >> 4, (z + face.modZ) >> 4)
++                    // == ChunkProviderServer.isLoaded(...); BlockFace.getModX/Z equal EnumDirection's adjacent offsets.
++                    boolean expected = holder[0].isLoaded((x + direction.getAdjacentX()) >> 4, (z + direction.getAdjacentZ()) >> 4);
++                    boolean actual = (Boolean) canFlowTo.invoke(Blocks.FLOWING_WATER, world, pos, direction);
++                    assertEquals("x=" + x + " z=" + z + " " + direction, expected, actual);
++                    if (!expected) {
++                        ++unloaded;
++                    }
++                }
++            }
++        }
++        assertTrue("the probe must include unloaded targets", unloaded > 100);
++    }
++
++    @Test
++    public void slopeSearchOnAnEmptyWorldAndAtLoadedBorder() throws Exception {
++        TerrainProvider[] holder = new TerrainProvider[1];
++        WorldServer world = newWorld(false, holder);
++        for (BlockFlowing fluid : new BlockFlowing[] {Blocks.FLOWING_WATER, Blocks.FLOWING_LAVA}) {
++            BlockPosition pos = new BlockPosition(0, 10, 0);
++            assertEquals(new ArrayList<EnumDirection>(oldC(fluid, world, pos)), newOrder(fluid, world, pos));
++            // y = 1: the "below" read goes to y = 0; y = 0 itself reads y = -1 (the old code did the same through getType).
++            for (int y : new int[] {0, 1}) {
++                BlockPosition low = new BlockPosition(15, y, 15);
++                assertEquals(new ArrayList<EnumDirection>(oldC(fluid, world, low)), newOrder(fluid, world, low));
++            }
++        }
++        assertFalse(holder[0].chunks.isEmpty());
++    }
++}
+diff --git a/test/java/net/minecraft/server/BlockFlowingPerfTest.java b/test/java/net/minecraft/server/BlockFlowingPerfTest.java
+new file mode 100644
+index 0000000..6e3af8c
+--- /dev/null
++++ b/test/java/net/minecraft/server/BlockFlowingPerfTest.java
+@@ -0,0 +1,77 @@
++package net.minecraft.server;
++
++import static org.junit.Assert.assertTrue;
++
++import java.lang.management.ManagementFactory;
++import java.lang.reflect.Field;
++import java.lang.reflect.Method;
++import java.util.Random;
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++/** Timed and allocation-counting comparison of the old and new slope search on identical terrain. */
++public class BlockFlowingPerfTest {
++
++    private static final com.sun.management.ThreadMXBean MX = (com.sun.management.ThreadMXBean) ManagementFactory.getThreadMXBean();
++
++    @BeforeClass
++    public static void bootstrap() throws Exception {
++        BlockFlowingParityTest.bootstrap();
++    }
++
++    private static long sink;
++
++    @Test
++    public void slopeSearchIsFasterAndAllocatesLess() throws Exception {
++        BlockFlowingParityTest.TerrainProvider[] holder = new BlockFlowingParityTest.TerrainProvider[1];
++        WorldServer world = BlockFlowingParityTest.buildTerrain(99, false, holder);
++        Method flowDirections = BlockFlowing.class.getDeclaredMethod("getFlowDirections", World.class, BlockPosition.class);
++        flowDirections.setAccessible(true);
++        BlockFlowing fluid = Blocks.FLOWING_WATER;
++
++        // Open flat terrain: the realistic hot case (a sheet of water with holes), where slope searches run to full depth.
++        for (int cx = -2; cx <= 1; ++cx) {
++            for (int cz = -2; cz <= 1; ++cz) {
++                Chunk chunk = holder[0].getChunkIfLoaded(cx, cz);
++                for (int x = 0; x < 16; ++x) {
++                    for (int z = 0; z < 16; ++z) {
++                        BlockFlowingParityTest.put(chunk, x, 9, z, (x * 7 + z * 13) % 11 == 0 ? Blocks.AIR.getBlockData() : Blocks.STONE.getBlockData());
++                        BlockFlowingParityTest.put(chunk, x, 10, z, Blocks.AIR.getBlockData());
++                    }
++                }
++            }
++        }
++        Random random = new Random(5);
++        BlockPosition[] positions = new BlockPosition[20_000];
++        for (int i = 0; i < positions.length; ++i) {
++            positions[i] = new BlockPosition(random.nextInt(40) - 20, 10, random.nextInt(40) - 20);
++        }
++
++        long oldNanos = Long.MAX_VALUE;
++        long newNanos = Long.MAX_VALUE;
++        long oldBytes = 0;
++        long newBytes = 0;
++        for (int round = 0; round < 6; ++round) {
++            long a0 = MX.getThreadAllocatedBytes(Thread.currentThread().getId());
++            long t0 = System.nanoTime();
++            for (BlockPosition pos : positions) {
++                sink += BlockFlowingParityTest.oldC(fluid, world, pos).size();
++            }
++            oldNanos = Math.min(oldNanos, System.nanoTime() - t0);
++            oldBytes = MX.getThreadAllocatedBytes(Thread.currentThread().getId()) - a0;
++
++            a0 = MX.getThreadAllocatedBytes(Thread.currentThread().getId());
++            t0 = System.nanoTime();
++            for (BlockPosition pos : positions) {
++                sink += (Integer) flowDirections.invoke(fluid, world, pos);
++            }
++            newNanos = Math.min(newNanos, System.nanoTime() - t0);
++            newBytes = MX.getThreadAllocatedBytes(Thread.currentThread().getId()) - a0;
++        }
++        System.out.println("[perf] BlockFlowing slope search, 20k positions on open terrain: old=" + oldNanos / 1000 + "us/" + oldBytes / 1024
++                + "KiB new=" + newNanos / 1000 + "us/" + newBytes / 1024 + "KiB time=" + String.format("%.2f", (double) oldNanos / Math.max(1, newNanos))
++                + "x alloc=" + String.format("%.1f", (double) oldBytes / Math.max(1, newBytes)) + "x (new includes reflection overhead) sink=" + sink);
++        assertTrue("new slope search should allocate clearly less", newBytes * 2 < oldBytes);
++        assertTrue("new slope search should be faster", newNanos < oldNanos);
++    }
++}
