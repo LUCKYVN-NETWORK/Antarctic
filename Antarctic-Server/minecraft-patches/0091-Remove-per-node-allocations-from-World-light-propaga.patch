@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Tue, 17 Nov 2026 16:33:41 +0700
-Subject: [PATCH 91/91] Remove per-node allocations from World light
+Subject: [PATCH 91/92] Remove per-node allocations from World light
  propagation
 
 World.c (the sky/block light BFS) allocated a BlockPosition per dequeued node plus six more for the neighbor probes, cloned EnumDirection.values() per node, and every probe did isLoaded + chunk lookup + BlockPosition clamp. Now:
@@ -216,7 +216,7 @@ index aaa052a..7be6f61 100644
                          }
 diff --git a/test/java/net/minecraft/server/LightPropagationParityTest.java b/test/java/net/minecraft/server/LightPropagationParityTest.java
 new file mode 100644
-index 0000000..628ebee
+index 0000000..0103a70
 --- /dev/null
 +++ b/test/java/net/minecraft/server/LightPropagationParityTest.java
 @@ -0,0 +1,451 @@
@@ -673,7 +673,7 @@ index 0000000..628ebee
 +}
 diff --git a/test/java/net/minecraft/server/LightPropagationPerfTest.java b/test/java/net/minecraft/server/LightPropagationPerfTest.java
 new file mode 100644
-index 0000000..6d2d252
+index 0000000..763ed98
 --- /dev/null
 +++ b/test/java/net/minecraft/server/LightPropagationPerfTest.java
 @@ -0,0 +1,96 @@

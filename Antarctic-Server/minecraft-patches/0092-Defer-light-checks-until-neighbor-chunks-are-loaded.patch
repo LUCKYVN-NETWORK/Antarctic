@@ -1,0 +1,1685 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 17 Nov 2026 17:02:11 +0700
+Subject: [PATCH 92/92] Defer light checks until neighbor chunks are loaded
+
+World.c discards a light check when the 3x3 chunk neighborhood of the changed block is not fully loaded (island and region edges); nothing recomputes it, so the light stays wrong. With defer-light-updates (default true) the check is remembered per chunk (PendingLightRegistry, chunk-local packed ints, capped) and replayed in recording order, budgeted per tick, once the neighborhood is complete (hooked after Chunk.loadNearby links neighbors; cleared on unload; drained before the chunk map flush). Checks whose own chunk is not loaded are still dropped, as before.
+
+Config (optimizations.lighting): defer-light-updates (true), deferred-light-updates-per-tick (1024; 4096 measured ~35-60 ms in a dense light-emitting case), deferred-light-max-entries (262144). Deliberate deviation from vanilla: strictly more light is computed, never less.
+
+Finding recorded in DeferredLightUpdateTest: vanilla's incremental relight is path dependent. Placing sources and relighting after each gives a different result than placing all first and relighting afterwards (1147 differing block-light cells for three torches), because the second source's search finds its cell already raised and the radius-17 limit is measured from the first source. Replay therefore equals running the same checks after all of the block changes. This is likely the mechanism behind broken lighting after bulk pastes and motivates the async bulk relight step.
+
+Tests: PendingLightRegistryTest (pack/unpack, cap, budget carry-over, WAIT/GONE, clear, visitor re-entrancy), DeferredLightUpdateTest (replay equals running the same checks after all changes, per-tick budget, toggle off keeps vanilla, unloaded center not recorded, out-of-range Y), DeferredLightPerfTest: normal fully loaded path 27.6 ms vs 25.7 ms with the toggle (noise, branch not taken); recording 4096 checks 2 ms; replaying one default budget (1024 checks) 9.2 ms. Not covered: a real chunk load/unload sequence on a running server.
+
+diff --git a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+index c6b9501..f34a10a 100644
+--- a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
++++ b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+@@ -19,6 +19,7 @@ import com.destroystokyo.paper.config.toml.modules.optimizations.Projectiles;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Suffocation;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Physics;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Rails;
++import com.destroystokyo.paper.config.toml.modules.optimizations.Lighting;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.SunBurn;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.WorldBorder;
+ import com.electronwill.nightconfig.core.file.CommentedFileConfig;
+@@ -51,7 +52,7 @@ public final class AntarcticTomlConfig {
+             new Rebrand(), new Privacy(),
+             new Deflate(),
+             new VirtualThreads(), new AsyncPlayerDataSaving(),
+-            new Pathfinder(), new Suffocation(), new Projectiles(), new ArmourStands(), new WorldBorder(), new SunBurn(), new Rails(), new Physics(),
++            new Pathfinder(), new Suffocation(), new Projectiles(), new ArmourStands(), new WorldBorder(), new SunBurn(), new Rails(), new Physics(), new Lighting(),
+             new MergeChecks(), new ChunkOverloadDupe(), new Collisions(),
+             new MapDecorations(), new Books());
+     private static final YamlConfiguration yamlFacade = new YamlConfiguration();
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/Lighting.java b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/Lighting.java
+new file mode 100644
+index 0000000..76b2533
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/Lighting.java
+@@ -0,0 +1,37 @@
++package com.destroystokyo.paper.config.toml.modules.optimizations;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++
++public class Lighting implements IConfigModule {
++
++    @ConfigInfo(baseName = "defer-light-updates", comments = "Vanilla discards a light check when the 3x3 chunk neighborhood of the changed block is not fully loaded (island and region edges), which can leave permanently wrong light after large pastes.\nWhen true, such checks are remembered per chunk and replayed once the neighbors have loaded. The result is more correct than vanilla, not identical to it.\nDefault true. Set false for strict vanilla behavior.")
++    public static boolean deferLightUpdates = true;
++
++    @ConfigInfo(baseName = "deferred-light-updates-per-tick", comments = "Maximum number of deferred light checks replayed per world per tick. Higher values fix light faster but cost more tick time. Must be positive. Default 1024 (about 9 ms in the worst measured case of dense light-emitting pastes; 4096 measured about 35 ms).")
++    public static int deferredLightUpdatesPerTick = 1024;
++
++    @ConfigInfo(baseName = "deferred-light-max-entries", comments = "Maximum number of deferred light checks remembered per world. Further checks are dropped (as vanilla drops all of them). Must be positive. Default 262144.")
++    public static int deferredLightMaxEntries = 262144;
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.OPTIMIZATIONS;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "lighting";
++    }
++
++    @Override
++    public void onLoaded(com.electronwill.nightconfig.core.file.CommentedFileConfig config) {
++        if (deferredLightUpdatesPerTick < 1) {
++            throw new IllegalArgumentException("optimizations.lighting.deferred-light-updates-per-tick must be positive");
++        }
++        if (deferredLightMaxEntries < 1) {
++            throw new IllegalArgumentException("optimizations.lighting.deferred-light-max-entries must be positive");
++        }
++    }
++}
+diff --git a/main/java/me/stella/antarctic/collection/PendingLightRegistry.java b/main/java/me/stella/antarctic/collection/PendingLightRegistry.java
+new file mode 100644
+index 0000000..451bdc1
+--- /dev/null
++++ b/main/java/me/stella/antarctic/collection/PendingLightRegistry.java
+@@ -0,0 +1,171 @@
++package me.stella.antarctic.collection;
++
++import it.unimi.dsi.fastutil.ints.IntLinkedOpenHashSet;
++import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
++import it.unimi.dsi.fastutil.longs.LongArrayFIFOQueue;
++import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
++
++/**
++ * Remembers light checks that vanilla discards because the 3x3 chunk neighborhood of the changed block is not fully
++ * loaded, so they can be replayed once the neighbors arrive. Entries are keyed by the chunk that contains the block and
++ * store only chunk-local data ({@code x & 15}, y, {@code z & 15}, sky/block flag), which fits one int.
++ *
++ * <p>A light check is level-triggered (it recomputes what the light at that position should be), so replaying an old
++ * entry later is harmless. Entries replay in the order they were first recorded, against the block states as they are
++ * at replay time; vanilla's incremental algorithm is path dependent (see DeferredLightUpdateTest), so the result equals
++ * running the same checks after all of the block changes, not after each one. The registry is capped; once full, new entries are dropped (and counted),
++ * which is exactly what vanilla does for every entry. Not thread safe; main-thread confined.
++ *
++ * <p>Antarctic - original work; the "never save or light a chunk with pending light updates" rule is the one Starlight
++ * documents (Spottedleaf / PaperMC; LGPL-3.0), used here only as a design reference.
++ */
++public final class PendingLightRegistry {
++
++    /** What a replay should do with a chunk that has pending entries. */
++    public interface Gate {
++        int READY = 0;
++        /** The neighborhood is incomplete again; keep the entries and wait for the next load event. */
++        int WAIT = 1;
++        /** The chunk is gone; discard its entries. */
++        int GONE = 2;
++
++        int check(long chunkKey);
++    }
++
++    public interface Visitor {
++        void accept(long chunkKey, int localX, int y, int localZ, boolean sky);
++    }
++
++    private final Long2ObjectOpenHashMap<IntLinkedOpenHashSet> pending = new Long2ObjectOpenHashMap<IntLinkedOpenHashSet>();
++    private final LongArrayFIFOQueue ready = new LongArrayFIFOQueue();
++    private final LongOpenHashSet readySet = new LongOpenHashSet();
++    private final int maxEntries;
++    private int total;
++    private long dropped;
++    private int[] buffer = new int[256];
++
++    public PendingLightRegistry(int maxEntries) {
++        this.maxEntries = Math.max(0, maxEntries);
++    }
++
++    public static int pack(int localX, int y, int localZ, boolean sky) {
++        return (sky ? 1 << 16 : 0) | (y & 255) << 8 | (localZ & 15) << 4 | (localX & 15);
++    }
++
++    public static int unpackX(int packed) {
++        return packed & 15;
++    }
++
++    public static int unpackZ(int packed) {
++        return packed >> 4 & 15;
++    }
++
++    public static int unpackY(int packed) {
++        return packed >> 8 & 255;
++    }
++
++    public static boolean unpackSky(int packed) {
++        return (packed >> 16 & 1) != 0;
++    }
++
++    /** @return true when the entry is stored (false: duplicate, or dropped because the registry is full) */
++    public boolean add(long chunkKey, int packed) {
++        IntLinkedOpenHashSet set = this.pending.get(chunkKey);
++        if (set != null && set.contains(packed)) {
++            return false;
++        }
++        if (this.total >= this.maxEntries) {
++            ++this.dropped;
++            return false;
++        }
++        if (set == null) {
++            set = new IntLinkedOpenHashSet(8);
++            this.pending.put(chunkKey, set);
++        }
++        set.add(packed);
++        ++this.total;
++        return true;
++    }
++
++    public boolean hasPending(long chunkKey) {
++        return !this.pending.isEmpty() && this.pending.containsKey(chunkKey);
++    }
++
++    /** Queue a chunk for replay if it has entries and is not already queued. */
++    public void markReady(long chunkKey) {
++        if (this.pending.containsKey(chunkKey) && this.readySet.add(chunkKey)) {
++            this.ready.enqueue(chunkKey);
++        }
++    }
++
++    /** Forget a chunk (it unloaded). */
++    public void clearChunk(long chunkKey) {
++        IntLinkedOpenHashSet set = this.pending.remove(chunkKey);
++        if (set != null) {
++            this.total -= set.size();
++        }
++        this.readySet.remove(chunkKey);
++        // The key may still sit in the ready queue; drain() skips keys without entries.
++    }
++
++    /**
++     * Replays up to {@code budget} entries from queued chunks, oldest queued chunk first.
++     *
++     * @return the number of entries replayed
++     */
++    public int drain(int budget, Gate gate, Visitor visitor) {
++        int processed = 0;
++        while (processed < budget && !this.ready.isEmpty()) {
++            long key = this.ready.firstLong();
++            IntLinkedOpenHashSet set = this.pending.get(key);
++            if (set == null || !this.readySet.contains(key)) { // cleared or already handled
++                this.ready.dequeueLong();
++                this.readySet.remove(key);
++                continue;
++            }
++            int state = gate.check(key);
++            if (state == Gate.GONE) {
++                this.clearChunk(key);
++                this.ready.dequeueLong();
++                continue;
++            }
++            if (state == Gate.WAIT) {
++                this.ready.dequeueLong();
++                this.readySet.remove(key);
++                continue;
++            }
++            int take = Math.min(budget - processed, set.size());
++            if (this.buffer.length < take) {
++                this.buffer = new int[Math.max(take, this.buffer.length * 2)];
++            }
++            for (int i = 0; i < take; ++i) {
++                this.buffer[i] = set.removeFirstInt(); // insertion order: checks replay in the order they were first recorded
++            }
++            this.total -= take;
++            if (set.isEmpty()) {
++                this.pending.remove(key);
++                this.ready.dequeueLong();
++                this.readySet.remove(key);
++            }
++            // Visit after bookkeeping, so a visitor that records new entries cannot disturb the iteration above.
++            for (int i = 0; i < take; ++i) {
++                int packed = this.buffer[i];
++                visitor.accept(key, unpackX(packed), unpackY(packed), unpackZ(packed), unpackSky(packed));
++            }
++            processed += take;
++        }
++        return processed;
++    }
++
++    public int size() {
++        return this.total;
++    }
++
++    public int pendingChunks() {
++        return this.pending.size();
++    }
++
++    public long dropped() {
++        return this.dropped;
++    }
++}
+diff --git a/main/java/net/minecraft/server/Chunk.java b/main/java/net/minecraft/server/Chunk.java
+index 6dc6be4..a8a5200 100644
+--- a/main/java/net/minecraft/server/Chunk.java
++++ b/main/java/net/minecraft/server/Chunk.java
+@@ -1142,6 +1142,7 @@ public class Chunk {
+             }
+         }
+         // CraftBukkit end
++        world.onChunkNeighborsLinked(this); // Antarctic - replay light checks that were deferred for lack of neighbors
+         world.timings.syncChunkLoadPostTimer.stopTiming(); // Paper
+         world.timings.syncChunkLoadPopulateNeighbors.startTiming(); // Paper
+         Chunk chunk = MCUtil.getLoadedChunkWithoutMarkingActive(ichunkprovider,this.locX, this.locZ - 1); // Paper
+diff --git a/main/java/net/minecraft/server/ChunkProviderServer.java b/main/java/net/minecraft/server/ChunkProviderServer.java
+index 2b7e7d7..7a7afb6 100644
+--- a/main/java/net/minecraft/server/ChunkProviderServer.java
++++ b/main/java/net/minecraft/server/ChunkProviderServer.java
+@@ -413,6 +413,7 @@ public class ChunkProviderServer implements IChunkProvider {
+                 }
+             }
+         }
++        this.world.pendingLight.clearChunk(chunk.chunkKey); // Antarctic - drop deferred light checks of the unloading chunk
+         // Moved from unloadChunks above
+         chunk.removeEntities();
+         if (save) {
+diff --git a/main/java/net/minecraft/server/World.java b/main/java/net/minecraft/server/World.java
+index 7be6f61..dc442e5 100644
+--- a/main/java/net/minecraft/server/World.java
++++ b/main/java/net/minecraft/server/World.java
+@@ -112,6 +112,9 @@ public abstract class World implements IBlockAccess {
+     private boolean O;
+     private final WorldBorder P;
+     int[] J;
++    // Antarctic start - light checks vanilla discards at partially loaded borders, replayed once the neighbors load
++    public final me.stella.antarctic.collection.PendingLightRegistry pendingLight = new me.stella.antarctic.collection.PendingLightRegistry(com.destroystokyo.paper.config.toml.modules.optimizations.Lighting.deferredLightMaxEntries);
++    // Antarctic end
+ 
+     // CraftBukkit start Added the following
+     private final CraftWorld world;
+@@ -2537,11 +2540,54 @@ public abstract class World implements IBlockAccess {
+         }
+     }
+ 
++    // Antarctic start - deferred light checks (see PendingLightRegistry)
++    private void deferLightCheck(Chunk chunk, EnumSkyBlock enumskyblock, BlockPosition blockposition) {
++        int y = blockposition.getY();
++
++        if (y >= 0 && y < 256) {
++            this.pendingLight.add(chunk.chunkKey, me.stella.antarctic.collection.PendingLightRegistry.pack(blockposition.getX() & 15, y, blockposition.getZ() & 15, enumskyblock == EnumSkyBlock.SKY));
++        }
++    }
++
++    /** Called after a chunk has been linked to its neighbors: queue every chunk around it whose 3x3 neighborhood is now complete. */
++    public void onChunkNeighborsLinked(Chunk chunk) {
++        if (this.pendingLight.pendingChunks() == 0) {
++            return;
++        }
++
++        for (int dx = -1; dx <= 1; ++dx) {
++            for (int dz = -1; dz <= 1; ++dz) {
++                Chunk candidate = dx == 0 && dz == 0 ? chunk : this.getChunkIfLoaded(chunk.locX + dx, chunk.locZ + dz);
++
++                if (candidate != null && this.pendingLight.hasPending(candidate.chunkKey) && candidate.areNeighborsLoaded(1)) {
++                    this.pendingLight.markReady(candidate.chunkKey);
++                }
++            }
++        }
++    }
++
++    /** Replays up to {@code budget} deferred light checks whose chunks are now fully surrounded. */
++    public int drainDeferredLight(int budget) {
++        if (this.pendingLight.pendingChunks() == 0) {
++            return 0;
++        }
++
++        return this.pendingLight.drain(budget, key -> {
++            Chunk chunk = this.getChunkIfLoaded((int) key, (int) (key >>> 32));
++
++            return chunk == null ? me.stella.antarctic.collection.PendingLightRegistry.Gate.GONE : (chunk.areNeighborsLoaded(1) ? me.stella.antarctic.collection.PendingLightRegistry.Gate.READY : me.stella.antarctic.collection.PendingLightRegistry.Gate.WAIT);
++        }, (key, localX, y, localZ, sky) -> this.c(sky ? EnumSkyBlock.SKY : EnumSkyBlock.BLOCK, new BlockPosition(((int) key << 4) + localX, y, ((int) (key >>> 32) << 4) + localZ)));
++    }
++    // Antarctic end
++
+     public boolean c(EnumSkyBlock enumskyblock, BlockPosition blockposition) {
+         // CraftBukkit start - Use neighbor cache instead of looking up
+         Chunk chunk = this.getChunkIfLoaded(blockposition.getX() >> 4, blockposition.getZ() >> 4);
+         if (chunk == null || !chunk.areNeighborsLoaded(1) /*!this.areChunksLoaded(blockposition, 17, false)*/) {
+             // CraftBukkit end
++            if (chunk != null && com.destroystokyo.paper.config.toml.modules.optimizations.Lighting.deferLightUpdates) { // Antarctic - remember it instead of losing it
++                this.deferLightCheck(chunk, enumskyblock, blockposition);
++            }
+             return false;
+         } else {
+             int i = 0;
+diff --git a/main/java/net/minecraft/server/WorldServer.java b/main/java/net/minecraft/server/WorldServer.java
+index 7ce608b..deccb7a 100644
+--- a/main/java/net/minecraft/server/WorldServer.java
++++ b/main/java/net/minecraft/server/WorldServer.java
+@@ -340,6 +340,9 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+         timings.chunkTicks.stopTiming(); // Paper
+         this.methodProfiler.c("chunkMap");
+         timings.doChunkMap.startTiming(); // Spigot
++        if (com.destroystokyo.paper.config.toml.modules.optimizations.Lighting.deferLightUpdates) { // Antarctic
++            this.drainDeferredLight(com.destroystokyo.paper.config.toml.modules.optimizations.Lighting.deferredLightUpdatesPerTick);
++        }
+         this.manager.flush();
+         timings.doChunkMap.stopTiming(); // Spigot
+         this.methodProfiler.c("village");
+diff --git a/test/java/me/stella/antarctic/collection/PendingLightRegistryTest.java b/test/java/me/stella/antarctic/collection/PendingLightRegistryTest.java
+new file mode 100644
+index 0000000..9db4aa6
+--- /dev/null
++++ b/test/java/me/stella/antarctic/collection/PendingLightRegistryTest.java
+@@ -0,0 +1,155 @@
++package me.stella.antarctic.collection;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++
++import java.util.ArrayList;
++import java.util.List;
++import org.junit.Test;
++
++public class PendingLightRegistryTest {
++
++    private static final PendingLightRegistry.Gate READY = key -> PendingLightRegistry.Gate.READY;
++
++    private static final class Recorder implements PendingLightRegistry.Visitor {
++        final List<long[]> seen = new ArrayList<long[]>();
++
++        @Override
++        public void accept(long chunkKey, int localX, int y, int localZ, boolean sky) {
++            seen.add(new long[] {chunkKey, localX, y, localZ, sky ? 1 : 0});
++        }
++    }
++
++    @Test
++    public void packRoundTripsEveryField() {
++        for (int x = 0; x < 16; ++x) {
++            for (int z = 0; z < 16; ++z) {
++                for (int y : new int[] {0, 1, 63, 127, 128, 254, 255}) {
++                    for (boolean sky : new boolean[] {false, true}) {
++                        int packed = PendingLightRegistry.pack(x, y, z, sky);
++                        assertEquals(x, PendingLightRegistry.unpackX(packed));
++                        assertEquals(z, PendingLightRegistry.unpackZ(packed));
++                        assertEquals(y, PendingLightRegistry.unpackY(packed));
++                        assertEquals(sky, PendingLightRegistry.unpackSky(packed));
++                    }
++                }
++            }
++        }
++    }
++
++    @Test
++    public void negativeWorldCoordinatesPackToTheirChunkLocalValues() {
++        // -1 & 15 == 15, -16 & 15 == 0: the registry stores chunk-local data, callers pass `x & 15`
++        assertEquals(15, PendingLightRegistry.unpackX(PendingLightRegistry.pack(-1 & 15, 5, -1 & 15, false)));
++        assertEquals(0, PendingLightRegistry.unpackZ(PendingLightRegistry.pack(-16 & 15, 5, -16 & 15, true)));
++    }
++
++    @Test
++    public void duplicatesAreIgnoredAndTheCapDropsNewEntries() {
++        PendingLightRegistry registry = new PendingLightRegistry(3);
++        assertTrue(registry.add(1L, PendingLightRegistry.pack(1, 1, 1, true)));
++        assertFalse("duplicate", registry.add(1L, PendingLightRegistry.pack(1, 1, 1, true)));
++        assertTrue(registry.add(1L, PendingLightRegistry.pack(1, 1, 1, false)));
++        assertTrue(registry.add(2L, PendingLightRegistry.pack(1, 1, 1, true)));
++        assertFalse("cap reached", registry.add(2L, PendingLightRegistry.pack(2, 2, 2, true)));
++        assertEquals(3, registry.size());
++        assertEquals(1, registry.dropped());
++        assertEquals(2, registry.pendingChunks());
++    }
++
++    @Test
++    public void emptyRegistryDrainsNothing() {
++        PendingLightRegistry registry = new PendingLightRegistry(10);
++        assertEquals(0, registry.drain(100, READY, new Recorder()));
++        assertFalse(registry.hasPending(5L));
++        registry.markReady(5L); // no entries: must not queue anything
++        assertEquals(0, registry.drain(100, READY, new Recorder()));
++    }
++
++    @Test
++    public void drainRespectsTheBudgetAndCarriesTheRemainderOver() {
++        PendingLightRegistry registry = new PendingLightRegistry(1000);
++        for (int i = 0; i < 10; ++i) {
++            registry.add(7L, PendingLightRegistry.pack(i, 10, i, true));
++        }
++        registry.markReady(7L);
++        registry.markReady(7L); // idempotent
++        Recorder recorder = new Recorder();
++        assertEquals(4, registry.drain(4, READY, recorder));
++        assertEquals(6, registry.size());
++        assertEquals(4, registry.drain(4, READY, recorder));
++        assertEquals(2, registry.drain(4, READY, recorder));
++        assertEquals(0, registry.size());
++        assertEquals(0, registry.pendingChunks());
++        assertEquals(10, recorder.seen.size());
++        assertEquals(0, registry.drain(4, READY, recorder));
++    }
++
++    @Test
++    public void minimumOnePerChunkOrderIsOldestQueuedFirst() {
++        PendingLightRegistry registry = new PendingLightRegistry(100);
++        registry.add(10L, PendingLightRegistry.pack(0, 0, 0, true));
++        registry.add(20L, PendingLightRegistry.pack(0, 0, 0, true));
++        registry.markReady(20L);
++        registry.markReady(10L);
++        Recorder recorder = new Recorder();
++        registry.drain(10, READY, recorder);
++        assertEquals(20L, recorder.seen.get(0)[0]);
++        assertEquals(10L, recorder.seen.get(1)[0]);
++    }
++
++    @Test
++    public void waitingChunksKeepTheirEntriesAndGoneChunksLoseThem() {
++        PendingLightRegistry registry = new PendingLightRegistry(100);
++        registry.add(1L, PendingLightRegistry.pack(0, 0, 0, true));
++        registry.add(2L, PendingLightRegistry.pack(0, 0, 0, true));
++        registry.markReady(1L);
++        registry.markReady(2L);
++        Recorder recorder = new Recorder();
++        int replayed = registry.drain(10, key -> key == 1L ? PendingLightRegistry.Gate.WAIT : PendingLightRegistry.Gate.GONE, recorder);
++        assertEquals(0, replayed);
++        assertTrue("WAIT keeps the entries", registry.hasPending(1L));
++        assertFalse("GONE discards them", registry.hasPending(2L));
++        assertEquals(1, registry.size());
++        // After the next load event the waiting chunk can be queued again and replayed.
++        registry.markReady(1L);
++        assertEquals(1, registry.drain(10, READY, recorder));
++        assertEquals(0, registry.size());
++    }
++
++    @Test
++    public void clearChunkFixesTheTotalAndSurvivesStaleQueueEntries() {
++        PendingLightRegistry registry = new PendingLightRegistry(100);
++        registry.add(3L, PendingLightRegistry.pack(1, 1, 1, true));
++        registry.add(3L, PendingLightRegistry.pack(2, 2, 2, true));
++        registry.markReady(3L);
++        registry.clearChunk(3L);
++        assertEquals(0, registry.size());
++        assertFalse(registry.hasPending(3L));
++        // Re-add after clearing: the stale queue slot must not replay the new entry twice.
++        registry.add(3L, PendingLightRegistry.pack(5, 5, 5, false));
++        registry.markReady(3L);
++        Recorder recorder = new Recorder();
++        assertEquals(1, registry.drain(10, READY, recorder));
++        assertEquals(1, recorder.seen.size());
++        assertEquals(0, registry.size());
++    }
++
++    @Test
++    public void aVisitorThatRecordsNewEntriesCannotCorruptTheDrain() {
++        PendingLightRegistry registry = new PendingLightRegistry(100);
++        for (int i = 0; i < 5; ++i) {
++            registry.add(4L, PendingLightRegistry.pack(i, 0, 0, true));
++        }
++        registry.markReady(4L);
++        final int[] visits = {0};
++        int replayed = registry.drain(100, READY, (key, x, y, z, sky) -> {
++            ++visits[0];
++            registry.add(4L, PendingLightRegistry.pack(x, 1, 1, false)); // new entries for the same chunk
++        });
++        assertEquals(5, replayed);
++        assertEquals(5, visits[0]);
++        assertEquals("the new entries stay for a later drain", 5, registry.size());
++    }
++}
+diff --git a/test/java/net/minecraft/server/DeferredLightPerfTest.java b/test/java/net/minecraft/server/DeferredLightPerfTest.java
+new file mode 100644
+index 0000000..c3833ef
+--- /dev/null
++++ b/test/java/net/minecraft/server/DeferredLightPerfTest.java
+@@ -0,0 +1,77 @@
++package net.minecraft.server;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertTrue;
++
++import com.destroystokyo.paper.config.toml.modules.optimizations.Lighting;
++import org.junit.After;
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++/** Cost of recording and replaying deferred light checks, and proof the toggle adds nothing to the normal path. */
++public class DeferredLightPerfTest {
++
++    @BeforeClass
++    public static void bootstrap() throws Exception {
++        LightPropagationParityTest.bootstrap();
++    }
++
++    @After
++    public void restore() {
++        Lighting.deferLightUpdates = true;
++    }
++
++    @Test
++    public void fullyLoadedPathIsUnaffectedByTheToggle() throws Exception {
++        long[] best = {Long.MAX_VALUE, Long.MAX_VALUE};
++        for (int round = 0; round < 12; ++round) { // alternate the modes so JIT warm-up and GC hit both equally
++            for (int mode = 0; mode < 2; ++mode) {
++                Lighting.deferLightUpdates = mode == 1;
++                WorldServer world = LightPropagationParityTest.buildWorld(21, new LightPropagationParityTest.StubProvider[1]);
++                long t0 = System.nanoTime();
++                for (int i = 0; i < 400; ++i) {
++                    BlockPosition pos = new BlockPosition(i % 20 - 10, 5 + i % 3, i / 20 - 10);
++                    LightPropagationParityTest.setBlock(world, pos.getX(), pos.getY(), pos.getZ(), i % 2 == 0 ? Blocks.TORCH.getBlockData() : Blocks.AIR.getBlockData());
++                    world.w(pos);
++                }
++                best[mode] = Math.min(best[mode], System.nanoTime() - t0);
++                assertEquals("neighbors are all loaded: nothing may be deferred", 0, world.pendingLight.size());
++            }
++        }
++        System.out.println("[perf] fully loaded relight (400 edits, best of 12): defer off=" + best[0] / 1000 + "us defer on=" + best[1] / 1000 + "us");
++        assertTrue("the toggle must not slow the normal path", best[1] < best[0] * 1.25 + 1_000_000);
++    }
++
++    @Test
++    public void replayCostPerTickBudget() throws Exception {
++        long recordNanos = Long.MAX_VALUE;
++        long replayNanos = Long.MAX_VALUE;
++        for (int round = 0; round < 5; ++round) {
++            WorldServer world = LightPropagationParityTest.buildWorld(22, new LightPropagationParityTest.StubProvider[1]);
++            LightPropagationParityTest.set(Chunk.class, world.getChunkIfLoaded(0, 0), "neighbors", 0x1 << 12);
++            // 2048 positions with a light-emitting block each = 4096 checks (sky + block), a worst-case-ish paste edge
++            long t0 = System.nanoTime();
++            for (int i = 0; i < 2048; ++i) {
++                BlockPosition pos = new BlockPosition(i % 16, 8 + i / 256, i / 16 % 16);
++                LightPropagationParityTest.setBlock(world, pos.getX(), pos.getY(), pos.getZ(), i % 7 == 0 ? Blocks.GLOWSTONE.getBlockData() : Blocks.STONE.getBlockData());
++                world.w(pos);
++            }
++            recordNanos = Math.min(recordNanos, System.nanoTime() - t0);
++            assertEquals(4096, world.pendingLight.size());
++            LightPropagationParityTest.set(Chunk.class, world.getChunkIfLoaded(0, 0), "neighbors", -1);
++            world.onChunkNeighborsLinked(world.getChunkIfLoaded(0, 0));
++            int budget = Lighting.deferredLightUpdatesPerTick;
++            t0 = System.nanoTime();
++            int replayed = world.drainDeferredLight(budget); // one tick's worth at the default budget
++            replayNanos = Math.min(replayNanos, System.nanoTime() - t0);
++            assertEquals(budget, replayed);
++            assertEquals(4096 - budget, world.pendingLight.size());
++            while (world.drainDeferredLight(budget) > 0) {
++                // the rest replays over the following ticks
++            }
++            assertEquals(0, world.pendingLight.size());
++        }
++        System.out.println("[perf] deferred light: recording 4096 checks=" + recordNanos / 1000 + "us, replaying one default budget (" + Lighting.deferredLightUpdatesPerTick + " checks)=" + replayNanos / 1000 + "us");
++        assertTrue("replaying one tick's budget should stay well under a tick (50 ms)", replayNanos < 50_000_000L);
++    }
++}
+diff --git a/test/java/net/minecraft/server/DeferredLightUpdateTest.java b/test/java/net/minecraft/server/DeferredLightUpdateTest.java
+new file mode 100644
+index 0000000..4ff52df
+--- /dev/null
++++ b/test/java/net/minecraft/server/DeferredLightUpdateTest.java
+@@ -0,0 +1,166 @@
++package net.minecraft.server;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++
++import com.destroystokyo.paper.config.toml.modules.optimizations.Lighting;
++import org.junit.After;
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++/**
++ * Light checks vanilla drops at a partially loaded border are deferred and replayed once the neighbors load; the replay
++ * must leave exactly the light an immediate update on a fully loaded world would have left.
++ */
++public class DeferredLightUpdateTest {
++
++    private static final int ONLY_SELF = 0x1 << 12;
++
++    @BeforeClass
++    public static void bootstrap() throws Exception {
++        LightPropagationParityTest.bootstrap();
++    }
++
++    @After
++    public void restoreConfig() {
++        Lighting.deferLightUpdates = true;
++        Lighting.deferredLightUpdatesPerTick = 1024;
++    }
++
++    private static void setNeighbors(WorldServer world, int cx, int cz, int mask) throws Exception {
++        LightPropagationParityTest.set(Chunk.class, world.getChunkIfLoaded(cx, cz), "neighbors", mask);
++    }
++
++    @Test
++    public void defaultsAreSafe() {
++        assertTrue("deferral restores light vanilla loses; documented as an intentional deviation", Lighting.deferLightUpdates);
++        assertEquals(1024, Lighting.deferredLightUpdatesPerTick);
++        assertEquals(262144, Lighting.deferredLightMaxEntries);
++    }
++
++    /**
++     * Vanilla's incremental light algorithm is path dependent: relighting after each block change gives a different result
++     * than placing every block first and relighting afterwards (the second source's own propagation is cut off, because
++     * the first source's search has already raised its cell and the radius-17 limit is measured from the first source).
++     * That is a vanilla property, measured here, and the likely reason bulk pastes light incorrectly.
++     */
++    @Test
++    public void vanillaRelightingIsPathDependent() throws Exception {
++        BlockPosition[] torches = {new BlockPosition(5, 10, 5), new BlockPosition(3, 12, 9), new BlockPosition(12, 9, 2)};
++        WorldServer sequential = LightPropagationParityTest.buildWorld(11, new LightPropagationParityTest.StubProvider[1]);
++        WorldServer batched = LightPropagationParityTest.buildWorld(11, new LightPropagationParityTest.StubProvider[1]);
++        for (BlockPosition p : torches) {
++            LightPropagationParityTest.setBlock(sequential, p.getX(), p.getY(), p.getZ(), Blocks.TORCH.getBlockData());
++            sequential.w(p);
++            LightPropagationParityTest.setBlock(batched, p.getX(), p.getY(), p.getZ(), Blocks.TORCH.getBlockData());
++        }
++        for (BlockPosition p : torches) {
++            batched.w(p);
++        }
++        int differing = 0;
++        for (int x = -32; x < 32; ++x) {
++            for (int z = -32; z < 32; ++z) {
++                for (int y = 0; y < 40; ++y) {
++                    if (sequential.getBrightness(EnumSkyBlock.BLOCK, x, y, z) != batched.getBrightness(EnumSkyBlock.BLOCK, x, y, z)) {
++                        ++differing;
++                    }
++                }
++            }
++        }
++        assertTrue("expected the vanilla algorithm to be path dependent, differing cells: " + differing, differing > 0);
++    }
++
++    @Test
++    public void deferredChecksReplayAsIfRunAfterAllBlockChanges() throws Exception {
++        LightPropagationParityTest.StubProvider[] hd = new LightPropagationParityTest.StubProvider[1];
++        LightPropagationParityTest.StubProvider[] hr = new LightPropagationParityTest.StubProvider[1];
++        WorldServer deferred = LightPropagationParityTest.buildWorld(11, hd);
++        WorldServer reference = LightPropagationParityTest.buildWorld(11, hr);
++
++        // The deferred world's chunk (0,0) only knows about itself, so vanilla drops the checks. The reference world gets the
++        // same block changes and runs the same checks in the same order, but after all of the changes, with every neighbor loaded.
++        setNeighbors(deferred, 0, 0, ONLY_SELF);
++        BlockPosition[] torches = {new BlockPosition(5, 10, 5), new BlockPosition(3, 12, 9), new BlockPosition(12, 9, 2)};
++        for (BlockPosition pos : torches) {
++            LightPropagationParityTest.setBlock(deferred, pos.getX(), pos.getY(), pos.getZ(), Blocks.TORCH.getBlockData());
++            LightPropagationParityTest.setBlock(reference, pos.getX(), pos.getY(), pos.getZ(), Blocks.TORCH.getBlockData());
++            assertFalse("vanilla result is unchanged: the check returns false", deferred.w(pos));
++        }
++        for (BlockPosition pos : torches) {
++            assertTrue(reference.w(pos));
++        }
++        assertEquals("one sky and one block check per torch", 6, deferred.pendingLight.size());
++        assertEquals("nothing replays before the neighbors are linked", 0, deferred.drainDeferredLight(100));
++        assertEquals(0, deferred.getBrightness(EnumSkyBlock.BLOCK, 5, 10, 5));
++
++        setNeighbors(deferred, 0, 0, -1); // all neighbors now loaded
++        deferred.onChunkNeighborsLinked(deferred.getChunkIfLoaded(0, 0));
++        assertEquals(6, deferred.drainDeferredLight(100));
++        assertEquals(0, deferred.pendingLight.size());
++        LightPropagationParityTest.assertSameLight(reference, deferred, "replay");
++        assertEquals(14, deferred.getBrightness(EnumSkyBlock.BLOCK, 5, 10, 5));
++    }
++
++    @Test
++    public void replayIsBudgetedPerTick() throws Exception {
++        LightPropagationParityTest.StubProvider[] hd = new LightPropagationParityTest.StubProvider[1];
++        WorldServer world = LightPropagationParityTest.buildWorld(12, hd);
++        setNeighbors(world, 0, 0, ONLY_SELF);
++        for (int i = 0; i < 10; ++i) {
++            BlockPosition pos = new BlockPosition(i, 10, 3);
++            LightPropagationParityTest.setBlock(world, pos.getX(), pos.getY(), pos.getZ(), Blocks.TORCH.getBlockData());
++            world.w(pos);
++        }
++        assertEquals(20, world.pendingLight.size());
++        setNeighbors(world, 0, 0, -1);
++        world.onChunkNeighborsLinked(world.getChunkIfLoaded(0, 0));
++        assertEquals(8, world.drainDeferredLight(8));
++        assertEquals(12, world.pendingLight.size());
++        assertEquals(8, world.drainDeferredLight(8));
++        assertEquals(4, world.drainDeferredLight(8));
++        assertEquals(0, world.pendingLight.size());
++    }
++
++    @Test
++    public void toggleOffKeepsVanillaBehavior() throws Exception {
++        LightPropagationParityTest.StubProvider[] hd = new LightPropagationParityTest.StubProvider[1];
++        WorldServer world = LightPropagationParityTest.buildWorld(13, hd);
++        setNeighbors(world, 0, 0, ONLY_SELF);
++        Lighting.deferLightUpdates = false;
++        BlockPosition pos = new BlockPosition(5, 10, 5);
++        LightPropagationParityTest.setBlock(world, 5, 10, 5, Blocks.TORCH.getBlockData());
++        assertFalse(world.w(pos));
++        assertEquals("nothing is remembered with the toggle off", 0, world.pendingLight.size());
++        setNeighbors(world, 0, 0, -1);
++        world.onChunkNeighborsLinked(world.getChunkIfLoaded(0, 0));
++        assertEquals(0, world.drainDeferredLight(100));
++        assertEquals("the light stays as vanilla left it", 0, world.getBrightness(EnumSkyBlock.BLOCK, 5, 10, 5));
++    }
++
++    @Test
++    public void unloadedCenterChunkIsNotRecordedAndUnloadClearsEntries() throws Exception {
++        LightPropagationParityTest.StubProvider[] hd = new LightPropagationParityTest.StubProvider[1];
++        WorldServer world = LightPropagationParityTest.buildWorld(14, hd);
++        // A check whose own chunk is not loaded is dropped (the chunk's load path lights it); nothing is recorded.
++        assertFalse(world.c(EnumSkyBlock.BLOCK, new BlockPosition(500, 10, 500)));
++        assertEquals(0, world.pendingLight.size());
++        // An unload clears the chunk's entries.
++        setNeighbors(world, 0, 0, ONLY_SELF);
++        LightPropagationParityTest.setBlock(world, 5, 10, 5, Blocks.TORCH.getBlockData());
++        world.w(new BlockPosition(5, 10, 5));
++        assertTrue(world.pendingLight.size() > 0);
++        world.pendingLight.clearChunk(world.getChunkIfLoaded(0, 0).chunkKey);
++        assertEquals(0, world.pendingLight.size());
++    }
++
++    @Test
++    public void outOfRangeYIsNeverRecorded() throws Exception {
++        LightPropagationParityTest.StubProvider[] hd = new LightPropagationParityTest.StubProvider[1];
++        WorldServer world = LightPropagationParityTest.buildWorld(15, hd);
++        setNeighbors(world, 0, 0, ONLY_SELF);
++        world.c(EnumSkyBlock.BLOCK, new BlockPosition(1, -1, 1));
++        world.c(EnumSkyBlock.BLOCK, new BlockPosition(1, 256, 1));
++        assertEquals(0, world.pendingLight.size());
++    }
++}
+diff --git a/test/java/net/minecraft/server/LightPropagationParityTest.java b/test/java/net/minecraft/server/LightPropagationParityTest.java
+index 0103a70..e126e72 100644
+--- a/test/java/net/minecraft/server/LightPropagationParityTest.java
++++ b/test/java/net/minecraft/server/LightPropagationParityTest.java
+@@ -1,451 +1,452 @@
+-package net.minecraft.server;
+-
+-import static org.junit.Assert.assertArrayEquals;
+-import static org.junit.Assert.assertEquals;
+-import static org.junit.Assert.assertFalse;
+-import static org.junit.Assert.assertTrue;
+-
+-import java.lang.reflect.Field;
+-import java.util.ArrayList;
+-import java.util.Random;
+-import org.junit.BeforeClass;
+-import org.junit.Test;
+-import sun.misc.Unsafe;
+-
+-/**
+- * The light propagation rewrite must leave every sky and block light nibble exactly as vanilla's did. "Old" is a
+- * verbatim copy of the pre-Antarctic World.c / World.a(BlockPosition, EnumSkyBlock) running on an identical world.
+- */
+-public class LightPropagationParityTest {
+-
+-    private static Unsafe unsafe;
+-
+-    static final class StubProvider extends ChunkProviderServer {
+-        StubProvider(WorldServer world) {
+-            super(world, null, null);
+-        }
+-
+-        @Override
+-        public Chunk originalGetChunkAt(int x, int z) {
+-            throw new AssertionError("light propagation must not load chunks: " + x + "," + z);
+-        }
+-    }
+-
+-    static void set(Class<?> owner, Object instance, String name, Object value) throws Exception {
+-        Field field = owner.getDeclaredField(name);
+-        field.setAccessible(true);
+-        field.set(instance, value);
+-    }
+-
+-    @BeforeClass
+-    public static void bootstrap() throws Exception {
+-        Field field = Unsafe.class.getDeclaredField("theUnsafe");
+-        field.setAccessible(true);
+-        unsafe = (Unsafe) field.get(null);
+-        DispenserRegistry.c();
+-    }
+-
+-    /** A world of chunks -2..1 (blocks -32..31) with all 16 sections, a stone floor with pillars, sky light above the height map. */
+-    static WorldServer buildWorld(long seed, StubProvider[] providerOut) throws Exception {
+-        WorldServer world = (WorldServer) unsafe.allocateInstance(WorldServer.class);
+-        set(World.class, world, "paperConfig", unsafe.allocateInstance(com.destroystokyo.paper.PaperWorldConfig.class));
+-        WorldProvider provider = (WorldProvider) unsafe.allocateInstance(WorldProviderNormal.class);
+-        set(WorldProvider.class, provider, "f", true); // WorldProvider.m(): has sky light
+-        world.worldProvider = provider;
+-        set(World.class, world, "methodProfiler", new MethodProfiler());
+-        set(World.class, world, "J", new int[0x8000]);
+-        set(World.class, world, "u", new ArrayList<IWorldAccess>());
+-        StubProvider chunks = new StubProvider(world);
+-        set(World.class, world, "chunkProvider", chunks);
+-        providerOut[0] = chunks;
+-
+-        Random random = new Random(seed);
+-        for (int cx = -2; cx <= 1; ++cx) {
+-            for (int cz = -2; cz <= 1; ++cz) {
+-                Chunk chunk = (Chunk) unsafe.allocateInstance(Chunk.class);
+-                ChunkSection[] sections = new ChunkSection[16];
+-                for (int i = 0; i < 16; ++i) {
+-                    sections[i] = new ChunkSection(i << 4, true);
+-                }
+-                set(Chunk.class, chunk, "sections", sections);
+-                set(Chunk.class, chunk, "world", world);
+-                set(Chunk.class, chunk, "chunkKey", ChunkCoordIntPair.a(cx, cz));
+-                set(Chunk.class, chunk, "neighbors", -1); // every neighbor counts as loaded
+-                set(Chunk.class, chunk, "heightMap", new int[256]);
+-                for (int x = 0; x < 16; ++x) {
+-                    for (int z = 0; z < 16; ++z) {
+-                        int top = 4 + random.nextInt(3) + (random.nextInt(9) == 0 ? random.nextInt(20) : 0); // floor with pillars
+-                        for (int y = 0; y < top; ++y) {
+-                            sections[y >> 4].setType(x, y & 15, z, Blocks.STONE.getBlockData());
+-                        }
+-                        chunk.heightMap[z << 4 | x] = top;
+-                        for (int y = top; y < 256; ++y) {
+-                            sections[y >> 4].a(x, y & 15, z, 15); // sky light above the height map
+-                        }
+-                    }
+-                }
+-                chunks.chunks.put(ChunkCoordIntPair.a(cx, cz), chunk);
+-            }
+-        }
+-        return world;
+-    }
+-
+-    // ----------------------------------------------------------------- verbatim copy of the old implementation
+-
+-    static boolean oldW(World w, BlockPosition blockposition) {
+-        boolean flag = false;
+-
+-        if (w.worldProvider.m()) {
+-            flag |= oldC(w, EnumSkyBlock.SKY, blockposition);
+-        }
+-
+-        flag |= oldC(w, EnumSkyBlock.BLOCK, blockposition);
+-        return flag;
+-    }
+-
+-    private static int oldA(World w, BlockPosition blockposition, EnumSkyBlock enumskyblock) {
+-        if (enumskyblock == EnumSkyBlock.SKY && w.h(blockposition)) {
+-            return 15;
+-        } else {
+-            IBlockData iblockdata = w.getType(blockposition);
+-            int i = enumskyblock == EnumSkyBlock.SKY ? 0 : iblockdata.d();
+-            int j = iblockdata.c();
+-
+-            if (j >= 15 && iblockdata.d() > 0) {
+-                j = 1;
+-            }
+-
+-            if (j < 1) {
+-                j = 1;
+-            }
+-
+-            if (j >= 15) {
+-                return 0;
+-            } else if (i >= 14) {
+-                return i;
+-            } else {
+-                BlockPosition.PooledBlockPosition blockposition_pooledblockposition = BlockPosition.PooledBlockPosition.s();
+-
+-                try {
+-                    EnumDirection[] aenumdirection = EnumDirection.values();
+-                    int k = aenumdirection.length;
+-
+-                    for (int l = 0; l < k; ++l) {
+-                        EnumDirection enumdirection = aenumdirection[l];
+-
+-                        blockposition_pooledblockposition.j(blockposition).d(enumdirection);
+-                        int i1 = w.getBrightness(enumskyblock, blockposition_pooledblockposition) - j;
+-
+-                        if (i1 > i) {
+-                            i = i1;
+-                        }
+-
+-                        if (i >= 14) {
+-                            int j1 = i;
+-
+-                            return j1;
+-                        }
+-                    }
+-
+-                    return i;
+-                } finally {
+-                    blockposition_pooledblockposition.t();
+-                }
+-            }
+-        }
+-    }
+-
+-    static boolean oldC(World w, EnumSkyBlock enumskyblock, BlockPosition blockposition) {
+-        Chunk chunk = w.getChunkIfLoaded(blockposition.getX() >> 4, blockposition.getZ() >> 4);
+-        if (chunk == null || !chunk.areNeighborsLoaded(1)) {
+-            return false;
+-        } else {
+-            int i = 0;
+-            int j = 0;
+-
+-            int k = w.getBrightness(enumskyblock, blockposition);
+-            int l = oldA(w, blockposition, enumskyblock);
+-            int i1 = blockposition.getX();
+-            int j1 = blockposition.getY();
+-            int k1 = blockposition.getZ();
+-            int l1;
+-            int i2;
+-            int j2;
+-            int k2;
+-            int l2;
+-            int i3;
+-            int j3;
+-            int k3;
+-
+-            if (l > k) {
+-                w.J[j++] = 133152;
+-            } else if (l < k) {
+-                w.J[j++] = 133152 | k << 18;
+-
+-                while (i < j) {
+-                    l1 = w.J[i++];
+-                    i2 = (l1 & 63) - 32 + i1;
+-                    j2 = (l1 >> 6 & 63) - 32 + j1;
+-                    k2 = (l1 >> 12 & 63) - 32 + k1;
+-                    int l3 = l1 >> 18 & 15;
+-                    BlockPosition blockposition1 = new BlockPosition(i2, j2, k2);
+-
+-                    l2 = w.getBrightness(enumskyblock, blockposition1);
+-                    if (l2 == l3) {
+-                        w.a(enumskyblock, blockposition1, 0);
+-                        if (l3 > 0) {
+-                            i3 = MathHelper.a(i2 - i1);
+-                            j3 = MathHelper.a(j2 - j1);
+-                            k3 = MathHelper.a(k2 - k1);
+-                            if (i3 + j3 + k3 < 17) {
+-                                BlockPosition.PooledBlockPosition blockposition_pooledblockposition = BlockPosition.PooledBlockPosition.s();
+-                                EnumDirection[] aenumdirection = EnumDirection.values();
+-                                int i4 = aenumdirection.length;
+-
+-                                for (int j4 = 0; j4 < i4; ++j4) {
+-                                    EnumDirection enumdirection = aenumdirection[j4];
+-                                    int k4 = i2 + enumdirection.getAdjacentX();
+-                                    int l4 = j2 + enumdirection.getAdjacentY();
+-                                    int i5 = k2 + enumdirection.getAdjacentZ();
+-
+-                                    blockposition_pooledblockposition.f(k4, l4, i5);
+-                                    int j5 = Math.max(1, w.getType(blockposition_pooledblockposition).c());
+-
+-                                    l2 = w.getBrightness(enumskyblock, blockposition_pooledblockposition);
+-                                    if (l2 == l3 - j5 && j < w.J.length) {
+-                                        w.J[j++] = k4 - i1 + 32 | l4 - j1 + 32 << 6 | i5 - k1 + 32 << 12 | l3 - j5 << 18;
+-                                    }
+-                                }
+-
+-                                blockposition_pooledblockposition.t();
+-                            }
+-                        }
+-                    }
+-                }
+-
+-                i = 0;
+-            }
+-
+-            while (i < j) {
+-                l1 = w.J[i++];
+-                i2 = (l1 & 63) - 32 + i1;
+-                j2 = (l1 >> 6 & 63) - 32 + j1;
+-                k2 = (l1 >> 12 & 63) - 32 + k1;
+-                BlockPosition blockposition2 = new BlockPosition(i2, j2, k2);
+-                int k5 = w.getBrightness(enumskyblock, blockposition2);
+-
+-                l2 = oldA(w, blockposition2, enumskyblock);
+-                if (l2 != k5) {
+-                    w.a(enumskyblock, blockposition2, l2);
+-                    if (l2 > k5) {
+-                        i3 = Math.abs(i2 - i1);
+-                        j3 = Math.abs(j2 - j1);
+-                        k3 = Math.abs(k2 - k1);
+-                        boolean flag = j < w.J.length - 6;
+-
+-                        if (i3 + j3 + k3 < 17 && flag) {
+-                            if (w.getBrightness(enumskyblock, blockposition2.west()) < l2) {
+-                                w.J[j++] = i2 - 1 - i1 + 32 + (j2 - j1 + 32 << 6) + (k2 - k1 + 32 << 12);
+-                            }
+-
+-                            if (w.getBrightness(enumskyblock, blockposition2.east()) < l2) {
+-                                w.J[j++] = i2 + 1 - i1 + 32 + (j2 - j1 + 32 << 6) + (k2 - k1 + 32 << 12);
+-                            }
+-
+-                            if (w.getBrightness(enumskyblock, blockposition2.down()) < l2) {
+-                                w.J[j++] = i2 - i1 + 32 + (j2 - 1 - j1 + 32 << 6) + (k2 - k1 + 32 << 12);
+-                            }
+-
+-                            if (w.getBrightness(enumskyblock, blockposition2.up()) < l2) {
+-                                w.J[j++] = i2 - i1 + 32 + (j2 + 1 - j1 + 32 << 6) + (k2 - k1 + 32 << 12);
+-                            }
+-
+-                            if (w.getBrightness(enumskyblock, blockposition2.north()) < l2) {
+-                                w.J[j++] = i2 - i1 + 32 + (j2 - j1 + 32 << 6) + (k2 - 1 - k1 + 32 << 12);
+-                            }
+-
+-                            if (w.getBrightness(enumskyblock, blockposition2.south()) < l2) {
+-                                w.J[j++] = i2 - i1 + 32 + (j2 - j1 + 32 << 6) + (k2 + 1 - k1 + 32 << 12);
+-                            }
+-                        }
+-                    }
+-                }
+-            }
+-
+-            return true;
+-        }
+-    }
+-
+-    // ----------------------------------------------------------------- helpers
+-
+-    static IBlockData block(int kind) {
+-        switch (kind) {
+-            case 0:
+-                return Blocks.AIR.getBlockData();
+-            case 1:
+-                return Blocks.STONE.getBlockData();
+-            case 2:
+-                return Blocks.TORCH.getBlockData();
+-            case 3:
+-                return Blocks.GLOWSTONE.getBlockData();
+-            case 4:
+-                return Blocks.LEAVES.getBlockData();
+-            default:
+-                return Blocks.FLOWING_WATER.getBlockData();
+-        }
+-    }
+-
+-    static void setBlock(World w, int x, int y, int z, IBlockData state) {
+-        Chunk chunk = w.getChunkIfLoaded(x >> 4, z >> 4);
+-        chunk.getSections()[y >> 4].setType(x & 15, y & 15, z & 15, state);
+-    }
+-
+-    static void assertSameLight(World a, World b, String message) {
+-        for (int cx = -2; cx <= 1; ++cx) {
+-            for (int cz = -2; cz <= 1; ++cz) {
+-                ChunkSection[] sa = a.getChunkIfLoaded(cx, cz).getSections();
+-                ChunkSection[] sb = b.getChunkIfLoaded(cx, cz).getSections();
+-                for (int i = 0; i < 16; ++i) {
+-                    assertArrayEquals(message + " sky chunk " + cx + "," + cz + " section " + i, sa[i].getSkyLightArray().asBytes(), sb[i].getSkyLightArray().asBytes());
+-                    assertArrayEquals(message + " block chunk " + cx + "," + cz + " section " + i, sa[i].getEmittedLightArray().asBytes(), sb[i].getEmittedLightArray().asBytes());
+-                }
+-            }
+-        }
+-    }
+-
+-    // ----------------------------------------------------------------- tests
+-
+-    @Test
+-    public void randomizedBlockChangesLeaveIdenticalLight() throws Exception {
+-        for (long seed = 1; seed <= 6; ++seed) {
+-            StubProvider[] ha = new StubProvider[1];
+-            StubProvider[] hb = new StubProvider[1];
+-            WorldServer oldWorld = buildWorld(seed, ha);
+-            WorldServer newWorld = buildWorld(seed, hb);
+-            assertSameLight(oldWorld, newWorld, "initial");
+-            Random random = new Random(seed * 77);
+-            int changed = 0;
+-            for (int op = 0; op < 400; ++op) {
+-                int x = random.nextInt(28) - 14; // the radius-17 search plus its neighbor reads must stay inside the loaded -32..31
+-                int z = random.nextInt(28) - 14;
+-                int y = 1 + random.nextInt(random.nextInt(4) == 0 ? 80 : 14);
+-                IBlockData state = block(random.nextInt(6));
+-                setBlock(oldWorld, x, y, z, state);
+-                setBlock(newWorld, x, y, z, state);
+-                BlockPosition pos = new BlockPosition(x, y, z);
+-                boolean oldResult = oldW(oldWorld, pos);
+-                boolean newResult = newWorld.w(pos);
+-                assertEquals("return value seed=" + seed + " op=" + op, oldResult, newResult);
+-                if (op % 25 == 24) {
+-                    assertSameLight(oldWorld, newWorld, "seed=" + seed + " after op " + op);
+-                }
+-                ++changed;
+-            }
+-            assertSameLight(oldWorld, newWorld, "seed=" + seed + " final");
+-            assertTrue(changed > 0);
+-        }
+-    }
+-
+-    @Test
+-    public void largeCubeAndTorchScenariosMatch() throws Exception {
+-        StubProvider[] ha = new StubProvider[1];
+-        StubProvider[] hb = new StubProvider[1];
+-        WorldServer oldWorld = buildWorld(5, ha);
+-        WorldServer newWorld = buildWorld(5, hb);
+-        // A 12x12x12 opaque cube placed under open sky, block by block (what a paste does), then a glowstone wall, then removal.
+-        for (int pass = 0; pass < 3; ++pass) {
+-            for (int x = -6; x < 6; ++x) {
+-                for (int y = 20; y < 32; ++y) {
+-                    for (int z = -6; z < 6; ++z) {
+-                        IBlockData state = pass == 0 ? Blocks.STONE.getBlockData() : (pass == 1 ? ((x + z) % 3 == 0 ? Blocks.GLOWSTONE.getBlockData() : Blocks.AIR.getBlockData()) : Blocks.AIR.getBlockData());
+-                        setBlock(oldWorld, x, y, z, state);
+-                        setBlock(newWorld, x, y, z, state);
+-                        BlockPosition pos = new BlockPosition(x, y, z);
+-                        oldW(oldWorld, pos);
+-                        newWorld.w(pos);
+-                    }
+-                }
+-            }
+-            assertSameLight(oldWorld, newWorld, "cube pass " + pass);
+-        }
+-    }
+-
+-    @Test
+-    public void edgesOfTheWorldMatch() throws Exception {
+-        StubProvider[] ha = new StubProvider[1];
+-        StubProvider[] hb = new StubProvider[1];
+-        WorldServer oldWorld = buildWorld(9, ha);
+-        WorldServer newWorld = buildWorld(9, hb);
+-        int[][] positions = {{0, 0, 0}, {-14, 1, -14}, {13, 254, 13}, {0, 255, 0}, {-1, 255, -1}, {15, 0, 15}, {-14, 0, -14}};
+-        for (int[] p : positions) {
+-            for (int kind : new int[] {2, 3, 1, 0}) {
+-                setBlock(oldWorld, p[0], p[1], p[2], block(kind));
+-                setBlock(newWorld, p[0], p[1], p[2], block(kind));
+-                BlockPosition pos = new BlockPosition(p[0], p[1], p[2]);
+-                assertEquals(oldW(oldWorld, pos), newWorld.w(pos));
+-            }
+-        }
+-        assertSameLight(oldWorld, newWorld, "edges");
+-    }
+-
+-    @Test
+-    public void intBrightnessMatchesPositionBrightness() throws Exception {
+-        StubProvider[] holder = new StubProvider[1];
+-        WorldServer world = buildWorld(2, holder);
+-        Random random = new Random(1234);
+-        int[] extremes = {Integer.MIN_VALUE, -30000001, -30000000, -33, -32, -1, 0, 1, 31, 32, 33, 29999999, 30000000, Integer.MAX_VALUE};
+-        int mismatches = 0;
+-        for (int n = 0; n < 20000; ++n) {
+-            int x = n % 4 == 0 ? extremes[random.nextInt(extremes.length)] : random.nextInt(80) - 40; // beyond -32..31 is unloaded
+-            int z = n % 5 == 0 ? extremes[random.nextInt(extremes.length)] : random.nextInt(80) - 40;
+-            int y = n % 7 == 0 ? random.nextInt(600) - 200 : random.nextInt(256);
+-            for (EnumSkyBlock type : EnumSkyBlock.values()) {
+-                int expected = world.getBrightness(type, new BlockPosition(x, y, z));
+-                int actual = world.getBrightness(type, x, y, z);
+-                if (expected != actual) {
+-                    ++mismatches;
+-                }
+-                assertEquals("x=" + x + " y=" + y + " z=" + z + " " + type, expected, actual);
+-            }
+-        }
+-        assertEquals(0, mismatches);
+-    }
+-
+-    @Test
+-    public void emptySectionsFollowTheHeightMap() throws Exception {
+-        StubProvider[] holder = new StubProvider[1];
+-        WorldServer world = buildWorld(4, holder);
+-        Chunk chunk = world.getChunkIfLoaded(0, 0);
+-        chunk.getSections()[10] = Chunk.a; // empty section: light comes from the height map
+-        for (int x = 0; x < 16; x += 5) {
+-            for (int z = 0; z < 16; z += 5) {
+-                for (int y = 160; y < 176; ++y) {
+-                    for (EnumSkyBlock type : EnumSkyBlock.values()) {
+-                        assertEquals(world.getBrightness(type, new BlockPosition(x, y, z)), world.getBrightness(type, x, y, z));
+-                    }
+-                }
+-            }
+-        }
+-    }
+-
+-    @Test
+-    public void permanentChunkLoaderOptionStillClearsTheUnloadFlag() throws Exception {
+-        StubProvider[] holder = new StubProvider[1];
+-        WorldServer world = buildWorld(4, holder);
+-        Chunk chunk = world.getChunkIfLoaded(0, 0);
+-        // allow-permanent-chunk-loaders = false (the default): neither path touches Chunk.d
+-        chunk.d = true;
+-        world.getBrightness(EnumSkyBlock.BLOCK, 3, 10, 3);
+-        assertTrue(chunk.d);
+-        world.getBrightness(EnumSkyBlock.BLOCK, new BlockPosition(3, 10, 3));
+-        assertTrue(chunk.d);
+-        // true: the old path went through getLoadedChunkAt, which clears the flag; the int path must as well
+-        world.paperConfig.allowPermaChunkLoaders = true;
+-        chunk.d = true;
+-        world.getBrightness(EnumSkyBlock.BLOCK, new BlockPosition(3, 10, 3));
+-        assertFalse(chunk.d);
+-        chunk.d = true;
+-        world.getBrightness(EnumSkyBlock.BLOCK, 3, 10, 3);
+-        assertFalse(chunk.d);
+-    }
+-}
++package net.minecraft.server;
++
++import static org.junit.Assert.assertArrayEquals;
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.Random;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++/**
++ * The light propagation rewrite must leave every sky and block light nibble exactly as vanilla's did. "Old" is a
++ * verbatim copy of the pre-Antarctic World.c / World.a(BlockPosition, EnumSkyBlock) running on an identical world.
++ */
++public class LightPropagationParityTest {
++
++    private static Unsafe unsafe;
++
++    static final class StubProvider extends ChunkProviderServer {
++        StubProvider(WorldServer world) {
++            super(world, null, null);
++        }
++
++        @Override
++        public Chunk originalGetChunkAt(int x, int z) {
++            throw new AssertionError("light propagation must not load chunks: " + x + "," + z);
++        }
++    }
++
++    static void set(Class<?> owner, Object instance, String name, Object value) throws Exception {
++        Field field = owner.getDeclaredField(name);
++        field.setAccessible(true);
++        field.set(instance, value);
++    }
++
++    @BeforeClass
++    public static void bootstrap() throws Exception {
++        Field field = Unsafe.class.getDeclaredField("theUnsafe");
++        field.setAccessible(true);
++        unsafe = (Unsafe) field.get(null);
++        DispenserRegistry.c();
++    }
++
++    /** A world of chunks -2..1 (blocks -32..31) with all 16 sections, a stone floor with pillars, sky light above the height map. */
++    static WorldServer buildWorld(long seed, StubProvider[] providerOut) throws Exception {
++        WorldServer world = (WorldServer) unsafe.allocateInstance(WorldServer.class);
++        set(World.class, world, "paperConfig", unsafe.allocateInstance(com.destroystokyo.paper.PaperWorldConfig.class));
++        WorldProvider provider = (WorldProvider) unsafe.allocateInstance(WorldProviderNormal.class);
++        set(WorldProvider.class, provider, "f", true); // WorldProvider.m(): has sky light
++        world.worldProvider = provider;
++        set(World.class, world, "methodProfiler", new MethodProfiler());
++        set(World.class, world, "J", new int[0x8000]);
++        set(World.class, world, "u", new ArrayList<IWorldAccess>());
++        set(World.class, world, "pendingLight", new me.stella.antarctic.collection.PendingLightRegistry(1 << 18)); // field initializers do not run for Unsafe-allocated worlds
++        StubProvider chunks = new StubProvider(world);
++        set(World.class, world, "chunkProvider", chunks);
++        providerOut[0] = chunks;
++
++        Random random = new Random(seed);
++        for (int cx = -2; cx <= 1; ++cx) {
++            for (int cz = -2; cz <= 1; ++cz) {
++                Chunk chunk = (Chunk) unsafe.allocateInstance(Chunk.class);
++                ChunkSection[] sections = new ChunkSection[16];
++                for (int i = 0; i < 16; ++i) {
++                    sections[i] = new ChunkSection(i << 4, true);
++                }
++                set(Chunk.class, chunk, "sections", sections);
++                set(Chunk.class, chunk, "world", world);
++                set(Chunk.class, chunk, "chunkKey", ChunkCoordIntPair.a(cx, cz));
++                set(Chunk.class, chunk, "neighbors", -1); // every neighbor counts as loaded
++                set(Chunk.class, chunk, "heightMap", new int[256]);
++                for (int x = 0; x < 16; ++x) {
++                    for (int z = 0; z < 16; ++z) {
++                        int top = 4 + random.nextInt(3) + (random.nextInt(9) == 0 ? random.nextInt(20) : 0); // floor with pillars
++                        for (int y = 0; y < top; ++y) {
++                            sections[y >> 4].setType(x, y & 15, z, Blocks.STONE.getBlockData());
++                        }
++                        chunk.heightMap[z << 4 | x] = top;
++                        for (int y = top; y < 256; ++y) {
++                            sections[y >> 4].a(x, y & 15, z, 15); // sky light above the height map
++                        }
++                    }
++                }
++                chunks.chunks.put(ChunkCoordIntPair.a(cx, cz), chunk);
++            }
++        }
++        return world;
++    }
++
++    // ----------------------------------------------------------------- verbatim copy of the old implementation
++
++    static boolean oldW(World w, BlockPosition blockposition) {
++        boolean flag = false;
++
++        if (w.worldProvider.m()) {
++            flag |= oldC(w, EnumSkyBlock.SKY, blockposition);
++        }
++
++        flag |= oldC(w, EnumSkyBlock.BLOCK, blockposition);
++        return flag;
++    }
++
++    private static int oldA(World w, BlockPosition blockposition, EnumSkyBlock enumskyblock) {
++        if (enumskyblock == EnumSkyBlock.SKY && w.h(blockposition)) {
++            return 15;
++        } else {
++            IBlockData iblockdata = w.getType(blockposition);
++            int i = enumskyblock == EnumSkyBlock.SKY ? 0 : iblockdata.d();
++            int j = iblockdata.c();
++
++            if (j >= 15 && iblockdata.d() > 0) {
++                j = 1;
++            }
++
++            if (j < 1) {
++                j = 1;
++            }
++
++            if (j >= 15) {
++                return 0;
++            } else if (i >= 14) {
++                return i;
++            } else {
++                BlockPosition.PooledBlockPosition blockposition_pooledblockposition = BlockPosition.PooledBlockPosition.s();
++
++                try {
++                    EnumDirection[] aenumdirection = EnumDirection.values();
++                    int k = aenumdirection.length;
++
++                    for (int l = 0; l < k; ++l) {
++                        EnumDirection enumdirection = aenumdirection[l];
++
++                        blockposition_pooledblockposition.j(blockposition).d(enumdirection);
++                        int i1 = w.getBrightness(enumskyblock, blockposition_pooledblockposition) - j;
++
++                        if (i1 > i) {
++                            i = i1;
++                        }
++
++                        if (i >= 14) {
++                            int j1 = i;
++
++                            return j1;
++                        }
++                    }
++
++                    return i;
++                } finally {
++                    blockposition_pooledblockposition.t();
++                }
++            }
++        }
++    }
++
++    static boolean oldC(World w, EnumSkyBlock enumskyblock, BlockPosition blockposition) {
++        Chunk chunk = w.getChunkIfLoaded(blockposition.getX() >> 4, blockposition.getZ() >> 4);
++        if (chunk == null || !chunk.areNeighborsLoaded(1)) {
++            return false;
++        } else {
++            int i = 0;
++            int j = 0;
++
++            int k = w.getBrightness(enumskyblock, blockposition);
++            int l = oldA(w, blockposition, enumskyblock);
++            int i1 = blockposition.getX();
++            int j1 = blockposition.getY();
++            int k1 = blockposition.getZ();
++            int l1;
++            int i2;
++            int j2;
++            int k2;
++            int l2;
++            int i3;
++            int j3;
++            int k3;
++
++            if (l > k) {
++                w.J[j++] = 133152;
++            } else if (l < k) {
++                w.J[j++] = 133152 | k << 18;
++
++                while (i < j) {
++                    l1 = w.J[i++];
++                    i2 = (l1 & 63) - 32 + i1;
++                    j2 = (l1 >> 6 & 63) - 32 + j1;
++                    k2 = (l1 >> 12 & 63) - 32 + k1;
++                    int l3 = l1 >> 18 & 15;
++                    BlockPosition blockposition1 = new BlockPosition(i2, j2, k2);
++
++                    l2 = w.getBrightness(enumskyblock, blockposition1);
++                    if (l2 == l3) {
++                        w.a(enumskyblock, blockposition1, 0);
++                        if (l3 > 0) {
++                            i3 = MathHelper.a(i2 - i1);
++                            j3 = MathHelper.a(j2 - j1);
++                            k3 = MathHelper.a(k2 - k1);
++                            if (i3 + j3 + k3 < 17) {
++                                BlockPosition.PooledBlockPosition blockposition_pooledblockposition = BlockPosition.PooledBlockPosition.s();
++                                EnumDirection[] aenumdirection = EnumDirection.values();
++                                int i4 = aenumdirection.length;
++
++                                for (int j4 = 0; j4 < i4; ++j4) {
++                                    EnumDirection enumdirection = aenumdirection[j4];
++                                    int k4 = i2 + enumdirection.getAdjacentX();
++                                    int l4 = j2 + enumdirection.getAdjacentY();
++                                    int i5 = k2 + enumdirection.getAdjacentZ();
++
++                                    blockposition_pooledblockposition.f(k4, l4, i5);
++                                    int j5 = Math.max(1, w.getType(blockposition_pooledblockposition).c());
++
++                                    l2 = w.getBrightness(enumskyblock, blockposition_pooledblockposition);
++                                    if (l2 == l3 - j5 && j < w.J.length) {
++                                        w.J[j++] = k4 - i1 + 32 | l4 - j1 + 32 << 6 | i5 - k1 + 32 << 12 | l3 - j5 << 18;
++                                    }
++                                }
++
++                                blockposition_pooledblockposition.t();
++                            }
++                        }
++                    }
++                }
++
++                i = 0;
++            }
++
++            while (i < j) {
++                l1 = w.J[i++];
++                i2 = (l1 & 63) - 32 + i1;
++                j2 = (l1 >> 6 & 63) - 32 + j1;
++                k2 = (l1 >> 12 & 63) - 32 + k1;
++                BlockPosition blockposition2 = new BlockPosition(i2, j2, k2);
++                int k5 = w.getBrightness(enumskyblock, blockposition2);
++
++                l2 = oldA(w, blockposition2, enumskyblock);
++                if (l2 != k5) {
++                    w.a(enumskyblock, blockposition2, l2);
++                    if (l2 > k5) {
++                        i3 = Math.abs(i2 - i1);
++                        j3 = Math.abs(j2 - j1);
++                        k3 = Math.abs(k2 - k1);
++                        boolean flag = j < w.J.length - 6;
++
++                        if (i3 + j3 + k3 < 17 && flag) {
++                            if (w.getBrightness(enumskyblock, blockposition2.west()) < l2) {
++                                w.J[j++] = i2 - 1 - i1 + 32 + (j2 - j1 + 32 << 6) + (k2 - k1 + 32 << 12);
++                            }
++
++                            if (w.getBrightness(enumskyblock, blockposition2.east()) < l2) {
++                                w.J[j++] = i2 + 1 - i1 + 32 + (j2 - j1 + 32 << 6) + (k2 - k1 + 32 << 12);
++                            }
++
++                            if (w.getBrightness(enumskyblock, blockposition2.down()) < l2) {
++                                w.J[j++] = i2 - i1 + 32 + (j2 - 1 - j1 + 32 << 6) + (k2 - k1 + 32 << 12);
++                            }
++
++                            if (w.getBrightness(enumskyblock, blockposition2.up()) < l2) {
++                                w.J[j++] = i2 - i1 + 32 + (j2 + 1 - j1 + 32 << 6) + (k2 - k1 + 32 << 12);
++                            }
++
++                            if (w.getBrightness(enumskyblock, blockposition2.north()) < l2) {
++                                w.J[j++] = i2 - i1 + 32 + (j2 - j1 + 32 << 6) + (k2 - 1 - k1 + 32 << 12);
++                            }
++
++                            if (w.getBrightness(enumskyblock, blockposition2.south()) < l2) {
++                                w.J[j++] = i2 - i1 + 32 + (j2 - j1 + 32 << 6) + (k2 + 1 - k1 + 32 << 12);
++                            }
++                        }
++                    }
++                }
++            }
++
++            return true;
++        }
++    }
++
++    // ----------------------------------------------------------------- helpers
++
++    static IBlockData block(int kind) {
++        switch (kind) {
++            case 0:
++                return Blocks.AIR.getBlockData();
++            case 1:
++                return Blocks.STONE.getBlockData();
++            case 2:
++                return Blocks.TORCH.getBlockData();
++            case 3:
++                return Blocks.GLOWSTONE.getBlockData();
++            case 4:
++                return Blocks.LEAVES.getBlockData();
++            default:
++                return Blocks.FLOWING_WATER.getBlockData();
++        }
++    }
++
++    static void setBlock(World w, int x, int y, int z, IBlockData state) {
++        Chunk chunk = w.getChunkIfLoaded(x >> 4, z >> 4);
++        chunk.getSections()[y >> 4].setType(x & 15, y & 15, z & 15, state);
++    }
++
++    static void assertSameLight(World a, World b, String message) {
++        for (int cx = -2; cx <= 1; ++cx) {
++            for (int cz = -2; cz <= 1; ++cz) {
++                ChunkSection[] sa = a.getChunkIfLoaded(cx, cz).getSections();
++                ChunkSection[] sb = b.getChunkIfLoaded(cx, cz).getSections();
++                for (int i = 0; i < 16; ++i) {
++                    assertArrayEquals(message + " sky chunk " + cx + "," + cz + " section " + i, sa[i].getSkyLightArray().asBytes(), sb[i].getSkyLightArray().asBytes());
++                    assertArrayEquals(message + " block chunk " + cx + "," + cz + " section " + i, sa[i].getEmittedLightArray().asBytes(), sb[i].getEmittedLightArray().asBytes());
++                }
++            }
++        }
++    }
++
++    // ----------------------------------------------------------------- tests
++
++    @Test
++    public void randomizedBlockChangesLeaveIdenticalLight() throws Exception {
++        for (long seed = 1; seed <= 6; ++seed) {
++            StubProvider[] ha = new StubProvider[1];
++            StubProvider[] hb = new StubProvider[1];
++            WorldServer oldWorld = buildWorld(seed, ha);
++            WorldServer newWorld = buildWorld(seed, hb);
++            assertSameLight(oldWorld, newWorld, "initial");
++            Random random = new Random(seed * 77);
++            int changed = 0;
++            for (int op = 0; op < 400; ++op) {
++                int x = random.nextInt(28) - 14; // the radius-17 search plus its neighbor reads must stay inside the loaded -32..31
++                int z = random.nextInt(28) - 14;
++                int y = 1 + random.nextInt(random.nextInt(4) == 0 ? 80 : 14);
++                IBlockData state = block(random.nextInt(6));
++                setBlock(oldWorld, x, y, z, state);
++                setBlock(newWorld, x, y, z, state);
++                BlockPosition pos = new BlockPosition(x, y, z);
++                boolean oldResult = oldW(oldWorld, pos);
++                boolean newResult = newWorld.w(pos);
++                assertEquals("return value seed=" + seed + " op=" + op, oldResult, newResult);
++                if (op % 25 == 24) {
++                    assertSameLight(oldWorld, newWorld, "seed=" + seed + " after op " + op);
++                }
++                ++changed;
++            }
++            assertSameLight(oldWorld, newWorld, "seed=" + seed + " final");
++            assertTrue(changed > 0);
++        }
++    }
++
++    @Test
++    public void largeCubeAndTorchScenariosMatch() throws Exception {
++        StubProvider[] ha = new StubProvider[1];
++        StubProvider[] hb = new StubProvider[1];
++        WorldServer oldWorld = buildWorld(5, ha);
++        WorldServer newWorld = buildWorld(5, hb);
++        // A 12x12x12 opaque cube placed under open sky, block by block (what a paste does), then a glowstone wall, then removal.
++        for (int pass = 0; pass < 3; ++pass) {
++            for (int x = -6; x < 6; ++x) {
++                for (int y = 20; y < 32; ++y) {
++                    for (int z = -6; z < 6; ++z) {
++                        IBlockData state = pass == 0 ? Blocks.STONE.getBlockData() : (pass == 1 ? ((x + z) % 3 == 0 ? Blocks.GLOWSTONE.getBlockData() : Blocks.AIR.getBlockData()) : Blocks.AIR.getBlockData());
++                        setBlock(oldWorld, x, y, z, state);
++                        setBlock(newWorld, x, y, z, state);
++                        BlockPosition pos = new BlockPosition(x, y, z);
++                        oldW(oldWorld, pos);
++                        newWorld.w(pos);
++                    }
++                }
++            }
++            assertSameLight(oldWorld, newWorld, "cube pass " + pass);
++        }
++    }
++
++    @Test
++    public void edgesOfTheWorldMatch() throws Exception {
++        StubProvider[] ha = new StubProvider[1];
++        StubProvider[] hb = new StubProvider[1];
++        WorldServer oldWorld = buildWorld(9, ha);
++        WorldServer newWorld = buildWorld(9, hb);
++        int[][] positions = {{0, 0, 0}, {-14, 1, -14}, {13, 254, 13}, {0, 255, 0}, {-1, 255, -1}, {15, 0, 15}, {-14, 0, -14}};
++        for (int[] p : positions) {
++            for (int kind : new int[] {2, 3, 1, 0}) {
++                setBlock(oldWorld, p[0], p[1], p[2], block(kind));
++                setBlock(newWorld, p[0], p[1], p[2], block(kind));
++                BlockPosition pos = new BlockPosition(p[0], p[1], p[2]);
++                assertEquals(oldW(oldWorld, pos), newWorld.w(pos));
++            }
++        }
++        assertSameLight(oldWorld, newWorld, "edges");
++    }
++
++    @Test
++    public void intBrightnessMatchesPositionBrightness() throws Exception {
++        StubProvider[] holder = new StubProvider[1];
++        WorldServer world = buildWorld(2, holder);
++        Random random = new Random(1234);
++        int[] extremes = {Integer.MIN_VALUE, -30000001, -30000000, -33, -32, -1, 0, 1, 31, 32, 33, 29999999, 30000000, Integer.MAX_VALUE};
++        int mismatches = 0;
++        for (int n = 0; n < 20000; ++n) {
++            int x = n % 4 == 0 ? extremes[random.nextInt(extremes.length)] : random.nextInt(80) - 40; // beyond -32..31 is unloaded
++            int z = n % 5 == 0 ? extremes[random.nextInt(extremes.length)] : random.nextInt(80) - 40;
++            int y = n % 7 == 0 ? random.nextInt(600) - 200 : random.nextInt(256);
++            for (EnumSkyBlock type : EnumSkyBlock.values()) {
++                int expected = world.getBrightness(type, new BlockPosition(x, y, z));
++                int actual = world.getBrightness(type, x, y, z);
++                if (expected != actual) {
++                    ++mismatches;
++                }
++                assertEquals("x=" + x + " y=" + y + " z=" + z + " " + type, expected, actual);
++            }
++        }
++        assertEquals(0, mismatches);
++    }
++
++    @Test
++    public void emptySectionsFollowTheHeightMap() throws Exception {
++        StubProvider[] holder = new StubProvider[1];
++        WorldServer world = buildWorld(4, holder);
++        Chunk chunk = world.getChunkIfLoaded(0, 0);
++        chunk.getSections()[10] = Chunk.a; // empty section: light comes from the height map
++        for (int x = 0; x < 16; x += 5) {
++            for (int z = 0; z < 16; z += 5) {
++                for (int y = 160; y < 176; ++y) {
++                    for (EnumSkyBlock type : EnumSkyBlock.values()) {
++                        assertEquals(world.getBrightness(type, new BlockPosition(x, y, z)), world.getBrightness(type, x, y, z));
++                    }
++                }
++            }
++        }
++    }
++
++    @Test
++    public void permanentChunkLoaderOptionStillClearsTheUnloadFlag() throws Exception {
++        StubProvider[] holder = new StubProvider[1];
++        WorldServer world = buildWorld(4, holder);
++        Chunk chunk = world.getChunkIfLoaded(0, 0);
++        // allow-permanent-chunk-loaders = false (the default): neither path touches Chunk.d
++        chunk.d = true;
++        world.getBrightness(EnumSkyBlock.BLOCK, 3, 10, 3);
++        assertTrue(chunk.d);
++        world.getBrightness(EnumSkyBlock.BLOCK, new BlockPosition(3, 10, 3));
++        assertTrue(chunk.d);
++        // true: the old path went through getLoadedChunkAt, which clears the flag; the int path must as well
++        world.paperConfig.allowPermaChunkLoaders = true;
++        chunk.d = true;
++        world.getBrightness(EnumSkyBlock.BLOCK, new BlockPosition(3, 10, 3));
++        assertFalse(chunk.d);
++        chunk.d = true;
++        world.getBrightness(EnumSkyBlock.BLOCK, 3, 10, 3);
++        assertFalse(chunk.d);
++    }
++}
