@@ -1,0 +1,333 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Wed, 18 Nov 2026 14:30:34 +0700
+Subject: [PATCH 97/97] test(physics): cover neighbour shapes, entities, early
+ return and world border in voxel parity
+
+VoxelCollisionContextTest compares World collision results with the voxel fast path on and off for every registered block state in contexts the isolated-block test missed: four neighbour sets (air, stone, fence, glass pane, stairs) on all sides, the boolean early-return query, a real pig and boat (lily pad boat rule), and the world-border placeholder branch with entities inside, outside and absent. A diagnostic sweep reports fast-path timing over vegetation-only, shapes-only and mixed terrain.
+
+Removing the soul sand guard from FastVoxelCache makes all five tests fail. Tile-entity-backed blocks (moving piston, shulker box) throw on the stub world in vanilla's own dispatch; both paths must throw identically and no other block may throw.
+
+diff --git a/test/java/net/minecraft/server/VoxelCollisionContextTest.java b/test/java/net/minecraft/server/VoxelCollisionContextTest.java
+new file mode 100644
+index 0000000..1fe1268
+--- /dev/null
++++ b/test/java/net/minecraft/server/VoxelCollisionContextTest.java
+@@ -0,0 +1,317 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.config.toml.modules.optimizations.Physics;
++import java.lang.reflect.Field;
++import java.lang.reflect.InvocationTargetException;
++import java.lang.reflect.Method;
++import java.util.ArrayList;
++import java.util.List;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++import static org.junit.Assert.*;
++
++/**
++ * Vanilla-parity checks for the voxel collision fast path in contexts the isolated-block registry test cannot reach:
++ * neighbour-dependent shapes, the early-return boolean query, non-null entities (including the lily pad boat rule),
++ * the world-border placeholder branch, plus a diagnostic timing sweep over vegetation-heavy terrain.
++ */
++public class VoxelCollisionContextTest {
++
++    private static final Method BLOCK_BOXES;
++
++    static {
++        try {
++            BLOCK_BOXES = World.class.getDeclaredMethod("a", Entity.class, AxisAlignedBB.class, boolean.class, List.class);
++            BLOCK_BOXES.setAccessible(true);
++        } catch (Exception e) {
++            throw new ExceptionInInitializerError(e);
++        }
++    }
++
++    private static volatile long checksum;
++    private boolean original;
++
++    @BeforeClass
++    public static void setUp() throws Exception {
++        LightPropagationParityTest.bootstrap();
++    }
++
++    @Before
++    public void save() {
++        original = Physics.optimizeVoxelCollisions;
++    }
++
++    @After
++    public void restore() {
++        Physics.optimizeVoxelCollisions = original;
++    }
++
++    private static WorldServer world(WorldBorder border) throws Exception {
++        WorldServer world = LightPropagationParityTest.buildWorld(7, new LightPropagationParityTest.StubProvider[1]);
++        LightPropagationParityTest.set(World.class, world, "P", border);
++        return world;
++    }
++
++    private static void put(World world, int x, int y, int z, IBlockData state) {
++        LightPropagationParityTest.setBlock(world, x, y, z, state);
++    }
++
++    private static Entity entity(Class<? extends Entity> type, World world, double x, double y, double z) throws Exception {
++        Field field = Unsafe.class.getDeclaredField("theUnsafe");
++        field.setAccessible(true);
++        Entity entity = (Entity) ((Unsafe) field.get(null)).allocateInstance(type);
++        entity.world = world;
++        entity.locX = x;
++        entity.locY = y;
++        entity.locZ = z;
++        return entity;
++    }
++
++    private static String describe(List<AxisAlignedBB> boxes) {
++        StringBuilder sb = new StringBuilder();
++        for (AxisAlignedBB b : boxes) {
++            sb.append('[').append(b.a).append(',').append(b.b).append(',').append(b.c).append(" -> ")
++                    .append(b.d).append(',').append(b.e).append(',').append(b.f).append(']');
++        }
++        return sb.toString();
++    }
++
++    /** The block-collision part of World.getCubes (private World.a(entity, box, earlyReturn=false, list)). */
++    private static String blockBoxes(World world, Entity entity, AxisAlignedBB query, boolean optimized) {
++        Physics.optimizeVoxelCollisions = optimized;
++        try {
++            List<AxisAlignedBB> list = new ArrayList<AxisAlignedBB>();
++            Object result = BLOCK_BOXES.invoke(world, entity, query, false, list);
++            return result + ":" + describe(list);
++        } catch (InvocationTargetException e) {
++            return "throws " + e.getCause().getClass().getName();
++        } catch (Exception e) {
++            throw new RuntimeException(e);
++        }
++    }
++
++    private static String cubes(World world, AxisAlignedBB query, boolean optimized) {
++        Physics.optimizeVoxelCollisions = optimized;
++        try {
++            return describe(world.getCubes(null, query));
++        } catch (Throwable t) {
++            return "throws " + t.getClass().getName();
++        }
++    }
++
++    private static String earlyReturn(World world, AxisAlignedBB query, boolean optimized) {
++        Physics.optimizeVoxelCollisions = optimized;
++        try {
++            return String.valueOf(world.a(query));
++        } catch (Throwable t) {
++            return "throws " + t.getClass().getName();
++        }
++    }
++
++    private static final AxisAlignedBB[] QUERIES = {
++        new AxisAlignedBB(-1.5D, 63.5D, -1.5D, 2.5D, 66.5D, 2.5D), // whole cell and all four neighbours
++        new AxisAlignedBB(0.3D, 64.9D, 0.3D, 0.7D, 65.1D, 0.7D),   // thin slice at the top of the cell
++        new AxisAlignedBB(0.3D, 64.0D, 0.3D, 0.7D, 64.2D, 0.7D),   // low slice
++        new AxisAlignedBB(0.9D, 64.3D, 0.3D, 1.6D, 65.6D, 0.7D),   // reaches into the +X neighbour
++    };
++
++    private static void assertNoMismatches(String what, List<String> mismatches) {
++        assertTrue(mismatches.size() + " " + what + " mismatches (first 12):\n"
++                + String.join("\n", mismatches.subList(0, Math.min(12, mismatches.size()))), mismatches.isEmpty());
++    }
++
++    @Test
++    public void everyStateMatchesWithNeighbourDependentShapes() throws Exception {
++        WorldServer world = world(new WorldBorder());
++        Block[] neighbours = {Blocks.AIR, Blocks.STONE, Blocks.FENCE, Blocks.GLASS_PANE, Blocks.OAK_STAIRS};
++        int[][] offsets = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
++        List<String> mismatches = new ArrayList<String>();
++        int checks = 0;
++        java.util.Set<String> throwingBlocks = new java.util.TreeSet<String>();
++        for (Block neighbour : neighbours) {
++            for (int[] o : offsets) {
++                put(world, o[0], 64, o[1], neighbour.getBlockData());
++            }
++            for (IBlockData state : Block.REGISTRY_ID) {
++                put(world, 0, 64, 0, state);
++                for (AxisAlignedBB query : QUERIES) {
++                    String expected = cubes(world, query, false);
++                    String actual = cubes(world, query, true);
++                    ++checks;
++                    if (expected.startsWith("throws")) {
++                        // Tile-entity-backed blocks (moving piston, shulker box) throw in vanilla's own dispatch on a stub world
++                        // with no tile entities. Both paths must throw identically (compared below); which blocks do is checked
++                        // against an allow-list after the loop so a genuine defect cannot hide behind a throw.
++                        throwingBlocks.add(state.getBlock().getClass().getSimpleName());
++                    }
++                    if (!expected.equals(actual)) {
++                        mismatches.add(neighbour.a() + " neighbours, " + state + " query=" + query + "\n   canonical=" + expected + "\n   optimized=" + actual);
++                    }
++                }
++                put(world, 0, 64, 0, Blocks.AIR.getBlockData());
++            }
++        }
++        assertTrue("many states x neighbour sets x queries must run, saw " + checks, checks > 30_000);
++        java.util.Set<String> unexpected = new java.util.TreeSet<String>(throwingBlocks);
++        unexpected.removeAll(java.util.Arrays.asList("BlockPistonMoving", "BlockShulkerBox"));
++        assertTrue("only tile-entity-backed blocks may throw on the stub world, but also threw: " + unexpected, unexpected.isEmpty());
++        assertNoMismatches("neighbour-dependent", mismatches);
++    }
++
++    @Test
++    public void earlyReturnQueryMatchesForEveryState() throws Exception {
++        WorldServer world = world(new WorldBorder());
++        List<String> mismatches = new ArrayList<String>();
++        int trueResults = 0;
++        for (IBlockData state : Block.REGISTRY_ID) {
++            put(world, 0, 64, 0, state);
++            for (AxisAlignedBB query : QUERIES) {
++                String expected = earlyReturn(world, query, false);
++                String actual = earlyReturn(world, query, true);
++                if (expected.equals("true")) {
++                    ++trueResults;
++                }
++                if (!expected.equals(actual)) {
++                    mismatches.add(state + " query=" + query + " canonical=" + expected + " optimized=" + actual);
++                }
++            }
++            put(world, 0, 64, 0, Blocks.AIR.getBlockData());
++        }
++        assertTrue("the baseline must hit collisions for many states, saw " + trueResults, trueResults > 1000);
++        assertNoMismatches("early-return", mismatches);
++    }
++
++    @Test
++    public void everyStateMatchesForRealEntitiesIncludingTheBoatLilyPadRule() throws Exception {
++        WorldServer world = world(new WorldBorder());
++        List<Entity> entities = new ArrayList<Entity>();
++        entities.add(entity(EntityPig.class, world, 0.5D, 64.0D, 0.5D));
++        entities.add(entity(EntityBoat.class, world, 0.5D, 64.0D, 0.5D));
++        List<String> mismatches = new ArrayList<String>();
++        int checks = 0;
++        for (IBlockData state : Block.REGISTRY_ID) {
++            put(world, 0, 64, 0, state);
++            for (Entity entity : entities) {
++                for (AxisAlignedBB query : QUERIES) {
++                    String expected = blockBoxes(world, entity, query, false);
++                    String actual = blockBoxes(world, entity, query, true);
++                    ++checks;
++                    if (!expected.equals(actual)) {
++                        mismatches.add(entity.getClass().getSimpleName() + " " + state + " query=" + query + "\n   canonical=" + expected + "\n   optimized=" + actual);
++                    }
++                }
++            }
++            put(world, 0, 64, 0, Blocks.AIR.getBlockData());
++        }
++        assertTrue("saw " + checks, checks > 8000);
++        assertNoMismatches("entity", mismatches);
++
++        // The boat exception must really be exercised: a boat sees no lily pad box, a pig does.
++        put(world, 0, 64, 0, Blocks.WATERLILY.getBlockData());
++        AxisAlignedBB lilyQuery = new AxisAlignedBB(0, 64, 0, 1, 65, 1);
++        for (boolean optimized : new boolean[] {false, true}) {
++            assertTrue("pig collides with the lily pad", blockBoxes(world, entities.get(0), lilyQuery, optimized).startsWith("true:["));
++            assertEquals("boat passes through the lily pad", "false:", blockBoxes(world, entities.get(1), lilyQuery, optimized));
++        }
++    }
++
++    @Test
++    public void worldBorderPlaceholderBranchMatches() throws Exception {
++        WorldBorder border = new WorldBorder();
++        border.setSize(6.0D); // blocks x/z in [-3, 3)
++        WorldServer world = world(border);
++        Entity inside = entity(EntityPig.class, world, 0.0D, 64.0D, 0.0D);
++        Entity outside = entity(EntityPig.class, world, 10.0D, 64.0D, 0.0D);
++        AxisAlignedBB acrossEdge = new AxisAlignedBB(1.5D, 64.0D, -1.0D, 5.5D, 65.0D, 1.0D);
++        for (Block block : new Block[] {Blocks.AIR, Blocks.STONE, Blocks.CARPET, Blocks.SOUL_SAND, Blocks.WATERLILY, Blocks.FENCE}) {
++            for (int x = -6; x <= 6; ++x) {
++                for (int z = -2; z <= 2; ++z) {
++                    put(world, x, 64, z, block.getBlockData());
++                }
++            }
++            for (Entity entity : new Entity[] {inside, outside, null}) {
++                String expected = blockBoxes(world, entity, acrossEdge, false);
++                String actual = blockBoxes(world, entity, acrossEdge, true);
++                assertEquals(block.a() + " entity=" + (entity == null ? "none" : entity.locX), expected, actual);
++            }
++        }
++        // Air everywhere: only an entity INSIDE the border sees the stone placeholder beyond it (vanilla behaviour).
++        for (int x = -6; x <= 6; ++x) {
++            for (int z = -2; z <= 2; ++z) {
++                put(world, x, 64, z, Blocks.AIR.getBlockData());
++            }
++        }
++        for (boolean optimized : new boolean[] {false, true}) {
++            String seenInside = blockBoxes(world, inside, acrossEdge, optimized);
++            assertTrue("entity inside the border must collide with the placeholder blocks past it: " + seenInside, seenInside.startsWith("true:["));
++            assertEquals("entity already outside the border gets no placeholder", "false:", blockBoxes(world, outside, acrossEdge, optimized));
++            assertEquals("no entity: no placeholder", "false:", blockBoxes(world, null, acrossEdge, optimized));
++        }
++    }
++
++    private static long sweep(World world, AxisAlignedBB[] queries, boolean optimized, int rounds) {
++        Physics.optimizeVoxelCollisions = optimized;
++        long sum = 0;
++        long start = System.nanoTime();
++        for (int round = 0; round < rounds; ++round) {
++            for (AxisAlignedBB query : queries) {
++                sum += world.getCubes(null, query).size();
++            }
++        }
++        long elapsed = System.nanoTime() - start;
++        checksum = sum;
++        return elapsed;
++    }
++
++    private static AxisAlignedBB[] playerQueries() {
++        AxisAlignedBB[] queries = new AxisAlignedBB[128];
++        for (int i = 0; i < queries.length; ++i) {
++            double x = (i % 16) - 8 + 0.15D;
++            double z = (i / 16) - 4 + 0.35D;
++            queries[i] = new AxisAlignedBB(x - 0.3D, 64.0D, z - 0.3D, x + 0.3D, 65.8D, z + 0.3D);
++        }
++        return queries;
++    }
++
++    private void runScene(String label, WorldServer world, Block[] palette) {
++        for (int x = -12; x <= 12; ++x) {
++            for (int z = -12; z <= 12; ++z) {
++                put(world, x, 64, z, palette[Math.floorMod(x * 7 + z * 13 + (x ^ z), palette.length)].getBlockData());
++            }
++        }
++        AxisAlignedBB[] queries = playerQueries();
++        for (AxisAlignedBB query : queries) {
++            assertEquals(label + " parity", cubes(world, query, false), cubes(world, query, true));
++        }
++        for (int warmup = 0; warmup < 4; ++warmup) {
++            sweep(world, queries, false, 10);
++            sweep(world, queries, true, 10);
++        }
++        long baseline = 0;
++        long optimized = 0;
++        for (int sample = 0; sample < 6; ++sample) {
++            if ((sample & 1) == 0) {
++                baseline += sweep(world, queries, false, 25);
++                optimized += sweep(world, queries, true, 25);
++            } else {
++                optimized += sweep(world, queries, true, 25);
++                baseline += sweep(world, queries, false, 25);
++            }
++        }
++        System.out.printf("VoxelCollisionContextTest %s: queries/path=%d baseline=%.3f ms optimized=%.3f ms ratio=%.2f checksum=%d%n",
++                label, queries.length * 150, baseline / 1_000_000.0D, optimized / 1_000_000.0D, (double) optimized / baseline, checksum);
++    }
++
++    @Test
++    public void reportVegetationHeavySweepTimings() throws Exception {
++        WorldServer world = world(new WorldBorder());
++        // No full cubes at all: every probe falls back to canonical dispatch (worst case for the fast path).
++        runScene("vegetation-only", world, new Block[] {Blocks.TALLGRASS, Blocks.RED_FLOWER, Blocks.YELLOW_FLOWER, Blocks.CARPET,
++                Blocks.SAPLING, Blocks.AIR, Blocks.WATERLILY, Blocks.SNOW_LAYER});
++        runScene("shapes-only", world, new Block[] {Blocks.OAK_STAIRS, Blocks.FENCE, Blocks.SOUL_SAND, Blocks.CARPET, Blocks.AIR, Blocks.GLASS_PANE});
++        runScene("mixed", world, new Block[] {Blocks.STONE, Blocks.TALLGRASS, Blocks.OAK_STAIRS, Blocks.AIR, Blocks.CARPET, Blocks.STONE, Blocks.FENCE});
++    }
++}
