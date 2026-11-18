@@ -1,0 +1,327 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Wed, 18 Nov 2026 12:09:52 +0700
+Subject: [PATCH 93/94] fix(physics): preserve thin block collisions in voxel
+ fast path
+
+Material flags cannot prove collision absence: carpet and lily pads require canonical block dispatch. Classify each state once per World collision probe.
+
+Verify ordered World.getCubes parity with optimization enabled and disabled, thin shapes, exact touching faces, chunk and height boundaries, and lily-pad boat dispatch. Full API and server suites pass on JDK 21 with no build cache. Stone/air 12800-query diagnostic: 46.074 ms baseline, 39.029 ms optimized; later suite run 31.591 vs 30.453 ms shows timing variability. MCP 9.40 BlockCarpet and BlockLilyPad checked.
+
+diff --git a/main/java/me/stella/antarctic/spatial/FastVoxelCache.java b/main/java/me/stella/antarctic/spatial/FastVoxelCache.java
+index 8b0378d..446c3a6 100644
+--- a/main/java/me/stella/antarctic/spatial/FastVoxelCache.java
++++ b/main/java/me/stella/antarctic/spatial/FastVoxelCache.java
+@@ -3,7 +3,6 @@ package me.stella.antarctic.spatial;
+ import net.minecraft.server.Block;
+ import net.minecraft.server.Blocks;
+ import net.minecraft.server.IBlockData;
+-import net.minecraft.server.Material;
+ 
+ /**
+  * Fast collision shape classification inferred from Lithium / Leaf.
+@@ -32,12 +31,7 @@ public final class FastVoxelCache {
+         if (block == Blocks.AIR) {
+             return ShapeType.EMPTY;
+         }
+-        Material material = data.getMaterial();
+-        if (material == Material.AIR || !material.isSolid()) {
+-            if (!material.isLiquid() && !material.isBuildable()) {
+-                return ShapeType.EMPTY;
+-            }
+-        }
++        // Material flags do not prove collision absence: carpet and lily pads still have collision boxes.
+         if (block.isOccluding(data) && block.l(data)) {
+             return ShapeType.FULL_CUBE;
+         }
+diff --git a/main/java/net/minecraft/server/World.java b/main/java/net/minecraft/server/World.java
+index dc442e5..b331c75 100644
+--- a/main/java/net/minecraft/server/World.java
++++ b/main/java/net/minecraft/server/World.java
+@@ -1407,10 +1407,11 @@ public abstract class World implements IBlockAccess {
+                             }
+ 
+                             if (optimizeVoxel) {
+-                                if (me.stella.antarctic.spatial.FastVoxelCache.isEmpty(iblockdata1)) {
++                                me.stella.antarctic.spatial.FastVoxelCache.ShapeType shape = me.stella.antarctic.spatial.FastVoxelCache.classify(iblockdata1);
++                                if (shape == me.stella.antarctic.spatial.FastVoxelCache.ShapeType.EMPTY) {
+                                     continue;
+                                 }
+-                                if (me.stella.antarctic.spatial.FastVoxelCache.isFullCube(iblockdata1)) {
++                                if (shape == me.stella.antarctic.spatial.FastVoxelCache.ShapeType.FULL_CUBE) {
+                                     if (axisalignedbb.a < (double) (k1 + 1) && axisalignedbb.d > (double) k1 &&
+                                         axisalignedbb.b < (double) (i2 + 1) && axisalignedbb.e > (double) i2 &&
+                                         axisalignedbb.c < (double) (l1 + 1) && axisalignedbb.f > (double) l1) {
+diff --git a/test/java/me/stella/antarctic/spatial/FastVoxelCacheTest.java b/test/java/me/stella/antarctic/spatial/FastVoxelCacheTest.java
+index 7b09a5a..a479f35 100644
+--- a/test/java/me/stella/antarctic/spatial/FastVoxelCacheTest.java
++++ b/test/java/me/stella/antarctic/spatial/FastVoxelCacheTest.java
+@@ -17,8 +17,11 @@ public class FastVoxelCacheTest {
+     public void testEmptyBlock() {
+         assertTrue(FastVoxelCache.isEmpty(null));
+         assertTrue(FastVoxelCache.isEmpty(Blocks.AIR.getBlockData()));
+-        assertTrue(FastVoxelCache.isEmpty(Blocks.TALLGRASS.getBlockData()));
+-        assertTrue(FastVoxelCache.isEmpty(Blocks.TORCH.getBlockData()));
++        // Non-air blocks conservatively use canonical collision dispatch, even when their current box is empty.
++        assertEquals(FastVoxelCache.ShapeType.CUSTOM, FastVoxelCache.classify(Blocks.TALLGRASS.getBlockData()));
++        assertEquals(FastVoxelCache.ShapeType.CUSTOM, FastVoxelCache.classify(Blocks.TORCH.getBlockData()));
++        assertFalse(FastVoxelCache.isEmpty(Blocks.CARPET.getBlockData()));
++        assertFalse(FastVoxelCache.isEmpty(Blocks.WATERLILY.getBlockData()));
+     }
+ 
+     @Test
+diff --git a/test/java/net/minecraft/server/VoxelCollisionTest.java b/test/java/net/minecraft/server/VoxelCollisionTest.java
+index d551834..8aea208 100644
+--- a/test/java/net/minecraft/server/VoxelCollisionTest.java
++++ b/test/java/net/minecraft/server/VoxelCollisionTest.java
+@@ -1,26 +1,242 @@
+ package net.minecraft.server;
+ 
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Physics;
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.List;
++import me.stella.antarctic.spatial.FastVoxelCache;
++import org.junit.After;
++import org.junit.Before;
+ import org.junit.BeforeClass;
+ import org.junit.Test;
++import sun.misc.Unsafe;
+ import static org.junit.Assert.*;
+ 
+ public class VoxelCollisionTest {
+ 
++    private boolean originalOptimization;
++    private static volatile long benchmarkChecksum;
++
+     @BeforeClass
+-    public static void setUp() {
+-        DispenserRegistry.c();
++    public static void setUp() throws Exception {
++        LightPropagationParityTest.bootstrap();
++    }
++
++    @Before
++    public void saveConfig() {
++        originalOptimization = Physics.optimizeVoxelCollisions;
++    }
++
++    @After
++    public void restoreConfig() {
++        Physics.optimizeVoxelCollisions = originalOptimization;
++    }
++
++    private static WorldServer world() throws Exception {
++        WorldServer world = LightPropagationParityTest.buildWorld(42,
++                new LightPropagationParityTest.StubProvider[1]);
++        // Unsafe skips World's final border initializer; getCubes reads it even with a null entity.
++        LightPropagationParityTest.set(World.class, world, "P", new WorldBorder());
++        return world;
++    }
++
++    private static void block(World world, int x, int y, int z, Block block) {
++        LightPropagationParityTest.setBlock(world, x, y, z, block.getBlockData());
++    }
++
++    private static void assertBoxes(String context, List<AxisAlignedBB> expected, List<AxisAlignedBB> actual) {
++        assertEquals(context + " count", expected.size(), actual.size());
++        for (int i = 0; i < expected.size(); ++i) {
++            AxisAlignedBB a = expected.get(i);
++            AxisAlignedBB b = actual.get(i);
++            String message = context + " box " + i;
++            assertEquals(message + " minX", a.a, b.a, 0.0D);
++            assertEquals(message + " minY", a.b, b.b, 0.0D);
++            assertEquals(message + " minZ", a.c, b.c, 0.0D);
++            assertEquals(message + " maxX", a.d, b.d, 0.0D);
++            assertEquals(message + " maxY", a.e, b.e, 0.0D);
++            assertEquals(message + " maxZ", a.f, b.f, 0.0D);
++        }
++    }
++
++    private static List<AxisAlignedBB> parity(World world, AxisAlignedBB query) {
++        Physics.optimizeVoxelCollisions = false;
++        List<AxisAlignedBB> expected = world.getCubes(null, query);
++        Physics.optimizeVoxelCollisions = true;
++        assertBoxes("query " + query, expected, world.getCubes(null, query));
++        return expected;
++    }
++
++    @Test
++    public void emptyClassificationMustNotDiscardThinCollisionShapes() {
++        assertTrue(FastVoxelCache.isEmpty(Blocks.AIR.getBlockData()));
++        assertTrue(FastVoxelCache.isFullCube(Blocks.STONE.getBlockData()));
++        assertFalse("carpet still has a 1/16-block collision box", FastVoxelCache.isEmpty(Blocks.CARPET.getBlockData()));
++        assertFalse(FastVoxelCache.isFullCube(Blocks.CARPET.getBlockData()));
++        assertFalse(FastVoxelCache.isFullCube(Blocks.WATERLILY.getBlockData()));
++        assertFalse(FastVoxelCache.isFullCube(Blocks.OAK_STAIRS.getBlockData()));
++    }
++
++    @Test
++    public void lilyPadIsNotEmpty() {
++        assertFalse("lily pad collides except with boats", FastVoxelCache.isEmpty(Blocks.WATERLILY.getBlockData()));
++    }
++
++    @Test
++    public void lilyPadWorldQueryRetainsCollision() throws Exception {
++        WorldServer world = world();
++        block(world, 0, 64, 0, Blocks.WATERLILY);
++        assertEquals(1, parity(world, new AxisAlignedBB(0, 64, 0, 1, 65, 1)).size());
++    }
++
++    @Test
++    public void isolatedBlockShapesMatchActualWorldQueries() throws Exception {
++        WorldServer world = world();
++        AxisAlignedBB query = new AxisAlignedBB(-0.25D, 63.75D, -0.25D, 1.25D, 65.25D, 1.25D);
++        for (Block block : new Block[] {Blocks.AIR, Blocks.STONE, Blocks.CARPET, Blocks.WATERLILY, Blocks.OAK_STAIRS}) {
++            block(world, 0, 64, 0, block);
++            List<AxisAlignedBB> boxes = parity(world, query);
++            if (block == Blocks.AIR) {
++                assertTrue(boxes.isEmpty());
++            } else {
++                assertFalse("baseline must exercise " + block, boxes.isEmpty());
++            }
++            if (block == Blocks.CARPET || block == Blocks.WATERLILY) {
++                double inset = block == Blocks.CARPET ? 0.0D : 0.0625D;
++                double height = block == Blocks.CARPET ? 0.0625D : 0.09375D;
++                assertEquals(1, boxes.size());
++                assertBoxes("thin shape", java.util.Collections.singletonList(
++                        new AxisAlignedBB(inset, 64, inset, 1 - inset, 64 + height, 1 - inset)), boxes);
++            }
++        }
++    }
++
++    @Test
++    public void mixedShapesPreserveOrderedBoxesAcrossChunkEdges() throws Exception {
++        WorldServer world = world();
++        Block[] blocks = {Blocks.AIR, Blocks.STONE, Blocks.CARPET, Blocks.WATERLILY, Blocks.OAK_STAIRS};
++        for (int x = -18; x <= 18; ++x) {
++            for (int z = -3; z <= 3; ++z) {
++                block(world, x, 64, z, blocks[Math.floorMod(x + z, blocks.length)]);
++                if ((x + z) % 3 == 0) {
++                    block(world, x, 65, z, Blocks.STONE);
++                }
++            }
++        }
++        assertTrue(parity(world, new AxisAlignedBB(-18.2D, 63.9D, -3.2D, 18.2D, 66.1D, 3.2D)).size() > 20);
++        for (int x : new int[] {-17, -16, -1, 0, 15, 16}) {
++            parity(world, new AxisAlignedBB(x - 0.3D, 64, -0.3D, x + 0.3D, 65.8D, 0.3D));
++        }
+     }
+ 
+     @Test
+-    public void testPhysicsConfigDefault() {
+-        assertTrue(Physics.optimizeVoxelCollisions);
++    public void exactTouchingFacesDoNotCollide() throws Exception {
++        WorldServer world = world();
++        block(world, 0, 64, 0, Blocks.STONE);
++        AxisAlignedBB[] touching = {
++            new AxisAlignedBB(-1, 64, 0, 0, 65, 1),
++            new AxisAlignedBB(1, 64, 0, 2, 65, 1),
++            new AxisAlignedBB(0, 63, 0, 1, 64, 1),
++            new AxisAlignedBB(0, 65, 0, 1, 66, 1),
++            new AxisAlignedBB(0, 64, -1, 1, 65, 0),
++            new AxisAlignedBB(0, 64, 1, 1, 65, 2)
++        };
++        for (AxisAlignedBB query : touching) {
++            assertTrue("touching faces must not intersect", parity(world, query).isEmpty());
++        }
++        assertEquals(1, parity(world, new AxisAlignedBB(1 - 1.0E-7D, 64, 0, 2, 65, 1)).size());
++        for (Block thin : new Block[] {Blocks.CARPET, Blocks.WATERLILY}) {
++            block(world, 0, 64, 0, thin);
++            double top = 64 + (thin == Blocks.CARPET ? 0.0625D : 0.09375D);
++            assertTrue(parity(world, new AxisAlignedBB(0, top, 0, 1, 65, 1)).isEmpty());
++            assertEquals(1, parity(world, new AxisAlignedBB(0, top - 1.0E-7D, 0, 1, 65, 1)).size());
++        }
++    }
++
++    @Test
++    public void unloadedChunksAndHeightBoundariesMatchWithoutLoading() throws Exception {
++        WorldServer world = world();
++        block(world, 31, 64, 0, Blocks.STONE);
++        block(world, -32, 64, 0, Blocks.CARPET);
++        assertEquals(1, parity(world, new AxisAlignedBB(30.5D, 64, 0, 33, 65, 1)).size());
++        assertEquals(1, parity(world, new AxisAlignedBB(-34, 64, 0, -31.5D, 65, 1)).size());
++        assertTrue(parity(world, new AxisAlignedBB(32, 64, 0, 34, 65, 1)).isEmpty());
++        assertTrue(parity(world, new AxisAlignedBB(-34, 64, 0, -32, 65, 1)).isEmpty());
++        assertTrue(parity(world, new AxisAlignedBB(0, -2, 0, 1, 0, 1)).isEmpty());
++        assertFalse(parity(world, new AxisAlignedBB(0, -0.5D, 0, 1, 0.5D, 1)).isEmpty());
++        block(world, 0, 255, 0, Blocks.STONE);
++        assertEquals(1, parity(world, new AxisAlignedBB(0, 255.5D, 0, 1, 256.5D, 1)).size());
++        assertTrue(parity(world, new AxisAlignedBB(0, 256, 0, 1, 258, 1)).isEmpty());
++    }
++
++    @Test
++    public void lilyPadRetainsBoatException() throws Exception {
++        WorldServer world = world();
++        Field field = Unsafe.class.getDeclaredField("theUnsafe");
++        field.setAccessible(true);
++        EntityBoat boat = (EntityBoat) ((Unsafe) field.get(null)).allocateInstance(EntityBoat.class);
++        IBlockData lily = Blocks.WATERLILY.getBlockData();
++        BlockPosition position = new BlockPosition(0, 64, 0);
++        AxisAlignedBB query = new AxisAlignedBB(0, 64, 0, 1, 65, 1);
++        List<AxisAlignedBB> boxes = new ArrayList<>();
++        // Direct dispatch isolates the boat-specific shape without constructing unrelated entity tracking state.
++        lily.a(world, position, query, boxes, null, false);
++        assertEquals(1, boxes.size());
++        boxes.clear();
++        lily.a(world, position, query, boxes, boat, false);
++        assertTrue(boxes.isEmpty());
++    }
++
++    private static long sweep(World world, AxisAlignedBB[] queries, boolean optimized, int rounds) {
++        Physics.optimizeVoxelCollisions = optimized;
++        long checksum = 0;
++        long start = System.nanoTime();
++        for (int round = 0; round < rounds; ++round) {
++            for (AxisAlignedBB query : queries) {
++                checksum += world.getCubes(null, query).size();
++            }
++        }
++        long elapsed = System.nanoTime() - start;
++        benchmarkChecksum = checksum;
++        return elapsed;
+     }
+ 
+     @Test
+-    public void testVoxelFastCacheClassification() {
+-        assertTrue(me.stella.antarctic.spatial.FastVoxelCache.isEmpty(Blocks.AIR.getBlockData()));
+-        assertTrue(me.stella.antarctic.spatial.FastVoxelCache.isFullCube(Blocks.STONE.getBlockData()));
+-        assertFalse(me.stella.antarctic.spatial.FastVoxelCache.isFullCube(Blocks.OAK_STAIRS.getBlockData()));
++    public void reportStoneAirSweepTimings() throws Exception {
++        WorldServer world = world();
++        for (int x = -12; x <= 12; ++x) {
++            for (int z = -12; z <= 12; ++z) {
++                block(world, x, 64, z, Blocks.STONE);
++                if ((x + z) % 7 == 0) {
++                    block(world, x, 65, z, Blocks.STONE);
++                }
++            }
++        }
++        AxisAlignedBB[] queries = new AxisAlignedBB[128];
++        for (int i = 0; i < queries.length; ++i) {
++            double x = (i % 16) - 8 + 0.15D;
++            double z = (i / 16) - 4 + 0.35D;
++            double y = i % 3 == 0 ? 67 : 64.8D;
++            queries[i] = new AxisAlignedBB(x - 0.3D, y, z - 0.3D, x + 0.3D, y + 1.8D, z + 0.3D);
++            parity(world, queries[i]);
++        }
++        for (int warmup = 0; warmup < 4; ++warmup) {
++            sweep(world, queries, false, 10);
++            sweep(world, queries, true, 10);
++        }
++        long baseline = 0;
++        long optimized = 0;
++        for (int sample = 0; sample < 4; ++sample) {
++            // Alternate measurement order; timings are diagnostic, never a pass/fail threshold.
++            if ((sample & 1) == 0) {
++                baseline += sweep(world, queries, false, 25);
++                optimized += sweep(world, queries, true, 25);
++            } else {
++                optimized += sweep(world, queries, true, 25);
++                baseline += sweep(world, queries, false, 25);
++            }
++        }
++        System.out.printf("VoxelCollisionTest stone/air sweeps: queries/path=%d baseline=%.3f ms optimized=%.3f ms checksum=%d%n",
++                queries.length * 100, baseline / 1_000_000.0D, optimized / 1_000_000.0D, benchmarkChecksum);
+     }
+ }

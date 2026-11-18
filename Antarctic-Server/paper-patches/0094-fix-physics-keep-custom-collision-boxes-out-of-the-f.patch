@@ -1,0 +1,176 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Wed, 18 Nov 2026 13:02:07 +0700
+Subject: [PATCH 94/94] fix(physics): keep custom collision boxes out of the
+ full-cube fast path
+
+Occluding and full-cube flags do not prove a unit collision box: soul sand is an opaque cube whose collision box is 0.875 tall, so the voxel fast path emitted a 1.0 box and entities stood 0.125 too high. FULL_CUBE now also requires that the block class declares none of the collision box, bounding box or addCollisionBoxToList hooks (cached per class); other blocks use canonical dispatch.
+
+VoxelCollisionRegistryTest compares World.getCubes with the optimization on and off for every registered block state: 3 soul sand mismatches before, none after. Full API and server suites pass on JDK 21.
+
+diff --git a/main/java/me/stella/antarctic/spatial/FastVoxelCache.java b/main/java/me/stella/antarctic/spatial/FastVoxelCache.java
+index 446c3a6..871b734 100644
+--- a/main/java/me/stella/antarctic/spatial/FastVoxelCache.java
++++ b/main/java/me/stella/antarctic/spatial/FastVoxelCache.java
+@@ -1,8 +1,14 @@
+ package me.stella.antarctic.spatial;
+ 
++import java.util.List;
++import net.minecraft.server.AxisAlignedBB;
+ import net.minecraft.server.Block;
++import net.minecraft.server.BlockPosition;
+ import net.minecraft.server.Blocks;
++import net.minecraft.server.Entity;
++import net.minecraft.server.IBlockAccess;
+ import net.minecraft.server.IBlockData;
++import net.minecraft.server.World;
+ 
+ /**
+  * Fast collision shape classification inferred from Lithium / Leaf.
+@@ -17,6 +23,36 @@ public final class FastVoxelCache {
+         CUSTOM
+     }
+ 
++    /**
++     * Whether a block class replaces any of the three shape hooks that feed collision: the collision box
++     * ({@code Block.a(IBlockData, IBlockAccess, BlockPosition)}, 1.12.2 getCollisionBoundingBox), the selection box
++     * ({@code Block.b(...)}, getBoundingBox) and the box-list hook ({@code addCollisionBoxToList}). The occluding
++     * and full-cube flags do not prove a unit collision box: soul sand is an opaque cube whose collision box is 0.875 tall.
++     */
++    private static final ClassValue<Boolean> CUSTOM_SHAPE = new ClassValue<Boolean>() {
++        @Override
++        protected Boolean computeValue(Class<?> type) {
++            for (Class<?> c = type; c != null && c != Block.class; c = c.getSuperclass()) {
++                if (declares(c, "a", IBlockData.class, IBlockAccess.class, BlockPosition.class)
++                        || declares(c, "b", IBlockData.class, IBlockAccess.class, BlockPosition.class)
++                        || declares(c, "a", IBlockData.class, World.class, BlockPosition.class, AxisAlignedBB.class,
++                                List.class, Entity.class, boolean.class)) {
++                    return Boolean.TRUE;
++                }
++            }
++            return Boolean.FALSE;
++        }
++    };
++
++    private static boolean declares(Class<?> type, String name, Class<?>... parameters) {
++        try {
++            type.getDeclaredMethod(name, parameters);
++            return true;
++        } catch (NoSuchMethodException e) {
++            return false;
++        }
++    }
++
+     private FastVoxelCache() {
+     }
+ 
+@@ -32,7 +68,7 @@ public final class FastVoxelCache {
+             return ShapeType.EMPTY;
+         }
+         // Material flags do not prove collision absence: carpet and lily pads still have collision boxes.
+-        if (block.isOccluding(data) && block.l(data)) {
++        if (block.isOccluding(data) && block.l(data) && !CUSTOM_SHAPE.get(block.getClass())) {
+             return ShapeType.FULL_CUBE;
+         }
+         return ShapeType.CUSTOM;
+diff --git a/test/java/me/stella/antarctic/spatial/FastVoxelCacheTest.java b/test/java/me/stella/antarctic/spatial/FastVoxelCacheTest.java
+index a479f35..8aeba1b 100644
+--- a/test/java/me/stella/antarctic/spatial/FastVoxelCacheTest.java
++++ b/test/java/me/stella/antarctic/spatial/FastVoxelCacheTest.java
+@@ -33,4 +33,11 @@ public class FastVoxelCacheTest {
+         assertFalse(FastVoxelCache.isFullCube(Blocks.OAK_STAIRS.getBlockData()));
+         assertFalse(FastVoxelCache.isFullCube(Blocks.WOODEN_SLAB.getBlockData()));
+     }
++
++    @Test
++    public void opaqueCubesWithShorterCollisionBoxesAreNotFullCubes() {
++        // Soul sand is an opaque full cube for rendering and light, but its collision box is only 0.875 tall.
++        assertFalse(FastVoxelCache.isFullCube(Blocks.SOUL_SAND.getBlockData()));
++        assertEquals(FastVoxelCache.ShapeType.CUSTOM, FastVoxelCache.classify(Blocks.SOUL_SAND.getBlockData()));
++    }
+ }
+diff --git a/test/java/net/minecraft/server/VoxelCollisionRegistryTest.java b/test/java/net/minecraft/server/VoxelCollisionRegistryTest.java
+new file mode 100644
+index 0000000..6be45bd
+--- /dev/null
++++ b/test/java/net/minecraft/server/VoxelCollisionRegistryTest.java
+@@ -0,0 +1,79 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.config.toml.modules.optimizations.Physics;
++import java.util.ArrayList;
++import java.util.List;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import static org.junit.Assert.*;
++
++/**
++ * Exhaustive vanilla-parity check for the voxel collision fast path: every registered 1.12.2 block state is placed in a
++ * stub world and World.getCubes must return the same ordered boxes with the optimization on and off.
++ */
++public class VoxelCollisionRegistryTest {
++
++    private boolean original;
++
++    @BeforeClass
++    public static void setUp() throws Exception {
++        LightPropagationParityTest.bootstrap();
++    }
++
++    @Before
++    public void save() {
++        original = Physics.optimizeVoxelCollisions;
++    }
++
++    @After
++    public void restore() {
++        Physics.optimizeVoxelCollisions = original;
++    }
++
++    private static String describe(List<AxisAlignedBB> boxes) {
++        StringBuilder sb = new StringBuilder();
++        for (AxisAlignedBB b : boxes) {
++            sb.append('[').append(b.a).append(',').append(b.b).append(',').append(b.c).append(" -> ")
++                    .append(b.d).append(',').append(b.e).append(',').append(b.f).append(']');
++        }
++        return sb.toString();
++    }
++
++    private static String run(World world, AxisAlignedBB query, boolean optimized) {
++        Physics.optimizeVoxelCollisions = optimized;
++        try {
++            return describe(world.getCubes(null, query));
++        } catch (Throwable t) {
++            return "throws " + t.getClass().getName();
++        }
++    }
++
++    @Test
++    public void everyRegisteredBlockStateMatchesTheCanonicalCollisionPath() throws Exception {
++        WorldServer world = LightPropagationParityTest.buildWorld(7, new LightPropagationParityTest.StubProvider[1]);
++        LightPropagationParityTest.set(World.class, world, "P", new WorldBorder());
++        AxisAlignedBB[] queries = {
++            new AxisAlignedBB(-0.5D, 63.5D, -0.5D, 1.5D, 66.5D, 1.5D), // covers the whole cell and its neighbors
++            new AxisAlignedBB(0.3D, 64.9D, 0.3D, 0.7D, 65.1D, 0.7D),   // thin slice around y+0.9..1.0 (soul sand, farmland, slabs)
++            new AxisAlignedBB(0.3D, 64.0D, 0.3D, 0.7D, 64.2D, 0.7D),   // low slice
++        };
++        List<String> mismatches = new ArrayList<String>();
++        int states = 0;
++        for (IBlockData state : Block.REGISTRY_ID) {
++            ++states;
++            LightPropagationParityTest.setBlock(world, 0, 64, 0, state);
++            for (AxisAlignedBB query : queries) {
++                String expected = run(world, query, false);
++                String actual = run(world, query, true);
++                if (!expected.equals(actual)) {
++                    mismatches.add(state.getBlock().a() + " " + state + " query=" + query + "\n   canonical=" + expected + "\n   optimized=" + actual);
++                }
++            }
++            LightPropagationParityTest.setBlock(world, 0, 64, 0, Blocks.AIR.getBlockData());
++        }
++        assertTrue("registry should contain the vanilla states, saw " + states, states > 1000);
++        assertTrue(mismatches.size() + " mismatching block states:\n" + String.join("\n", mismatches), mismatches.isEmpty());
++    }
++}

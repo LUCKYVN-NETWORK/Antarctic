@@ -1,9 +1,14 @@
 package me.stella.antarctic.spatial;
 
+import java.util.List;
+import net.minecraft.server.AxisAlignedBB;
 import net.minecraft.server.Block;
+import net.minecraft.server.BlockPosition;
 import net.minecraft.server.Blocks;
+import net.minecraft.server.Entity;
+import net.minecraft.server.IBlockAccess;
 import net.minecraft.server.IBlockData;
-import net.minecraft.server.Material;
+import net.minecraft.server.World;
 
 /**
  * Fast collision shape classification inferred from Lithium / Leaf.
@@ -16,6 +21,36 @@ public final class FastVoxelCache {
         EMPTY,
         FULL_CUBE,
         CUSTOM
+    }
+
+    /**
+     * Whether a block class replaces any of the three shape hooks that feed collision: the collision box
+     * ({@code Block.a(IBlockData, IBlockAccess, BlockPosition)}, 1.12.2 getCollisionBoundingBox), the selection box
+     * ({@code Block.b(...)}, getBoundingBox) and the box-list hook ({@code addCollisionBoxToList}). The occluding
+     * and full-cube flags do not prove a unit collision box: soul sand is an opaque cube whose collision box is 0.875 tall.
+     */
+    private static final ClassValue<Boolean> CUSTOM_SHAPE = new ClassValue<Boolean>() {
+        @Override
+        protected Boolean computeValue(Class<?> type) {
+            for (Class<?> c = type; c != null && c != Block.class; c = c.getSuperclass()) {
+                if (declares(c, "a", IBlockData.class, IBlockAccess.class, BlockPosition.class)
+                        || declares(c, "b", IBlockData.class, IBlockAccess.class, BlockPosition.class)
+                        || declares(c, "a", IBlockData.class, World.class, BlockPosition.class, AxisAlignedBB.class,
+                                List.class, Entity.class, boolean.class)) {
+                    return Boolean.TRUE;
+                }
+            }
+            return Boolean.FALSE;
+        }
+    };
+
+    private static boolean declares(Class<?> type, String name, Class<?>... parameters) {
+        try {
+            type.getDeclaredMethod(name, parameters);
+            return true;
+        } catch (NoSuchMethodException e) {
+            return false;
+        }
     }
 
     private FastVoxelCache() {
@@ -32,13 +67,8 @@ public final class FastVoxelCache {
         if (block == Blocks.AIR) {
             return ShapeType.EMPTY;
         }
-        Material material = data.getMaterial();
-        if (material == Material.AIR || !material.isSolid()) {
-            if (!material.isLiquid() && !material.isBuildable()) {
-                return ShapeType.EMPTY;
-            }
-        }
-        if (block.isOccluding(data) && block.l(data)) {
+        // Material flags do not prove collision absence: carpet and lily pads still have collision boxes.
+        if (block.isOccluding(data) && block.l(data) && !CUSTOM_SHAPE.get(block.getClass())) {
             return ShapeType.FULL_CUBE;
         }
         return ShapeType.CUSTOM;
