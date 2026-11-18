@@ -1,9 +1,9 @@
 package me.stella.antarctic.collection;
 
 import it.unimi.dsi.fastutil.ints.IntLinkedOpenHashSet;
+import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongArrayFIFOQueue;
-import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 
 /**
  * Remembers light checks that vanilla discards because the 3x3 chunk neighborhood of the changed block is not fully
@@ -11,10 +11,13 @@ import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
  * store only chunk-local data ({@code x & 15}, y, {@code z & 15}, sky/block flag), which fits one int.
  *
  * <p>A light check is level-triggered (it recomputes what the light at that position should be), so replaying an old
- * entry later is harmless. Entries replay in the order they were first recorded, against the block states as they are
- * at replay time; vanilla's incremental algorithm is path dependent (see DeferredLightUpdateTest), so the result equals
- * running the same checks after all of the block changes, not after each one. The registry is capped; once full, new entries are dropped (and counted),
- * which is exactly what vanilla does for every entry. Not thread safe; main-thread confined.
+ * entry later is harmless. Replay order is grouped per chunk: entries of one chunk keep the order in which they were
+ * first recorded, and chunks replay in the order they became ready ({@link #markReady}). It is NOT a global recording
+ * order: recording A1, B1, A2 and marking A then B ready replays A1, A2, B1. Replay runs against the block states as
+ * they are at replay time; vanilla's incremental algorithm is path dependent (see DeferredLightUpdateTest), so the
+ * result equals running the same checks after all of the block changes, not after each one. The registry is capped;
+ * once full, new entries are dropped (and counted), which is exactly what vanilla does for every entry. Not thread
+ * safe; main-thread confined.
  *
  * <p>Antarctic - original work; the "never save or light a chunk with pending light updates" rule is the one Starlight
  * documents (Spottedleaf / PaperMC; LGPL-3.0), used here only as a design reference.
@@ -37,8 +40,16 @@ public final class PendingLightRegistry {
     }
 
     private final Long2ObjectOpenHashMap<IntLinkedOpenHashSet> pending = new Long2ObjectOpenHashMap<IntLinkedOpenHashSet>();
+    /**
+     * Ready queue of chunk keys with a parallel queue of sequence numbers. {@link #queued} maps each chunk that has a
+     * live slot to that slot's sequence number; a slot whose number no longer matches (the chunk was cleared after it
+     * was queued) is stale and skipped. Sequence numbers are never reused, so a chunk that unloads and reloads cannot
+     * revive its old, earlier position in the line, and no per-chunk state outlives its stale slot.
+     */
     private final LongArrayFIFOQueue ready = new LongArrayFIFOQueue();
-    private final LongOpenHashSet readySet = new LongOpenHashSet();
+    private final LongArrayFIFOQueue readySeq = new LongArrayFIFOQueue();
+    private final Long2LongOpenHashMap queued = new Long2LongOpenHashMap();
+    private long nextSeq;
     private final int maxEntries;
     private int total;
     private long dropped;
@@ -46,6 +57,7 @@ public final class PendingLightRegistry {
 
     public PendingLightRegistry(int maxEntries) {
         this.maxEntries = Math.max(0, maxEntries);
+        this.queued.defaultReturnValue(-1L);
     }
 
     public static int pack(int localX, int y, int localZ, boolean sky) {
@@ -93,19 +105,21 @@ public final class PendingLightRegistry {
 
     /** Queue a chunk for replay if it has entries and is not already queued. */
     public void markReady(long chunkKey) {
-        if (this.pending.containsKey(chunkKey) && this.readySet.add(chunkKey)) {
+        if (this.pending.containsKey(chunkKey) && !this.queued.containsKey(chunkKey)) {
+            long seq = this.nextSeq++;
+            this.queued.put(chunkKey, seq);
             this.ready.enqueue(chunkKey);
+            this.readySeq.enqueue(seq);
         }
     }
 
-    /** Forget a chunk (it unloaded). */
+    /** Forget a chunk (it unloaded). Any slot it still holds in the ready queue becomes stale and is skipped. */
     public void clearChunk(long chunkKey) {
         IntLinkedOpenHashSet set = this.pending.remove(chunkKey);
         if (set != null) {
             this.total -= set.size();
         }
-        this.readySet.remove(chunkKey);
-        // The key may still sit in the ready queue; drain() skips keys without entries.
+        this.queued.remove(chunkKey);
     }
 
     /**
@@ -117,21 +131,26 @@ public final class PendingLightRegistry {
         int processed = 0;
         while (processed < budget && !this.ready.isEmpty()) {
             long key = this.ready.firstLong();
+            long seq = this.readySeq.firstLong();
+            if (this.queued.get(key) != seq) { // stale slot: the chunk was cleared after it was queued
+                this.dequeueSlot();
+                continue;
+            }
             IntLinkedOpenHashSet set = this.pending.get(key);
-            if (set == null || !this.readySet.contains(key)) { // cleared or already handled
-                this.ready.dequeueLong();
-                this.readySet.remove(key);
+            if (set == null) { // defensive: a live slot always has entries
+                this.queued.remove(key);
+                this.dequeueSlot();
                 continue;
             }
             int state = gate.check(key);
             if (state == Gate.GONE) {
                 this.clearChunk(key);
-                this.ready.dequeueLong();
+                this.dequeueSlot();
                 continue;
             }
             if (state == Gate.WAIT) {
-                this.ready.dequeueLong();
-                this.readySet.remove(key);
+                this.queued.remove(key);
+                this.dequeueSlot();
                 continue;
             }
             int take = Math.min(budget - processed, set.size());
@@ -144,8 +163,8 @@ public final class PendingLightRegistry {
             this.total -= take;
             if (set.isEmpty()) {
                 this.pending.remove(key);
-                this.ready.dequeueLong();
-                this.readySet.remove(key);
+                this.queued.remove(key);
+                this.dequeueSlot();
             }
             // Visit after bookkeeping, so a visitor that records new entries cannot disturb the iteration above.
             for (int i = 0; i < take; ++i) {
@@ -155,6 +174,11 @@ public final class PendingLightRegistry {
             processed += take;
         }
         return processed;
+    }
+
+    private void dequeueSlot() {
+        this.ready.dequeueLong();
+        this.readySeq.dequeueLong();
     }
 
     public int size() {
