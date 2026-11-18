@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: AlexProgrammerDE <40795980+AlexProgrammerDE@users.noreply.github.com>
 Date: Sat, 18 Jun 2022 11:12:06 +0200
-Subject: [PATCH 54/97] Simpler ShapelessRecipes comparison for Vanilla
+Subject: [PATCH 54/98] Simpler ShapelessRecipes comparison for Vanilla
 
 - Backport Dionysus server/0053-Simpler-ShapelessRecipes-comparison-for-Vanilla.patch
 - Source: https://github.com/nopjmp/Dionysus at b5c71b62f6f1f555b22bd52f5751e33be4690b6e
