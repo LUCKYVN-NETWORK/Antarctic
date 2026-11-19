@@ -105,7 +105,7 @@ Every implementation **must** pass both **base logic tests** and **performance t
 5. **Commit inside the inner repository & export patches:**
     ```bash
     git --git-dir=Antarctic-Server/.git-sources --work-tree=Antarctic-Server/src add -A
-    git --git-dir=Antarctic-Server/.git-sources --work-tree=Antarctic-Server/src commit -m "<Concise imperative subject>"
+    git --git-dir=Antarctic-Server/.git-sources --work-tree=Antarctic-Server/src commit -m "<type>: <message>"
     ./gradlew rebuildPatches
     ```
 6. **Verify clean patch round-trip & script integrity:**
@@ -118,6 +118,12 @@ Every implementation **must** pass both **base logic tests** and **performance t
     - Commit updated `.patch` files under `Antarctic-API/` and/or `Antarctic-Server/` (plus any `me/stella/antarctic/**` files if touched).
     - **Never** commit generated/proprietary files (`mc-dev/`, `libs/`, `.upstream/`, `work/`, `run/`, logs, or unpatched NMS dumps).
     - Target the `dev` branch (`main` is protected for production-verified snapshots).
+
+### 3.1 Commit Message Convention
+- Every commit, in the inner source repositories (its subject becomes the patch file name) and in the outer repository, uses the form `type: message`, e.g. `feat: add pure light engine`, `fix: keep deferred light replay in queue order`, `test: cover neighbour shapes in voxel parity`, `refactor: ...`, `docs: ...`, `chore: ...`.
+- `type` is lowercase and one of `feat`, `fix`, `test`, `refactor`, `perf`, `docs`, `build`, `ci`, `chore`. `message` is lowercase, imperative, has no trailing period, and keeps the subject under about 72 characters.
+- Put any detail in the commit body, not the subject. Keep the attribution lines the session requires.
+- Reword a commit before `rebuildPatches` if its subject is wrong; the patch name follows the subject. Do not rewrite commits that are already pushed, unless the user asks.
 
 ---
 
