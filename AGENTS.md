@@ -119,7 +119,8 @@ Every implementation **must** pass both **base logic tests** and **performance t
     - **Never** commit generated/proprietary files (`mc-dev/`, `libs/`, `.upstream/`, `work/`, `run/`, logs, or unpatched NMS dumps).
     - Target the `dev` branch (`main` is protected for production-verified snapshots).
 
-### 3.1 Commit Message Convention
+### 3.1 Commit Hygiene & Message Convention
+- **One change per commit:** Each logical change must be its own atomic commit — both in the inner source repositories (one patch per fix, optimization, or feature) and in the outer repository (export via `rebuildPatches` and commit each change individually rather than bundling multiple changes into one commit).
 - Every commit, in the inner source repositories (its subject becomes the patch file name) and in the outer repository, uses the form `type: message`, e.g. `feat: add pure light engine`, `fix: keep deferred light replay in queue order`, `test: cover neighbour shapes in voxel parity`, `refactor: ...`, `docs: ...`, `chore: ...`.
 - `type` is lowercase and one of `feat`, `fix`, `test`, `refactor`, `perf`, `docs`, `build`, `ci`, `chore`. `message` is lowercase, imperative, has no trailing period, and keeps the subject under about 72 characters.
 - Put any detail in the commit body, not the subject. Keep the attribution lines the session requires.
