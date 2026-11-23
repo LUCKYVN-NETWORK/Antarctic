@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Wed, 18 Nov 2026 13:31:05 +0700
-Subject: [PATCH 096/152] test(lighting): make the deferred-light toggle perf
+Subject: [PATCH 096/153] test(lighting): make the deferred-light toggle perf
  check robust to machine noise
 
 The fully-loaded relight check compared best-of-12 times with a 1.25 bound and failed once under load. It now measures off/on back to back per round with alternating order after warm-up, asserts on the median of the per-round on/off ratios (bound 1.5), and adds exact guards: no deferred entries and no extra thread allocation when the toggle is on.

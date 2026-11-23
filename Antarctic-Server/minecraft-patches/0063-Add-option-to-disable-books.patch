@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: AlexProgrammerDE <40795980+AlexProgrammerDE@users.noreply.github.com>
 Date: Sat, 18 Jun 2022 09:40:26 +0200
-Subject: [PATCH 063/152] Add option to disable books
+Subject: [PATCH 063/153] Add option to disable books
 
 - Add enable-books option in AntarcticConfig (defaults to true)
 - Reject book editing packets when disabled unless player has antarctic.usebooks permission

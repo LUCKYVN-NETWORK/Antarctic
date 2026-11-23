@@ -1,0 +1,242 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 02:03:58 +0700
+Subject: [PATCH 153/153] perf: batch-pack DataPaletteBlock light cells with
+ palette lookup table
+
+
+diff --git a/main/java/net/minecraft/server/DataPaletteBlock.java b/main/java/net/minecraft/server/DataPaletteBlock.java
+index b0ce100..e551808 100644
+--- a/main/java/net/minecraft/server/DataPaletteBlock.java
++++ b/main/java/net/minecraft/server/DataPaletteBlock.java
+@@ -109,6 +109,70 @@ public class DataPaletteBlock implements DataPaletteExpandable {
+ 
+     // Antarctic start - fast section cell packer for LightEngine snapshots (main thread)
+     public void packLightCells(byte[] out) {
++        final int bits = this.e;
++        if (bits <= 8) {
++            final int paletteCap = 1 << bits;
++            final byte[] lut = new byte[paletteCap];
++            final DataPalette palette = this.c;
++            for (int p = 0; p < paletteCap; ++p) {
++                IBlockData data = palette.a(p);
++                if (data != null && data != DataPaletteBlock.a) {
++                    int opacity = data.c();
++                    int emission = data.d();
++                    if ((opacity | emission) != 0) {
++                        lut[p] = me.stella.antarctic.light.LightRules.pack(opacity, emission);
++                    }
++                }
++            }
++            final long[] words = this.b.a();
++            if (bits == 4) {
++                final byte zeroCell = lut[0];
++                for (int w = 0, idx = 0; w < 256; ++w, idx += 16) {
++                    long word = words[w];
++                    if (word == 0L) {
++                        if (zeroCell != 0) {
++                            java.util.Arrays.fill(out, idx, idx + 16, zeroCell);
++                        }
++                        continue;
++                    }
++                    out[idx]      = lut[(int) (word & 15L)];
++                    out[idx + 1]  = lut[(int) ((word >>> 4) & 15L)];
++                    out[idx + 2]  = lut[(int) ((word >>> 8) & 15L)];
++                    out[idx + 3]  = lut[(int) ((word >>> 12) & 15L)];
++                    out[idx + 4]  = lut[(int) ((word >>> 16) & 15L)];
++                    out[idx + 5]  = lut[(int) ((word >>> 20) & 15L)];
++                    out[idx + 6]  = lut[(int) ((word >>> 24) & 15L)];
++                    out[idx + 7]  = lut[(int) ((word >>> 28) & 15L)];
++                    out[idx + 8]  = lut[(int) ((word >>> 32) & 15L)];
++                    out[idx + 9]  = lut[(int) ((word >>> 36) & 15L)];
++                    out[idx + 10] = lut[(int) ((word >>> 40) & 15L)];
++                    out[idx + 11] = lut[(int) ((word >>> 44) & 15L)];
++                    out[idx + 12] = lut[(int) ((word >>> 48) & 15L)];
++                    out[idx + 13] = lut[(int) ((word >>> 52) & 15L)];
++                    out[idx + 14] = lut[(int) ((word >>> 56) & 15L)];
++                    out[idx + 15] = lut[(int) (word >>> 60)];
++                }
++                return;
++            }
++            final long mask = (1L << bits) - 1L;
++            int bitIndex = 0;
++            for (int i = 0; i < 4096; ++i) {
++                int wordIdx = bitIndex >>> 6;
++                int bitOffset = bitIndex & 63;
++                bitIndex += bits;
++                int paletteIdx;
++                if (bitOffset + bits <= 64) {
++                    paletteIdx = (int) ((words[wordIdx] >>> bitOffset) & mask);
++                } else {
++                    paletteIdx = (int) (((words[wordIdx] >>> bitOffset) | (words[wordIdx + 1] << (64 - bitOffset))) & mask);
++                }
++                byte packed = lut[paletteIdx];
++                if (packed != 0) {
++                    out[i] = packed;
++                }
++            }
++            return;
++        }
+         for (int i = 0; i < 4096; ++i) {
+             IBlockData data = this.a(i);
+             if (data != DataPaletteBlock.a) {
+diff --git a/test/java/net/minecraft/server/DataPaletteBlockPackLightCellsTest.java b/test/java/net/minecraft/server/DataPaletteBlockPackLightCellsTest.java
+new file mode 100644
+index 0000000..26cf8aa
+--- /dev/null
++++ b/test/java/net/minecraft/server/DataPaletteBlockPackLightCellsTest.java
+@@ -0,0 +1,154 @@
++package net.minecraft.server;
++
++import java.util.ArrayList;
++import java.util.List;
++import me.stella.antarctic.light.LightRules;
++import org.junit.Assert;
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++public class DataPaletteBlockPackLightCellsTest {
++
++    @BeforeClass
++    public static void setup() {
++        DispenserRegistry.c();
++    }
++
++    private static byte[] referencePack(DataPaletteBlock block) {
++        byte[] out = new byte[4096];
++        for (int i = 0; i < 4096; ++i) {
++            IBlockData data = block.a(i);
++            if (data != DataPaletteBlock.a) {
++                int opacity = data.c();
++                int emission = data.d();
++                if ((opacity | emission) != 0) {
++                    out[i] = LightRules.pack(opacity, emission);
++                }
++            }
++        }
++        return out;
++    }
++
++    @Test
++    public void testExactParityAcrossLinearHashAndGlobalPalettes() {
++        List<IBlockData> allStates = new ArrayList<IBlockData>();
++        for (IBlockData state : Block.REGISTRY_ID) {
++            allStates.add(state);
++        }
++
++        // 1. 4-bit linear palette (<= 16 unique states)
++        DataPaletteBlock linear = new DataPaletteBlock();
++        IBlockData[] linearSet = new IBlockData[] {
++            Blocks.AIR.getBlockData(),
++            Blocks.STONE.getBlockData(),
++            Blocks.GLOWSTONE.getBlockData(),
++            Blocks.WATER.getBlockData(),
++            Blocks.TORCH.getBlockData(),
++            Blocks.GLASS.getBlockData(),
++            Blocks.LEAVES.getBlockData()
++        };
++        for (int i = 0; i < 4096; ++i) {
++            linear.setBlockIndex(i, linearSet[(i * 7 + 3) % linearSet.length]);
++        }
++        byte[] actualLinear = new byte[4096];
++        linear.packLightCells(actualLinear);
++        Assert.assertArrayEquals("4-bit linear palette pack must match reference byte-for-byte",
++                referencePack(linear), actualLinear);
++
++        // 2. 5-bit hash palette (25 unique states -> exercises cross-64-bit-word splits!)
++        DataPaletteBlock hash5 = new DataPaletteBlock();
++        for (int i = 0; i < 4096; ++i) {
++            hash5.setBlockIndex(i, allStates.get((i * 13) % 25));
++        }
++        byte[] actualHash5 = new byte[4096];
++        hash5.packLightCells(actualHash5);
++        Assert.assertArrayEquals("5-bit hash palette pack must match reference byte-for-byte",
++                referencePack(hash5), actualHash5);
++
++        // 3. 7-bit hash palette (90 unique states -> odd bit width)
++        DataPaletteBlock hash7 = new DataPaletteBlock();
++        for (int i = 0; i < 4096; ++i) {
++            hash7.setBlockIndex(i, allStates.get((i * 17) % 90));
++        }
++        byte[] actualHash7 = new byte[4096];
++        hash7.packLightCells(actualHash7);
++        Assert.assertArrayEquals("7-bit hash palette pack must match reference byte-for-byte",
++                referencePack(hash7), actualHash7);
++
++        // 4. Global palette (> 256 unique states)
++        DataPaletteBlock global = new DataPaletteBlock();
++        for (int i = 0; i < 4096; ++i) {
++            global.setBlockIndex(i, allStates.get(i % 300));
++        }
++        byte[] actualGlobal = new byte[4096];
++        global.packLightCells(actualGlobal);
++        Assert.assertArrayEquals("Global palette pack must match reference byte-for-byte",
++                referencePack(global), actualGlobal);
++    }
++
++    @Test
++    public void testPackLightCellsSpeedupOverPerBlockLookup() {
++        DataPaletteBlock linear = new DataPaletteBlock();
++        IBlockData[] set = new IBlockData[] {
++            Blocks.AIR.getBlockData(),
++            Blocks.STONE.getBlockData(),
++            Blocks.DIRT.getBlockData(),
++            Blocks.GLOWSTONE.getBlockData(),
++            Blocks.WATER.getBlockData(),
++            Blocks.LEAVES.getBlockData()
++        };
++        for (int i = 0; i < 4096; ++i) {
++            linear.setBlockIndex(i, (i < 2048) ? set[i % set.length] : Blocks.AIR.getBlockData());
++        }
++
++        byte[] out = new byte[4096];
++        final int warmup = 2_000;
++        final int measured = 20_000;
++        long sink = 0;
++
++        for (int i = 0; i < warmup; ++i) {
++            java.util.Arrays.fill(out, (byte) 0);
++            referencePackInto(linear, out);
++            sink += out[i & 4095];
++            java.util.Arrays.fill(out, (byte) 0);
++            linear.packLightCells(out);
++            sink += out[i & 4095];
++        }
++
++        long t0 = System.nanoTime();
++        for (int i = 0; i < measured; ++i) {
++            java.util.Arrays.fill(out, (byte) 0);
++            referencePackInto(linear, out);
++            sink += out[i & 4095];
++        }
++        long baseNs = System.nanoTime() - t0;
++
++        long t1 = System.nanoTime();
++        for (int i = 0; i < measured; ++i) {
++            java.util.Arrays.fill(out, (byte) 0);
++            linear.packLightCells(out);
++            sink += out[i & 4095];
++        }
++        long optNs = System.nanoTime() - t1;
++
++        System.out.printf(
++                "[perf] DataPaletteBlock.packLightCells (%d sections x 4096 blocks): baseline=%.2f ms vs paletteLUT=%.2f ms, speedup=%.2fx (sink=%d)%n",
++                measured, baseNs / 1e6, optNs / 1e6, (double) baseNs / Math.max(1L, optNs), sink);
++
++        Assert.assertTrue("Palette LUT bit-unpack must be dramatically faster than per-block lookup",
++                optNs * 3L < baseNs);
++    }
++
++    private static void referencePackInto(DataPaletteBlock block, byte[] out) {
++        for (int i = 0; i < 4096; ++i) {
++            IBlockData data = block.a(i);
++            if (data != DataPaletteBlock.a) {
++                int opacity = data.c();
++                int emission = data.d();
++                if ((opacity | emission) != 0) {
++                    out[i] = LightRules.pack(opacity, emission);
++                }
++            }
++        }
++    }
++}
