@@ -1,0 +1,327 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 00:26:58 +0700
+Subject: [PATCH 126/126] fix: repair PacketPlayOutMapChunk split race and tile
+ entity limits
+
+
+diff --git a/main/java/net/minecraft/server/PacketPlayOutMapChunk.java b/main/java/net/minecraft/server/PacketPlayOutMapChunk.java
+index d941e3e..1d0e2f8 100644
+--- a/main/java/net/minecraft/server/PacketPlayOutMapChunk.java
++++ b/main/java/net/minecraft/server/PacketPlayOutMapChunk.java
+@@ -29,7 +29,8 @@ public class PacketPlayOutMapChunk implements Packet<PacketListenerPlayOut> {
+     // Paper end
+ 
+     // Paper start
+-    private final java.util.List<Packet> extraPackets = new java.util.ArrayList<>();
++    private java.util.List<Packet> extraPackets; // Antarctic - lazy allocate only when split or extra TE packets are needed
++    private static final int SKIP_EXCESSIVE_SIGNS_LIMIT = Integer.getInteger("Paper.excessiveSignsLimit", 500);
+     private static final int TE_LIMIT = Integer.getInteger("antarctic.te-limit", 750); // Dionysus - Tuinity - handle oversized chunk data packets more robustly
+     private static final int TE_SPLIT_LIMIT = Math.max(4096 + 1, Integer.getInteger("antarctic.te-split-limit", 15_000)); // Dionysus - Tuinity- handle oversized chunk data packets more robustly
+     private boolean mustSplit = false; // Dionysus - Tuinity - handle oversized chunk data packets more robustly
+@@ -37,16 +38,62 @@ public class PacketPlayOutMapChunk implements Packet<PacketListenerPlayOut> {
+     public java.util.List<Packet> getExtraPackets() {
+         return extraPackets;
+     }
++
++    private void addExtraPacket(Packet packet) {
++        if (packet == null) {
++            return;
++        }
++        if (this.extraPackets == null) {
++            this.extraPackets = new java.util.ArrayList<>();
++        }
++        this.extraPackets.add(packet);
++    }
+     // Paper end
+ 
+-    public PacketPlayOutMapChunk(Chunk chunk, int i) { final int chunkSectionBitSet = i; // Dionysus - Tuinity - handle oversized chunk data packets more robustly
+-        PacketPlayOutMapChunkInfo packetPlayOutMapChunkInfo = chunk.world.chunkPacketBlockController.getPacketPlayOutMapChunkInfo(this, chunk, i); // Paper - Anti-Xray - Add chunk packet info
++    public PacketPlayOutMapChunk(Chunk chunk, int i) {
++        final int chunkSectionBitSet = i & 0xFFFF; // Antarctic - clamp to 16 valid section bits
+         this.a = chunk.locX;
+         this.b = chunk.locZ;
+         this.f = i == '\uffff';
+         boolean flag = chunk.getWorld().worldProvider.m();
+ 
+-        this.d = new byte[this.a(chunk, flag, i)];
++        // Antarctic start - decide split before serializing sections so sections are never serialized/sent twice
++        java.util.Map<BlockPosition, TileEntity> tileEntities = chunk.getTileEntities();
++        if (Integer.bitCount(chunkSectionBitSet) > 1 && tileEntities.size() > TE_SPLIT_LIMIT) {
++            int matchingTileEntities = 0;
++            for (BlockPosition pos : tileEntities.keySet()) {
++                int sectionY = pos.getY() >> 4;
++                if (this.e() || (sectionY >= 0 && sectionY < 16 && (chunkSectionBitSet & (1 << sectionY)) != 0)) {
++                    if (++matchingTileEntities > TE_SPLIT_LIMIT) {
++                        this.mustSplit = true;
++                        break;
++                    }
++                }
++            }
++            if (this.mustSplit) {
++                this.c = 0;
++                this.d = this.e() ? chunk.getBiomeIndex().clone() : new byte[0];
++                this.e = java.util.Collections.emptyList();
++                this.ready = true;
++                ChunkSection[] sections = chunk.getSections();
++                int chunkSectionBitSetCopy = chunkSectionBitSet;
++                while (chunkSectionBitSetCopy != 0) {
++                    int trailingBit = -chunkSectionBitSetCopy & chunkSectionBitSetCopy;
++                    int sectionIndex = Integer.numberOfTrailingZeros(trailingBit);
++                    chunkSectionBitSetCopy ^= trailingBit;
++
++                    if (sectionIndex < sections.length && sections[sectionIndex] != Chunk.a) {
++                        this.addExtraPacket(new PacketPlayOutMapChunk(chunk, trailingBit));
++                    }
++                }
++                return;
++            }
++        }
++        // Antarctic end
++
++        PacketPlayOutMapChunkInfo packetPlayOutMapChunkInfo = chunk.world.chunkPacketBlockController.getPacketPlayOutMapChunkInfo(this, chunk, chunkSectionBitSet); // Paper - Anti-Xray - Add chunk packet info
++
++        this.d = new byte[this.a(chunk, flag, chunkSectionBitSet)];
+ 
+         // Paper start - Anti-Xray - Add chunk packet info
+         if (packetPlayOutMapChunkInfo != null) {
+@@ -54,9 +101,10 @@ public class PacketPlayOutMapChunk implements Packet<PacketListenerPlayOut> {
+         }
+         // Paper end
+ 
+-        this.c = this.writeChunk(new PacketDataSerializer(this.g()), chunk, flag, i, packetPlayOutMapChunkInfo); // Paper - Anti-Xray - Add chunk packet info
++        this.c = this.writeChunk(new PacketDataSerializer(this.g()), chunk, flag, chunkSectionBitSet, packetPlayOutMapChunkInfo); // Paper - Anti-Xray - Add chunk packet info
+         this.e = Lists.newArrayList();
+-        Iterator iterator = chunk.getTileEntities().entrySet().iterator();
++        Iterator iterator = tileEntities.entrySet().iterator();
++        int totalSigns = 0; // Paper
+         int totalTileEntities = 0; // Dionysus
+ 
+         while (iterator.hasNext()) {
+@@ -65,19 +113,24 @@ public class PacketPlayOutMapChunk implements Packet<PacketListenerPlayOut> {
+             TileEntity tileentity = (TileEntity) entry.getValue();
+             int j = blockposition.getY() >> 4;
+ 
+-            if (this.e() || (i & 1 << j) != 0) {
++            if (this.e() || (j >= 0 && j < 16 && (chunkSectionBitSet & 1 << j) != 0)) {
++                // Paper start - restore separate sign packets & excessive sign cap
++                if (tileentity instanceof TileEntitySign) {
++                    if (SKIP_EXCESSIVE_SIGNS_LIMIT < 0 || ++totalSigns < SKIP_EXCESSIVE_SIGNS_LIMIT) {
++                        this.addExtraPacket(tileentity.getUpdatePacket());
++                    }
++                    continue;
++                }
++                // Paper end
+                 // Dionysus Start - handle tile entities better
+                 ++totalTileEntities;
+-                if (totalTileEntities > TE_SPLIT_LIMIT) {
+-                    this.mustSplit = true;
+-                    this.getTileDataEntityData().clear();
+-                    this.extraPackets.clear();
+-                    break;
+-                }
+                 if (totalTileEntities > TE_LIMIT) {
+                     PacketPlayOutTileEntityData updatePacket = tileentity.getUpdatePacket();
+                     if (updatePacket != null) {
+-                        extraPackets.add(updatePacket);
++                        this.addExtraPacket(updatePacket);
++                        continue;
++                    }
++                    if (!(tileentity instanceof TileEntityPiston)) {
+                         continue;
+                     }
+                 }
+@@ -89,26 +142,24 @@ public class PacketPlayOutMapChunk implements Packet<PacketListenerPlayOut> {
+         }
+ 
+         chunk.world.chunkPacketBlockController.modifyBlocks(this, packetPlayOutMapChunkInfo); // Paper - Anti-Xray - Modify blocks
+-        // Dionysus - Tuinity start - improve oversized chunk data packet handling
+-        if (this.mustSplit) {
+-            int chunkSectionBitSetCopy = chunkSectionBitSet;
+-            for (int a = 0, len = Integer.bitCount(chunkSectionBitSet); a < len; ++a) {
+-                // IntegerUtil.getTrailingBit (-n & n)
+-                int trailingBit = -chunkSectionBitSetCopy & chunkSectionBitSetCopy;
+-                int sectionIndex = Integer.numberOfTrailingZeros(trailingBit);
+-                chunkSectionBitSetCopy ^= trailingBit; // move on to the next
+-
+-                if (chunk.getSections()[sectionIndex] != null) {
+-                    this.extraPackets.add(new PacketPlayOutMapChunk(chunk, trailingBit));
+-                }
+-            }
+-        }
+-        // Dionysus - Tuinity end - improve oversized chunk data packet handling
+     }
+ 
+     // Paper start - Async-Anti-Xray - Getter and Setter for the ready flag
+     public boolean isReady() {
+-        return this.ready;
++        if (!this.ready) {
++            return false;
++        }
++        // Antarctic start - wait until all split child chunk packets finish Async-Anti-Xray
++        if (this.extraPackets != null) {
++            for (int idx = 0, len = this.extraPackets.size(); idx < len; ++idx) {
++                Packet<?> extra = this.extraPackets.get(idx);
++                if (extra instanceof PacketPlayOutMapChunk && !((PacketPlayOutMapChunk) extra).isReady()) {
++                    return false;
++                }
++            }
++        }
++        // Antarctic end
++        return true;
+     }
+ 
+     public void setReady(boolean ready) {
+diff --git a/test/java/net/minecraft/server/PacketPlayOutMapChunkSplitTest.java b/test/java/net/minecraft/server/PacketPlayOutMapChunkSplitTest.java
+new file mode 100644
+index 0000000..6fa33c3
+--- /dev/null
++++ b/test/java/net/minecraft/server/PacketPlayOutMapChunkSplitTest.java
+@@ -0,0 +1,147 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.antixray.ChunkPacketBlockController;
++import com.destroystokyo.paper.antixray.PacketPlayOutMapChunkInfo;
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import org.junit.Assert;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++public class PacketPlayOutMapChunkSplitTest {
++
++    private static Unsafe unsafe;
++
++    @BeforeClass
++    public static void setup() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        unsafe = (Unsafe) f.get(null);
++    }
++
++    private static final class DeferringAntiXrayController extends ChunkPacketBlockController {
++        final List<PacketPlayOutMapChunk> captured = new ArrayList<>();
++
++        @Override
++        public void modifyBlocks(PacketPlayOutMapChunk packetPlayOutMapChunk, PacketPlayOutMapChunkInfo packetPlayOutMapChunkInfo) {
++            // Simulate async Anti-Xray leaving packet not-ready until worker completes
++            packetPlayOutMapChunk.setReady(false);
++            captured.add(packetPlayOutMapChunk);
++        }
++    }
++
++    private static Chunk newStubChunk(ChunkPacketBlockController controller, Map<BlockPosition, TileEntity> tileEntities, ChunkSection[] sections) throws Exception {
++        World world = (World) unsafe.allocateInstance(WorldServer.class);
++        Field wpField = World.class.getDeclaredField("worldProvider");
++        wpField.setAccessible(true);
++        wpField.set(world, new WorldProviderNormal());
++        Field ctrlField = World.class.getDeclaredField("chunkPacketBlockController");
++        ctrlField.setAccessible(true);
++        ctrlField.set(world, controller);
++
++        Chunk chunk = (Chunk) unsafe.allocateInstance(Chunk.class);
++        Field worldField = Chunk.class.getDeclaredField("world");
++        worldField.setAccessible(true);
++        worldField.set(chunk, world);
++        Field sectionsField = Chunk.class.getDeclaredField("sections");
++        sectionsField.setAccessible(true);
++        sectionsField.set(chunk, sections);
++        Field teField = Chunk.class.getDeclaredField("tileEntities");
++        teField.setAccessible(true);
++        teField.set(chunk, tileEntities);
++        Field biomesField = Chunk.class.getDeclaredField("g");
++        biomesField.setAccessible(true);
++        biomesField.set(chunk, new byte[256]);
++        return chunk;
++    }
++
++    @Test
++    public void testNormalChunkHasNullExtraPacketsAndEnforcesTeAndSignLimits() throws Exception {
++        Map<BlockPosition, TileEntity> tes = new HashMap<>();
++        ChunkSection[] sections = new ChunkSection[16];
++        sections[0] = new ChunkSection(0, true);
++        sections[0].setType(0, 0, 0, Blocks.STONE.getBlockData());
++
++        // Empty-TE chunk should not allocate extraPackets at all
++        Chunk emptyChunk = newStubChunk(ChunkPacketBlockController.NO_OPERATION_INSTANCE, tes, sections);
++        PacketPlayOutMapChunk emptyPacket = new PacketPlayOutMapChunk(emptyChunk, 0xFFFF);
++        Assert.assertNull("Normal chunk without extra packets must lazily keep extraPackets null", emptyPacket.getExtraPackets());
++        Assert.assertTrue(emptyPacket.isReady());
++
++        // Chunk with 800 chests + 510 signs: chests > 750 must not bypass TE_LIMIT, signs capped at 500
++        for (int i = 0; i < 800; ++i) {
++            BlockPosition pos = new BlockPosition(i & 15, (i >> 8) & 15, (i >> 4) & 15);
++            TileEntityChest chest = new TileEntityChest();
++            chest.setPosition(pos);
++            tes.put(pos, chest);
++        }
++        for (int i = 0; i < 510; ++i) {
++            BlockPosition pos = new BlockPosition(i & 15, 16 + ((i >> 8) & 15), (i >> 4) & 15);
++            TileEntitySign sign = new TileEntitySign();
++            sign.setPosition(pos);
++            tes.put(pos, sign);
++        }
++        sections[1] = new ChunkSection(16, true);
++        sections[1].setType(0, 0, 0, Blocks.STONE.getBlockData());
++
++        Chunk heavyChunk = newStubChunk(ChunkPacketBlockController.NO_OPERATION_INSTANCE, tes, sections);
++        PacketPlayOutMapChunk heavyPacket = new PacketPlayOutMapChunk(heavyChunk, 0xFFFF);
++
++        Field eField = PacketPlayOutMapChunk.class.getDeclaredField("e");
++        eField.setAccessible(true);
++        List<?> inlineTes = (List<?>) eField.get(heavyPacket);
++        Assert.assertEquals("Non-update-packet containers must not bypass TE_LIMIT (750)", 750, inlineTes.size());
++        Assert.assertNotNull(heavyPacket.getExtraPackets());
++        Assert.assertEquals("Signs must be capped by Paper.excessiveSignsLimit (500 -> 499 sent)", 499, heavyPacket.getExtraPackets().size());
++    }
++
++    @Test
++    public void testSplitChunkWaitsForChildAsyncAntiXrayAndDoesNotDoubleSendSections() throws Exception {
++        DeferringAntiXrayController controller = new DeferringAntiXrayController();
++        ChunkSection[] sections = new ChunkSection[16];
++        for (int s = 0; s < 4; ++s) {
++            sections[s] = new ChunkSection(s << 4, true);
++            sections[s].setType(0, 0, 0, Blocks.STONE.getBlockData());
++        }
++
++        Map<BlockPosition, TileEntity> tes = new HashMap<>();
++        // 15,005 distinct chests across sections 0..3 (16,384 positions available > TE_SPLIT_LIMIT=15000)
++        for (int i = 0; i < 15005; ++i) {
++            int y = i >> 8;
++            int x = i & 15;
++            int z = (i >> 4) & 15;
++            BlockPosition pos = new BlockPosition(x, y, z);
++            TileEntityChest chest = new TileEntityChest();
++            chest.setPosition(pos);
++            tes.put(pos, chest);
++        }
++
++        Chunk chunk = newStubChunk(controller, tes, sections);
++        PacketPlayOutMapChunk outer = new PacketPlayOutMapChunk(chunk, 0xFFFF);
++
++        // Outer packet must contain 0 sections (only 256-byte biome array) and 4 split child packets
++        Field cField = PacketPlayOutMapChunk.class.getDeclaredField("c");
++        cField.setAccessible(true);
++        Field dField = PacketPlayOutMapChunk.class.getDeclaredField("d");
++        dField.setAccessible(true);
++        Assert.assertEquals("Outer split packet must not duplicate section data (bitmask 0)", 0, cField.getInt(outer));
++        Assert.assertEquals("Outer split full-chunk packet must carry only 256-byte biome array", 256, ((byte[]) dField.get(outer)).length);
++        Assert.assertNotNull(outer.getExtraPackets());
++        Assert.assertEquals("Exactly 4 non-empty sections should be emitted as child packets", 4, outer.getExtraPackets().size());
++        Assert.assertEquals("Anti-Xray must run once per child section, never twice", 4, controller.captured.size());
++
++        // Async-Anti-Xray gate: outer.isReady() must remain FALSE while any child packet is still pending!
++        Assert.assertFalse("Outer split packet must NOT report ready while children await Async-Anti-Xray", outer.isReady());
++        for (int s = 0; s < 3; ++s) {
++            controller.captured.get(s).setReady(true);
++            Assert.assertFalse("Outer split packet must wait until ALL children are ready", outer.isReady());
++        }
++        controller.captured.get(3).setReady(true);
++        Assert.assertTrue("Outer split packet must report ready once all children finish", outer.isReady());
++    }
++}
