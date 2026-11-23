@@ -1,0 +1,134 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 00:55:00 +0700
+Subject: [PATCH 135/135] fix: re-read block state in BlockMinecartDetector
+ onPlace
+
+
+diff --git a/main/java/net/minecraft/server/BlockMinecartDetector.java b/main/java/net/minecraft/server/BlockMinecartDetector.java
+index ebabf82..79ca3cc 100644
+--- a/main/java/net/minecraft/server/BlockMinecartDetector.java
++++ b/main/java/net/minecraft/server/BlockMinecartDetector.java
+@@ -59,11 +59,14 @@ public class BlockMinecartDetector extends BlockMinecartTrackAbstract {
+         return !((Boolean) iblockdata.get(BlockMinecartDetector.POWERED)).booleanValue() ? 0 : (enumdirection == EnumDirection.UP ? 15 : 0);
+     }
+ 
++    @SuppressWarnings("unchecked")
++    private static final Predicate<Entity>[] EMPTY_PREDICATES = new Predicate[0]; // Antarctic - avoid per-call varargs array allocation
++
+     private void e(World world, BlockPosition blockposition, IBlockData iblockdata) {
+         if (iblockdata.getBlock() != this) { return; } // Dionysus - not our block, don't do anything
+         boolean flag = ((Boolean) iblockdata.get(BlockMinecartDetector.POWERED)).booleanValue();
+         boolean flag1 = false;
+-        List list = this.a(world, blockposition, EntityMinecartAbstract.class, new Predicate[0]);
++        List list = this.a(world, blockposition, EntityMinecartAbstract.class, EMPTY_PREDICATES);
+ 
+         if (!list.isEmpty()) {
+             flag1 = true;
+@@ -121,7 +124,8 @@ public class BlockMinecartDetector extends BlockMinecartTrackAbstract {
+ 
+     public void onPlace(World world, BlockPosition blockposition, IBlockData iblockdata) {
+         super.onPlace(world, blockposition, iblockdata);
+-        this.e(world, blockposition, iblockdata);
++        // Antarctic - re-read post-super.onPlace state (rail may have connected or broken into air)
++        this.e(world, blockposition, world.getType(blockposition));
+     }
+ 
+     public IBlockState<BlockMinecartTrackAbstract.EnumTrackPosition> g() {
+@@ -134,7 +138,7 @@ public class BlockMinecartDetector extends BlockMinecartTrackAbstract {
+ 
+     public int c(IBlockData iblockdata, World world, BlockPosition blockposition) {
+         if (((Boolean) iblockdata.get(BlockMinecartDetector.POWERED)).booleanValue()) {
+-            List list = this.a(world, blockposition, EntityMinecartCommandBlock.class, new Predicate[0]);
++            List list = this.a(world, blockposition, EntityMinecartCommandBlock.class, EMPTY_PREDICATES);
+ 
+             if (!list.isEmpty()) {
+                 return ((EntityMinecartCommandBlock) list.get(0)).getCommandBlock().k();
+diff --git a/test/java/net/minecraft/server/BlockMinecartDetectorOnPlaceTest.java b/test/java/net/minecraft/server/BlockMinecartDetectorOnPlaceTest.java
+new file mode 100644
+index 0000000..d3c8e7c
+--- /dev/null
++++ b/test/java/net/minecraft/server/BlockMinecartDetectorOnPlaceTest.java
+@@ -0,0 +1,82 @@
++package net.minecraft.server;
++
++import java.lang.reflect.Field;
++import java.util.Collections;
++import java.util.List;
++import org.junit.Assert;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++public class BlockMinecartDetectorOnPlaceTest {
++
++    private static Unsafe unsafe;
++
++    @BeforeClass
++    public static void setup() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        unsafe = (Unsafe) f.get(null);
++    }
++
++    private static final class RecordingWorld extends World {
++        IBlockData currentState;
++        int setTypeCalls;
++        int getEntitiesCalls;
++
++        RecordingWorld() {
++            super(null, null, null, null, false, null, null);
++        }
++
++        @Override
++        protected IChunkProvider n() {
++            return null;
++        }
++
++        @Override
++        protected boolean isChunkLoaded(int i, int j, boolean flag) {
++            return true;
++        }
++
++        @Override
++        public IBlockData getType(BlockPosition pos) {
++            return currentState;
++        }
++
++        @Override
++        public boolean setTypeAndData(BlockPosition pos, IBlockData state, int flags) {
++            setTypeCalls++;
++            currentState = state;
++            return true;
++        }
++
++        @Override
++        public <T extends Entity> List<T> a(Class<? extends T> oclass, AxisAlignedBB axisalignedbb) {
++            getEntitiesCalls++;
++            return Collections.emptyList();
++        }
++
++        @Override
++        public void updateAdjacentComparators(BlockPosition pos, Block block) {
++        }
++    }
++
++    @Test
++    public void testOnPlaceReReadsStateAndSkipsIfBlockChangedToAir() throws Exception {
++        RecordingWorld world = (RecordingWorld) unsafe.allocateInstance(RecordingWorld.class);
++        // Simulate super.onPlace() having broken/replaced the detector rail with AIR before e() runs
++        Field clientSide = World.class.getDeclaredField("isClientSide");
++        clientSide.setAccessible(true);
++        clientSide.setBoolean(world, true); // skip super.onPlace track connection while testing re-read
++        world.currentState = Blocks.AIR.getBlockData();
++
++        BlockMinecartDetector detector = (BlockMinecartDetector) Blocks.DETECTOR_RAIL;
++        IBlockData staleDetectorState = detector.getBlockData();
++
++        detector.onPlace(world, new BlockPosition(0, 64, 0), staleDetectorState);
++
++        Assert.assertEquals("Must abort e() when world.getType(pos) is no longer detector rail", 0, world.getEntitiesCalls);
++        Assert.assertEquals("Must not overwrite AIR with stale detector rail state", 0, world.setTypeCalls);
++    }
++}
