@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: nopjmp <kthompson@hey.com>
 Date: Fri, 5 Feb 2021 00:18:18 -0600
-Subject: [PATCH 006/146] Change Math.sin and Math.cos to respective MathHelper
+Subject: [PATCH 006/147] Change Math.sin and Math.cos to respective MathHelper
 
 - Backported from Dionysus 0017 by nopjmp (original notices retained; see licenses/Dionysus-MIT.md)
 

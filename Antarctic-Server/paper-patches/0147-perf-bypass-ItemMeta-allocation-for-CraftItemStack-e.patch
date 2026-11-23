@@ -1,0 +1,296 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 01:41:59 +0700
+Subject: [PATCH 147/147] perf: bypass ItemMeta allocation for CraftItemStack
+ enchant queries
+
+
+diff --git a/main/java/org/bukkit/craftbukkit/inventory/CraftItemStack.java b/main/java/org/bukkit/craftbukkit/inventory/CraftItemStack.java
+index be90db9..77c5238 100644
+--- a/main/java/org/bukkit/craftbukkit/inventory/CraftItemStack.java
++++ b/main/java/org/bukkit/craftbukkit/inventory/CraftItemStack.java
+@@ -212,12 +212,49 @@ public final class CraftItemStack extends ItemStack {
+ 
+     @Override
+     public boolean containsEnchantment(Enchantment ench) {
+-        return hasItemMeta() && getItemMeta(false).hasEnchant(ench); // Paper - use meta
++        // Antarctic start - read NBT enchant list directly without constructing ItemMeta
++        if (!hasItemMeta()) {
++            return false;
++        }
++        Validate.notNull(ench, "Enchantment cannot be null");
++        NBTTagCompound tag = this.handle.getTag();
++        if (tag == null || !tag.hasKeyOfType(ENCHANTMENTS.NBT, CraftMagicNumbers.NBT.TAG_LIST)) {
++            return false;
++        }
++        NBTTagList list = tag.getList(ENCHANTMENTS.NBT, CraftMagicNumbers.NBT.TAG_COMPOUND);
++        int targetId = ench.getId();
++        for (int i = list.size() - 1; i >= 0; --i) {
++            int id = 0xffff & list.get(i).getShort(ENCHANTMENTS_ID.NBT);
++            if (id == targetId) {
++                return Enchantment.getById(id) != null;
++            }
++        }
++        return false;
++        // Antarctic end
+     }
+ 
+     @Override
+     public int getEnchantmentLevel(Enchantment ench) {
+-        return hasItemMeta() ? getItemMeta(false).getEnchantLevel(ench) : 0; // Pape - replace entire method with meta
++        // Antarctic start - read NBT enchant list directly without constructing ItemMeta
++        if (!hasItemMeta()) {
++            return 0;
++        }
++        Validate.notNull(ench, "Enchantment cannot be null");
++        NBTTagCompound tag = this.handle.getTag();
++        if (tag == null || !tag.hasKeyOfType(ENCHANTMENTS.NBT, CraftMagicNumbers.NBT.TAG_LIST)) {
++            return 0;
++        }
++        NBTTagList list = tag.getList(ENCHANTMENTS.NBT, CraftMagicNumbers.NBT.TAG_COMPOUND);
++        int targetId = ench.getId();
++        for (int i = list.size() - 1; i >= 0; --i) {
++            NBTTagCompound entry = list.get(i);
++            int id = 0xffff & entry.getShort(ENCHANTMENTS_ID.NBT);
++            if (id == targetId) {
++                return Enchantment.getById(id) != null ? (0xffff & entry.getShort(ENCHANTMENTS_LVL.NBT)) : 0;
++            }
++        }
++        return 0;
++        // Antarctic end
+     }
+ 
+     @Override
+@@ -236,7 +273,27 @@ public final class CraftItemStack extends ItemStack {
+ 
+     @Override
+     public Map<Enchantment, Integer> getEnchantments() {
+-        return hasItemMeta() ? getItemMeta(false).getEnchants() : ImmutableMap.<Enchantment, Integer>of(); // Paper - use Item Meta // Dionysus - Increase Book Meta Performance
++        // Antarctic start - read NBT enchant list directly without constructing ItemMeta
++        if (!hasItemMeta()) {
++            return ImmutableMap.<Enchantment, Integer>of();
++        }
++        NBTTagCompound tag = this.handle.getTag();
++        if (tag == null || !tag.hasKeyOfType(ENCHANTMENTS.NBT, CraftMagicNumbers.NBT.TAG_LIST)) {
++            return ImmutableMap.<Enchantment, Integer>of();
++        }
++        NBTTagList list = tag.getList(ENCHANTMENTS.NBT, CraftMagicNumbers.NBT.TAG_COMPOUND);
++        int size = list.size();
++        if (size == 0) {
++            return ImmutableMap.<Enchantment, Integer>of();
++        }
++        if (size == 1) {
++            NBTTagCompound entry = list.get(0);
++            Enchantment enchant = Enchantment.getById(0xffff & entry.getShort(ENCHANTMENTS_ID.NBT));
++            return enchant != null ? ImmutableMap.of(enchant, 0xffff & entry.getShort(ENCHANTMENTS_LVL.NBT)) : ImmutableMap.<Enchantment, Integer>of();
++        }
++        java.util.SortedMap<Enchantment, Integer> enchants = CraftMetaItem.buildEnchantments(tag, ENCHANTMENTS);
++        return (enchants == null || enchants.isEmpty()) ? ImmutableMap.<Enchantment, Integer>of() : com.google.common.collect.ImmutableSortedMap.copyOfSorted(enchants);
++        // Antarctic end
+     }
+ 
+     static Map<Enchantment, Integer> getEnchantments(net.minecraft.server.ItemStack item) {
+@@ -276,17 +333,13 @@ public final class CraftItemStack extends ItemStack {
+         return getItemMeta(handle);
+     }
+ 
+-    // Dionysus start - Increase Book Meta Performance
+-    public ItemMeta getItemMeta(boolean resolveFurther) {
+-        return getItemMeta(handle, resolveFurther);
+-    }
+-
++    // Antarctic start - restrict unsafe partial book-meta resolution to internal use
+     public static ItemMeta getItemMeta(net.minecraft.server.ItemStack item) {
+         return getItemMeta(item, true);
+     }
+-    // Dionysus end
+ 
+-    public static ItemMeta getItemMeta(net.minecraft.server.ItemStack item, boolean resolveFurther) { // Dionysus - Increase Book Meta Performance
++    private static ItemMeta getItemMeta(net.minecraft.server.ItemStack item, boolean resolveFurther) { // Dionysus - Increase Book Meta Performance
++    // Antarctic end
+         if (!hasItemMeta(item)) {
+             return CraftItemFactory.instance().getItemMeta(getType(item));
+         }
+diff --git a/main/java/org/bukkit/craftbukkit/inventory/CraftMetaItem.java b/main/java/org/bukkit/craftbukkit/inventory/CraftMetaItem.java
+index 9d063df..4c88860 100644
+--- a/main/java/org/bukkit/craftbukkit/inventory/CraftMetaItem.java
++++ b/main/java/org/bukkit/craftbukkit/inventory/CraftMetaItem.java
+@@ -1061,7 +1061,7 @@ class CraftMetaItem implements ItemMeta, Repairable {
+         }
+ 
+         private EnchantmentMap() {
+-            super((o1, o2) -> ((Integer) o1.getId()).compareTo(o2.getId()));
++            super((o1, o2) -> Integer.compare(o1.getId(), o2.getId())); // Antarctic - avoid boxing Integer on compare
+         }
+ 
+         public EnchantmentMap clone() {
+diff --git a/test/java/org/bukkit/craftbukkit/inventory/CraftItemStackEnchantFastPathTest.java b/test/java/org/bukkit/craftbukkit/inventory/CraftItemStackEnchantFastPathTest.java
+new file mode 100644
+index 0000000..f775fcc
+--- /dev/null
++++ b/test/java/org/bukkit/craftbukkit/inventory/CraftItemStackEnchantFastPathTest.java
+@@ -0,0 +1,164 @@
++package org.bukkit.craftbukkit.inventory;
++
++import com.sun.management.ThreadMXBean;
++import java.lang.management.ManagementFactory;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Map;
++import net.minecraft.server.DispenserRegistry;
++import net.minecraft.server.Items;
++import net.minecraft.server.NBTTagCompound;
++import net.minecraft.server.NBTTagList;
++import net.minecraft.server.NBTTagString;
++import org.bukkit.craftbukkit.enchantments.CraftEnchantment;
++import org.bukkit.enchantments.Enchantment;
++import org.junit.Assert;
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++public class CraftItemStackEnchantFastPathTest {
++
++    @BeforeClass
++    public static void setup() {
++        DispenserRegistry.c();
++        for (net.minecraft.server.Enchantment nms : net.minecraft.server.Enchantment.enchantments) {
++            if (nms != null && Enchantment.getById(net.minecraft.server.Enchantment.getId(nms)) == null) {
++                Enchantment.registerEnchantment(new CraftEnchantment(nms));
++            }
++        }
++    }
++
++    private static NBTTagCompound enchantTag(int id, int level) {
++        NBTTagCompound c = new NBTTagCompound();
++        c.setShort("id", (short) id);
++        c.setShort("lvl", (short) level);
++        return c;
++    }
++
++    private static net.minecraft.server.ItemStack makeHeavyBook(NBTTagList enchList) {
++        net.minecraft.server.ItemStack nms = new net.minecraft.server.ItemStack(Items.WRITTEN_BOOK, 1, 0);
++        NBTTagCompound tag = new NBTTagCompound();
++        tag.setString("title", "Heavy Book");
++        tag.setString("author", "Antarctic");
++        NBTTagList pages = new NBTTagList();
++        for (int i = 0; i < 50; ++i) {
++            pages.add(new NBTTagString("{\"text\":\"Page " + i + " with rich JSON text payload\"}"));
++        }
++        tag.set("pages", pages);
++        if (enchList != null) {
++            tag.set("ench", enchList);
++        }
++        nms.setTag(tag);
++        return nms;
++    }
++
++    @Test
++    public void testExactParityWithItemMetaAcrossEdgeCases() {
++        // 1. Plain item without tag -> false / 0 / empty (even null enchant on meta-less item)
++        CraftItemStack plain = CraftItemStack.asCraftMirror(new net.minecraft.server.ItemStack(Items.DIAMOND_SWORD, 1, 0));
++        Assert.assertFalse(plain.containsEnchantment(Enchantment.DAMAGE_ALL));
++        Assert.assertFalse(plain.containsEnchantment(null));
++        Assert.assertEquals(0, plain.getEnchantmentLevel(Enchantment.DAMAGE_ALL));
++        Assert.assertEquals(0, plain.getEnchantmentLevel(null));
++        Assert.assertTrue(plain.getEnchantments().isEmpty());
++
++        // 2. Heavy written book with meta but NO enchants -> false / 0 / empty, null throws IAE
++        CraftItemStack unenchantedBook = CraftItemStack.asCraftMirror(makeHeavyBook(null));
++        Assert.assertFalse(unenchantedBook.containsEnchantment(Enchantment.DAMAGE_ALL));
++        Assert.assertEquals(0, unenchantedBook.getEnchantmentLevel(Enchantment.DAMAGE_ALL));
++        Assert.assertTrue(unenchantedBook.getEnchantments().isEmpty());
++        try {
++            unenchantedBook.containsEnchantment(null);
++            Assert.fail("Expected IllegalArgumentException for null enchantment when item has meta");
++        } catch (IllegalArgumentException expected) {
++        }
++        try {
++            unenchantedBook.getEnchantmentLevel(null);
++            Assert.fail("Expected IllegalArgumentException for null enchantment when item has meta");
++        } catch (IllegalArgumentException expected) {
++        }
++
++        // 3. Single enchantment
++        NBTTagList single = new NBTTagList();
++        single.add(enchantTag(Enchantment.DURABILITY.getId(), 3));
++        CraftItemStack singleItem = CraftItemStack.asCraftMirror(makeHeavyBook(single));
++        Assert.assertTrue(singleItem.containsEnchantment(Enchantment.DURABILITY));
++        Assert.assertFalse(singleItem.containsEnchantment(Enchantment.MENDING));
++        Assert.assertEquals(3, singleItem.getEnchantmentLevel(Enchantment.DURABILITY));
++        Assert.assertEquals(singleItem.getItemMeta().getEnchants(), singleItem.getEnchantments());
++
++        // 4. Multiple enchantments with out-of-order IDs, duplicate ID (last wins!), and unknown ID (ignored!)
++        NBTTagList complex = new NBTTagList();
++        complex.add(enchantTag(Enchantment.MENDING.getId(), 1));
++        complex.add(enchantTag(Enchantment.DAMAGE_ALL.getId(), 2));
++        complex.add(enchantTag(9999, 5)); // unregistered ID must be ignored
++        complex.add(enchantTag(Enchantment.DAMAGE_ALL.getId(), 5)); // duplicate ID -> last wins (5)
++        complex.add(enchantTag(Enchantment.KNOCKBACK.getId(), 2));
++
++        CraftItemStack complexItem = CraftItemStack.asCraftMirror(makeHeavyBook(complex));
++        Map<Enchantment, Integer> expected = complexItem.getItemMeta().getEnchants();
++        Map<Enchantment, Integer> actual = complexItem.getEnchantments();
++
++        Assert.assertEquals("Enchantment map must match CraftMetaItem.getEnchants()", expected, actual);
++        Assert.assertEquals("Key iteration order must match sorted EnchantmentMap order",
++                new ArrayList<Enchantment>(expected.keySet()), new ArrayList<Enchantment>(actual.keySet()));
++        Assert.assertEquals("Duplicate ID must preserve last-wins level", 5, complexItem.getEnchantmentLevel(Enchantment.DAMAGE_ALL));
++        Assert.assertTrue(complexItem.containsEnchantment(Enchantment.MENDING));
++        Assert.assertEquals(1, complexItem.getEnchantmentLevel(Enchantment.MENDING));
++    }
++
++    @Test
++    public void testZeroAllocationAndThroughputGainOverItemMetaConstruction() {
++        NBTTagList ench = new NBTTagList();
++        ench.add(enchantTag(Enchantment.DAMAGE_ALL.getId(), 5));
++        ench.add(enchantTag(Enchantment.DURABILITY.getId(), 3));
++        CraftItemStack sword = CraftItemStack.asCraftMirror(makeHeavyBook(ench));
++
++        final int warmup = 1_000;
++        final int measured = 5_000;
++        long sink = 0;
++
++        for (int i = 0; i < warmup; ++i) {
++            sink += sword.getItemMeta().getEnchantLevel(Enchantment.DAMAGE_ALL);
++            sink += sword.getEnchantmentLevel(Enchantment.DAMAGE_ALL);
++            if (sword.containsEnchantment(Enchantment.DURABILITY)) {
++                sink++;
++            }
++        }
++
++        ThreadMXBean bean = (ThreadMXBean) ManagementFactory.getThreadMXBean();
++        long tid = Thread.currentThread().getId();
++
++        long a0 = bean.getThreadAllocatedBytes(tid);
++        long t0 = System.nanoTime();
++        for (int i = 0; i < measured; ++i) {
++            sink += sword.getItemMeta().getEnchantLevel(Enchantment.DAMAGE_ALL);
++            if (sword.getItemMeta().hasEnchant(Enchantment.DURABILITY)) {
++                sink++;
++            }
++        }
++        long baseNs = System.nanoTime() - t0;
++        long baseAlloc = Math.max(0L, bean.getThreadAllocatedBytes(tid) - a0);
++
++        long a1 = bean.getThreadAllocatedBytes(tid);
++        long t1 = System.nanoTime();
++        for (int i = 0; i < measured; ++i) {
++            sink += sword.getEnchantmentLevel(Enchantment.DAMAGE_ALL);
++            if (sword.containsEnchantment(Enchantment.DURABILITY)) {
++                sink++;
++            }
++        }
++        long fastNs = System.nanoTime() - t1;
++        long fastAlloc = Math.max(0L, bean.getThreadAllocatedBytes(tid) - a1);
++
++        System.out.printf(
++                "[perf] CraftItemStack enchant query (%d pairs on 50-page book): meta=%.2f ms (alloc=%.2f MB) vs directNBT=%.2f ms (alloc=%d B), speedup=%.1fx (sink=%d)%n",
++                measured, baseNs / 1e6, baseAlloc / (1024.0 * 1024.0),
++                fastNs / 1e6, fastAlloc, (double) baseNs / Math.max(1L, fastNs), sink);
++
++        Assert.assertTrue("Direct NBT enchant queries must be near-zero allocation (actual=" + fastAlloc + ")",
++                fastAlloc <= 1024L);
++        Assert.assertTrue("Direct NBT enchant queries must be dramatically faster than constructing ItemMeta",
++                fastNs * 10L < baseNs);
++    }
++}
