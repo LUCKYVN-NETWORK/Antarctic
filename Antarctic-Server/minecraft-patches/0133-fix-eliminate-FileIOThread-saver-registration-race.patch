@@ -1,0 +1,176 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 00:52:09 +0700
+Subject: [PATCH 133/133] fix: eliminate FileIOThread saver registration race
+
+
+diff --git a/main/java/net/minecraft/server/FileIOThread.java b/main/java/net/minecraft/server/FileIOThread.java
+index 9186836..9f3aab2 100644
+--- a/main/java/net/minecraft/server/FileIOThread.java
++++ b/main/java/net/minecraft/server/FileIOThread.java
+@@ -7,9 +7,9 @@ import java.util.List;
+ public class FileIOThread implements Runnable {
+ 
+     private static final FileIOThread a = new FileIOThread();
+-    private final List<IAsyncChunkSaver> b = Collections.synchronizedList(Lists.newArrayList()); private List<IAsyncChunkSaver> getThreadedIOQueue() { return b; } // Paper - OBFHELPER
+-    private volatile long c;
+-    private volatile long d;
++    private final Object queueLock = new Object();
++    private final List<IAsyncChunkSaver> b = Lists.newArrayList(); private List<IAsyncChunkSaver> getThreadedIOQueue() { return b; } // Paper - OBFHELPER
++    private final java.util.Set<IAsyncChunkSaver> requeued = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<IAsyncChunkSaver, Boolean>());
+     private volatile boolean e;
+ 
+     private FileIOThread() {
+@@ -30,14 +30,37 @@ public class FileIOThread implements Runnable {
+     }
+ 
+     private void c() {
+-        for (int i = 0; i < this.b.size(); ++i) {
+-            IAsyncChunkSaver iasyncchunksaver = (IAsyncChunkSaver) this.b.get(i);
++        // Antarctic start - atomic saver removal with re-enqueue tracking to eliminate TOCTOU chunk-save loss
++        int i = 0;
++        while (true) {
++            IAsyncChunkSaver iasyncchunksaver;
++            synchronized (this.queueLock) {
++                if (i >= this.b.size()) {
++                    break;
++                }
++                iasyncchunksaver = this.b.get(i);
++                this.requeued.remove(iasyncchunksaver);
++            }
++
+             boolean flag = iasyncchunksaver.a();
+ 
+             if (!flag) {
+-                this.b.remove(i--);
+-                ++this.d;
++                synchronized (this.queueLock) {
++                    if (!this.requeued.remove(iasyncchunksaver)) {
++                        int removeIdx = this.b.indexOf(iasyncchunksaver);
++                        if (removeIdx >= 0) {
++                            this.b.remove(removeIdx);
++                            if (removeIdx <= i) {
++                                --i;
++                            }
++                        }
++                        if (this.b.isEmpty()) {
++                            this.queueLock.notifyAll();
++                        }
++                    }
++                }
+             }
++            ++i;
+ 
+             // Paper start - Add toggle
+             if (com.destroystokyo.paper.PaperConfig.enableFileIOThreadSleep) {
+@@ -50,28 +73,37 @@ public class FileIOThread implements Runnable {
+             // Paper end
+         }
+ 
+-        if (this.b.isEmpty()) {
+-            try {
+-                Thread.sleep(25L);
+-            } catch (InterruptedException interruptedexception1) {
+-                interruptedexception1.printStackTrace();
++        synchronized (this.queueLock) {
++            if (this.b.isEmpty()) {
++                try {
++                    this.queueLock.wait(25L);
++                } catch (InterruptedException interruptedexception1) {
++                    interruptedexception1.printStackTrace();
++                }
+             }
+         }
++        // Antarctic end
+ 
+     }
+ 
+     public void a(IAsyncChunkSaver iasyncchunksaver) {
+-        if (!this.b.contains(iasyncchunksaver)) {
+-            ++this.c;
+-            this.b.add(iasyncchunksaver);
++        synchronized (this.queueLock) {
++            if (!this.b.contains(iasyncchunksaver)) {
++                this.b.add(iasyncchunksaver);
++            } else {
++                this.requeued.add(iasyncchunksaver);
++            }
++            this.queueLock.notifyAll();
+         }
+     }
+ 
+     public void b() throws InterruptedException {
+         this.e = true;
+ 
+-        while(!this.getThreadedIOQueue().isEmpty()) { // Paper - check actual list size
+-            Thread.sleep(10L);
++        synchronized (this.queueLock) {
++            while (!this.getThreadedIOQueue().isEmpty()) { // Paper - check actual list size
++                this.queueLock.wait(10L);
++            }
+         }
+ 
+         this.e = false;
+diff --git a/test/java/net/minecraft/server/FileIOThreadConcurrencyTest.java b/test/java/net/minecraft/server/FileIOThreadConcurrencyTest.java
+new file mode 100644
+index 0000000..c827e73
+--- /dev/null
++++ b/test/java/net/minecraft/server/FileIOThreadConcurrencyTest.java
+@@ -0,0 +1,57 @@
++package net.minecraft.server;
++
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicInteger;
++import org.junit.Assert;
++import org.junit.Test;
++
++public class FileIOThreadConcurrencyTest {
++
++    @Test
++    public void testConcurrentReenqueueDuringSaverCompletionIsNeverDropped() throws Exception {
++        FileIOThread io = FileIOThread.a();
++        AtomicInteger remainingChunks = new AtomicInteger(1);
++        AtomicInteger savedCount = new AtomicInteger(0);
++        CountDownLatch enteredFirstEmptyReturn = new CountDownLatch(1);
++        CountDownLatch allowFirstReturn = new CountDownLatch(1);
++
++        IAsyncChunkSaver saver = new IAsyncChunkSaver() {
++            private boolean injectedRace = false;
++
++            @Override
++            public boolean a() {
++                if (remainingChunks.get() > 0) {
++                    remainingChunks.decrementAndGet();
++                    savedCount.incrementAndGet();
++                    return true;
++                }
++                if (!injectedRace) {
++                    injectedRace = true;
++                    enteredFirstEmptyReturn.countDown();
++                    try {
++                        allowFirstReturn.await(5, TimeUnit.SECONDS);
++                    } catch (InterruptedException e) {
++                        Thread.currentThread().interrupt();
++                    }
++                }
++                return false;
++            }
++        };
++
++        io.a(saver);
++        Assert.assertTrue("Saver must reach its empty return point", enteredFirstEmptyReturn.await(5, TimeUnit.SECONDS));
++
++        // Simulate main thread enqueuing a new chunk and calling FileIOThread.a(saver)
++        // right before saver.a() returns false!
++        remainingChunks.incrementAndGet();
++        io.a(saver);
++        allowFirstReturn.countDown();
++
++        // Wait for FileIOThread to finish all queued work
++        io.b();
++
++        Assert.assertEquals("Re-enqueued chunk during saver completion must NOT be dropped", 2, savedCount.get());
++        Assert.assertEquals(0, remainingChunks.get());
++    }
++}
