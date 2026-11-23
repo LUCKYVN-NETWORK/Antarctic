@@ -1,0 +1,331 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 01:48:57 +0700
+Subject: [PATCH 148/148] perf: use ArrayDeque for WorldServer pending ticks
+ and probe first
+
+
+diff --git a/main/java/me/stella/antarctic/collection/ChunkIndexedTreeSet.java b/main/java/me/stella/antarctic/collection/ChunkIndexedTreeSet.java
+index 3b6505e..2ec153c 100644
+--- a/main/java/me/stella/antarctic/collection/ChunkIndexedTreeSet.java
++++ b/main/java/me/stella/antarctic/collection/ChunkIndexedTreeSet.java
+@@ -3,6 +3,7 @@ package me.stella.antarctic.collection;
+ import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
+ import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
+ import it.unimi.dsi.fastutil.objects.ObjectArrayList;
++import it.unimi.dsi.fastutil.objects.ObjectIterator;
+ import it.unimi.dsi.fastutil.objects.ObjectOpenHashSet;
+ 
+ import java.util.ArrayList;
+@@ -116,6 +117,34 @@ public final class ChunkIndexedTreeSet<E extends Comparable<? super E>> {
+         return (E) this.heap[0];
+     }
+ 
++    /** Removes and returns the minimum element without redundant hash lookup. */
++    @SuppressWarnings("unchecked")
++    public E pollFirst() {
++        if (this.heapSize == 0) {
++            throw new NoSuchElementException();
++        }
++        E root = (E) this.heap[0];
++        if (root instanceof Indexed) {
++            ((Indexed) root).antarcticHeapIndex(-1);
++        }
++        int lastIdx = --this.heapSize;
++        E last = (E) this.heap[lastIdx];
++        this.heap[lastIdx] = null;
++        if (lastIdx > 0) {
++            this.siftDown(0, last);
++        }
++        this.hash.remove(root);
++        long key = chunkKey(this.locator.blockX(root) >> 4, this.locator.blockZ(root) >> 4);
++        ObjectArrayList<E> bucket = this.buckets.get(key);
++        if (bucket != null) {
++            this.bucketRemove(bucket, root);
++            if (bucket.isEmpty()) {
++                this.buckets.remove(key);
++            }
++        }
++        return root;
++    }
++
+     public void clear() {
+         for (int i = 0; i < this.heapSize; ++i) {
+             Object obj = this.heap[i];
+@@ -159,8 +188,10 @@ public final class ChunkIndexedTreeSet<E extends Comparable<? super E>> {
+                 }
+             }
+         } else {
+-            // The box covers more chunk columns than exist; walk the populated buckets instead.
+-            for (Long2ObjectMap.Entry<ObjectArrayList<E>> entry : this.buckets.long2ObjectEntrySet()) {
++            // The box covers more chunk columns than exist; walk the populated buckets instead using fastIterator.
++            ObjectIterator<Long2ObjectMap.Entry<ObjectArrayList<E>>> it = this.buckets.long2ObjectEntrySet().fastIterator();
++            while (it.hasNext()) {
++                Long2ObjectMap.Entry<ObjectArrayList<E>> entry = it.next();
+                 long key = entry.getLongKey();
+                 int cx = (int) key;
+                 int cz = (int) (key >>> 32);
+diff --git a/main/java/net/minecraft/server/WorldServer.java b/main/java/net/minecraft/server/WorldServer.java
+index 516ce85..72d48ed 100644
+--- a/main/java/net/minecraft/server/WorldServer.java
++++ b/main/java/net/minecraft/server/WorldServer.java
+@@ -61,7 +61,7 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+     protected final VillageSiege siegeManager = new VillageSiege(this);
+     private final WorldServer.BlockActionDataList[] U = new WorldServer.BlockActionDataList[] { new WorldServer.BlockActionDataList(null), new WorldServer.BlockActionDataList(null)};
+     private int V;
+-    private final List<NextTickListEntry> W = Lists.newArrayList();
++    private final java.util.ArrayDeque<NextTickListEntry> W = new java.util.ArrayDeque<NextTickListEntry>(); // Antarctic - O(1) FIFO drain instead of O(n) ArrayList head shifts
+     private final me.stella.antarctic.collection.MultiplicitySet<NextTickListEntry> currentTickBatch = new me.stella.antarctic.collection.MultiplicitySet<NextTickListEntry>(); // Antarctic - O(1) mirror of W for isBlockTickPending checks
+     private final BlockPosition.MutableBlockPosition antarcticTickProbePos = new BlockPosition.MutableBlockPosition(); // Antarctic - zero-alloc tick probe
+     private final NextTickListEntry antarcticTickProbe = NextTickListEntry.createProbe(this.antarcticTickProbePos); // Antarctic
+@@ -649,21 +649,36 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+             i = 1;
+         }
+ 
+-        NextTickListEntry nextticklistentry = new NextTickListEntry(blockposition, block);
+-
++        // Antarctic start - check loaded and probe existing pending ticks before allocating NextTickListEntry
+         if (this.isLoaded(blockposition)) {
++            this.antarcticTickProbePos.c(blockposition.getX(), blockposition.getY(), blockposition.getZ());
++            this.antarcticTickProbe.setProbeBlock(block);
++            if (this.nextTickList.contains(this.antarcticTickProbe)) {
++                return;
++            }
++
++            NextTickListEntry nextticklistentry = new NextTickListEntry(blockposition, block);
++
+             if (material != Material.AIR) {
+                 nextticklistentry.a((long) i + this.worldData.getTime());
+                 nextticklistentry.a(j);
+             }
+ 
+             // CraftBukkit - use nextTickList
+-            this.nextTickList.add(nextticklistentry); // Antarctic - add() already refuses an equal entry; was contains() + add()
++            this.nextTickList.add(nextticklistentry);
+         }
++        // Antarctic end
+ 
+     }
+ 
+     public void b(BlockPosition blockposition, Block block, int i, int j) {
++        // Antarctic start - probe existing pending ticks before allocating NextTickListEntry
++        this.antarcticTickProbePos.c(blockposition.getX(), blockposition.getY(), blockposition.getZ());
++        this.antarcticTickProbe.setProbeBlock(block);
++        if (this.nextTickList.contains(this.antarcticTickProbe)) {
++            return;
++        }
++        // Antarctic end
+         NextTickListEntry nextticklistentry = new NextTickListEntry(blockposition, block);
+ 
+         nextticklistentry.a(j);
+@@ -674,7 +689,7 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+         }
+ 
+         // CraftBukkit - use nextTickList
+-        this.nextTickList.add(nextticklistentry); // Antarctic - add() already refuses an equal entry; was contains() + add()
++        this.nextTickList.add(nextticklistentry);
+ 
+     }
+ 
+@@ -812,21 +827,18 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+                     }
+ 
+                     // CraftBukkit - use nextTickList
+-                    this.nextTickList.remove(nextticklistentry);
++                    this.nextTickList.pollFirst(); // Antarctic - skip redundant hash.get() lookup
+                     // this.nextTickListHash.remove(nextticklistentry);
+-                    this.W.add(nextticklistentry);
++                    this.W.addLast(nextticklistentry);
+                     this.currentTickBatch.add(nextticklistentry); // Antarctic
+                 }
+                 timings.scheduledBlocksCleanup.stopTiming(); // Paper
+ 
+                 this.methodProfiler.b();
+                 this.methodProfiler.a("ticking");
+-                Iterator iterator = this.W.iterator();
+                 timings.scheduledBlocksTicking.startTiming(); // Paper
+ 
+-                while (iterator.hasNext()) {
+-                    nextticklistentry = (NextTickListEntry) iterator.next();
+-                    iterator.remove();
++                while ((nextticklistentry = this.W.pollFirst()) != null) {
+                     this.currentTickBatch.removeOne(nextticklistentry); // Antarctic
+                     boolean flag1 = false;
+ 
+diff --git a/test/java/net/minecraft/server/WorldServerPendingTickPerfTest.java b/test/java/net/minecraft/server/WorldServerPendingTickPerfTest.java
+new file mode 100644
+index 0000000..5734a5b
+--- /dev/null
++++ b/test/java/net/minecraft/server/WorldServerPendingTickPerfTest.java
+@@ -0,0 +1,171 @@
++package net.minecraft.server;
++
++import com.sun.management.ThreadMXBean;
++import java.lang.management.ManagementFactory;
++import java.lang.reflect.Field;
++import java.util.ArrayDeque;
++import java.util.ArrayList;
++import java.util.Iterator;
++import java.util.List;
++import me.stella.antarctic.collection.ChunkIndexedTreeSet;
++import org.junit.Assert;
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++public class WorldServerPendingTickPerfTest {
++
++    @BeforeClass
++    public static void setup() throws Exception {
++        LightPropagationParityTest.bootstrap();
++    }
++
++    @SuppressWarnings("unchecked")
++    private static WorldServer newTickWorld() throws Exception {
++        WorldServer world = LightPropagationParityTest.buildWorld(1, new LightPropagationParityTest.StubProvider[1]);
++        world.worldData = new WorldData();
++        world.worldData.setTime(100L);
++        BlockPosition.MutableBlockPosition probePos = new BlockPosition.MutableBlockPosition();
++        LightPropagationParityTest.set(WorldServer.class, world, "antarcticTickProbePos", probePos);
++        LightPropagationParityTest.set(WorldServer.class, world, "antarcticTickProbe", NextTickListEntry.createProbe(probePos));
++        Field locatorField = WorldServer.class.getDeclaredField("NEXT_TICK_LOCATOR");
++        locatorField.setAccessible(true);
++        ChunkIndexedTreeSet.Locator<NextTickListEntry> locator = (ChunkIndexedTreeSet.Locator<NextTickListEntry>) locatorField.get(null);
++        LightPropagationParityTest.set(WorldServer.class, world, "nextTickList", new ChunkIndexedTreeSet<NextTickListEntry>(locator));
++        LightPropagationParityTest.set(WorldServer.class, world, "W", new ArrayDeque<NextTickListEntry>());
++        LightPropagationParityTest.set(WorldServer.class, world, "currentTickBatch", new me.stella.antarctic.collection.MultiplicitySet<NextTickListEntry>());
++        return world;
++    }
++
++    @SuppressWarnings("unchecked")
++    private static ChunkIndexedTreeSet<NextTickListEntry> getNextTickList(WorldServer world) throws Exception {
++        Field f = WorldServer.class.getDeclaredField("nextTickList");
++        f.setAccessible(true);
++        return (ChunkIndexedTreeSet<NextTickListEntry>) f.get(world);
++    }
++
++    @Test
++    public void testProbeDeduplicationUnloadedGuardAndPollFirstOrder() throws Exception {
++        WorldServer world = newTickWorld();
++        ChunkIndexedTreeSet<NextTickListEntry> queue = getNextTickList(world);
++
++        // Unloaded chunk must not enqueue
++        BlockPosition unloaded = new BlockPosition(5000, 64, 5000);
++        world.a(unloaded, Blocks.SAND, 5, 0);
++        Assert.assertTrue("Unloaded position must not schedule tick", queue.isEmpty());
++
++        // Loaded chunk schedules normally and deduplicates equivalent Block families (REDSTONE_TORCH == UNLIT_REDSTONE_TORCH)
++        BlockPosition p1 = new BlockPosition(2, 64, 2);
++        BlockPosition p2 = new BlockPosition(3, 64, 2);
++        BlockPosition p3 = new BlockPosition(4, 64, 2);
++        world.a(p1, Blocks.REDSTONE_TORCH, 10, 0);
++        world.a(p1, Blocks.UNLIT_REDSTONE_TORCH, 2, -1); // equal family -> ignored
++        world.a(p2, Blocks.SAND, 5, -1);
++        world.a(p3, Blocks.SAND, 5, 0);
++        Assert.assertEquals(3, queue.size());
++
++        // pollFirst() must pop in exact compareTo order: (time=105, prio=-1), (time=105, prio=0), (time=110, prio=0)
++        NextTickListEntry e1 = queue.pollFirst();
++        NextTickListEntry e2 = queue.pollFirst();
++        NextTickListEntry e3 = queue.pollFirst();
++        Assert.assertEquals(p2, e1.a);
++        Assert.assertEquals(p3, e2.a);
++        Assert.assertEquals(p1, e3.a);
++        Assert.assertTrue(queue.isEmpty());
++
++        // b() also deduplicates without allocating duplicates
++        world.b(p1, Blocks.SAND, 3, 0);
++        world.b(p1, Blocks.SAND, 1, 0);
++        Assert.assertEquals(1, queue.size());
++
++        // collect() wide query exercises fastIterator over populated buckets
++        world.b(new BlockPosition(64, 64, 64), Blocks.SAND, 2, 0);
++        List<NextTickListEntry> collected = queue.collect(-1000, -1000, 1000, 1000, true);
++        Assert.assertNotNull(collected);
++        Assert.assertEquals(2, collected.size());
++        Assert.assertTrue(queue.isEmpty());
++    }
++
++    @Test
++    public void testZeroAllocationDuplicateScheduleAndArrayDequeStormSpeedup() throws Exception {
++        WorldServer world = newTickWorld();
++        BlockPosition pos = new BlockPosition(4, 64, 4);
++        BlockPosition unloaded = new BlockPosition(9999, 64, 9999);
++        world.a(pos, Blocks.REDSTONE_TORCH, 4, 0);
++
++        final int warmup = 10_000;
++        final int measured = 50_000;
++        for (int i = 0; i < warmup; ++i) {
++            world.a(pos, Blocks.REDSTONE_TORCH, 4, 0);
++            world.b(pos, Blocks.REDSTONE_TORCH, 4, 0);
++            world.a(unloaded, Blocks.REDSTONE_TORCH, 4, 0);
++        }
++
++        ThreadMXBean bean = (ThreadMXBean) ManagementFactory.getThreadMXBean();
++        long tid = Thread.currentThread().getId();
++        long a0 = bean.getThreadAllocatedBytes(tid);
++        long t0 = System.nanoTime();
++        for (int i = 0; i < measured; ++i) {
++            world.a(pos, Blocks.REDSTONE_TORCH, 4, 0);
++            world.b(pos, Blocks.REDSTONE_TORCH, 4, 0);
++            world.a(unloaded, Blocks.REDSTONE_TORCH, 4, 0);
++        }
++        long dupNs = System.nanoTime() - t0;
++        long dupAlloc = Math.max(0L, bean.getThreadAllocatedBytes(tid) - a0);
++
++        // Compare ArrayList head-shift drain (old W) vs ArrayDeque pollFirst drain (new W) on a 15,000-entry tick storm
++        final int batchSize = 15_000;
++        NextTickListEntry[] entries = new NextTickListEntry[batchSize];
++        for (int i = 0; i < batchSize; ++i) {
++            entries[i] = new NextTickListEntry(new BlockPosition(i & 15, 64, i >> 4), Blocks.SAND);
++        }
++
++        ArrayList<NextTickListEntry> listBatch = new ArrayList<NextTickListEntry>(batchSize);
++        ArrayDeque<NextTickListEntry> dequeBatch = new ArrayDeque<NextTickListEntry>(batchSize);
++
++        // Warmup small batches
++        for (int w = 0; w < 5; ++w) {
++            for (int i = 0; i < 500; ++i) {
++                listBatch.add(entries[i]);
++                dequeBatch.addLast(entries[i]);
++            }
++            Iterator<NextTickListEntry> it = listBatch.iterator();
++            while (it.hasNext()) {
++                it.next();
++                it.remove();
++            }
++            while (dequeBatch.pollFirst() != null) {
++            }
++        }
++
++        for (int i = 0; i < batchSize; ++i) {
++            listBatch.add(entries[i]);
++        }
++        long listStart = System.nanoTime();
++        long sink = 0;
++        Iterator<NextTickListEntry> it = listBatch.iterator();
++        while (it.hasNext()) {
++            sink += it.next().a.getX();
++            it.remove();
++        }
++        long listNs = System.nanoTime() - listStart;
++
++        for (int i = 0; i < batchSize; ++i) {
++            dequeBatch.addLast(entries[i]);
++        }
++        long dequeStart = System.nanoTime();
++        NextTickListEntry polled;
++        while ((polled = dequeBatch.pollFirst()) != null) {
++            sink += polled.a.getX();
++        }
++        long dequeNs = System.nanoTime() - dequeStart;
++
++        System.out.printf(
++                "[perf] WorldServer dup/unloaded schedule (%d x 3 ops): %.2f ms (alloc=%d B) | tick batch drain (%d entries): ArrayList=%.2f ms vs ArrayDeque=%.2f ms (speedup=%.1fx, sink=%d)%n",
++                measured, dupNs / 1e6, dupAlloc, batchSize, listNs / 1e6, dequeNs / 1e6,
++                (double) listNs / Math.max(1L, dequeNs), sink);
++
++        Assert.assertEquals("Duplicate and unloaded schedule probes must allocate 0 bytes", 0L, dupAlloc);
++        Assert.assertTrue("ArrayDeque pollFirst must be vastly faster than ArrayList head removal",
++                dequeNs * 10L < listNs);
++    }
++}

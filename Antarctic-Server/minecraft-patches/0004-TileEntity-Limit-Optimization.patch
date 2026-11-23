@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: nopjmp <kthompson@hey.com>
 Date: Fri, 5 Feb 2021 00:10:45 -0600
-Subject: [PATCH 004/147] TileEntity Limit Optimization
+Subject: [PATCH 004/148] TileEntity Limit Optimization
 
 This limits the number of entities that are sent when a chunk is loaded.
 - Backported from Dionysus 0013 by nopjmp (original notices retained; see licenses/Dionysus-MIT.md)

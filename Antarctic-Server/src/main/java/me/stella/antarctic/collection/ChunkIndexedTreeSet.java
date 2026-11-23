@@ -3,6 +3,7 @@ package me.stella.antarctic.collection;
 import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.objects.ObjectArrayList;
+import it.unimi.dsi.fastutil.objects.ObjectIterator;
 import it.unimi.dsi.fastutil.objects.ObjectOpenHashSet;
 
 import java.util.ArrayList;
@@ -116,6 +117,34 @@ public final class ChunkIndexedTreeSet<E extends Comparable<? super E>> {
         return (E) this.heap[0];
     }
 
+    /** Removes and returns the minimum element without redundant hash lookup. */
+    @SuppressWarnings("unchecked")
+    public E pollFirst() {
+        if (this.heapSize == 0) {
+            throw new NoSuchElementException();
+        }
+        E root = (E) this.heap[0];
+        if (root instanceof Indexed) {
+            ((Indexed) root).antarcticHeapIndex(-1);
+        }
+        int lastIdx = --this.heapSize;
+        E last = (E) this.heap[lastIdx];
+        this.heap[lastIdx] = null;
+        if (lastIdx > 0) {
+            this.siftDown(0, last);
+        }
+        this.hash.remove(root);
+        long key = chunkKey(this.locator.blockX(root) >> 4, this.locator.blockZ(root) >> 4);
+        ObjectArrayList<E> bucket = this.buckets.get(key);
+        if (bucket != null) {
+            this.bucketRemove(bucket, root);
+            if (bucket.isEmpty()) {
+                this.buckets.remove(key);
+            }
+        }
+        return root;
+    }
+
     public void clear() {
         for (int i = 0; i < this.heapSize; ++i) {
             Object obj = this.heap[i];
@@ -159,8 +188,10 @@ public final class ChunkIndexedTreeSet<E extends Comparable<? super E>> {
                 }
             }
         } else {
-            // The box covers more chunk columns than exist; walk the populated buckets instead.
-            for (Long2ObjectMap.Entry<ObjectArrayList<E>> entry : this.buckets.long2ObjectEntrySet()) {
+            // The box covers more chunk columns than exist; walk the populated buckets instead using fastIterator.
+            ObjectIterator<Long2ObjectMap.Entry<ObjectArrayList<E>>> it = this.buckets.long2ObjectEntrySet().fastIterator();
+            while (it.hasNext()) {
+                Long2ObjectMap.Entry<ObjectArrayList<E>> entry = it.next();
                 long key = entry.getLongKey();
                 int cx = (int) key;
                 int cz = (int) (key >>> 32);

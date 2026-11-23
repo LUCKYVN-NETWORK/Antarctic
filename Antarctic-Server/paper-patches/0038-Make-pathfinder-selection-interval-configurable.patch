@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Sat, 17 Oct 2026 16:05:02 +0700
-Subject: [PATCH 038/147] Make pathfinder selection interval configurable
+Subject: [PATCH 038/148] Make pathfinder selection interval configurable
 
 - Preserve vanilla interval 3 and reject nonpositive intervals before modulo-by-zero failures
 - Import unpatched vanilla selector from mc-dev; restart to apply changes to existing entities
