@@ -1,0 +1,218 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 00:19:00 +0700
+Subject: [PATCH 124/124] fix: restore NetworkManager ITickable dispatch and
+ dynamic join cap
+
+
+diff --git a/main/java/com/destroystokyo/paper/PaperConfig.java b/main/java/com/destroystokyo/paper/PaperConfig.java
+index 7ea7dd0..672cbb6 100644
+--- a/main/java/com/destroystokyo/paper/PaperConfig.java
++++ b/main/java/com/destroystokyo/paper/PaperConfig.java
+@@ -271,7 +271,7 @@ public class PaperConfig {
+     }
+ 
+ 
+-    public static int maxJoinsPerTick;
++    public static int maxJoinsPerTick = 3;
+     private static void maxJoinsPerTick() {
+         maxJoinsPerTick = getInt("settings.max-joins-per-tick", 3);
+     }
+diff --git a/main/java/net/minecraft/server/NetworkManager.java b/main/java/net/minecraft/server/NetworkManager.java
+index ed02568..ce51f44 100644
+--- a/main/java/net/minecraft/server/NetworkManager.java
++++ b/main/java/net/minecraft/server/NetworkManager.java
+@@ -267,7 +267,6 @@ public class NetworkManager extends SimpleChannelInboundHandler<Packet<?>> {
+     }
+     // Paper end
+ 
+-    private static final int MAX_PER_TICK = com.destroystokyo.paper.PaperConfig.maxJoinsPerTick; // Paper
+     private static int joinAttemptsThisTick; // Paper
+     private static int currTick; // Paper
+     public void a() {
+@@ -278,17 +277,21 @@ public class NetworkManager extends SimpleChannelInboundHandler<Packet<?>> {
+             joinAttemptsThisTick = 0;
+         }
+         // Paper end
+-        if (this.m instanceof LoginListener) {
+-            LoginListener loginListener = (LoginListener) this.m;
+-            if (loginListener.getLoginState() != LoginListener.EnumProtocolState.READY_TO_ACCEPT  // Paper
+-                    || (joinAttemptsThisTick++ < MAX_PER_TICK)) { // Paper - limit the number of joins which can be processed each tick
+-                loginListener.e();
++        // Antarctic start - preserve single ITickable dispatch per tick and dynamic maxJoinsPerTick
++        if (this.m instanceof ITickable) {
++            if (this.m instanceof LoginListener) {
++                LoginListener loginListener = (LoginListener) this.m;
++                int maxPerTick = com.destroystokyo.paper.PaperConfig.maxJoinsPerTick;
++                if (loginListener.getLoginState() != LoginListener.EnumProtocolState.READY_TO_ACCEPT
++                        || maxPerTick <= 0
++                        || joinAttemptsThisTick++ < maxPerTick) {
++                    loginListener.e();
++                }
++            } else {
++                ((ITickable) this.m).e();
+             }
+         }
+-
+-        if (this.m instanceof PlayerConnection) {
+-            ((PlayerConnection)this.m).e();
+-        }
++        // Antarctic end
+ 
+         if (this.channel != null) {
+             if (enableExplicitFlush) this.channel.eventLoop().execute(() -> this.channel.flush()); // Paper - we don't need to explicit flush here, but allow opt in incase issues are found to a better version
+diff --git a/test/java/net/minecraft/server/NetworkManagerTickDispatchTest.java b/test/java/net/minecraft/server/NetworkManagerTickDispatchTest.java
+new file mode 100644
+index 0000000..e6a0d0b
+--- /dev/null
++++ b/test/java/net/minecraft/server/NetworkManagerTickDispatchTest.java
+@@ -0,0 +1,149 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.PaperConfig;
++import java.lang.reflect.Field;
++import org.junit.Assert;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++public class NetworkManagerTickDispatchTest {
++
++    private static Unsafe unsafe;
++
++    @BeforeClass
++    public static void setup() throws Exception {
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        unsafe = (Unsafe) f.get(null);
++    }
++
++    private static final class CustomTickableListener implements PacketListener, ITickable {
++        int ticks;
++
++        @Override
++        public void a(IChatBaseComponent ichatbasecomponent) {
++        }
++
++        @Override
++        public void e() {
++            ticks++;
++        }
++    }
++
++    private static final class StubPlayerConnection extends PlayerConnection {
++        int ticks;
++
++        StubPlayerConnection() {
++            super(null, null, null);
++        }
++
++        @Override
++        public void e() {
++            ticks++;
++        }
++    }
++
++    private static final class TransitionLoginListener extends LoginListener {
++        int ticks;
++        NetworkManager nm;
++        PlayerConnection nextConnection;
++
++        TransitionLoginListener() {
++            super(null, null);
++        }
++
++        @Override
++        public void e() {
++            ticks++;
++            if (nextConnection != null) {
++                nm.setPacketListener(nextConnection);
++            }
++        }
++    }
++
++    private static void setLoginState(LoginListener listener, LoginListener.EnumProtocolState state) throws Exception {
++        Field g = LoginListener.class.getDeclaredField("g");
++        g.setAccessible(true);
++        g.set(listener, state);
++    }
++
++    @Test
++    public void testCustomITickableListenerStillTicks() {
++        NetworkManager nm = new NetworkManager(EnumProtocolDirection.SERVERBOUND);
++        CustomTickableListener custom = new CustomTickableListener();
++        nm.setPacketListener(custom);
++
++        nm.a();
++        nm.a();
++
++        Assert.assertEquals("Custom ITickable PacketListener must tick once per NetworkManager.a()", 2, custom.ticks);
++    }
++
++    @Test
++    public void testLoginTransitionDoesNotDoubleTickPlayerConnectionOnSameTick() throws Exception {
++        int prevMax = PaperConfig.maxJoinsPerTick;
++        int prevTick = MinecraftServer.currentTick;
++        try {
++            PaperConfig.maxJoinsPerTick = 5;
++            MinecraftServer.currentTick = prevTick + 101;
++
++            NetworkManager nm = new NetworkManager(EnumProtocolDirection.SERVERBOUND);
++            TransitionLoginListener login = (TransitionLoginListener) unsafe.allocateInstance(TransitionLoginListener.class);
++            StubPlayerConnection conn = (StubPlayerConnection) unsafe.allocateInstance(StubPlayerConnection.class);
++            login.nm = nm;
++            login.nextConnection = conn;
++            setLoginState(login, LoginListener.EnumProtocolState.READY_TO_ACCEPT);
++            nm.setPacketListener(login);
++
++            // Tick 1: LoginListener accepts and transitions packet listener to PlayerConnection.
++            // PlayerConnection must NOT also tick on this same tick.
++            nm.a();
++            Assert.assertEquals(1, login.ticks);
++            Assert.assertEquals("PlayerConnection must not double-tick on join tick", 0, conn.ticks);
++
++            // Tick 2: Now PlayerConnection ticks normally.
++            nm.a();
++            Assert.assertEquals(1, login.ticks);
++            Assert.assertEquals(1, conn.ticks);
++        } finally {
++            PaperConfig.maxJoinsPerTick = prevMax;
++            MinecraftServer.currentTick = prevTick;
++        }
++    }
++
++    @Test
++    public void testDynamicMaxJoinsPerTickHonoredAndZeroDoesNotLockOut() throws Exception {
++        int prevMax = PaperConfig.maxJoinsPerTick;
++        int prevTick = MinecraftServer.currentTick;
++        try {
++            MinecraftServer.currentTick = prevTick + 202;
++            PaperConfig.maxJoinsPerTick = 1;
++
++            NetworkManager nm1 = new NetworkManager(EnumProtocolDirection.SERVERBOUND);
++            NetworkManager nm2 = new NetworkManager(EnumProtocolDirection.SERVERBOUND);
++            TransitionLoginListener l1 = (TransitionLoginListener) unsafe.allocateInstance(TransitionLoginListener.class);
++            TransitionLoginListener l2 = (TransitionLoginListener) unsafe.allocateInstance(TransitionLoginListener.class);
++            setLoginState(l1, LoginListener.EnumProtocolState.READY_TO_ACCEPT);
++            setLoginState(l2, LoginListener.EnumProtocolState.READY_TO_ACCEPT);
++            nm1.setPacketListener(l1);
++            nm2.setPacketListener(l2);
++
++            nm1.a();
++            nm2.a();
++            Assert.assertEquals("First login within maxJoinsPerTick=1 must run", 1, l1.ticks);
++            Assert.assertEquals("Second login exceeding maxJoinsPerTick=1 must be deferred", 0, l2.ticks);
++
++            // Dynamically change config to <= 0 (unlimited) on next tick
++            MinecraftServer.currentTick = prevTick + 203;
++            PaperConfig.maxJoinsPerTick = 0;
++            nm1.a();
++            nm2.a();
++            Assert.assertEquals(2, l1.ticks);
++            Assert.assertEquals("maxJoinsPerTick <= 0 must not lock out logins", 1, l2.ticks);
++        } finally {
++            PaperConfig.maxJoinsPerTick = prevMax;
++            MinecraftServer.currentTick = prevTick;
++        }
++    }
++}

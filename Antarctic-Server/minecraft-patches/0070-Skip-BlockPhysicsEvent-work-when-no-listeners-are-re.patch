@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Sun, 18 Oct 2026 14:51:42 +0700
-Subject: [PATCH 070/123] Skip BlockPhysicsEvent work when no listeners are
+Subject: [PATCH 070/124] Skip BlockPhysicsEvent work when no listeners are
  registered
 
 - Hoist a BlockPhysicsEvent.getHandlerList().getRegisteredListeners().length != 0 check into World neighborChanged so the event, its CraftBlock snapshot and the dispatch are skipped entirely when no plugin listens (backport of Leaf MC 0256; BlockPhysicsEvent can fire 50k+/sec during redstone, liquid and sand activity)
