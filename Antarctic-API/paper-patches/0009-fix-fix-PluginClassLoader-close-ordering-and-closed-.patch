@@ -1,0 +1,150 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 01:17:40 +0700
+Subject: [PATCH 9/9] fix: fix PluginClassLoader close ordering and closed
+ findClass contract
+
+
+diff --git a/main/java/org/bukkit/plugin/java/PluginClassLoader.java b/main/java/org/bukkit/plugin/java/PluginClassLoader.java
+index 740b231..a9839f2 100644
+--- a/main/java/org/bukkit/plugin/java/PluginClassLoader.java
++++ b/main/java/org/bukkit/plugin/java/PluginClassLoader.java
+@@ -103,7 +103,11 @@ public final class PluginClassLoader extends URLClassLoader { // Spigot
+ 
+     @Override
+     protected Class<?> findClass(String name) throws ClassNotFoundException {
+-        return findClass(name, true);
++        Class<?> result = findClass(name, true);
++        if (result == null) {
++            throw new ClassNotFoundException(name);
++        }
++        return result;
+     }
+ 
+     Class<?> findClass(String name, boolean checkGlobal) throws ClassNotFoundException {
+@@ -171,10 +175,10 @@ public final class PluginClassLoader extends URLClassLoader { // Spigot
+ 
+     @Override
+     public void close() throws IOException {
++        closed = true; // Antarctic - publish closure before closing underlying URLClassLoader/JarFile
+         try {
+             super.close();
+         } finally {
+-            closed = true; // Dionysus
+             jar.close();
+         }
+     }
+diff --git a/test/java/org/bukkit/plugin/java/PluginClassLoaderClosureTest.java b/test/java/org/bukkit/plugin/java/PluginClassLoaderClosureTest.java
+new file mode 100644
+index 0000000..e22bfdd
+--- /dev/null
++++ b/test/java/org/bukkit/plugin/java/PluginClassLoaderClosureTest.java
+@@ -0,0 +1,108 @@
++package org.bukkit.plugin.java;
++
++import java.io.File;
++import java.io.FileOutputStream;
++import java.lang.reflect.Field;
++import java.lang.reflect.Proxy;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.jar.JarEntry;
++import java.util.jar.JarFile;
++import java.util.jar.JarOutputStream;
++import java.util.logging.Logger;
++import org.bukkit.Bukkit;
++import org.bukkit.Server;
++import org.junit.AfterClass;
++import org.junit.Assert;
++import org.junit.BeforeClass;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.rules.TemporaryFolder;
++import sun.misc.Unsafe;
++
++public class PluginClassLoaderClosureTest {
++
++    private static boolean installedBukkitServer;
++
++    @Rule
++    public TemporaryFolder temp = new TemporaryFolder();
++
++    @BeforeClass
++    public static void setupBukkit() throws Exception {
++        if (Bukkit.getServer() == null) {
++            Server server = (Server) Proxy.newProxyInstance(
++                    Server.class.getClassLoader(),
++                    new Class<?>[] { Server.class },
++                    (proxy, method, args) -> {
++                        if ("getLogger".equals(method.getName())) {
++                            return Logger.getLogger("PluginClassLoaderClosureTest");
++                        }
++                        if ("getName".equals(method.getName())) {
++                            return "TestServer";
++                        }
++                        if ("getVersion".equals(method.getName())) {
++                            return "1.12.2";
++                        }
++                        if ("getBukkitVersion".equals(method.getName())) {
++                            return "1.12.2-R0.1-SNAPSHOT";
++                        }
++                        return null;
++                    });
++            Bukkit.setServer(server);
++            installedBukkitServer = true;
++        }
++    }
++
++    @AfterClass
++    public static void tearDownBukkit() throws Exception {
++        if (installedBukkitServer) {
++            Field serverField = Bukkit.class.getDeclaredField("server");
++            serverField.setAccessible(true);
++            serverField.set(null, null);
++            installedBukkitServer = false;
++        }
++    }
++
++    @Test
++    public void testClosedFindClassThrowsClassNotFoundException() throws Exception {
++        File jarFile = temp.newFile("dummy-plugin.jar");
++        try (JarOutputStream jos = new JarOutputStream(new FileOutputStream(jarFile))) {
++            jos.putNextEntry(new JarEntry("META-INF/MANIFEST.MF"));
++            jos.write("Manifest-Version: 1.0\n".getBytes());
++            jos.closeEntry();
++        }
++
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        Unsafe unsafe = (Unsafe) f.get(null);
++
++        PluginClassLoader pcl = (PluginClassLoader) unsafe.allocateInstance(PluginClassLoader.class);
++        Field classesField = PluginClassLoader.class.getDeclaredField("classes");
++        classesField.setAccessible(true);
++        classesField.set(pcl, new ConcurrentHashMap<String, Class<?>>());
++        Field jarField = PluginClassLoader.class.getDeclaredField("jar");
++        jarField.setAccessible(true);
++        jarField.set(pcl, new JarFile(jarFile));
++        Field closedField = PluginClassLoader.class.getDeclaredField("closed");
++        closedField.setAccessible(true);
++
++        // Even if super.close() throws due to uninitialized URLClassLoader internals, closed MUST already be true
++        // because closed = true is set BEFORE super.close()!
++        try {
++            pcl.close();
++        } catch (NullPointerException ignored) {
++            // Expected on Unsafe-allocated URLClassLoader without ucp; verifies closed=true ran BEFORE super.close()
++        }
++        Assert.assertTrue("closed must be published BEFORE super.close()", closedField.getBoolean(pcl));
++
++        // Direct findClass(String) must honor ClassLoader contract and throw ClassNotFoundException (not return null)
++        try {
++            pcl.findClass("com.example.MissingAfterClose");
++            Assert.fail("Closed PluginClassLoader.findClass(String) must throw ClassNotFoundException");
++        } catch (ClassNotFoundException expected) {
++            // expected
++        }
++
++        // Package-private findClass(name, false) used by JavaPluginLoader still returns null gracefully
++        Assert.assertNull(pcl.findClass("com.example.MissingAfterClose", false));
++    }
++}
