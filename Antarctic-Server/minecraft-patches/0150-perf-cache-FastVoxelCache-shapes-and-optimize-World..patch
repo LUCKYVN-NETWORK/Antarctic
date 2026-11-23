@@ -1,0 +1,458 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 01:58:27 +0700
+Subject: [PATCH 150/150] perf: cache FastVoxelCache shapes and optimize
+ World.getCubes paths
+
+
+diff --git a/main/java/me/stella/antarctic/spatial/FastVoxelCache.java b/main/java/me/stella/antarctic/spatial/FastVoxelCache.java
+index 871b734..1c21f73 100644
+--- a/main/java/me/stella/antarctic/spatial/FastVoxelCache.java
++++ b/main/java/me/stella/antarctic/spatial/FastVoxelCache.java
+@@ -57,9 +57,23 @@ public final class FastVoxelCache {
+     }
+ 
+     /**
+-     * Classifies an IBlockData instance into an optimization category.
++     * Classifies an IBlockData instance into an optimization category using the per-state cache on
++     * {@link net.minecraft.server.BlockDataAbstract} to eliminate repeated virtual dispatch and {@link ClassValue} probes.
+      */
+     public static ShapeType classify(IBlockData data) {
++        if (data == null) {
++            return ShapeType.EMPTY;
++        }
++        if (data instanceof net.minecraft.server.BlockDataAbstract) {
++            return ((net.minecraft.server.BlockDataAbstract) data).antarcticShapeType();
++        }
++        return computeShapeType(data);
++    }
++
++    /**
++     * Uncached classification used to populate {@link net.minecraft.server.BlockDataAbstract#antarcticShapeType()} once per state.
++     */
++    public static ShapeType computeShapeType(IBlockData data) {
+         if (data == null) {
+             return ShapeType.EMPTY;
+         }
+diff --git a/main/java/net/minecraft/server/BlockDataAbstract.java b/main/java/net/minecraft/server/BlockDataAbstract.java
+new file mode 100644
+index 0000000..562ca56
+--- /dev/null
++++ b/main/java/net/minecraft/server/BlockDataAbstract.java
+@@ -0,0 +1,84 @@
++package net.minecraft.server;
++
++import com.google.common.base.Function;
++import com.google.common.base.Joiner;
++import com.google.common.collect.Iterables;
++import java.util.Collection;
++import java.util.Iterator;
++import java.util.Map.Entry;
++import javax.annotation.Nullable;
++
++public abstract class BlockDataAbstract implements IBlockData {
++
++    private static final Joiner a = Joiner.on(',');
++    private static final Function<Entry<IBlockState<?>, Comparable<?>>, String> b = new Function() {
++        @Nullable
++        public String a(@Nullable Entry<IBlockState<?>, Comparable<?>> entry) {
++            if (entry == null) {
++                return "<NULL>";
++            } else {
++                IBlockState iblockstate = (IBlockState) entry.getKey();
++
++                return iblockstate.a() + "=" + this.a(iblockstate, (Comparable) entry.getValue());
++            }
++        }
++
++        @SuppressWarnings("unchecked")
++        private <T extends Comparable<T>> String a(IBlockState<T> iblockstate, Comparable<?> comparable) {
++            return iblockstate.a((T) comparable);
++        }
++
++        @Nullable
++        public Object apply(@Nullable Object object) {
++            return this.a((Entry) object);
++        }
++    };
++
++    // Antarctic start - per-state cached collision shape for FastVoxelCache
++    private me.stella.antarctic.spatial.FastVoxelCache.ShapeType antarcticShape;
++
++    public final me.stella.antarctic.spatial.FastVoxelCache.ShapeType antarcticShapeType() {
++        me.stella.antarctic.spatial.FastVoxelCache.ShapeType shape = this.antarcticShape;
++        if (shape == null) {
++            shape = me.stella.antarctic.spatial.FastVoxelCache.computeShapeType(this);
++            this.antarcticShape = shape;
++        }
++        return shape;
++    }
++    // Antarctic end
++
++    public BlockDataAbstract() {}
++
++    public <T extends Comparable<T>> IBlockData a(IBlockState<T> iblockstate) {
++        return this.set(iblockstate, a(iblockstate.c(), this.get(iblockstate)));
++    }
++
++    protected static <T> T a(Collection<T> collection, T t0) {
++        Iterator<T> iterator = collection.iterator();
++
++        do {
++            if (!iterator.hasNext()) {
++                return iterator.next();
++            }
++        } while (!iterator.next().equals(t0));
++
++        if (iterator.hasNext()) {
++            return iterator.next();
++        } else {
++            return collection.iterator().next();
++        }
++    }
++
++    public String toString() {
++        StringBuilder stringbuilder = new StringBuilder();
++
++        stringbuilder.append(Block.REGISTRY.b(this.getBlock()));
++        if (!this.t().isEmpty()) {
++            stringbuilder.append("[");
++            BlockDataAbstract.a.appendTo(stringbuilder, Iterables.transform(this.t().entrySet(), BlockDataAbstract.b));
++            stringbuilder.append("]");
++        }
++
++        return stringbuilder.toString();
++    }
++}
+diff --git a/main/java/net/minecraft/server/Entity.java b/main/java/net/minecraft/server/Entity.java
+index edad4bf..555a88d 100644
+--- a/main/java/net/minecraft/server/Entity.java
++++ b/main/java/net/minecraft/server/Entity.java
+@@ -583,7 +583,7 @@ public abstract class Entity implements ICommandListener, KeyedObject { // Paper
+     }
+ 
+     private boolean b(AxisAlignedBB axisalignedbb) {
+-        return this.world.getCubes(this, axisalignedbb).isEmpty() && !this.world.containsLiquid(axisalignedbb);
++        return !this.world.hasAnyBlockOrEntityCollision(this, axisalignedbb) && !this.world.containsLiquid(axisalignedbb); // Antarctic - zero-alloc early-exit collision check
+     }
+ 
+     public void move(EnumMoveType enummovetype, double d0, double d1, double d2) {
+@@ -669,7 +669,7 @@ public abstract class Entity implements ICommandListener, KeyedObject { // Paper
+             double d9 = d2;
+ 
+             if ((enummovetype == EnumMoveType.SELF || enummovetype == EnumMoveType.PLAYER) && this.onGround && this.isSneaking() && this instanceof EntityHuman) {
+-                for (double d10 = 0.05D; d0 != 0.0D && this.world.getCubes(this, this.getBoundingBox().d(d0, (double) (-this.P), 0.0D)).isEmpty(); d7 = d0) {
++                for (double d10 = 0.05D; d0 != 0.0D && !this.world.hasAnyBlockOrEntityCollision(this, this.getBoundingBox().d(d0, (double) (-this.P), 0.0D)); d7 = d0) { // Antarctic
+                     if (d0 < 0.05D && d0 >= -0.05D) {
+                         d0 = 0.0D;
+                     } else if (d0 > 0.0D) {
+@@ -679,7 +679,7 @@ public abstract class Entity implements ICommandListener, KeyedObject { // Paper
+                     }
+                 }
+ 
+-                for (; d2 != 0.0D && this.world.getCubes(this, this.getBoundingBox().d(0.0D, (double) (-this.P), d2)).isEmpty(); d9 = d2) {
++                for (; d2 != 0.0D && !this.world.hasAnyBlockOrEntityCollision(this, this.getBoundingBox().d(0.0D, (double) (-this.P), d2)); d9 = d2) { // Antarctic
+                     if (d2 < 0.05D && d2 >= -0.05D) {
+                         d2 = 0.0D;
+                     } else if (d2 > 0.0D) {
+@@ -689,7 +689,7 @@ public abstract class Entity implements ICommandListener, KeyedObject { // Paper
+                     }
+                 }
+ 
+-                for (; d0 != 0.0D && d2 != 0.0D && this.world.getCubes(this, this.getBoundingBox().d(d0, (double) (-this.P), d2)).isEmpty(); d9 = d2) {
++                for (; d0 != 0.0D && d2 != 0.0D && !this.world.hasAnyBlockOrEntityCollision(this, this.getBoundingBox().d(d0, (double) (-this.P), d2)); d9 = d2) { // Antarctic
+                     if (d0 < 0.05D && d0 >= -0.05D) {
+                         d0 = 0.0D;
+                     } else if (d0 > 0.0D) {
+diff --git a/main/java/net/minecraft/server/World.java b/main/java/net/minecraft/server/World.java
+index 3220da7..ae977c8 100644
+--- a/main/java/net/minecraft/server/World.java
++++ b/main/java/net/minecraft/server/World.java
+@@ -1418,94 +1418,95 @@ public abstract class World implements IBlockAccess {
+         boolean flag1 = entity != null && entity.bz();
+         boolean flag2 = entity != null && this.g(entity);
+         IBlockData iblockdata = Blocks.STONE.getBlockData();
+-        BlockPosition.PooledBlockPosition blockposition_pooledblockposition = BlockPosition.PooledBlockPosition.s();
++        // Antarctic start - lock-free lazy MutableBlockPosition and hoisted WorldBorder column check
++        boolean optimizeVoxel = com.destroystokyo.paper.config.toml.modules.optimizations.Physics.optimizeVoxelCollisions;
++        BlockPosition.MutableBlockPosition pos = optimizeVoxel ? null : new BlockPosition.MutableBlockPosition();
++        int cachedChunkX = Integer.MIN_VALUE;
++        int cachedChunkZ = Integer.MIN_VALUE;
++        Chunk cachedChunk = null;
+ 
+-        try {
+-            boolean optimizeVoxel = com.destroystokyo.paper.config.toml.modules.optimizations.Physics.optimizeVoxelCollisions;
+-            int cachedChunkX = Integer.MIN_VALUE;
+-            int cachedChunkZ = Integer.MIN_VALUE;
+-            Chunk cachedChunk = null;
++        for (int k1 = i; k1 < j; ++k1) {
++            for (int l1 = i1; l1 < j1; ++l1) {
++                boolean flag3 = k1 == i || k1 == j - 1;
++                boolean flag4 = l1 == i1 || l1 == j1 - 1;
+ 
+-            for (int k1 = i; k1 < j; ++k1) {
+-                for (int l1 = i1; l1 < j1; ++l1) {
+-                    boolean flag3 = k1 == i || k1 == j - 1;
+-                    boolean flag4 = l1 == i1 || l1 == j1 - 1;
++                if (flag3 && flag4) {
++                    continue;
++                }
+ 
+-                    if (flag3 && flag4) {
+-                        continue;
++                if (optimizeVoxel) {
++                    int chunkX = k1 >> 4;
++                    int chunkZ = l1 >> 4;
++                    if (chunkX != cachedChunkX || chunkZ != cachedChunkZ) {
++                        cachedChunkX = chunkX;
++                        cachedChunkZ = chunkZ;
++                        cachedChunk = this.getChunkIfLoaded(chunkX, chunkZ);
+                     }
+-
+-                    if (optimizeVoxel) {
+-                        int chunkX = k1 >> 4;
+-                        int chunkZ = l1 >> 4;
+-                        if (chunkX != cachedChunkX || chunkZ != cachedChunkZ) {
+-                            cachedChunkX = chunkX;
+-                            cachedChunkZ = chunkZ;
+-                            cachedChunk = this.getChunkIfLoaded(chunkX, chunkZ);
+-                        }
+-                        if (cachedChunk == null) {
+-                            continue;
+-                        }
+-                    } else if (!this.isLoaded(blockposition_pooledblockposition.f(k1, 64, l1))) {
++                    if (cachedChunk == null) {
+                         continue;
+                     }
++                } else if (!this.isLoaded(pos.c(k1, 64, l1))) {
++                    continue;
++                }
+ 
+-                    for (int i2 = k; i2 < l; ++i2) {
+-                        if (!flag3 && !flag4 || i2 != l - 1) {
+-                            if (flag) {
+-                                if (k1 < -30000000 || k1 >= 30000000 || l1 < -30000000 || l1 >= 30000000) {
+-                                    boolean flag5 = true;
++                boolean outsideBorder = !flag && flag2 && !worldborder.isBlockInBounds(k1, l1);
+ 
+-                                    return flag5;
+-                                }
+-                            } else if (entity != null && flag1 == flag2) {
+-                                entity.k(!flag2);
++                for (int i2 = k; i2 < l; ++i2) {
++                    if (!flag3 && !flag4 || i2 != l - 1) {
++                        if (flag) {
++                            if (k1 < -30000000 || k1 >= 30000000 || l1 < -30000000 || l1 >= 30000000) {
++                                return true;
+                             }
++                        } else if (entity != null && flag1 == flag2) {
++                            entity.k(!flag2);
++                        }
+ 
+-                            blockposition_pooledblockposition.f(k1, i2, l1);
+-                            IBlockData iblockdata1;
++                        IBlockData iblockdata1;
+ 
+-                            if (!flag && !worldborder.a((BlockPosition) blockposition_pooledblockposition) && flag2) {
+-                                iblockdata1 = iblockdata;
+-                            } else if (optimizeVoxel) {
+-                                iblockdata1 = cachedChunk.a(k1, i2, l1);
+-                            } else {
+-                                iblockdata1 = this.getType(blockposition_pooledblockposition);
+-                            }
++                        if (outsideBorder) {
++                            iblockdata1 = iblockdata;
++                        } else if (optimizeVoxel) {
++                            iblockdata1 = cachedChunk.a(k1, i2, l1);
++                        } else {
++                            iblockdata1 = this.getType(pos.c(k1, i2, l1));
++                        }
+ 
+-                            if (optimizeVoxel) {
+-                                me.stella.antarctic.spatial.FastVoxelCache.ShapeType shape = me.stella.antarctic.spatial.FastVoxelCache.classify(iblockdata1);
+-                                if (shape == me.stella.antarctic.spatial.FastVoxelCache.ShapeType.EMPTY) {
+-                                    continue;
+-                                }
+-                                if (shape == me.stella.antarctic.spatial.FastVoxelCache.ShapeType.FULL_CUBE) {
+-                                    if (axisalignedbb.a < (double) (k1 + 1) && axisalignedbb.d > (double) k1 &&
+-                                        axisalignedbb.b < (double) (i2 + 1) && axisalignedbb.e > (double) i2 &&
+-                                        axisalignedbb.c < (double) (l1 + 1) && axisalignedbb.f > (double) l1) {
+-                                        if (flag) {
+-                                            return true;
+-                                        }
+-                                        list.add(new AxisAlignedBB(k1, i2, l1, k1 + 1, i2 + 1, l1 + 1));
++                        if (optimizeVoxel) {
++                            me.stella.antarctic.spatial.FastVoxelCache.ShapeType shape = me.stella.antarctic.spatial.FastVoxelCache.classify(iblockdata1);
++                            if (shape == me.stella.antarctic.spatial.FastVoxelCache.ShapeType.EMPTY) {
++                                continue;
++                            }
++                            if (shape == me.stella.antarctic.spatial.FastVoxelCache.ShapeType.FULL_CUBE) {
++                                if (axisalignedbb.a < (double) (k1 + 1) && axisalignedbb.d > (double) k1 &&
++                                    axisalignedbb.b < (double) (i2 + 1) && axisalignedbb.e > (double) i2 &&
++                                    axisalignedbb.c < (double) (l1 + 1) && axisalignedbb.f > (double) l1) {
++                                    if (flag) {
++                                        return true;
+                                     }
+-                                    continue;
++                                    list.add(new AxisAlignedBB(k1, i2, l1, k1 + 1, i2 + 1, l1 + 1));
+                                 }
++                                continue;
+                             }
+-
+-                            iblockdata1.a(this, blockposition_pooledblockposition, axisalignedbb, list, entity, false);
+-                            if (flag && !list.isEmpty()) {
+-                                boolean flag6 = true;
+-
+-                                return flag6;
++                            if (pos == null) {
++                                pos = new BlockPosition.MutableBlockPosition(k1, i2, l1);
++                            } else {
++                                pos.c(k1, i2, l1);
+                             }
++                        } else if (outsideBorder) {
++                            pos.c(k1, i2, l1);
++                        }
++
++                        iblockdata1.a(this, pos, axisalignedbb, list, entity, false);
++                        if (flag && !list.isEmpty()) {
++                            return true;
+                         }
+                     }
+                 }
+             }
+-
+-            return !list.isEmpty();
+-        } finally {
+-            blockposition_pooledblockposition.t();
+         }
++
++        return !list.isEmpty();
++        // Antarctic end
+     }
+ 
+     public List<AxisAlignedBB> getCubes(@Nullable Entity entity, AxisAlignedBB axisalignedbb) {
+diff --git a/test/java/net/minecraft/server/FastVoxelAndGetCubesPerfTest.java b/test/java/net/minecraft/server/FastVoxelAndGetCubesPerfTest.java
+new file mode 100644
+index 0000000..35d7761
+--- /dev/null
++++ b/test/java/net/minecraft/server/FastVoxelAndGetCubesPerfTest.java
+@@ -0,0 +1,119 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.config.toml.modules.optimizations.Physics;
++import com.sun.management.ThreadMXBean;
++import java.lang.management.ManagementFactory;
++import me.stella.antarctic.spatial.FastVoxelCache;
++import org.junit.Assert;
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++public class FastVoxelAndGetCubesPerfTest {
++
++    @BeforeClass
++    public static void setup() throws Exception {
++        LightPropagationParityTest.bootstrap();
++    }
++
++    @Test
++    public void testCachedClassifyMatchesUncachedForEveryRegisteredBlockState() {
++        int count = 0;
++        for (IBlockData state : Block.REGISTRY_ID) {
++            ++count;
++            FastVoxelCache.ShapeType expected = FastVoxelCache.computeShapeType(state);
++            FastVoxelCache.ShapeType first = FastVoxelCache.classify(state);
++            FastVoxelCache.ShapeType second = FastVoxelCache.classify(state);
++            Assert.assertEquals("Mismatch for " + state, expected, first);
++            Assert.assertSame("Cached classification must return identical enum instance", first, second);
++        }
++        Assert.assertTrue("Expected full 1.12.2 block state registry", count > 1000);
++    }
++
++    @Test
++    public void testCachedClassifyAndHasAnyCollisionThroughputAndAllocation() throws Exception {
++        IBlockData[] palette = new IBlockData[] {
++            Blocks.STONE.getBlockData(),
++            Blocks.DIRT.getBlockData(),
++            Blocks.GRASS.getBlockData(),
++            Blocks.COBBLESTONE.getBlockData(),
++            Blocks.AIR.getBlockData(),
++            Blocks.SOUL_SAND.getBlockData(),
++            Blocks.OAK_STAIRS.getBlockData(),
++            Blocks.GLASS.getBlockData()
++        };
++
++        final int warmup = 200_000;
++        final int measured = 2_000_000;
++        int sink = 0;
++
++        for (int i = 0; i < warmup; ++i) {
++            IBlockData s = palette[i & 7];
++            sink += FastVoxelCache.computeShapeType(s).ordinal();
++            sink += FastVoxelCache.classify(s).ordinal();
++        }
++
++        long t0 = System.nanoTime();
++        for (int i = 0; i < measured; ++i) {
++            sink += FastVoxelCache.computeShapeType(palette[i & 7]).ordinal();
++        }
++        long uncachedNs = System.nanoTime() - t0;
++
++        long t1 = System.nanoTime();
++        for (int i = 0; i < measured; ++i) {
++            sink += FastVoxelCache.classify(palette[i & 7]).ordinal();
++        }
++        long cachedNs = System.nanoTime() - t1;
++
++        // Also benchmark World.getCubes(...).isEmpty() vs World.hasAnyBlockOrEntityCollision(...) on a solid floor
++        WorldServer world = LightPropagationParityTest.buildWorld(1, new LightPropagationParityTest.StubProvider[1]);
++        LightPropagationParityTest.set(World.class, world, "P", new WorldBorder());
++        for (int x = 0; x < 16; ++x) {
++            for (int z = 0; z < 16; ++z) {
++                LightPropagationParityTest.setBlock(world, x, 63, z, Blocks.STONE.getBlockData());
++            }
++        }
++
++        boolean prev = Physics.optimizeVoxelCollisions;
++        Physics.optimizeVoxelCollisions = true;
++        try {
++            AxisAlignedBB box = new AxisAlignedBB(4.2D, 62.8D, 4.2D, 4.8D, 64.6D, 4.8D);
++            Assert.assertEquals(!world.getCubes(null, box).isEmpty(), world.hasAnyBlockOrEntityCollision(null, box));
++
++            for (int i = 0; i < 10_000; ++i) {
++                if (!world.getCubes(null, box).isEmpty()) sink++;
++                if (world.hasAnyBlockOrEntityCollision(null, box)) sink++;
++            }
++
++            ThreadMXBean bean = (ThreadMXBean) ManagementFactory.getThreadMXBean();
++            long tid = Thread.currentThread().getId();
++
++            long a0 = bean.getThreadAllocatedBytes(tid);
++            long g0 = System.nanoTime();
++            for (int i = 0; i < 100_000; ++i) {
++                if (!world.getCubes(null, box).isEmpty()) sink++;
++            }
++            long getCubesNs = System.nanoTime() - g0;
++            long getCubesAlloc = Math.max(0L, bean.getThreadAllocatedBytes(tid) - a0);
++
++            long a1 = bean.getThreadAllocatedBytes(tid);
++            long g1 = System.nanoTime();
++            for (int i = 0; i < 100_000; ++i) {
++                if (world.hasAnyBlockOrEntityCollision(null, box)) sink++;
++            }
++            long earlyExitNs = System.nanoTime() - g1;
++            long earlyExitAlloc = Math.max(0L, bean.getThreadAllocatedBytes(tid) - a1);
++
++            System.out.printf(
++                    "[perf] FastVoxelCache.classify (%d ops): uncached=%.2f ms vs cached=%.2f ms (%.2fx) | collision check (100k ops): getCubes=%.2f ms (alloc=%.2f MB) vs hasAny=%.2f ms (alloc=%d B, %.2fx, sink=%d)%n",
++                    measured, uncachedNs / 1e6, cachedNs / 1e6, (double) uncachedNs / Math.max(1L, cachedNs),
++                    getCubesNs / 1e6, getCubesAlloc / (1024.0 * 1024.0),
++                    earlyExitNs / 1e6, earlyExitAlloc, (double) getCubesNs / Math.max(1L, earlyExitNs), sink);
++
++            Assert.assertEquals("hasAnyBlockOrEntityCollision on full-cube floor must allocate 0 bytes", 0L, earlyExitAlloc);
++            Assert.assertTrue("Cached classify must be faster than uncached ClassValue lookup", cachedNs < uncachedNs);
++            Assert.assertTrue("Early-exit collision check must be faster than getCubes().isEmpty()", earlyExitNs < getCubesNs);
++        } finally {
++            Physics.optimizeVoxelCollisions = prev;
++        }
++    }
++}

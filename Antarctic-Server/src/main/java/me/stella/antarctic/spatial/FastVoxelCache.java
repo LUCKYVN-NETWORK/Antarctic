@@ -57,9 +57,23 @@ public final class FastVoxelCache {
     }
 
     /**
-     * Classifies an IBlockData instance into an optimization category.
+     * Classifies an IBlockData instance into an optimization category using the per-state cache on
+     * {@link net.minecraft.server.BlockDataAbstract} to eliminate repeated virtual dispatch and {@link ClassValue} probes.
      */
     public static ShapeType classify(IBlockData data) {
+        if (data == null) {
+            return ShapeType.EMPTY;
+        }
+        if (data instanceof net.minecraft.server.BlockDataAbstract) {
+            return ((net.minecraft.server.BlockDataAbstract) data).antarcticShapeType();
+        }
+        return computeShapeType(data);
+    }
+
+    /**
+     * Uncached classification used to populate {@link net.minecraft.server.BlockDataAbstract#antarcticShapeType()} once per state.
+     */
+    public static ShapeType computeShapeType(IBlockData data) {
         if (data == null) {
             return ShapeType.EMPTY;
         }
