@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 01:19:27 +0700
+Subject: [PATCH 142/142] fix: exclude cancelled players from per-player mob
+ spawn caps
+
+
+diff --git a/main/java/net/minecraft/server/SpawnerCreature.java b/main/java/net/minecraft/server/SpawnerCreature.java
+index 0417796..61c1aa2 100644
+--- a/main/java/net/minecraft/server/SpawnerCreature.java
++++ b/main/java/net/minecraft/server/SpawnerCreature.java
+@@ -439,11 +439,6 @@ public final class SpawnerCreature {
+                     int l = MathHelper.floor(entityhuman.locX / 16.0D);
+ 
+                     j = MathHelper.floor(entityhuman.locZ / 16.0D);
+-                    if (perPlayerMobSpawns && entityhuman instanceof EntityPlayer) {
+-                        this.localCapPlayers.add((EntityPlayer) entityhuman);
+-                        this.localCapPlayerChunkX.add(l);
+-                        this.localCapPlayerChunkZ.add(j);
+-                    }
+                     // Spigot Start
+                     byte b0 = worldserver.spigotConfig.mobSpawnRange;
+                     b0 = ( b0 > worldserver.spigotConfig.viewDistance ) ? (byte) worldserver.spigotConfig.viewDistance : b0;
+@@ -458,6 +453,12 @@ public final class SpawnerCreature {
+                         b0 = event.getSpawnRadius();
+                     }
+                     // Paper end
++                    // Antarctic - register local-cap player only after PlayerNaturallySpawnCreaturesEvent passes
++                    if (perPlayerMobSpawns && entityhuman instanceof EntityPlayer) {
++                        this.localCapPlayers.add((EntityPlayer) entityhuman);
++                        this.localCapPlayerChunkX.add(l);
++                        this.localCapPlayerChunkZ.add(j);
++                    }
+ 
+                     for (int i1 = -b0; i1 <= b0; ++i1) {
+                         int cx = i1 + l;
