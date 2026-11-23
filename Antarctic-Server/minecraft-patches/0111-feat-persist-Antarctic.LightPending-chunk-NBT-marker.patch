@@ -1,0 +1,376 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Mon, 23 Nov 2026 10:19:12 +0700
+Subject: [PATCH 111/115] feat: persist Antarctic.LightPending chunk NBT marker
+ with toggle-off carry and T-load
+
+
+diff --git a/main/java/net/minecraft/server/Chunk.java b/main/java/net/minecraft/server/Chunk.java
+index 3a98e6f..4c59040 100644
+--- a/main/java/net/minecraft/server/Chunk.java
++++ b/main/java/net/minecraft/server/Chunk.java
+@@ -74,6 +74,7 @@ public class Chunk {
+     // Paper end
+     private boolean done;
+     private boolean lit;
++    public boolean antarcticLightPending; // Antarctic - carried NBT marker (Antarctic.LightPending), main-thread only
+     private boolean r; private boolean isTicked() { return r; }; // Paper - OBFHELPER
+     private boolean s;
+     private boolean t;
+@@ -1143,6 +1144,11 @@ public class Chunk {
+         }
+         // CraftBukkit end
+         world.onChunkNeighborsLinked(this); // Antarctic - replay light checks that were deferred for lack of neighbors
++        // Antarctic start - T-load: queue async relight for chunks loaded with Antarctic.LightPending marker
++        if (this.antarcticLightPending && com.destroystokyo.paper.config.toml.modules.optimizations.Lighting.asyncBulkRelight && this.world instanceof WorldServer) {
++            ((WorldServer) this.world).relightChunks(new long[]{this.chunkKey});
++        }
++        // Antarctic end
+         world.timings.syncChunkLoadPostTimer.stopTiming(); // Paper
+         world.timings.syncChunkLoadPopulateNeighbors.startTiming(); // Paper
+         Chunk chunk = MCUtil.getLoadedChunkWithoutMarkingActive(ichunkprovider,this.locX, this.locZ - 1); // Paper
+diff --git a/main/java/net/minecraft/server/ChunkRegionLoader.java b/main/java/net/minecraft/server/ChunkRegionLoader.java
+index e6906ef..1f6955b 100644
+--- a/main/java/net/minecraft/server/ChunkRegionLoader.java
++++ b/main/java/net/minecraft/server/ChunkRegionLoader.java
+@@ -93,6 +93,7 @@ public class ChunkRegionLoader implements IChunkLoader, IAsyncChunkSaver {
+     // Paper start
+     private static final int CURRENT_DATA_VERSION = 1343; // Paper
+     private static final boolean JUST_CORRUPT_IT = Boolean.valueOf("Paper.ignoreWorldDataVersion");
++    public static final String ANTARCTIC_LIGHT_PENDING_KEY = "Antarctic.LightPending"; // Antarctic - Appendix C v1 marker
+     // Paper end
+ 
+     @Nullable
+@@ -161,10 +162,13 @@ public class ChunkRegionLoader implements IChunkLoader, IAsyncChunkSaver {
+             // Spigot start
+             final long worldTime = world.getTime();
+             final boolean worldHasSkyLight = world.worldProvider.m();
++            // Antarctic start - capture pending light marker on main thread before building lazy IO-thread supplier
++            final boolean lightPending = captureLightPending(world, chunk);
++            // Antarctic end
+             saveEntities(nbttagcompound1, chunk, world);
+             Supplier<NBTTagCompound> completion = new Supplier<NBTTagCompound>() {
+                 public NBTTagCompound get() {
+-                    saveBody(nbttagcompound1, chunk, worldTime, worldHasSkyLight);
++                    saveBody(nbttagcompound1, chunk, worldTime, worldHasSkyLight, lightPending);
+                     return nbttagcompound;
+                 }
+             };
+@@ -301,13 +305,51 @@ public class ChunkRegionLoader implements IChunkLoader, IAsyncChunkSaver {
+         });
+     }
+ 
++    // Antarctic start - main-thread pending marker capture & tolerant read (Appendix C)
++    static boolean captureLightPending(World world, Chunk chunk) {
++        if (chunk.antarcticLightPending) {
++            return true;
++        }
++        if (world instanceof WorldServer) {
++            RelightService service = ((WorldServer) world).getRelightServiceIfPresent();
++            return service != null && service.isPending(chunk.chunkKey);
++        }
++        return false;
++    }
++
++    static void readAntarcticLightPending(Chunk chunk, NBTTagCompound levelTag, World world) {
++        if (!levelTag.hasKey(ANTARCTIC_LIGHT_PENDING_KEY)) {
++            chunk.antarcticLightPending = false;
++            return;
++        }
++        if (levelTag.hasKeyOfType(ANTARCTIC_LIGHT_PENDING_KEY, 99)) {
++            chunk.antarcticLightPending = levelTag.getByte(ANTARCTIC_LIGHT_PENDING_KEY) != 0;
++        } else {
++            chunk.antarcticLightPending = false;
++            if (world == null || !world.antarcticWarnedMalformedLightMarker) {
++                if (world != null) {
++                    world.antarcticWarnedMalformedLightMarker = true;
++                }
++                ChunkRegionLoader.a.debug("Ignoring non-numeric {} tag on chunk {},{}", ANTARCTIC_LIGHT_PENDING_KEY, chunk.locX, chunk.locZ);
++            }
++        }
++    }
++    // Antarctic end
++
+     private static void saveBody(NBTTagCompound nbttagcompound, Chunk chunk, long worldTime, boolean worldHasSkyLight) { // Spigot
++        saveBody(nbttagcompound, chunk, worldTime, worldHasSkyLight, false);
++    }
++
++    static void saveBody(NBTTagCompound nbttagcompound, Chunk chunk, long worldTime, boolean worldHasSkyLight, boolean lightPending) { // Spigot // Antarctic
+         nbttagcompound.setInt("xPos", chunk.locX);
+         nbttagcompound.setInt("zPos", chunk.locZ);
+         nbttagcompound.setLong("LastUpdate", worldTime); // Spigot
+         nbttagcompound.setIntArray("HeightMap", chunk.r());
+         nbttagcompound.setBoolean("TerrainPopulated", chunk.isDone());
+         nbttagcompound.setBoolean("LightPopulated", chunk.v());
++        if (lightPending) { // Antarctic - only written when pending or carried (vanilla-identical otherwise)
++            nbttagcompound.setByte(ANTARCTIC_LIGHT_PENDING_KEY, (byte) 1);
++        }
+         nbttagcompound.setLong("InhabitedTime", chunk.x());
+         ChunkSection[] achunksection = chunk.getSections();
+         NBTTagList nbttaglist = new NBTTagList();
+@@ -473,6 +515,7 @@ public class ChunkRegionLoader implements IChunkLoader, IAsyncChunkSaver {
+     public void loadEntities(Chunk chunk, NBTTagCompound nbttagcompound, World world) {
+         // CraftBukkit end
+         world.timings.syncChunkLoadNBTTimer.startTiming(); // Spigot
++        readAntarcticLightPending(chunk, nbttagcompound, world); // Antarctic - main-thread tolerant marker read (Appendix C)
+         NBTTagList nbttaglist1 = nbttagcompound.getList("Entities", 10);
+ 
+         for (int l = 0; l < nbttaglist1.size(); ++l) {
+diff --git a/main/java/net/minecraft/server/RelightService.java b/main/java/net/minecraft/server/RelightService.java
+index 29514f5..b15d7ed 100644
+--- a/main/java/net/minecraft/server/RelightService.java
++++ b/main/java/net/minecraft/server/RelightService.java
+@@ -115,6 +115,10 @@ public final class RelightService {
+             this.nonConvergedAttempts.remove(key); // fresh trigger resets non-convergence pause
+             int cx = (int) key;
+             int cz = (int) (key >>> 32);
++            Chunk live = this.world.getChunkIfLoaded(cx, cz);
++            if (live != null) {
++                live.antarcticLightPending = true;
++            }
+             long tileKey = ChunkCoordIntPair.a(Math.floorDiv(cx, 1 << TILE_SHIFT), Math.floorDiv(cz, 1 << TILE_SHIFT));
+             LongArrayList list = byTile.get(tileKey);
+             if (list == null) {
+@@ -462,7 +466,8 @@ public final class RelightService {
+             }
+         }
+ 
+-        // Clarification 3: mark dirty and lit=true so relit chunks exit the Chunk.o() per-tick retry loop
++        // Clarification 3: mark dirty, lit=true, and clear carried pending marker once validated light is written
++        live.antarcticLightPending = false;
+         live.f(true);
+         live.e(true);
+         if (Lighting.saveAfterRelight) {
+diff --git a/main/java/net/minecraft/server/World.java b/main/java/net/minecraft/server/World.java
+index 2b6dfc7..23c17f9 100644
+--- a/main/java/net/minecraft/server/World.java
++++ b/main/java/net/minecraft/server/World.java
+@@ -160,6 +160,7 @@ public abstract class World implements IBlockAccess {
+     public com.destroystokyo.paper.util.RedstoneWireTurbo redstoneWireTurbo; // Antarctic - per-world Eigencraft turbo state to avoid cross-world aliasing
+     int projectileChunkLoadsTick = Integer.MIN_VALUE; // Antarctic - per-world projectile chunk load cap
+     int projectileChunkLoadsThisTick = 0; // Antarctic
++    boolean antarcticWarnedMalformedLightMarker = false; // Antarctic - log malformed Antarctic.LightPending at most once per world
+ 
+     public CraftWorld getWorld() {
+         return this.world;
+diff --git a/test/java/net/minecraft/server/RelightSaveMarkerTest.java b/test/java/net/minecraft/server/RelightSaveMarkerTest.java
+new file mode 100644
+index 0000000..62fac5e
+--- /dev/null
++++ b/test/java/net/minecraft/server/RelightSaveMarkerTest.java
+@@ -0,0 +1,215 @@
++package net.minecraft.server;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++
++import com.destroystokyo.paper.config.toml.modules.optimizations.Lighting;
++import java.util.concurrent.CompletableFuture;
++import java.util.concurrent.TimeUnit;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++/**
++ * T6 / Appendix C.6 tests for the Antarctic.LightPending chunk NBT marker:
++ * round-trip write/omit, vanilla old-data compatibility, tolerant read of malformed/numeric tags,
++ * toggle-off carry semantics, main-thread capture isolation, and future-schema v2 coexistence.
++ */
++public class RelightSaveMarkerTest {
++
++    private boolean prevAsyncCatcher;
++    private WorldServer activeWorld;
++
++    @BeforeClass
++    public static void bootstrap() throws Exception {
++        LightPropagationParityTest.bootstrap();
++    }
++
++    @Before
++    public void setUp() {
++        this.prevAsyncCatcher = org.spigotmc.AsyncCatcher.enabled;
++        org.spigotmc.AsyncCatcher.enabled = false;
++        Lighting.asyncBulkRelight = true;
++        Lighting.asyncRelightThreads = 1;
++        Lighting.relightSnapshotBudgetMs = 50;
++        Lighting.relightApplyBudgetMs = 50;
++    }
++
++    @After
++    public void tearDown() {
++        if (this.activeWorld != null) {
++            this.activeWorld.shutdownRelightService();
++            this.activeWorld = null;
++        }
++        Lighting.asyncBulkRelight = false;
++        Lighting.asyncRelightThreads = 0;
++        Lighting.relightSnapshotBudgetMs = 5;
++        Lighting.relightApplyBudgetMs = 2;
++        org.spigotmc.AsyncCatcher.enabled = this.prevAsyncCatcher;
++    }
++
++    private WorldServer makeWorld(long seed) throws Exception {
++        LightPropagationParityTest.StubProvider[] p = new LightPropagationParityTest.StubProvider[1];
++        WorldServer world = LightPropagationParityTest.buildWorld(seed, p);
++        LightPropagationParityTest.set(World.class, world, "chunkPacketBlockController",
++            com.destroystokyo.paper.antixray.ChunkPacketBlockController.NO_OPERATION_INSTANCE);
++        for (int cx = -2; cx <= 1; ++cx) {
++            for (int cz = -2; cz <= 1; ++cz) {
++                Chunk c = world.getChunkIfLoaded(cx, cz);
++                LightPropagationParityTest.set(Chunk.class, c, "locX", cx);
++                LightPropagationParityTest.set(Chunk.class, c, "locZ", cz);
++                LightPropagationParityTest.set(Chunk.class, c, "g", new byte[256]); // biomes
++            }
++        }
++        this.activeWorld = world;
++        return world;
++    }
++
++    @Test
++    public void roundTripWritesMarkerWhilePendingAndOmitsAfterApply() throws Exception {
++        WorldServer world = makeWorld(601L);
++        Chunk chunk = world.getChunkIfLoaded(0, 0);
++        RelightService service = world.getRelightService();
++
++        // 1. Clean chunk: no marker written (vanilla-identical)
++        NBTTagCompound cleanLevel = new NBTTagCompound();
++        ChunkRegionLoader.saveBody(cleanLevel, chunk, 100L, true, ChunkRegionLoader.captureLightPending(world, chunk));
++        assertFalse("clean chunk must not write Antarctic.LightPending", cleanLevel.hasKey(ChunkRegionLoader.ANTARCTIC_LIGHT_PENDING_KEY));
++
++        // 2. Submit relight: chunk is pending -> marker written as TAG_Byte = 1
++        CompletableFuture<Integer> future = service.submit(new long[]{chunk.chunkKey});
++        assertTrue(chunk.antarcticLightPending);
++        assertTrue(ChunkRegionLoader.captureLightPending(world, chunk));
++
++        NBTTagCompound pendingLevel = new NBTTagCompound();
++        ChunkRegionLoader.saveBody(pendingLevel, chunk, 100L, true, ChunkRegionLoader.captureLightPending(world, chunk));
++        assertTrue(pendingLevel.hasKeyOfType(ChunkRegionLoader.ANTARCTIC_LIGHT_PENDING_KEY, 1)); // TAG_Byte
++        assertEquals((byte) 1, pendingLevel.getByte(ChunkRegionLoader.ANTARCTIC_LIGHT_PENDING_KEY));
++
++        // All other tags are identical to clean save
++        NBTTagCompound pendingCopyWithoutMarker = (NBTTagCompound) pendingLevel.clone();
++        pendingCopyWithoutMarker.remove(ChunkRegionLoader.ANTARCTIC_LIGHT_PENDING_KEY);
++        assertEquals("all non-marker tags must be byte-identical to vanilla save", cleanLevel, pendingCopyWithoutMarker);
++
++        // 3. Apply finishes: marker cleared and omitted on next save
++        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
++        while (!future.isDone() && System.nanoTime() < deadline) {
++            service.tick();
++            if (!future.isDone()) Thread.sleep(1);
++        }
++        assertTrue(future.isDone());
++        assertFalse("applied chunk must clear antarcticLightPending", chunk.antarcticLightPending);
++        assertFalse("applied chunk must not report pending on save capture", ChunkRegionLoader.captureLightPending(world, chunk));
++
++        NBTTagCompound afterApply = new NBTTagCompound();
++        ChunkRegionLoader.saveBody(afterApply, chunk, 100L, true, ChunkRegionLoader.captureLightPending(world, chunk));
++        assertFalse("save after apply must omit Antarctic.LightPending", afterApply.hasKey(ChunkRegionLoader.ANTARCTIC_LIGHT_PENDING_KEY));
++    }
++
++    @Test
++    public void tolerantReadHandlesAllNumericAndMalformedTypesPlusFutureSchema() throws Exception {
++        WorldServer world = makeWorld(602L);
++        Chunk chunk = world.getChunkIfLoaded(0, 0);
++
++        // Missing key (vanilla 1.12.2 save) -> false
++        ChunkRegionLoader.readAntarcticLightPending(chunk, new NBTTagCompound(), world);
++        assertFalse(chunk.antarcticLightPending);
++
++        // Numeric zero -> false
++        NBTTagCompound zero = new NBTTagCompound();
++        zero.setByte(ChunkRegionLoader.ANTARCTIC_LIGHT_PENDING_KEY, (byte) 0);
++        ChunkRegionLoader.readAntarcticLightPending(chunk, zero, world);
++        assertFalse(chunk.antarcticLightPending);
++
++        // Numeric non-zero types (byte, short, int, long) -> true
++        NBTTagCompound asShort = new NBTTagCompound();
++        asShort.setShort(ChunkRegionLoader.ANTARCTIC_LIGHT_PENDING_KEY, (short) 1);
++        ChunkRegionLoader.readAntarcticLightPending(chunk, asShort, world);
++        assertTrue(chunk.antarcticLightPending);
++
++        NBTTagCompound asInt = new NBTTagCompound();
++        asInt.setInt(ChunkRegionLoader.ANTARCTIC_LIGHT_PENDING_KEY, 1);
++        ChunkRegionLoader.readAntarcticLightPending(chunk, asInt, world);
++        assertTrue(chunk.antarcticLightPending);
++
++        NBTTagCompound asLong = new NBTTagCompound();
++        asLong.setLong(ChunkRegionLoader.ANTARCTIC_LIGHT_PENDING_KEY, 1L);
++        ChunkRegionLoader.readAntarcticLightPending(chunk, asLong, world);
++        assertTrue(chunk.antarcticLightPending);
++
++        // Malformed non-numeric types (string, compound, list) -> false, never throws, warns once
++        NBTTagCompound asString = new NBTTagCompound();
++        asString.setString(ChunkRegionLoader.ANTARCTIC_LIGHT_PENDING_KEY, "yes");
++        ChunkRegionLoader.readAntarcticLightPending(chunk, asString, world);
++        assertFalse(chunk.antarcticLightPending);
++        assertTrue("malformed tag should record one-time world warning flag", world.antarcticWarnedMalformedLightMarker);
++
++        NBTTagCompound asCompound = new NBTTagCompound();
++        asCompound.set(ChunkRegionLoader.ANTARCTIC_LIGHT_PENDING_KEY, new NBTTagCompound());
++        ChunkRegionLoader.readAntarcticLightPending(chunk, asCompound, world);
++        assertFalse(chunk.antarcticLightPending);
++
++        NBTTagCompound asList = new NBTTagCompound();
++        asList.set(ChunkRegionLoader.ANTARCTIC_LIGHT_PENDING_KEY, new NBTTagList());
++        ChunkRegionLoader.readAntarcticLightPending(chunk, asList, world);
++        assertFalse(chunk.antarcticLightPending);
++
++        // Future schema v2 coexistence: v1 marker honored, unknown Antarctic.Light compound ignored
++        NBTTagCompound futureV2 = new NBTTagCompound();
++        futureV2.setByte(ChunkRegionLoader.ANTARCTIC_LIGHT_PENDING_KEY, (byte) 1);
++        NBTTagCompound v2Payload = new NBTTagCompound();
++        v2Payload.setInt("Version", 2);
++        futureV2.set("Antarctic.Light", v2Payload);
++        ChunkRegionLoader.readAntarcticLightPending(chunk, futureV2, world);
++        assertTrue("v1 marker must still load as pending alongside unknown Antarctic.Light compound", chunk.antarcticLightPending);
++    }
++
++    @Test
++    public void toggleOffCarriesMarkerWithoutDroppingIt() throws Exception {
++        Lighting.asyncBulkRelight = false;
++        WorldServer world = makeWorld(603L);
++        Chunk chunk = world.getChunkIfLoaded(0, 0);
++
++        NBTTagCompound loadedLevel = new NBTTagCompound();
++        loadedLevel.setByte(ChunkRegionLoader.ANTARCTIC_LIGHT_PENDING_KEY, (byte) 1);
++        ChunkRegionLoader.readAntarcticLightPending(chunk, loadedLevel, world);
++        assertTrue("marker must be carried on chunk even when async-bulk-relight=false", chunk.antarcticLightPending);
++
++        // Save while toggle is still false -> marker is preserved for when feature is re-enabled!
++        boolean captured = ChunkRegionLoader.captureLightPending(world, chunk);
++        assertTrue(captured);
++        NBTTagCompound savedLevel = new NBTTagCompound();
++        ChunkRegionLoader.saveBody(savedLevel, chunk, 200L, true, captured);
++        assertEquals((byte) 1, savedLevel.getByte(ChunkRegionLoader.ANTARCTIC_LIGHT_PENDING_KEY));
++    }
++
++    @Test
++    public void capturedBooleanIsolatesLazySaveFromSubsequentApply() throws Exception {
++        WorldServer world = makeWorld(604L);
++        Chunk chunk = world.getChunkIfLoaded(0, 0);
++        RelightService service = world.getRelightService();
++
++        CompletableFuture<Integer> future = service.submit(new long[]{chunk.chunkKey});
++        // Capture happens on main thread BEFORE apply completes
++        boolean capturedBeforeApply = ChunkRegionLoader.captureLightPending(world, chunk);
++        assertTrue(capturedBeforeApply);
++
++        // Apply finishes on main thread BEFORE lazy IO-thread supplier executes saveBody
++        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
++        while (!future.isDone() && System.nanoTime() < deadline) {
++            service.tick();
++            if (!future.isDone()) Thread.sleep(1);
++        }
++        assertTrue(future.isDone());
++        assertFalse(chunk.antarcticLightPending);
++
++        // Capturing AFTER apply must yield false (never writes stale marker)
++        boolean capturedAfterApply = ChunkRegionLoader.captureLightPending(world, chunk);
++        assertFalse("save captured after apply must not write marker", capturedAfterApply);
++        NBTTagCompound afterLevel = new NBTTagCompound();
++        ChunkRegionLoader.saveBody(afterLevel, chunk, 300L, true, capturedAfterApply);
++        assertFalse(afterLevel.hasKey(ChunkRegionLoader.ANTARCTIC_LIGHT_PENDING_KEY));
++    }
++}

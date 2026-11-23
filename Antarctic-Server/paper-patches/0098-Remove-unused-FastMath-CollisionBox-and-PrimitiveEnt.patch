@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Wed, 18 Nov 2026 14:42:54 +0700
-Subject: [PATCH 98/98] Remove unused FastMath, CollisionBox and
+Subject: [PATCH 098/115] Remove unused FastMath, CollisionBox and
  PrimitiveEntityList
 
 These three helpers (299 lines plus their tests) had no production callers. Integration was evaluated and rejected: FastMath.floor lacks MathHelper.floor's overflow guard and its chunk key reverses the canonical X/Z halves; Entity.move already uses allocation-free AxisAlignedBB offset methods, so CollisionBox removes nothing; World.getEntities returns a List that plugins depend on, so PrimitiveEntityList cannot replace it. No measured gain exists for any of them.

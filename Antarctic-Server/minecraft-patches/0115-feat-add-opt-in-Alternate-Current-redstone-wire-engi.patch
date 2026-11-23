@@ -1,0 +1,1408 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Mon, 23 Nov 2026 10:47:16 +0700
+Subject: [PATCH 115/115] feat: add opt-in Alternate Current redstone wire
+ engine
+
+
+diff --git a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+index e5723d0..dbb37ce 100644
+--- a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
++++ b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+@@ -20,6 +20,7 @@ import com.destroystokyo.paper.config.toml.modules.optimizations.Projectiles;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Suffocation;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Physics;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Rails;
++import com.destroystokyo.paper.config.toml.modules.optimizations.Redstone;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Lighting;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.SunBurn;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.WorldBorder;
+@@ -53,7 +54,7 @@ public final class AntarcticTomlConfig {
+             new Rebrand(), new Privacy(),
+             new Deflate(),
+             new VirtualThreads(), new AsyncPlayerDataSaving(),
+-            new Pathfinder(), new Suffocation(), new Projectiles(), new ArmourStands(), new WorldBorder(), new ChunkLoading(), new SunBurn(), new Rails(), new Physics(), new Lighting(),
++            new Pathfinder(), new Suffocation(), new Projectiles(), new ArmourStands(), new WorldBorder(), new ChunkLoading(), new SunBurn(), new Rails(), new Redstone(), new Physics(), new Lighting(),
+             new MergeChecks(), new ChunkOverloadDupe(), new Collisions(),
+             new MapDecorations(), new Books());
+     private static final YamlConfiguration yamlFacade = new YamlConfiguration();
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/Redstone.java b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/Redstone.java
+new file mode 100644
+index 0000000..3832b08
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/Redstone.java
+@@ -0,0 +1,58 @@
++package com.destroystokyo.paper.config.toml.modules.optimizations;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++import java.util.Locale;
++
++public class Redstone implements IConfigModule {
++
++    @ConfigInfo(
++        baseName = "implementation",
++        comments = "Redstone wire update engine: 'vanilla' (default, honors paper.yml use-faster-eigencraft-redstone), 'eigencraft', or 'alternate-current' (Space Walker's O(N) non-locational algorithm adapted for 1.12.2).\nDefault 'vanilla' preserves strict 1.12.2 vanilla/Paper behavior."
++    )
++    public static String implementation = "vanilla";
++
++    public static boolean isAlternateCurrent() {
++        String impl = implementation;
++        return impl == "alternate-current" || "alternate-current".equalsIgnoreCase(impl);
++    }
++
++    public static boolean isEigencraft() {
++        String impl = implementation;
++        return impl == "eigencraft" || "eigencraft".equalsIgnoreCase(impl);
++    }
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.OPTIMIZATIONS;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "redstone";
++    }
++
++    @Override
++    public void onLoaded(com.electronwill.nightconfig.core.file.CommentedFileConfig config) {
++        if (implementation == null) {
++            throw new IllegalArgumentException("optimizations.redstone.implementation must not be null");
++        }
++        String normalized = implementation.trim().toLowerCase(Locale.ROOT);
++        switch (normalized) {
++            case "vanilla":
++                implementation = "vanilla";
++                break;
++            case "eigencraft":
++                implementation = "eigencraft";
++                break;
++            case "alternate-current":
++                implementation = "alternate-current";
++                break;
++            default:
++                throw new IllegalArgumentException(
++                    "optimizations.redstone.implementation must be one of 'vanilla', 'eigencraft', or 'alternate-current', got: " + implementation
++                );
++        }
++    }
++}
+diff --git a/main/java/com/destroystokyo/paper/util/AlternateCurrentWireHandler.java b/main/java/com/destroystokyo/paper/util/AlternateCurrentWireHandler.java
+new file mode 100644
+index 0000000..ee4db47
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/util/AlternateCurrentWireHandler.java
+@@ -0,0 +1,759 @@
++package com.destroystokyo.paper.util;
++
++import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
++import it.unimi.dsi.fastutil.longs.LongArrayList;
++import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
++import it.unimi.dsi.fastutil.objects.ObjectArrayList;
++import javax.annotation.Nullable;
++import net.minecraft.server.Block;
++import net.minecraft.server.BlockPosition;
++import net.minecraft.server.BlockRedstoneWire;
++import net.minecraft.server.Blocks;
++import net.minecraft.server.EnumDirection;
++import net.minecraft.server.IBlockData;
++import net.minecraft.server.World;
++import org.bukkit.craftbukkit.event.CraftEventFactory;
++import org.bukkit.event.block.BlockPhysicsEvent;
++
++/**
++ * Opt-in O(N) non-locational redstone wire engine for 1.12.2 inspired by
++ * Alternate Current (original algorithm by Space Walker, MIT license).
++ *
++ * <p>Preserves exact 1.12.2 MCP-940 wire connectivity:
++ * <ul>
++ *   <li>Horizontal neighbors: always bidirectional.</li>
++ *   <li>Upward step ({@code u -> side.up()}): allowed iff {@code !u.up().isNormalCube()}.</li>
++ *   <li>Downward step ({@code u -> side.down()}): allowed iff
++ *       {@code u.down().isNormalCube() && !side.isNormalCube()} — preserving the
++ *       glowstone / top-slab one-way upward diode and solid-block cut rules.</li>
++ *   <li>Deduplicated 24-neighbor (Manhattan &lt;= 2) physics notifications preserve
++ *       1.12.2 piston/dropper quasi-connectivity while eliminating MC-81098 O(N^2)
++ *       depower cascades.</li>
++ * </ul>
++ *
++ * <p>Per-world instance with {@code try/finally} cleanup prior to neighbor notifications,
++ * guaranteeing immunity to permanent freezes on exceptions and full reentrancy safety.
++ */
++public final class AlternateCurrentWireHandler {
++
++    private static final int MAX_RECURSION_DEPTH = 64;
++
++    // Horizontal cardinal offsets: W, E, N, S (deterministic non-locational order)
++    private static final int[] H_DX = {-1, 1, 0, 0};
++    private static final int[] H_DZ = {0, 0, -1, 1};
++
++    // 24 neighbors (Manhattan 1 and 2) with adjacent source offset (fromDx, fromDy, fromDz)
++    // Order matches vanilla notifyNeighborsOfStateChange: W, E, D, U, N, S then Manhattan-2 ring.
++    private static final int[][] NEIGHBOR_OFFSETS_24 = {
++        // Manhattan 1 (from wire itself: 0,0,0)
++        {-1,  0,  0,   0,  0,  0},
++        { 1,  0,  0,   0,  0,  0},
++        { 0, -1,  0,   0,  0,  0},
++        { 0,  1,  0,   0,  0,  0},
++        { 0,  0, -1,   0,  0,  0},
++        { 0,  0,  1,   0,  0,  0},
++        // Manhattan 2 (from intermediate Manhattan-1 neighbor)
++        {-2,  0,  0,  -1,  0,  0},
++        {-1, -1,  0,  -1,  0,  0},
++        {-1,  1,  0,  -1,  0,  0},
++        {-1,  0, -1,  -1,  0,  0},
++        {-1,  0,  1,  -1,  0,  0},
++        { 2,  0,  0,   1,  0,  0},
++        { 1, -1,  0,   1,  0,  0},
++        { 1,  1,  0,   1,  0,  0},
++        { 1,  0, -1,   1,  0,  0},
++        { 1,  0,  1,   1,  0,  0},
++        { 0, -2,  0,   0, -1,  0},
++        { 0, -1, -1,   0, -1,  0},
++        { 0, -1,  1,   0, -1,  0},
++        { 0,  2,  0,   0,  1,  0},
++        { 0,  1, -1,   0,  1,  0},
++        { 0,  1,  1,   0,  1,  0},
++        { 0,  0, -2,   0,  0, -1},
++        { 0,  0,  2,   0,  0,  1}
++    };
++
++    private static final class WireNode {
++        int x;
++        int y;
++        int z;
++        long key;
++        BlockPosition pos;
++        IBlockData state;
++        int currentPower;
++        int virtualPower;
++        int externalPower;
++        int maxPossible;
++        boolean externalComputed;
++        int queuedBucket;
++        WireNode prevInBucket;
++        WireNode nextInBucket;
++
++        void init(int x, int y, int z, long key, BlockPosition pos, IBlockData state) {
++            this.x = x;
++            this.y = y;
++            this.z = z;
++            this.key = key;
++            this.pos = pos;
++            this.state = state;
++            this.currentPower = state.get(BlockRedstoneWire.POWER).intValue();
++            this.virtualPower = 0;
++            this.externalPower = 0;
++            this.maxPossible = 0;
++            this.externalComputed = false;
++            this.queuedBucket = -1;
++            this.prevInBucket = null;
++            this.nextInBucket = null;
++        }
++    }
++
++    private final World world;
++    private final BlockRedstoneWire wire;
++
++    // Reusable per-world working structures (always cleared in finally before Phase B)
++    private final Long2ObjectOpenHashMap<WireNode> nodes = new Long2ObjectOpenHashMap<WireNode>(128);
++    private final ObjectArrayList<WireNode> network = new ObjectArrayList<WireNode>(128);
++    private final ObjectArrayList<WireNode> nodePool = new ObjectArrayList<WireNode>(128);
++    private final WireNode[] bucketHeads = new WireNode[16];
++    private final WireNode[] bucketTails = new WireNode[16];
++    private final BlockPosition.MutableBlockPosition cursor = new BlockPosition.MutableBlockPosition();
++    private final LongArrayList deferredTriggers = new LongArrayList();
++
++    private boolean inPhaseA = false;
++    private int recursionDepth = 0;
++
++    public AlternateCurrentWireHandler(World world, BlockRedstoneWire wire) {
++        this.world = world;
++        this.wire = wire;
++    }
++
++    public static long packPos(int x, int y, int z) {
++        return (((long) x & 0x3FFFFFFL) << 38) | (((long) y & 0xFFFL) << 26) | ((long) z & 0x3FFFFFFL);
++    }
++
++    private static int unpackX(long key) {
++        return (int) (key >> 38);
++    }
++
++    private static int unpackY(long key) {
++        return (int) ((key << 26) >> 52);
++    }
++
++    private static int unpackZ(long key) {
++        return (int) ((key << 38) >> 38);
++    }
++
++    public void onWireUpdated(BlockPosition pos, @Nullable BlockPosition source) {
++        if (this.world.isClientSide) {
++            return;
++        }
++        int x = pos.getX();
++        int y = pos.getY();
++        int z = pos.getZ();
++        if (this.inPhaseA) {
++            this.deferredTriggers.add(packPos(x, y, z));
++            return;
++        }
++        if (this.recursionDepth >= MAX_RECURSION_DEPTH) {
++            return;
++        }
++        IBlockData state = this.world.getType(pos);
++        if (state.getBlock() != this.wire) {
++            return;
++        }
++        // Fast O(1) equilibrium check: if trigger wire already matches external + incoming wire power, skip walk.
++        int current = state.get(BlockRedstoneWire.POWER).intValue();
++        int ext = this.computeExternalPower(pos);
++        int incoming = this.computeMaxIncomingWirePower(x, y, z);
++        int expected = Math.max(ext, incoming - 1);
++        if (expected == current) {
++            return;
++        }
++        runNetworkUpdate(x, y, z, pos, state, ext, true);
++    }
++
++    public void onWireAdded(BlockPosition pos) {
++        if (this.world.isClientSide) {
++            return;
++        }
++        int x = pos.getX();
++        int y = pos.getY();
++        int z = pos.getZ();
++        if (this.inPhaseA) {
++            this.deferredTriggers.add(packPos(x, y, z));
++            return;
++        }
++        if (this.recursionDepth >= MAX_RECURSION_DEPTH) {
++            return;
++        }
++        IBlockData state = this.world.getType(pos);
++        if (state.getBlock() != this.wire) {
++            return;
++        }
++        int ext = this.computeExternalPower(pos);
++        runNetworkUpdate(x, y, z, pos, state, ext, false);
++        // Match vanilla BlockRedstoneWire.onPlace vertical + neighboring wire shape/direction updates
++        this.world.applyPhysics(pos.up(), this.wire, false);
++        this.world.applyPhysics(pos.down(), this.wire, false);
++        notifyConnectedWireNeighborsForShapeChange(x, y, z);
++    }
++
++    public void onWireRemoved(BlockPosition pos, IBlockData oldState) {
++        if (this.world.isClientSide) {
++            return;
++        }
++        int x = pos.getX();
++        int y = pos.getY();
++        int z = pos.getZ();
++        // Notify 6 immediate neighbors of the removed wire first (matches vanilla remove)
++        for (EnumDirection dir : EnumDirection.values()) {
++            this.world.applyPhysics(pos.shift(dir), this.wire, false);
++        }
++        if (this.inPhaseA) {
++            enqueueAdjacentWireTriggers(x, y, z);
++            return;
++        }
++        if (this.recursionDepth >= MAX_RECURSION_DEPTH) {
++            return;
++        }
++        // Seed a combined network update from every adjacent wire that could have connected to the removed wire
++        runMultiSeedNetworkUpdate(x, y, z);
++        notifyConnectedWireNeighborsForShapeChange(x, y, z);
++    }
++
++    private void enqueueAdjacentWireTriggers(int x, int y, int z) {
++        for (int i = 0; i < 4; ++i) {
++            int nx = x + H_DX[i];
++            int nz = z + H_DZ[i];
++            if (isWireAt(nx, y, nz)) this.deferredTriggers.add(packPos(nx, y, nz));
++            if (isWireAt(nx, y + 1, nz)) this.deferredTriggers.add(packPos(nx, y + 1, nz));
++            if (isWireAt(nx, y - 1, nz)) this.deferredTriggers.add(packPos(nx, y - 1, nz));
++        }
++    }
++
++    private void notifyConnectedWireNeighborsForShapeChange(int x, int y, int z) {
++        boolean hasPhysicsListeners = BlockPhysicsEvent.getHandlerList().getRegisteredListeners().length != 0;
++        for (int i = 0; i < 4; ++i) {
++            int nx = x + H_DX[i];
++            int nz = z + H_DZ[i];
++            notifyWireShapeIfPresent(nx, y, nz, hasPhysicsListeners);
++            IBlockData sideState = getTypeAt(nx, y, nz);
++            if (sideState.l()) {
++                notifyWireShapeIfPresent(nx, y + 1, nz, hasPhysicsListeners);
++            } else {
++                notifyWireShapeIfPresent(nx, y - 1, nz, hasPhysicsListeners);
++            }
++        }
++    }
++
++    private void notifyWireShapeIfPresent(int x, int y, int z, boolean hasPhysicsListeners) {
++        if (!isWireAt(x, y, z)) {
++            return;
++        }
++        BlockPosition wirePos = new BlockPosition(x, y, z);
++        for (int d = 0; d < 6; ++d) {
++            int[] off = NEIGHBOR_OFFSETS_24[d];
++            int nx = x + off[0];
++            int ny = y + off[1];
++            int nz = z + off[2];
++            IBlockData ns = getTypeAt(nx, ny, nz);
++            Block nb = ns.getBlock();
++            if (nb == this.wire) {
++                continue;
++            }
++            if (nb == Blocks.AIR && !hasPhysicsListeners) {
++                continue;
++            }
++            this.world.a(new BlockPosition(nx, ny, nz), this.wire, wirePos);
++        }
++    }
++
++    private void runNetworkUpdate(int seedX, int seedY, int seedZ, BlockPosition seedPos, IBlockData seedState,
++                                  int seedExt, boolean singleTrigger) {
++        long[] changedCoords = null;
++        LongOpenHashSet settledWires = null;
++        this.recursionDepth++;
++        try {
++            this.inPhaseA = true;
++            try {
++                WireNode seed = getOrCreateNode(seedX, seedY, seedZ, seedPos, seedState);
++                seed.externalPower = seedExt;
++                seed.externalComputed = true;
++                int boundary = computeMaxIncomingWirePower(seedX, seedY, seedZ);
++                seed.maxPossible = Math.max(Math.max(seedExt, boundary - 1), seed.currentPower);
++                discoverAndResolve();
++                if (!this.network.isEmpty()) {
++                    settledWires = new LongOpenHashSet(this.network.size() * 2);
++                    changedCoords = commitChangesAndCollect(settledWires);
++                }
++            } finally {
++                resetWorkingState();
++                this.inPhaseA = false;
++            }
++
++            if (changedCoords != null && changedCoords.length > 0) {
++                emitNeighborUpdates(changedCoords, settledWires);
++            }
++
++            // Drain any reentrant triggers queued during Phase A (e.g. from BlockRedstoneEvent listeners)
++            drainDeferredTriggers();
++        } finally {
++            this.recursionDepth--;
++        }
++    }
++
++    private void runMultiSeedNetworkUpdate(int cx, int cy, int cz) {
++        long[] changedCoords = null;
++        LongOpenHashSet settledWires = null;
++        this.recursionDepth++;
++        try {
++            this.inPhaseA = true;
++            try {
++                for (int i = 0; i < 4; ++i) {
++                    int nx = cx + H_DX[i];
++                    int nz = cz + H_DZ[i];
++                    tryAddSeed(nx, cy, nz);
++                    tryAddSeed(nx, cy + 1, nz);
++                    tryAddSeed(nx, cy - 1, nz);
++                }
++                if (!this.network.isEmpty()) {
++                    discoverAndResolve();
++                    settledWires = new LongOpenHashSet(this.network.size() * 2);
++                    changedCoords = commitChangesAndCollect(settledWires);
++                }
++            } finally {
++                resetWorkingState();
++                this.inPhaseA = false;
++            }
++
++            if (changedCoords != null && changedCoords.length > 0) {
++                emitNeighborUpdates(changedCoords, settledWires);
++            }
++
++            drainDeferredTriggers();
++        } finally {
++            this.recursionDepth--;
++        }
++    }
++
++    private void tryAddSeed(int x, int y, int z) {
++        IBlockData state = getTypeAt(x, y, z);
++        if (state.getBlock() != this.wire) {
++            return;
++        }
++        long key = packPos(x, y, z);
++        if (this.nodes.containsKey(key)) {
++            return;
++        }
++        BlockPosition pos = new BlockPosition(x, y, z);
++        WireNode node = getOrCreateNode(x, y, z, pos, state);
++        int ext = computeExternalPower(pos);
++        node.externalPower = ext;
++        node.externalComputed = true;
++        int boundary = computeMaxIncomingWirePower(x, y, z);
++        node.maxPossible = Math.max(Math.max(ext, boundary - 1), node.currentPower);
++    }
++
++    private void drainDeferredTriggers() {
++        while (!this.deferredTriggers.isEmpty() && this.recursionDepth < MAX_RECURSION_DEPTH) {
++            long key = this.deferredTriggers.removeLong(this.deferredTriggers.size() - 1);
++            BlockPosition bp = new BlockPosition(unpackX(key), unpackY(key), unpackZ(key));
++            onWireUpdated(bp, null);
++        }
++    }
++
++    private void discoverAndResolve() {
++        // Step 1: BFS along outgoing MCP-940 directed edges to collect all potentially affected wires
++        for (int idx = 0; idx < this.network.size(); ++idx) {
++            WireNode u = this.network.get(idx);
++            if (!u.externalComputed) {
++                u.externalPower = computeExternalPower(u.pos);
++                u.externalComputed = true;
++                if (u.externalPower > u.maxPossible) {
++                    u.maxPossible = u.externalPower;
++                }
++            }
++
++            boolean canGoUp = !getTypeAt(u.x, u.y + 1, u.z).l();
++            boolean belowIsNormalCube = getTypeAt(u.x, u.y - 1, u.z).l();
++            int nextMax = u.maxPossible - 1;
++
++            for (int d = 0; d < 4; ++d) {
++                int nx = u.x + H_DX[d];
++                int nz = u.z + H_DZ[d];
++
++                IBlockData sideState = getTypeAt(nx, u.y, nz);
++                // 1) Horizontal neighbor: always connected
++                if (sideState.getBlock() == this.wire) {
++                    considerDiscoveryNeighbor(u, nx, u.y, nz, sideState, nextMax);
++                }
++
++                // 2) Upward step: u -> side.up() iff !u.up().isNormalCube()
++                if (canGoUp) {
++                    IBlockData upState = getTypeAt(nx, u.y + 1, nz);
++                    if (upState.getBlock() == this.wire) {
++                        considerDiscoveryNeighbor(u, nx, u.y + 1, nz, upState, nextMax);
++                    }
++                }
++
++                // 3) Downward step: u -> side.down() iff u.down().isNormalCube() && !side.isNormalCube()
++                if (belowIsNormalCube && !sideState.l()) {
++                    IBlockData downState = getTypeAt(nx, u.y - 1, nz);
++                    if (downState.getBlock() == this.wire) {
++                        considerDiscoveryNeighbor(u, nx, u.y - 1, nz, downState, nextMax);
++                    }
++                }
++            }
++        }
++
++        // Step 2: Initialize each network wire's virtualPower from external non-wire sources + non-network incoming wires
++        int size = this.network.size();
++        for (int i = 0; i < size; ++i) {
++            WireNode node = this.network.get(i);
++            int power = node.externalPower;
++            int boundaryPower = computeBoundaryIncomingPower(node);
++            if (boundaryPower - 1 > power) {
++                power = boundaryPower - 1;
++            }
++            node.virtualPower = power;
++            if (power >= 2) {
++                enqueueBucket(node, power);
++            }
++        }
++
++        // Step 3: Exact descending 16-bucket Dijkstra propagation (15 down to 2)
++        for (int p = 15; p >= 2; --p) {
++            WireNode u;
++            while ((u = pollBucket(p)) != null) {
++                if (u.virtualPower != p) {
++                    continue;
++                }
++                int nextPower = p - 1;
++                boolean canGoUp = !getTypeAt(u.x, u.y + 1, u.z).l();
++                boolean belowIsNormalCube = getTypeAt(u.x, u.y - 1, u.z).l();
++
++                for (int d = 0; d < 4; ++d) {
++                    int nx = u.x + H_DX[d];
++                    int nz = u.z + H_DZ[d];
++
++                    IBlockData sideState = getTypeAt(nx, u.y, nz);
++                    if (sideState.getBlock() == this.wire) {
++                        relaxNeighbor(nx, u.y, nz, sideState, nextPower);
++                    }
++                    if (canGoUp) {
++                        IBlockData upState = getTypeAt(nx, u.y + 1, nz);
++                        if (upState.getBlock() == this.wire) {
++                            relaxNeighbor(nx, u.y + 1, nz, upState, nextPower);
++                        }
++                    }
++                    if (belowIsNormalCube && !sideState.l()) {
++                        IBlockData downState = getTypeAt(nx, u.y - 1, nz);
++                        if (downState.getBlock() == this.wire) {
++                            relaxNeighbor(nx, u.y - 1, nz, downState, nextPower);
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    private void considerDiscoveryNeighbor(WireNode u, int vx, int vy, int vz, IBlockData vState, int nextMax) {
++        long key = packPos(vx, vy, vz);
++        WireNode existing = this.nodes.get(key);
++        if (existing != null) {
++            if (nextMax > existing.maxPossible) {
++                existing.maxPossible = nextMax;
++            }
++            return;
++        }
++        int vPower = vState.get(BlockRedstoneWire.POWER).intValue();
++        boolean mayLosePower = u.currentPower > 0 && vPower > 0 && vPower <= u.currentPower;
++        boolean mayGainPower = nextMax > vPower;
++        if (!mayLosePower && !mayGainPower) {
++            return;
++        }
++        WireNode v = getOrCreateNode(vx, vy, vz, new BlockPosition(vx, vy, vz), vState);
++        v.maxPossible = Math.max(nextMax, vPower);
++    }
++
++    private void relaxNeighbor(int vx, int vy, int vz, IBlockData vState, int nextPower) {
++        long key = packPos(vx, vy, vz);
++        WireNode v = this.nodes.get(key);
++        if (v == null) {
++            int vCurrent = vState.get(BlockRedstoneWire.POWER).intValue();
++            if (nextPower <= vCurrent) {
++                return;
++            }
++            // Dynamic expansion if a wire outside the initial discovery can receive higher power
++            BlockPosition vPos = new BlockPosition(vx, vy, vz);
++            v = getOrCreateNode(vx, vy, vz, vPos, vState);
++            v.externalPower = computeExternalPower(vPos);
++            v.externalComputed = true;
++            int base = Math.max(v.externalPower, computeBoundaryIncomingPower(v) - 1);
++            v.virtualPower = Math.max(base, nextPower);
++            if (v.virtualPower >= 2) {
++                enqueueBucket(v, v.virtualPower);
++            }
++            return;
++        }
++        if (nextPower > v.virtualPower) {
++            v.virtualPower = nextPower;
++            if (nextPower >= 2) {
++                enqueueBucket(v, nextPower);
++            }
++        }
++    }
++
++    private int computeBoundaryIncomingPower(WireNode node) {
++        int maxPower = 0;
++        boolean aboveIsNormalCube = getTypeAt(node.x, node.y + 1, node.z).l();
++        for (int d = 0; d < 4; ++d) {
++            int nx = node.x + H_DX[d];
++            int nz = node.z + H_DZ[d];
++
++            IBlockData sideState = getTypeAt(nx, node.y, nz);
++            if (sideState.getBlock() == this.wire && !this.nodes.containsKey(packPos(nx, node.y, nz))) {
++                int p = sideState.get(BlockRedstoneWire.POWER).intValue();
++                if (p > maxPower) maxPower = p;
++            }
++
++            // MCP-940 incoming rules for node pulling from neighbors:
++            // side.up() iff side.isNormalCube() && !node.up().isNormalCube()
++            // side.down() iff !side.isNormalCube()
++            if (sideState.l() && !aboveIsNormalCube) {
++                IBlockData upState = getTypeAt(nx, node.y + 1, nz);
++                if (upState.getBlock() == this.wire && !this.nodes.containsKey(packPos(nx, node.y + 1, nz))) {
++                    int p = upState.get(BlockRedstoneWire.POWER).intValue();
++                    if (p > maxPower) maxPower = p;
++                }
++            } else if (!sideState.l()) {
++                IBlockData downState = getTypeAt(nx, node.y - 1, nz);
++                if (downState.getBlock() == this.wire && !this.nodes.containsKey(packPos(nx, node.y - 1, nz))) {
++                    int p = downState.get(BlockRedstoneWire.POWER).intValue();
++                    if (p > maxPower) maxPower = p;
++                }
++            }
++        }
++        return maxPower;
++    }
++
++    private int computeMaxIncomingWirePower(int x, int y, int z) {
++        int maxPower = 0;
++        boolean aboveIsNormalCube = getTypeAt(x, y + 1, z).l();
++        for (int d = 0; d < 4; ++d) {
++            int nx = x + H_DX[d];
++            int nz = z + H_DZ[d];
++
++            IBlockData sideState = getTypeAt(nx, y, nz);
++            if (sideState.getBlock() == this.wire) {
++                int p = sideState.get(BlockRedstoneWire.POWER).intValue();
++                if (p > maxPower) maxPower = p;
++            }
++            if (sideState.l() && !aboveIsNormalCube) {
++                IBlockData upState = getTypeAt(nx, y + 1, nz);
++                if (upState.getBlock() == this.wire) {
++                    int p = upState.get(BlockRedstoneWire.POWER).intValue();
++                    if (p > maxPower) maxPower = p;
++                }
++            } else if (!sideState.l()) {
++                IBlockData downState = getTypeAt(nx, y - 1, nz);
++                if (downState.getBlock() == this.wire) {
++                    int p = downState.get(BlockRedstoneWire.POWER).intValue();
++                    if (p > maxPower) maxPower = p;
++                }
++            }
++        }
++        return maxPower;
++    }
++
++    private long[] commitChangesAndCollect(LongOpenHashSet settledWires) {
++        int size = this.network.size();
++        long[] changed = new long[size];
++        int changedCount = 0;
++        for (int i = 0; i < size; ++i) {
++            WireNode node = this.network.get(i);
++            settledWires.add(node.key);
++            int oldPower = node.currentPower;
++            int newPower = node.virtualPower;
++            if (oldPower == newPower) {
++                continue;
++            }
++            newPower = CraftEventFactory.callRedstoneChangeCurrent(this.world, node.x, node.y, node.z, oldPower, newPower);
++            if (newPower == oldPower) {
++                continue;
++            }
++            if (newPower < 0) {
++                newPower = 0;
++            } else if (newPower > 15) {
++                newPower = 15;
++            }
++            if (this.world.getType(node.pos) == node.state) {
++                this.world.setTypeAndData(node.pos, node.state.set(BlockRedstoneWire.POWER, Integer.valueOf(newPower)), 2);
++                changed[changedCount++] = node.key;
++            }
++        }
++        if (changedCount == 0) {
++            return null;
++        }
++        if (changedCount == size) {
++            return changed;
++        }
++        long[] trimmed = new long[changedCount];
++        System.arraycopy(changed, 0, trimmed, 0, changedCount);
++        return trimmed;
++    }
++
++    private void emitNeighborUpdates(long[] changedCoords, LongOpenHashSet settledWires) {
++        if (this.world.captureBlockStates) {
++            return;
++        }
++        boolean hasPhysicsListeners = BlockPhysicsEvent.getHandlerList().getRegisteredListeners().length != 0;
++        LongOpenHashSet notified = new LongOpenHashSet(Math.min(changedCoords.length * 16, 4096));
++
++        for (int i = 0; i < changedCoords.length; ++i) {
++            long wireKey = changedCoords[i];
++            int wx = unpackX(wireKey);
++            int wy = unpackY(wireKey);
++            int wz = unpackZ(wireKey);
++            BlockPosition wirePos = new BlockPosition(wx, wy, wz);
++
++            for (int n = 0; n < NEIGHBOR_OFFSETS_24.length; ++n) {
++                int[] off = NEIGHBOR_OFFSETS_24[n];
++                int nx = wx + off[0];
++                int ny = wy + off[1];
++                int nz = wz + off[2];
++                if (ny < 0 || ny >= 256) {
++                    continue;
++                }
++                long nKey = packPos(nx, ny, nz);
++                if (!notified.add(nKey)) {
++                    continue;
++                }
++                IBlockData nState = getTypeAt(nx, ny, nz);
++                Block nBlock = nState.getBlock();
++                if (nBlock == this.wire && settledWires.contains(nKey)) {
++                    continue;
++                }
++                if (nBlock == Blocks.AIR && !hasPhysicsListeners) {
++                    continue;
++                }
++                BlockPosition fromPos = (off[3] == 0 && off[4] == 0 && off[5] == 0)
++                        ? wirePos
++                        : new BlockPosition(wx + off[3], wy + off[4], wz + off[5]);
++                this.world.a(new BlockPosition(nx, ny, nz), this.wire, fromPos);
++            }
++
++            if (this.world.chunkPacketBlockController != null) {
++                this.world.chunkPacketBlockController.updateNearbyBlocks(this.world, wirePos);
++            }
++        }
++    }
++
++    private int computeExternalPower(BlockPosition pos) {
++        this.wire.setCanProvidePower(false);
++        try {
++            return this.world.isBlockIndirectlyGettingPowered(pos);
++        } finally {
++            this.wire.setCanProvidePower(true);
++        }
++    }
++
++    private IBlockData getTypeAt(int x, int y, int z) {
++        if (y < 0 || y >= 256) {
++            return Blocks.AIR.getBlockData();
++        }
++        this.cursor.c(x, y, z);
++        return this.world.getType(this.cursor);
++    }
++
++    private boolean isWireAt(int x, int y, int z) {
++        return getTypeAt(x, y, z).getBlock() == this.wire;
++    }
++
++    private WireNode getOrCreateNode(int x, int y, int z, BlockPosition pos, IBlockData state) {
++        long key = packPos(x, y, z);
++        WireNode node = this.nodes.get(key);
++        if (node != null) {
++            return node;
++        }
++        int poolSize = this.nodePool.size();
++        node = (poolSize > 0) ? this.nodePool.remove(poolSize - 1) : new WireNode();
++        node.init(x, y, z, key, pos, state);
++        this.nodes.put(key, node);
++        this.network.add(node);
++        return node;
++    }
++
++    private void enqueueBucket(WireNode node, int power) {
++        int prevBucket = node.queuedBucket;
++        if (prevBucket == power) {
++            return;
++        }
++        if (prevBucket >= 0) {
++            // Unlink O(1) from lower bucket before promoting to higher bucket
++            WireNode prev = node.prevInBucket;
++            WireNode next = node.nextInBucket;
++            if (prev != null) {
++                prev.nextInBucket = next;
++            } else {
++                this.bucketHeads[prevBucket] = next;
++            }
++            if (next != null) {
++                next.prevInBucket = prev;
++            } else {
++                this.bucketTails[prevBucket] = prev;
++            }
++        }
++        node.queuedBucket = power;
++        node.nextInBucket = null;
++        WireNode tail = this.bucketTails[power];
++        node.prevInBucket = tail;
++        if (tail == null) {
++            this.bucketHeads[power] = node;
++            this.bucketTails[power] = node;
++        } else {
++            tail.nextInBucket = node;
++            this.bucketTails[power] = node;
++        }
++    }
++
++    @Nullable
++    private WireNode pollBucket(int power) {
++        WireNode head = this.bucketHeads[power];
++        if (head == null) {
++            return null;
++        }
++        WireNode next = head.nextInBucket;
++        this.bucketHeads[power] = next;
++        if (next != null) {
++            next.prevInBucket = null;
++        } else {
++            this.bucketTails[power] = null;
++        }
++        head.prevInBucket = null;
++        head.nextInBucket = null;
++        head.queuedBucket = -1;
++        return head;
++    }
++
++    private void resetWorkingState() {
++        for (int i = 0; i < 16; ++i) {
++            this.bucketHeads[i] = null;
++            this.bucketTails[i] = null;
++        }
++        int size = this.network.size();
++        for (int i = 0; i < size; ++i) {
++            WireNode node = this.network.get(i);
++            node.pos = null;
++            node.state = null;
++            node.prevInBucket = null;
++            node.nextInBucket = null;
++            node.queuedBucket = -1;
++            if (this.nodePool.size() < 2048) {
++                this.nodePool.add(node);
++            }
++        }
++        this.network.clear();
++        this.nodes.clear();
++    }
++}
+diff --git a/main/java/net/minecraft/server/BlockRedstoneWire.java b/main/java/net/minecraft/server/BlockRedstoneWire.java
+index 4d31990..01900cb 100644
+--- a/main/java/net/minecraft/server/BlockRedstoneWire.java
++++ b/main/java/net/minecraft/server/BlockRedstoneWire.java
+@@ -118,17 +118,26 @@ public class BlockRedstoneWire extends Block {
+      * Note: Added 'source' argument so as to help determine direction of information flow
+      */
+     private void updateSurroundingRedstone(World worldIn, BlockPosition pos, IBlockData state, BlockPosition source) {
+-        if (worldIn.paperConfig.useEigencraftRedstone) {
+-            // Antarctic start - per-world turbo instance avoids cross-world nodeCache aliasing
++        // Antarctic start - opt-in Alternate Current and per-world Eigencraft dispatch
++        if (com.destroystokyo.paper.config.toml.modules.optimizations.Redstone.isAlternateCurrent()) {
++            com.destroystokyo.paper.util.AlternateCurrentWireHandler handler = worldIn.alternateCurrentWireHandler;
++            if (handler == null) {
++                handler = new com.destroystokyo.paper.util.AlternateCurrentWireHandler(worldIn, this);
++                worldIn.alternateCurrentWireHandler = handler;
++            }
++            handler.onWireUpdated(pos, source);
++            return;
++        }
++        if (com.destroystokyo.paper.config.toml.modules.optimizations.Redstone.isEigencraft() || worldIn.paperConfig.useEigencraftRedstone) {
+             RedstoneWireTurbo worldTurbo = worldIn.redstoneWireTurbo;
+             if (worldTurbo == null) {
+                 worldTurbo = new RedstoneWireTurbo(this);
+                 worldIn.redstoneWireTurbo = worldTurbo;
+             }
+             worldTurbo.updateSurroundingRedstone(worldIn, pos, state, source);
+-            // Antarctic end
+             return;
+         }
++        // Antarctic end
+         this.e(worldIn, pos, state);
+     }
+ 
+@@ -149,7 +158,8 @@ public class BlockRedstoneWire extends Block {
+         int k = worldIn.isBlockIndirectlyGettingPowered(pos1);
+         this.setCanProvidePower(true);
+ 
+-        if (!worldIn.paperConfig.useEigencraftRedstone) {
++        boolean eigencraft = com.destroystokyo.paper.config.toml.modules.optimizations.Redstone.isEigencraft() || worldIn.paperConfig.useEigencraftRedstone;
++        if (!eigencraft) {
+             // This code is totally redundant to if statements just below the loop.
+             if (k > 0 && k > j - 1) {
+                 j = k;
+@@ -163,7 +173,7 @@ public class BlockRedstoneWire extends Block {
+         // redstone wire will be set to 'k'.  If 'k' is already 15, then nothing inside the
+         // following loop can affect the power level of the wire.  Therefore, the loop is
+         // skipped if k is already 15.
+-        if (!worldIn.paperConfig.useEigencraftRedstone || k < 15) {
++        if (!eigencraft || k < 15) {
+             for (EnumDirection enumfacing : EnumDirection.EnumDirectionLimit.HORIZONTAL) {
+                 BlockPosition blockpos = pos1.shift(enumfacing);
+                 boolean flag = blockpos.getX() != pos2.getX() || blockpos.getZ() != pos2.getZ();
+@@ -182,7 +192,7 @@ public class BlockRedstoneWire extends Block {
+             }
+         }
+ 
+-        if (!worldIn.paperConfig.useEigencraftRedstone) {
++        if (!eigencraft) {
+             // The old code would decrement the wire value only by 1 at a time.
+             if (l > j) {
+                 j = l - 1;
+@@ -347,6 +357,17 @@ public class BlockRedstoneWire extends Block {
+ 
+     public void onPlace(World world, BlockPosition blockposition, IBlockData iblockdata) {
+         if (!world.isClientSide) {
++            // Antarctic start - Alternate Current placement fast path
++            if (com.destroystokyo.paper.config.toml.modules.optimizations.Redstone.isAlternateCurrent()) {
++                com.destroystokyo.paper.util.AlternateCurrentWireHandler handler = world.alternateCurrentWireHandler;
++                if (handler == null) {
++                    handler = new com.destroystokyo.paper.util.AlternateCurrentWireHandler(world, this);
++                    world.alternateCurrentWireHandler = handler;
++                }
++                handler.onWireAdded(blockposition);
++                return;
++            }
++            // Antarctic end
+             this.updateSurroundingRedstone(world, blockposition, iblockdata, null); // Paper - Optimize redstone
+             Iterator iterator = EnumDirection.EnumDirectionLimit.VERTICAL.iterator();
+ 
+@@ -383,6 +404,17 @@ public class BlockRedstoneWire extends Block {
+     public void remove(World world, BlockPosition blockposition, IBlockData iblockdata) {
+         super.remove(world, blockposition, iblockdata);
+         if (!world.isClientSide) {
++            // Antarctic start - Alternate Current removal fast path
++            if (com.destroystokyo.paper.config.toml.modules.optimizations.Redstone.isAlternateCurrent()) {
++                com.destroystokyo.paper.util.AlternateCurrentWireHandler handler = world.alternateCurrentWireHandler;
++                if (handler == null) {
++                    handler = new com.destroystokyo.paper.util.AlternateCurrentWireHandler(world, this);
++                    world.alternateCurrentWireHandler = handler;
++                }
++                handler.onWireRemoved(blockposition, iblockdata);
++                return;
++            }
++            // Antarctic end
+             EnumDirection[] aenumdirection = EnumDirection.values();
+             int i = aenumdirection.length;
+ 
+diff --git a/main/java/net/minecraft/server/World.java b/main/java/net/minecraft/server/World.java
+index 23bdfb2..055a0da 100644
+--- a/main/java/net/minecraft/server/World.java
++++ b/main/java/net/minecraft/server/World.java
+@@ -158,6 +158,7 @@ public abstract class World implements IBlockAccess {
+     public final Map<Explosion.CacheKey, Float> explosionDensityCache = new HashMap<>(); // Paper - Optimize explosions
+     public java.util.ArrayDeque<BlockRedstoneTorch.RedstoneUpdateInfo> redstoneUpdateInfos; // Paper - Move from Map in BlockRedstoneTorch to here
+     public com.destroystokyo.paper.util.RedstoneWireTurbo redstoneWireTurbo; // Antarctic - per-world Eigencraft turbo state to avoid cross-world aliasing
++    public com.destroystokyo.paper.util.AlternateCurrentWireHandler alternateCurrentWireHandler; // Antarctic - per-world opt-in Alternate Current wire engine
+     int projectileChunkLoadsTick = Integer.MIN_VALUE; // Antarctic - per-world projectile chunk load cap
+     int projectileChunkLoadsThisTick = 0; // Antarctic
+     boolean antarcticWarnedMalformedLightMarker = false; // Antarctic - log malformed Antarctic.LightPending at most once per world
+diff --git a/test/java/net/minecraft/server/AlternateCurrentRedstoneTest.java b/test/java/net/minecraft/server/AlternateCurrentRedstoneTest.java
+new file mode 100644
+index 0000000..ae52f25
+--- /dev/null
++++ b/test/java/net/minecraft/server/AlternateCurrentRedstoneTest.java
+@@ -0,0 +1,435 @@
++package net.minecraft.server;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertNotSame;
++import static org.junit.Assert.assertTrue;
++import static org.junit.Assert.fail;
++
++import com.destroystokyo.paper.config.toml.AntarcticTomlConfig;
++import com.destroystokyo.paper.config.toml.modules.optimizations.Redstone;
++import java.io.File;
++import java.io.IOException;
++import java.lang.reflect.Field;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.util.HashSet;
++import java.util.Set;
++import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.concurrent.atomic.AtomicInteger;
++import org.bukkit.event.EventPriority;
++import org.bukkit.event.Listener;
++import org.bukkit.event.block.BlockRedstoneEvent;
++import org.bukkit.plugin.Plugin;
++import org.bukkit.plugin.RegisteredListener;
++import org.bukkit.plugin.SimplePluginManager;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.BeforeClass;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.rules.TemporaryFolder;
++import sun.misc.Unsafe;
++
++public class AlternateCurrentRedstoneTest {
++
++    @Rule
++    public TemporaryFolder temp = new TemporaryFolder();
++
++    private static Unsafe unsafe;
++    private RegisteredListener registeredListener;
++    private String prevImpl;
++
++    private static final class StubCraftWorld extends org.bukkit.craftbukkit.CraftWorld {
++        StubCraftWorld() {
++            super(null, null, null);
++        }
++
++        @Override
++        public org.bukkit.block.Block getBlockAt(int x, int y, int z) {
++            return (org.bukkit.block.Block) java.lang.reflect.Proxy.newProxyInstance(
++                org.bukkit.block.Block.class.getClassLoader(),
++                new Class<?>[]{org.bukkit.block.Block.class},
++                (proxy, method, args) -> {
++                    if ("getX".equals(method.getName())) return x;
++                    if ("getY".equals(method.getName())) return y;
++                    if ("getZ".equals(method.getName())) return z;
++                    return null;
++                }
++            );
++        }
++    }
++
++    private static final class TrackingRedstoneWorld extends WorldServer {
++        AtomicInteger setTypeCount;
++        AtomicInteger neighborNotifyCount;
++        Set<BlockPosition> notifiedPositions;
++        AtomicBoolean throwOnNeighbor;
++        org.bukkit.craftbukkit.CraftWorld stubWorld;
++        org.bukkit.craftbukkit.CraftServer stubServer;
++
++        TrackingRedstoneWorld() {
++            super(null, null, null, 0, null, null, null);
++        }
++
++        @Override
++        public org.bukkit.craftbukkit.CraftWorld getWorld() {
++            return this.stubWorld;
++        }
++
++        @Override
++        public org.bukkit.craftbukkit.CraftServer getServer() {
++            return this.stubServer;
++        }
++
++        @Override
++        public boolean setTypeAndData(BlockPosition pos, IBlockData data, int flags) {
++            this.setTypeCount.incrementAndGet();
++            LightPropagationParityTest.setBlock(this, pos.getX(), pos.getY(), pos.getZ(), data);
++            return true;
++        }
++
++        @Override
++        public void a(BlockPosition pos, Block block, BlockPosition fromPos) {
++            this.neighborNotifyCount.incrementAndGet();
++            if (this.notifiedPositions != null) {
++                this.notifiedPositions.add(pos);
++            }
++            if (this.throwOnNeighbor.get()) {
++                throw new RuntimeException("simulated neighbor failure");
++            }
++            IBlockData state = this.getType(pos);
++            if (state.getBlock() == Blocks.REDSTONE_WIRE) {
++                state.doPhysics(this, pos, block, fromPos);
++            }
++        }
++    }
++
++    @BeforeClass
++    public static void bootstrap() throws Exception {
++        LightPropagationParityTest.bootstrap();
++        Field uf = Unsafe.class.getDeclaredField("theUnsafe");
++        uf.setAccessible(true);
++        unsafe = (Unsafe) uf.get(null);
++    }
++
++    @Before
++    public void setUp() {
++        this.prevImpl = Redstone.implementation;
++    }
++
++    @After
++    public void tearDown() {
++        Redstone.implementation = this.prevImpl;
++        if (this.registeredListener != null) {
++            BlockRedstoneEvent.getHandlerList().unregister(this.registeredListener);
++            this.registeredListener = null;
++        }
++    }
++
++    private static TrackingRedstoneWorld buildTrackingWorld(long seed) throws Exception {
++        LightPropagationParityTest.StubProvider[] p = new LightPropagationParityTest.StubProvider[1];
++        WorldServer base = LightPropagationParityTest.buildWorld(seed, p);
++        TrackingRedstoneWorld w = (TrackingRedstoneWorld) unsafe.allocateInstance(TrackingRedstoneWorld.class);
++        w.setTypeCount = new AtomicInteger();
++        w.neighborNotifyCount = new AtomicInteger();
++        w.notifiedPositions = new HashSet<BlockPosition>();
++        w.throwOnNeighbor = new AtomicBoolean(false);
++        w.stubWorld = (org.bukkit.craftbukkit.CraftWorld) unsafe.allocateInstance(StubCraftWorld.class);
++        w.stubServer = (org.bukkit.craftbukkit.CraftServer) unsafe.allocateInstance(org.bukkit.craftbukkit.CraftServer.class);
++        LightPropagationParityTest.set(org.bukkit.craftbukkit.CraftServer.class, w.stubServer, "pluginManager", new SimplePluginManager(null, null));
++        LightPropagationParityTest.set(World.class, w, "paperConfig", base.paperConfig);
++        w.paperConfig.useEigencraftRedstone = false;
++        LightPropagationParityTest.set(World.class, w, "chunkProvider", p[0]);
++        LightPropagationParityTest.set(World.class, w, "worldProvider", base.worldProvider);
++        LightPropagationParityTest.set(World.class, w, "chunkPacketBlockController",
++            com.destroystokyo.paper.antixray.ChunkPacketBlockController.NO_OPERATION_INSTANCE);
++        LightPropagationParityTest.set(World.class, w, "isClientSide", false);
++        return w;
++    }
++
++    private static int powerAt(World w, int x, int y, int z) {
++        return w.getType(new BlockPosition(x, y, z)).get(BlockRedstoneWire.POWER).intValue();
++    }
++
++    @Test
++    public void configDefaultsToVanillaAndValidatesImplementations() throws Exception {
++        assertEquals("vanilla", Redstone.implementation);
++        assertFalse(Redstone.isAlternateCurrent());
++        assertFalse(Redstone.isEigencraft());
++
++        File valid = temp.newFile("redstone-ac.toml");
++        Files.write(valid.toPath(), "[optimizations.redstone]\nimplementation = \"alternate-current\"\n".getBytes(StandardCharsets.UTF_8));
++        AntarcticTomlConfig.load(valid);
++        assertEquals("alternate-current", Redstone.implementation);
++        assertTrue(Redstone.isAlternateCurrent());
++
++        File invalid = temp.newFile("redstone-bad.toml");
++        Files.write(invalid.toPath(), "[optimizations.redstone]\nimplementation = \"invalid-engine\"\n".getBytes(StandardCharsets.UTF_8));
++        try {
++            AntarcticTomlConfig.load(invalid);
++            fail("invalid redstone implementation must be rejected");
++        } catch (IOException expected) {
++            assertNotNull(expected.getCause());
++        }
++        assertEquals("alternate-current", Redstone.implementation);
++    }
++
++    @Test
++    public void lineAndDualSourceParityMatchesVanillaExactly() throws Exception {
++        Redstone.implementation = "alternate-current";
++        TrackingRedstoneWorld w = buildTrackingWorld(901L);
++
++        // Build 18-block stone base with wires at x=1..17
++        for (int x = 0; x <= 18; ++x) {
++            LightPropagationParityTest.setBlock(w, x, 39, 0, Blocks.STONE.getBlockData());
++        }
++        for (int x = 1; x <= 17; ++x) {
++            LightPropagationParityTest.setBlock(w, x, 40, 0, Blocks.REDSTONE_WIRE.getBlockData());
++        }
++        // Power at x=0 (redstone block)
++        LightPropagationParityTest.setBlock(w, 0, 40, 0, Blocks.REDSTONE_BLOCK.getBlockData());
++        Blocks.REDSTONE_WIRE.a(w.getType(new BlockPosition(1, 40, 0)), w, new BlockPosition(1, 40, 0), Blocks.REDSTONE_BLOCK, new BlockPosition(0, 40, 0));
++
++        for (int x = 1; x <= 15; ++x) {
++            assertEquals("wire at x=" + x, 16 - x, powerAt(w, x, 40, 0));
++        }
++        assertEquals(0, powerAt(w, 16, 40, 0));
++        assertEquals(0, powerAt(w, 17, 40, 0));
++
++        // Add second source at x=10 (side redstone block at (10,40,1))
++        LightPropagationParityTest.setBlock(w, 10, 40, 1, Blocks.REDSTONE_BLOCK.getBlockData());
++        Blocks.REDSTONE_WIRE.a(w.getType(new BlockPosition(10, 40, 0)), w, new BlockPosition(10, 40, 0), Blocks.REDSTONE_BLOCK, new BlockPosition(10, 40, 1));
++        assertEquals(15, powerAt(w, 10, 40, 0));
++        assertEquals(14, powerAt(w, 9, 40, 0));
++        assertEquals(15, powerAt(w, 1, 40, 0));
++
++        // Remove first source at x=0 -> line must settle cleanly to power from x=10 only!
++        LightPropagationParityTest.setBlock(w, 0, 40, 0, Blocks.AIR.getBlockData());
++        Blocks.REDSTONE_WIRE.a(w.getType(new BlockPosition(1, 40, 0)), w, new BlockPosition(1, 40, 0), Blocks.AIR, new BlockPosition(0, 40, 0));
++        for (int x = 1; x <= 17; ++x) {
++            int expected = Math.max(0, 15 - Math.abs(x - 10));
++            assertEquals("dual-source fallback at x=" + x, expected, powerAt(w, x, 40, 0));
++        }
++    }
++
++    @Test
++    public void preservesGlowstoneOneWayUpwardDiodeAndStoneBidirectionalStaircaseAndCutRule() throws Exception {
++        Redstone.implementation = "alternate-current";
++
++        // 1) Glowstone one-way upward diode: UP allowed, DOWN blocked
++        TrackingRedstoneWorld wGlow = buildTrackingWorld(902L);
++        LightPropagationParityTest.setBlock(wGlow, 2, 39, 2, Blocks.STONE.getBlockData());
++        LightPropagationParityTest.setBlock(wGlow, 3, 40, 2, Blocks.GLOWSTONE.getBlockData());
++        LightPropagationParityTest.setBlock(wGlow, 2, 40, 2, Blocks.REDSTONE_WIRE.getBlockData()); // lower wire
++        LightPropagationParityTest.setBlock(wGlow, 3, 41, 2, Blocks.REDSTONE_WIRE.getBlockData()); // upper wire on glowstone
++
++        // Power lower wire -> MUST propagate UP onto glowstone
++        LightPropagationParityTest.setBlock(wGlow, 1, 40, 2, Blocks.REDSTONE_BLOCK.getBlockData());
++        Blocks.REDSTONE_WIRE.a(wGlow.getType(new BlockPosition(2, 40, 2)), wGlow, new BlockPosition(2, 40, 2), Blocks.REDSTONE_BLOCK, new BlockPosition(1, 40, 2));
++        assertEquals(15, powerAt(wGlow, 2, 40, 2));
++        assertEquals("signal must climb UP onto glowstone", 14, powerAt(wGlow, 3, 41, 2));
++
++        // Remove lower source -> both must drop to 0
++        LightPropagationParityTest.setBlock(wGlow, 1, 40, 2, Blocks.AIR.getBlockData());
++        Blocks.REDSTONE_WIRE.a(wGlow.getType(new BlockPosition(2, 40, 2)), wGlow, new BlockPosition(2, 40, 2), Blocks.AIR, new BlockPosition(1, 40, 2));
++        assertEquals(0, powerAt(wGlow, 2, 40, 2));
++        assertEquals(0, powerAt(wGlow, 3, 41, 2));
++
++        // Power upper wire on glowstone -> MUST NOT propagate DOWN off glowstone!
++        LightPropagationParityTest.setBlock(wGlow, 4, 41, 2, Blocks.REDSTONE_BLOCK.getBlockData());
++        Blocks.REDSTONE_WIRE.a(wGlow.getType(new BlockPosition(3, 41, 2)), wGlow, new BlockPosition(3, 41, 2), Blocks.REDSTONE_BLOCK, new BlockPosition(4, 41, 2));
++        assertEquals(15, powerAt(wGlow, 3, 41, 2));
++        assertEquals("glowstone diode MUST block downward propagation", 0, powerAt(wGlow, 2, 40, 2));
++
++        // 2) Solid stone staircase: bidirectional UP & DOWN, cut by solid stone above lower wire
++        TrackingRedstoneWorld wStone = buildTrackingWorld(903L);
++        LightPropagationParityTest.setBlock(wStone, 2, 39, 2, Blocks.STONE.getBlockData());
++        LightPropagationParityTest.setBlock(wStone, 3, 40, 2, Blocks.STONE.getBlockData());
++        LightPropagationParityTest.setBlock(wStone, 2, 40, 2, Blocks.REDSTONE_WIRE.getBlockData());
++        LightPropagationParityTest.setBlock(wStone, 3, 41, 2, Blocks.REDSTONE_WIRE.getBlockData());
++        LightPropagationParityTest.setBlock(wStone, 4, 41, 2, Blocks.REDSTONE_BLOCK.getBlockData());
++        Blocks.REDSTONE_WIRE.a(wStone.getType(new BlockPosition(3, 41, 2)), wStone, new BlockPosition(3, 41, 2), Blocks.REDSTONE_BLOCK, new BlockPosition(4, 41, 2));
++        assertEquals("solid stone staircase MUST propagate DOWN", 14, powerAt(wStone, 2, 40, 2));
++
++        // Place solid stone directly above lower wire at (2, 41, 2) -> cuts connection!
++        LightPropagationParityTest.setBlock(wStone, 2, 41, 2, Blocks.STONE.getBlockData());
++        Blocks.REDSTONE_WIRE.a(wStone.getType(new BlockPosition(2, 40, 2)), wStone, new BlockPosition(2, 40, 2), Blocks.STONE, new BlockPosition(2, 41, 2));
++        assertEquals("solid block above lower wire must cut vertical connection", 0, powerAt(wStone, 2, 40, 2));
++    }
++
++    @Test
++    public void notifiesManhattanTwoQuasiConnectivityNeighborsAndRecoversFromExceptions() throws Exception {
++        Redstone.implementation = "alternate-current";
++        TrackingRedstoneWorld w = buildTrackingWorld(904L);
++
++        LightPropagationParityTest.setBlock(w, 5, 39, 5, Blocks.STONE.getBlockData());
++        LightPropagationParityTest.setBlock(w, 5, 38, 5, Blocks.PISTON.getBlockData()); // Manhattan-2 below wire (QC!)
++        LightPropagationParityTest.setBlock(w, 5, 40, 5, Blocks.REDSTONE_WIRE.getBlockData());
++        LightPropagationParityTest.setBlock(w, 4, 40, 5, Blocks.REDSTONE_BLOCK.getBlockData());
++
++        // Trigger exception during neighbor notification; handler state must remain completely uncorrupted!
++        w.throwOnNeighbor.set(true);
++        try {
++            Blocks.REDSTONE_WIRE.a(w.getType(new BlockPosition(5, 40, 5)), w, new BlockPosition(5, 40, 5), Blocks.REDSTONE_BLOCK, new BlockPosition(4, 40, 5));
++            fail("expected neighbor exception");
++        } catch (RuntimeException expected) {
++            assertEquals("simulated neighbor failure", expected.getMessage());
++        }
++
++        // Recover: reset wire and verify QC piston at (5, 38, 5) receives notification!
++        w.throwOnNeighbor.set(false);
++        w.notifiedPositions.clear();
++        LightPropagationParityTest.setBlock(w, 5, 40, 5, Blocks.REDSTONE_WIRE.getBlockData());
++        Blocks.REDSTONE_WIRE.a(w.getType(new BlockPosition(5, 40, 5)), w, new BlockPosition(5, 40, 5), Blocks.REDSTONE_BLOCK, new BlockPosition(4, 40, 5));
++
++        assertEquals(15, powerAt(w, 5, 40, 5));
++        assertTrue("piston 2 blocks below wire must be notified for 1.12.2 QC",
++            w.notifiedPositions.contains(new BlockPosition(5, 38, 5)));
++
++        // Per-world isolation check
++        TrackingRedstoneWorld w2 = buildTrackingWorld(905L);
++        LightPropagationParityTest.setBlock(w2, 5, 39, 5, Blocks.STONE.getBlockData());
++        LightPropagationParityTest.setBlock(w2, 5, 40, 5, Blocks.REDSTONE_WIRE.getBlockData());
++        LightPropagationParityTest.setBlock(w2, 4, 40, 5, Blocks.REDSTONE_BLOCK.getBlockData());
++        Blocks.REDSTONE_WIRE.a(w2.getType(new BlockPosition(5, 40, 5)), w2, new BlockPosition(5, 40, 5), Blocks.REDSTONE_BLOCK, new BlockPosition(4, 40, 5));
++        assertNotSame(w.alternateCurrentWireHandler, w2.alternateCurrentWireHandler);
++    }
++
++    @Test
++    public void respectsBlockRedstoneEventListenerOverride() throws Exception {
++        Redstone.implementation = "alternate-current";
++        TrackingRedstoneWorld w = buildTrackingWorld(906L);
++        AtomicInteger calls = new AtomicInteger();
++        Plugin dummyPlugin = (Plugin) java.lang.reflect.Proxy.newProxyInstance(
++            Plugin.class.getClassLoader(),
++            new Class<?>[]{Plugin.class},
++            (proxy, method, args) -> "isEnabled".equals(method.getName()) ? true : ("getName".equals(method.getName()) ? "ACTest" : null)
++        );
++        this.registeredListener = new RegisteredListener(
++            new Listener() {},
++            (listener, event) -> {
++                if (event instanceof BlockRedstoneEvent) {
++                    calls.incrementAndGet();
++                    ((BlockRedstoneEvent) event).setNewCurrent(6);
++                }
++            },
++            EventPriority.NORMAL,
++            dummyPlugin,
++            false
++        );
++        BlockRedstoneEvent.getHandlerList().register(this.registeredListener);
++
++        LightPropagationParityTest.setBlock(w, 2, 39, 2, Blocks.STONE.getBlockData());
++        LightPropagationParityTest.setBlock(w, 2, 40, 2, Blocks.REDSTONE_WIRE.getBlockData());
++        LightPropagationParityTest.setBlock(w, 1, 40, 2, Blocks.REDSTONE_BLOCK.getBlockData());
++        Blocks.REDSTONE_WIRE.a(w.getType(new BlockPosition(2, 40, 2)), w, new BlockPosition(2, 40, 2), Blocks.REDSTONE_BLOCK, new BlockPosition(1, 40, 2));
++
++        assertEquals(1, calls.get());
++        assertEquals(6, powerAt(w, 2, 40, 2));
++    }
++
++    @Test
++    public void lagCarpetDepoweringBenchmarkBeatsVanillaByOrderOfMagnitude() throws Exception {
++        // 15x15 redstone dust carpet (MC-81098 worst case: depowering a 2D carpet from center)
++        TrackingRedstoneWorld wVanilla = buildTrackingWorld(910L);
++        TrackingRedstoneWorld wAc = buildTrackingWorld(911L);
++        wVanilla.notifiedPositions = null;
++        wAc.notifiedPositions = null;
++
++        for (int x = 0; x < 15; ++x) {
++            for (int z = 0; z < 15; ++z) {
++                LightPropagationParityTest.setBlock(wVanilla, x, 39, z, Blocks.STONE.getBlockData());
++                LightPropagationParityTest.setBlock(wVanilla, x, 40, z, Blocks.REDSTONE_WIRE.getBlockData());
++                LightPropagationParityTest.setBlock(wAc, x, 39, z, Blocks.STONE.getBlockData());
++                LightPropagationParityTest.setBlock(wAc, x, 40, z, Blocks.REDSTONE_WIRE.getBlockData());
++            }
++        }
++
++        BlockPosition sourcePos = new BlockPosition(7, 41, 7);
++        BlockPosition centerWire = new BlockPosition(7, 40, 7);
++
++        // Warmup + parity check on 15x15 carpet ON and OFF
++        Redstone.implementation = "vanilla";
++        LightPropagationParityTest.setBlock(wVanilla, 7, 41, 7, Blocks.REDSTONE_BLOCK.getBlockData());
++        Blocks.REDSTONE_WIRE.a(wVanilla.getType(centerWire), wVanilla, centerWire, Blocks.REDSTONE_BLOCK, sourcePos);
++
++        Redstone.implementation = "alternate-current";
++        LightPropagationParityTest.setBlock(wAc, 7, 41, 7, Blocks.REDSTONE_BLOCK.getBlockData());
++        Blocks.REDSTONE_WIRE.a(wAc.getType(centerWire), wAc, centerWire, Blocks.REDSTONE_BLOCK, sourcePos);
++
++        // Verify 100% power parity across all 225 wires when powered ON!
++        for (int x = 0; x < 15; ++x) {
++            for (int z = 0; z < 15; ++z) {
++                assertEquals("ON parity mismatch at (" + x + "," + z + ")", powerAt(wVanilla, x, 40, z), powerAt(wAc, x, 40, z));
++            }
++        }
++
++        // Measure MC-81098 depowering (10 cycles after 5 warmup cycles)
++        for (int i = 0; i < 5; ++i) {
++            Redstone.implementation = "vanilla";
++            LightPropagationParityTest.setBlock(wVanilla, 7, 41, 7, Blocks.AIR.getBlockData());
++            Blocks.REDSTONE_WIRE.a(wVanilla.getType(centerWire), wVanilla, centerWire, Blocks.AIR, sourcePos);
++            LightPropagationParityTest.setBlock(wVanilla, 7, 41, 7, Blocks.REDSTONE_BLOCK.getBlockData());
++            Blocks.REDSTONE_WIRE.a(wVanilla.getType(centerWire), wVanilla, centerWire, Blocks.REDSTONE_BLOCK, sourcePos);
++
++            Redstone.implementation = "alternate-current";
++            LightPropagationParityTest.setBlock(wAc, 7, 41, 7, Blocks.AIR.getBlockData());
++            Blocks.REDSTONE_WIRE.a(wAc.getType(centerWire), wAc, centerWire, Blocks.AIR, sourcePos);
++            LightPropagationParityTest.setBlock(wAc, 7, 41, 7, Blocks.REDSTONE_BLOCK.getBlockData());
++            Blocks.REDSTONE_WIRE.a(wAc.getType(centerWire), wAc, centerWire, Blocks.REDSTONE_BLOCK, sourcePos);
++        }
++
++        wVanilla.setTypeCount.set(0);
++        wVanilla.neighborNotifyCount.set(0);
++        wAc.setTypeCount.set(0);
++        wAc.neighborNotifyCount.set(0);
++
++        final int cycles = 10;
++        long vanillaNs = 0L;
++        long acNs = 0L;
++        for (int i = 0; i < cycles; ++i) {
++            Redstone.implementation = "vanilla";
++            LightPropagationParityTest.setBlock(wVanilla, 7, 41, 7, Blocks.AIR.getBlockData());
++            long t0 = System.nanoTime();
++            Blocks.REDSTONE_WIRE.a(wVanilla.getType(centerWire), wVanilla, centerWire, Blocks.AIR, sourcePos);
++            vanillaNs += System.nanoTime() - t0;
++            LightPropagationParityTest.setBlock(wVanilla, 7, 41, 7, Blocks.REDSTONE_BLOCK.getBlockData());
++            Blocks.REDSTONE_WIRE.a(wVanilla.getType(centerWire), wVanilla, centerWire, Blocks.REDSTONE_BLOCK, sourcePos);
++
++            Redstone.implementation = "alternate-current";
++            LightPropagationParityTest.setBlock(wAc, 7, 41, 7, Blocks.AIR.getBlockData());
++            long t1 = System.nanoTime();
++            Blocks.REDSTONE_WIRE.a(wAc.getType(centerWire), wAc, centerWire, Blocks.AIR, sourcePos);
++            acNs += System.nanoTime() - t1;
++            LightPropagationParityTest.setBlock(wAc, 7, 41, 7, Blocks.REDSTONE_BLOCK.getBlockData());
++            Blocks.REDSTONE_WIRE.a(wAc.getType(centerWire), wAc, centerWire, Blocks.REDSTONE_BLOCK, sourcePos);
++        }
++
++        // Verify OFF parity after final depower
++        Redstone.implementation = "vanilla";
++        LightPropagationParityTest.setBlock(wVanilla, 7, 41, 7, Blocks.AIR.getBlockData());
++        Blocks.REDSTONE_WIRE.a(wVanilla.getType(centerWire), wVanilla, centerWire, Blocks.AIR, sourcePos);
++        Redstone.implementation = "alternate-current";
++        LightPropagationParityTest.setBlock(wAc, 7, 41, 7, Blocks.AIR.getBlockData());
++        Blocks.REDSTONE_WIRE.a(wAc.getType(centerWire), wAc, centerWire, Blocks.AIR, sourcePos);
++        for (int x = 0; x < 15; ++x) {
++            for (int z = 0; z < 15; ++z) {
++                assertEquals("OFF parity mismatch at (" + x + "," + z + ")", 0, powerAt(wAc, x, 40, z));
++            }
++        }
++
++        double speedup = (double) vanillaNs / (double) Math.max(1L, acNs);
++        System.out.printf("[perf] AlternateCurrent 15x15 lag-carpet depower (%d cycles): vanilla=%.2f ms (setType=%d, notifies=%d) vs AC=%.2f ms (setType=%d, notifies=%d), speedup=%.1fx%n",
++            cycles, vanillaNs / 1e6, wVanilla.setTypeCount.get(), wVanilla.neighborNotifyCount.get(),
++            acNs / 1e6, wAc.setTypeCount.get(), wAc.neighborNotifyCount.get(), speedup);
++
++        assertTrue("AC must emit >= 10x fewer neighbor notifications on lag carpet",
++            wAc.neighborNotifyCount.get() * 10L < wVanilla.neighborNotifyCount.get());
++        assertTrue("AC must do >= 3x fewer setTypeAndData writes on lag carpet",
++            wAc.setTypeCount.get() * 3L < wVanilla.setTypeCount.get());
++        assertTrue("AC must be >= 5x faster than vanilla on 15x15 lag carpet depower (speedup=" + speedup + "x)",
++            acNs * 5L < vanillaNs);
++    }
++}

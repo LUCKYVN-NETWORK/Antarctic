@@ -1,0 +1,460 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Mon, 23 Nov 2026 09:42:29 +0700
+Subject: [PATCH 104/115] fix: harden eigencraft redstone against freezes,
+ cross-world leaks and rng bias
+
+
+diff --git a/main/java/com/destroystokyo/paper/util/RedstoneWireTurbo.java b/main/java/com/destroystokyo/paper/util/RedstoneWireTurbo.java
+index 7ab6a8e..f794276 100644
+--- a/main/java/com/destroystokyo/paper/util/RedstoneWireTurbo.java
++++ b/main/java/com/destroystokyo/paper/util/RedstoneWireTurbo.java
+@@ -348,7 +348,7 @@ public class RedstoneWireTurbo {
+             case 0: {
+                 // Both rx and rz are -1 (northwest)
+                 // Randomly choose one to be forward.
+-                final int j = ThreadLocalRandom.current().nextInt(0, 1);
++                final int j = ThreadLocalRandom.current().nextInt(0, 2); // Antarctic - upper bound is exclusive
+                 return (j == 0) ? North : West;
+             }
+             case 1: {
+@@ -359,7 +359,7 @@ public class RedstoneWireTurbo {
+             case 2: {
+                 // rx=1, rz=-1 (northeast)
+                 // Choose randomly between north and east
+-                final int j = ThreadLocalRandom.current().nextInt(0, 1);
++                final int j = ThreadLocalRandom.current().nextInt(0, 2); // Antarctic - upper bound is exclusive
+                 return (j == 0) ? North : East;
+             }
+             case 3: {
+@@ -381,7 +381,7 @@ public class RedstoneWireTurbo {
+             case 6: {
+                 // rx=-1, rz=1 (southwest)
+                 // Choose randomly between south and west
+-                final int j = ThreadLocalRandom.current().nextInt(0, 1);
++                final int j = ThreadLocalRandom.current().nextInt(0, 2); // Antarctic - upper bound is exclusive
+                 return (j == 0) ? South : West;
+             }
+             case 7: {
+@@ -392,7 +392,7 @@ public class RedstoneWireTurbo {
+             case 8: {
+                 // rx=1, rz=1 (southeast)
+                 // Choose randomly between south and east
+-                final int j = ThreadLocalRandom.current().nextInt(0, 1);
++                final int j = ThreadLocalRandom.current().nextInt(0, 2); // Antarctic - upper bound is exclusive
+                 return (j == 0) ? South : East;
+             }
+         }
+@@ -758,39 +758,43 @@ public class RedstoneWireTurbo {
+             return scheduleReentrantNeighborChanged(worldIn, pos, newState, source);
+         }
+         // If there are no on-going walks through redstone wire, then start a new walk.
++        // Antarctic start - always reset walk state in finally so a throwing listener/block cannot freeze all redstone
++        try {
++            // If the source of the block update to the redstone wire at 'pos' is known, we can use
++            // that to help determine the direction of information flow.
++            if (source != null) {
++                final UpdateNode src = new UpdateNode();
++                src.self = source;
++                src.parent = source;
++                src.visited = true;
++                nodeCache.put(source, src);
++                identifyNode(worldIn, src);
++            }
+ 
+-        // If the source of the block update to the redstone wire at 'pos' is known, we can use
+-        // that to help determine the direction of information flow.
+-        if (source != null) {
+-            final UpdateNode src = new UpdateNode();
+-            src.self = source;
+-            src.parent = source;
+-            src.visited = true;
+-            nodeCache.put(source, src);
+-            identifyNode(worldIn, src);
++            // Create a node representing the block at 'pos', and then propagate updates
++            // to its neighbors.  As stated above, the call to wire.calculateCurrentChanges
++            // already performs the update to the block at 'pos', so it is not added to the schedule.
++            final UpdateNode upd = new UpdateNode();
++            upd.self = pos;
++            upd.parent = source!=null ? source : pos;
++            upd.currentState = newState;
++            upd.type = UpdateNode.Type.REDSTONE;
++            upd.visited = true;
++            nodeCache.put(pos, upd);
++            propagateChanges(worldIn, upd, 0);
++
++            // Perform the walk over all directly reachable redstone wire blocks, propagating wire value
++            // updates in a breadth first order out from the initial update received for the block at 'pos'.
++            breadthFirstWalk(worldIn);
++        } finally {
++            // With the whole search completed (or aborted via exception), clear all walk state.
++            nodeCache.clear();
++            updateQueue0.clear();
++            updateQueue1.clear();
++            updateQueue2.clear();
++            currentWalkLayer = 0;
+         }
+-
+-        // Create a node representing the block at 'pos', and then propagate updates
+-        // to its neighbors.  As stated above, the call to wire.calculateCurrentChanges
+-        // already performs the update to the block at 'pos', so it is not added to the schedule.
+-        final UpdateNode upd = new UpdateNode();
+-        upd.self = pos;
+-        upd.parent = source!=null ? source : pos;
+-        upd.currentState = newState;
+-        upd.type = UpdateNode.Type.REDSTONE;
+-        upd.visited = true;
+-        nodeCache.put(pos, upd);
+-        propagateChanges(worldIn, upd, 0);
+-
+-        // Perform the walk over all directly reachable redstone wire blocks, propagating wire value
+-        // updates in a breadth first order out from the initial update received for the block at 'pos'.
+-        breadthFirstWalk(worldIn);
+-
+-        // With the whole search completed, clear the list of all known blocks.
+-        // We do not want to keep around state information that may be changed by other code.
+-        // In theory, we could cache the neighbor block positions, but that is a separate
+-        // optimization.
+-        nodeCache.clear();
++        // Antarctic end
+ 
+         return newState;
+     }
+@@ -886,8 +890,7 @@ public class RedstoneWireTurbo {
+             // and set it in the world.
+             // Possible optimization:  Don't commit state changes to the world until they
+             // need to be known by some nearby non-redstone-wire block.
+-            BlockPosition pos = new BlockPosition(upd.self.getX(), upd.self.getY(), upd.self.getZ());
+-            if (wire.canPlace(worldIn, pos)) {
++            if (wire.canPlace(worldIn, upd.self)) { // Antarctic - avoid redundant BlockPosition copy
+                 state = state.set(BlockRedstoneWire.POWER, j);
+                 worldIn.setTypeAndData(upd.self, state, 2);
+             }
+diff --git a/main/java/net/minecraft/server/BlockRedstoneWire.java b/main/java/net/minecraft/server/BlockRedstoneWire.java
+index 3306752..87f7dbc 100644
+--- a/main/java/net/minecraft/server/BlockRedstoneWire.java
++++ b/main/java/net/minecraft/server/BlockRedstoneWire.java
+@@ -119,7 +119,14 @@ public class BlockRedstoneWire extends Block {
+      */
+     private void updateSurroundingRedstone(World worldIn, BlockPosition pos, IBlockData state, BlockPosition source) {
+         if (worldIn.paperConfig.useEigencraftRedstone) {
+-            turbo.updateSurroundingRedstone(worldIn, pos, state, source);
++            // Antarctic start - per-world turbo instance avoids cross-world nodeCache aliasing
++            RedstoneWireTurbo worldTurbo = worldIn.redstoneWireTurbo;
++            if (worldTurbo == null) {
++                worldTurbo = new RedstoneWireTurbo(this);
++                worldIn.redstoneWireTurbo = worldTurbo;
++            }
++            worldTurbo.updateSurroundingRedstone(worldIn, pos, state, source);
++            // Antarctic end
+             return;
+         }
+         this.e(worldIn, pos, state);
+@@ -199,6 +206,14 @@ public class BlockRedstoneWire extends Block {
+             if (k > j) j = k;
+         }
+ 
++        // Antarctic start - fire BlockRedstoneEvent on trigger wire consistently with RedstoneWireTurbo
++        if (i != j && BlockRedstoneEvent.getHandlerList().getRegisteredListeners().length != 0) {
++            BlockRedstoneEvent event = new BlockRedstoneEvent(worldIn.getWorld().getBlockAt(pos1.getX(), pos1.getY(), pos1.getZ()), i, j);
++            worldIn.getServer().getPluginManager().callEvent(event);
++            j = event.getNewCurrent();
++        }
++        // Antarctic end
++
+         if (i != j) {
+             state = state.set(POWER, j);
+ 
+diff --git a/main/java/net/minecraft/server/World.java b/main/java/net/minecraft/server/World.java
+index 99c561e..2b6dfc7 100644
+--- a/main/java/net/minecraft/server/World.java
++++ b/main/java/net/minecraft/server/World.java
+@@ -157,6 +157,7 @@ public abstract class World implements IBlockAccess {
+     private int tileTickPosition;
+     public final Map<Explosion.CacheKey, Float> explosionDensityCache = new HashMap<>(); // Paper - Optimize explosions
+     public java.util.ArrayDeque<BlockRedstoneTorch.RedstoneUpdateInfo> redstoneUpdateInfos; // Paper - Move from Map in BlockRedstoneTorch to here
++    public com.destroystokyo.paper.util.RedstoneWireTurbo redstoneWireTurbo; // Antarctic - per-world Eigencraft turbo state to avoid cross-world aliasing
+     int projectileChunkLoadsTick = Integer.MIN_VALUE; // Antarctic - per-world projectile chunk load cap
+     int projectileChunkLoadsThisTick = 0; // Antarctic
+ 
+diff --git a/test/java/net/minecraft/server/RedstoneWireTurboHardeningTest.java b/test/java/net/minecraft/server/RedstoneWireTurboHardeningTest.java
+new file mode 100644
+index 0000000..5bd24b4
+--- /dev/null
++++ b/test/java/net/minecraft/server/RedstoneWireTurboHardeningTest.java
+@@ -0,0 +1,275 @@
++package net.minecraft.server;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertNotSame;
++import static org.junit.Assert.assertTrue;
++import static org.junit.Assert.fail;
++
++import com.destroystokyo.paper.util.RedstoneWireTurbo;
++import java.lang.reflect.Field;
++import java.lang.reflect.Method;
++import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.concurrent.atomic.AtomicInteger;
++import org.bukkit.event.EventPriority;
++import org.bukkit.event.Listener;
++import org.bukkit.event.block.BlockRedstoneEvent;
++import org.bukkit.plugin.Plugin;
++import org.bukkit.plugin.PluginManager;
++import org.bukkit.plugin.RegisteredListener;
++import org.junit.After;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++public class RedstoneWireTurboHardeningTest {
++
++    private static Unsafe unsafe;
++    private RegisteredListener registeredListener;
++
++    private static final class StubCraftWorld extends org.bukkit.craftbukkit.CraftWorld {
++        StubCraftWorld() {
++            super(null, null, null);
++        }
++
++        @Override
++        public org.bukkit.block.Block getBlockAt(int x, int y, int z) {
++            return (org.bukkit.block.Block) java.lang.reflect.Proxy.newProxyInstance(
++                org.bukkit.block.Block.class.getClassLoader(),
++                new Class<?>[]{org.bukkit.block.Block.class},
++                (proxy, method, args) -> {
++                    if ("getX".equals(method.getName())) return x;
++                    if ("getY".equals(method.getName())) return y;
++                    if ("getZ".equals(method.getName())) return z;
++                    return null;
++                }
++            );
++        }
++    }
++
++    private static org.bukkit.plugin.SimplePluginManager makePluginManager() {
++        return new org.bukkit.plugin.SimplePluginManager(null, null);
++    }
++
++    private static final class ThrowingWorld extends WorldServer {
++        AtomicBoolean shouldThrow;
++        AtomicInteger neighborCallsAfterRecovery;
++        org.bukkit.craftbukkit.CraftWorld stubWorld;
++        org.bukkit.craftbukkit.CraftServer stubServer;
++
++        ThrowingWorld() {
++            super(null, null, null, 0, null, null, null);
++        }
++
++        @Override
++        public org.bukkit.craftbukkit.CraftWorld getWorld() {
++            return this.stubWorld;
++        }
++
++        @Override
++        public org.bukkit.craftbukkit.CraftServer getServer() {
++            return this.stubServer;
++        }
++
++        @Override
++        public void a(BlockPosition pos, Block block, BlockPosition fromPos) {
++            if (this.shouldThrow.get()) {
++                throw new RuntimeException("simulated plugin/block exception during walk");
++            }
++            this.neighborCallsAfterRecovery.incrementAndGet();
++        }
++
++        @Override
++        public boolean setTypeAndData(BlockPosition pos, IBlockData data, int flags) {
++            LightPropagationParityTest.setBlock(this, pos.getX(), pos.getY(), pos.getZ(), data);
++            return true;
++        }
++    }
++
++    private static final class EventWorld extends WorldServer {
++        org.bukkit.craftbukkit.CraftWorld stubWorld;
++        org.bukkit.craftbukkit.CraftServer stubServer;
++
++        EventWorld() {
++            super(null, null, null, 0, null, null, null);
++        }
++
++        @Override
++        public org.bukkit.craftbukkit.CraftWorld getWorld() {
++            return this.stubWorld;
++        }
++
++        @Override
++        public org.bukkit.craftbukkit.CraftServer getServer() {
++            return this.stubServer;
++        }
++
++        @Override
++        public boolean setTypeAndData(BlockPosition pos, IBlockData data, int flags) {
++            LightPropagationParityTest.setBlock(this, pos.getX(), pos.getY(), pos.getZ(), data);
++            return true;
++        }
++    }
++
++    @BeforeClass
++    public static void bootstrap() throws Exception {
++        LightPropagationParityTest.bootstrap();
++        Field uf = Unsafe.class.getDeclaredField("theUnsafe");
++        uf.setAccessible(true);
++        unsafe = (Unsafe) uf.get(null);
++    }
++
++    @After
++    public void cleanupListeners() {
++        if (this.registeredListener != null) {
++            BlockRedstoneEvent.getHandlerList().unregister(this.registeredListener);
++            this.registeredListener = null;
++        }
++    }
++
++    @Test
++    public void diagonalHeadingsProduceBothDirectionsEvenly() throws Exception {
++        Method computeHeading = RedstoneWireTurbo.class.getDeclaredMethod("computeHeading", int.class, int.class);
++        computeHeading.setAccessible(true);
++
++        int[][] diagonals = {{-1, -1}, {1, -1}, {-1, 1}, {1, 1}};
++        int[][] expectedPairs = {{0, 3}, {0, 1}, {2, 3}, {2, 1}}; // N=0, E=1, S=2, W=3
++
++        for (int d = 0; d < diagonals.length; ++d) {
++            int first = 0;
++            int second = 0;
++            for (int trial = 0; trial < 10_000; ++trial) {
++                int heading = (Integer) computeHeading.invoke(null, diagonals[d][0], diagonals[d][1]);
++                if (heading == expectedPairs[d][0]) {
++                    first++;
++                } else if (heading == expectedPairs[d][1]) {
++                    second++;
++                } else {
++                    fail("unexpected heading " + heading + " for diagonal (" + diagonals[d][0] + "," + diagonals[d][1] + ")");
++                }
++            }
++            assertTrue("first diagonal branch must occur (~50%): got " + first, first > 4000 && first < 6000);
++            assertTrue("second diagonal branch must occur (~50%): got " + second, second > 4000 && second < 6000);
++        }
++    }
++
++    @Test
++    public void exceptionDuringWalkDoesNotPermanentlyFreezeSubsequentUpdates() throws Exception {
++        LightPropagationParityTest.StubProvider[] providerOut = new LightPropagationParityTest.StubProvider[1];
++        WorldServer base = LightPropagationParityTest.buildWorld(101L, providerOut);
++
++        ThrowingWorld world = (ThrowingWorld) unsafe.allocateInstance(ThrowingWorld.class);
++        world.shouldThrow = new AtomicBoolean(true);
++        world.neighborCallsAfterRecovery = new AtomicInteger();
++        world.stubWorld = (org.bukkit.craftbukkit.CraftWorld) unsafe.allocateInstance(StubCraftWorld.class);
++        world.stubServer = (org.bukkit.craftbukkit.CraftServer) unsafe.allocateInstance(org.bukkit.craftbukkit.CraftServer.class);
++        LightPropagationParityTest.set(org.bukkit.craftbukkit.CraftServer.class, world.stubServer, "pluginManager", makePluginManager());
++        LightPropagationParityTest.set(World.class, world, "paperConfig", base.paperConfig);
++        world.paperConfig.useEigencraftRedstone = true;
++        LightPropagationParityTest.set(World.class, world, "chunkProvider", providerOut[0]);
++        LightPropagationParityTest.set(World.class, world, "worldProvider", base.worldProvider);
++        LightPropagationParityTest.set(World.class, world, "isClientSide", false);
++
++        for (int x = 0; x <= 4; ++x) {
++            LightPropagationParityTest.setBlock(world, x, 39, 0, Blocks.STONE.getBlockData());
++        }
++        LightPropagationParityTest.setBlock(world, 0, 40, 0, Blocks.REDSTONE_BLOCK.getBlockData());
++        LightPropagationParityTest.setBlock(world, 1, 40, 0, Blocks.REDSTONE_WIRE.getBlockData());
++        LightPropagationParityTest.setBlock(world, 2, 40, 0, Blocks.REDSTONE_WIRE.getBlockData());
++        LightPropagationParityTest.setBlock(world, 3, 40, 0, Blocks.REDSTONE_WIRE.getBlockData());
++
++        BlockPosition trigger = new BlockPosition(1, 40, 0);
++        try {
++            Blocks.REDSTONE_WIRE.a(world.getType(trigger), world, trigger, Blocks.REDSTONE_BLOCK, new BlockPosition(0, 40, 0));
++            fail("expected simulated exception to propagate out of walk");
++        } catch (RuntimeException expected) {
++            assertEquals("simulated plugin/block exception during walk", expected.getMessage());
++        }
++
++        // Disable throwing and run another update: previously nodeCache stayed non-empty and froze all wire updates forever!
++        world.shouldThrow.set(false);
++        LightPropagationParityTest.setBlock(world, 1, 40, 0, Blocks.REDSTONE_WIRE.getBlockData());
++        LightPropagationParityTest.setBlock(world, 2, 40, 0, Blocks.REDSTONE_WIRE.getBlockData());
++        LightPropagationParityTest.setBlock(world, 3, 40, 0, Blocks.REDSTONE_WIRE.getBlockData());
++        Blocks.REDSTONE_WIRE.a(world.getType(trigger), world, trigger, Blocks.REDSTONE_BLOCK, new BlockPosition(0, 40, 0));
++
++        assertEquals("wire at x=1 must recover to power 15", 15, world.getType(new BlockPosition(1, 40, 0)).get(BlockRedstoneWire.POWER).intValue());
++        assertEquals("wire at x=2 must recover to power 14", 14, world.getType(new BlockPosition(2, 40, 0)).get(BlockRedstoneWire.POWER).intValue());
++        assertEquals("wire at x=3 must recover to power 13", 13, world.getType(new BlockPosition(3, 40, 0)).get(BlockRedstoneWire.POWER).intValue());
++        assertTrue("neighbor updates must resume after exception", world.neighborCallsAfterRecovery.get() > 0);
++    }
++
++    @Test
++    public void separateWorldsUseDistinctTurboInstances() throws Exception {
++        LightPropagationParityTest.StubProvider[] p1 = new LightPropagationParityTest.StubProvider[1];
++        LightPropagationParityTest.StubProvider[] p2 = new LightPropagationParityTest.StubProvider[1];
++        WorldServer worldA = LightPropagationParityTest.buildWorld(201L, p1);
++        WorldServer worldB = LightPropagationParityTest.buildWorld(202L, p2);
++        worldA.paperConfig.useEigencraftRedstone = true;
++        worldB.paperConfig.useEigencraftRedstone = true;
++
++        LightPropagationParityTest.setBlock(worldA, 2, 39, 2, Blocks.STONE.getBlockData());
++        LightPropagationParityTest.setBlock(worldA, 2, 40, 2, Blocks.REDSTONE_WIRE.getBlockData());
++        LightPropagationParityTest.setBlock(worldB, 2, 39, 2, Blocks.STONE.getBlockData());
++        LightPropagationParityTest.setBlock(worldB, 2, 40, 2, Blocks.REDSTONE_WIRE.getBlockData());
++
++        BlockPosition pos = new BlockPosition(2, 40, 2);
++        Blocks.REDSTONE_WIRE.a(worldA.getType(pos), worldA, pos, Blocks.STONE, pos);
++        Blocks.REDSTONE_WIRE.a(worldB.getType(pos), worldB, pos, Blocks.STONE, pos);
++
++        assertNotNull(worldA.redstoneWireTurbo);
++        assertNotNull(worldB.redstoneWireTurbo);
++        assertNotSame("worlds must never share a singleton RedstoneWireTurbo", worldA.redstoneWireTurbo, worldB.redstoneWireTurbo);
++    }
++
++    @Test
++    public void triggerWireFiresBlockRedstoneEventWhenListenerRegistered() throws Exception {
++        AtomicInteger eventCalls = new AtomicInteger();
++        Plugin dummyPlugin = (Plugin) java.lang.reflect.Proxy.newProxyInstance(
++            Plugin.class.getClassLoader(),
++            new Class<?>[]{Plugin.class},
++            (proxy, method, args) -> {
++                if ("isEnabled".equals(method.getName())) return true;
++                if ("getName".equals(method.getName())) return "TestPlugin";
++                return null;
++            }
++        );
++
++        this.registeredListener = new RegisteredListener(
++            new Listener() {},
++            (listener, event) -> {
++                if (event instanceof BlockRedstoneEvent) {
++                    eventCalls.incrementAndGet();
++                    ((BlockRedstoneEvent) event).setNewCurrent(7);
++                }
++            },
++            EventPriority.NORMAL,
++            dummyPlugin,
++            false
++        );
++        BlockRedstoneEvent.getHandlerList().register(this.registeredListener);
++
++        LightPropagationParityTest.StubProvider[] p = new LightPropagationParityTest.StubProvider[1];
++        WorldServer base = LightPropagationParityTest.buildWorld(303L, p);
++
++        EventWorld world = (EventWorld) unsafe.allocateInstance(EventWorld.class);
++        world.stubWorld = (org.bukkit.craftbukkit.CraftWorld) unsafe.allocateInstance(StubCraftWorld.class);
++        world.stubServer = (org.bukkit.craftbukkit.CraftServer) unsafe.allocateInstance(org.bukkit.craftbukkit.CraftServer.class);
++        LightPropagationParityTest.set(org.bukkit.craftbukkit.CraftServer.class, world.stubServer, "pluginManager", makePluginManager());
++        LightPropagationParityTest.set(World.class, world, "paperConfig", base.paperConfig);
++        world.paperConfig.useEigencraftRedstone = true;
++        LightPropagationParityTest.set(World.class, world, "chunkProvider", p[0]);
++        LightPropagationParityTest.set(World.class, world, "worldProvider", base.worldProvider);
++        LightPropagationParityTest.set(World.class, world, "isClientSide", false);
++
++        LightPropagationParityTest.setBlock(world, 0, 40, 0, Blocks.REDSTONE_BLOCK.getBlockData());
++        LightPropagationParityTest.setBlock(world, 1, 39, 0, Blocks.STONE.getBlockData());
++        LightPropagationParityTest.setBlock(world, 1, 40, 0, Blocks.REDSTONE_WIRE.getBlockData());
++
++        BlockPosition trigger = new BlockPosition(1, 40, 0);
++        IBlockData result = Blocks.REDSTONE_WIRE.calculateCurrentChanges(world, trigger, trigger, world.getType(trigger));
++
++        assertEquals("trigger wire must fire BlockRedstoneEvent", 1, eventCalls.get());
++        assertEquals("listener-modified current must be applied to trigger wire", 7, result.get(BlockRedstoneWire.POWER).intValue());
++    }
++}

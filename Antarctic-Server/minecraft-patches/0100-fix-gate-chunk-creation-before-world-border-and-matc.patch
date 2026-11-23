@@ -1,0 +1,369 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Mon, 23 Nov 2026 09:25:33 +0700
+Subject: [PATCH 100/115] fix: gate chunk creation before world border and
+ match vanilla chunk AABB
+
+
+diff --git a/main/java/net/minecraft/server/PlayerChunk.java b/main/java/net/minecraft/server/PlayerChunk.java
+index 3523777..b65e617 100644
+--- a/main/java/net/minecraft/server/PlayerChunk.java
++++ b/main/java/net/minecraft/server/PlayerChunk.java
+@@ -64,7 +64,6 @@ public class PlayerChunk {
+         if (this.c.contains(entityplayer)) {
+             PlayerChunk.a.debug("Failed to add player. {} already is in chunk {}, {}", entityplayer, Integer.valueOf(this.location.x), Integer.valueOf(this.location.z));
+         } else {
+-            if (!com.destroystokyo.paper.config.toml.modules.optimizations.WorldBorder.noChunksPastWorldBorder || playerChunkMap.getWorld().getWorldBorder().isChunkInBounds(location.x, location.z)) { // Dionysus
+             if (this.c.isEmpty()) {
+                 this.i = this.playerChunkMap.getWorld().getTime();
+             }
+@@ -78,7 +77,6 @@ public class PlayerChunk {
+                 this.sendChunk(entityplayer);
+             }
+             // CraftBukkit end
+-            } // Dionysus
+         }
+     }
+ 
+diff --git a/main/java/net/minecraft/server/PlayerChunkMap.java b/main/java/net/minecraft/server/PlayerChunkMap.java
+index 99652ae..00d8586 100644
+--- a/main/java/net/minecraft/server/PlayerChunkMap.java
++++ b/main/java/net/minecraft/server/PlayerChunkMap.java
+@@ -302,7 +302,9 @@ public class PlayerChunkMap {
+         for (int k = i - viewDistance; k <= i + viewDistance; ++k) {
+             for (int l = j - viewDistance; l <= j + viewDistance; ++l) {
+                 // Paper end
+-                chunkList.add(new ChunkCoordIntPair(k, l));
++                if (this.isChunkAllowedByWorldBorder(k, l)) { // Antarctic - gate before PlayerChunk creation
++                    chunkList.add(new ChunkCoordIntPair(k, l));
++                }
+             }
+         }
+ 
+@@ -365,7 +367,7 @@ public class PlayerChunkMap {
+             if (j1 != 0 || k1 != 0) {
+                 for (int l1 = i - i1; l1 <= i + i1; ++l1) {
+                     for (int i2 = j - i1; i2 <= j + i1; ++i2) {
+-                        if (!this.a(l1, i2, k, l, viewDistance)) { // Paper - Player view distance API
++                        if (!this.a(l1, i2, k, l, viewDistance) && this.isChunkAllowedByWorldBorder(l1, i2)) { // Paper - Player view distance API // Antarctic - gate before PlayerChunk creation
+                             // this.c(l1, i2).a(entityplayer);
+                             chunksToLoad.add(new ChunkCoordIntPair(l1, i2)); // CraftBukkit
+                         }
+@@ -438,6 +440,9 @@ public class PlayerChunkMap {
+             if (j > 0) {
+                 for (i1 = k - i; i1 <= k + i; ++i1) {
+                     for (j1 = l - i; j1 <= l + i; ++j1) {
++                        if (!this.isChunkAllowedByWorldBorder(i1, j1)) { // Antarctic - gate before PlayerChunk creation
++                            continue;
++                        }
+                         PlayerChunk playerchunk = this.c(i1, j1);
+ 
+                         if (!playerchunk.d(entityplayer)) {
+@@ -449,7 +454,10 @@ public class PlayerChunkMap {
+                 for (i1 = k - oldViewDistance; i1 <= k + oldViewDistance; ++i1) {
+                     for (j1 = l - oldViewDistance; j1 <= l + oldViewDistance; ++j1) {
+                         if (!this.a(i1, j1, k, l, i)) {
+-                            this.c(i1, j1).b(entityplayer);
++                            PlayerChunk playerchunk = this.getChunk(i1, j1); // Antarctic - do not create PlayerChunk on view shrink
++                            if (playerchunk != null) {
++                                playerchunk.b(entityplayer);
++                            }
+                         }
+                     }
+                 }
+@@ -459,6 +467,40 @@ public class PlayerChunkMap {
+             }
+         }
+     }
++
++    // Antarctic start - world border chunk gating and border expansion refresh
++    private boolean isChunkAllowedByWorldBorder(int chunkX, int chunkZ) {
++        return !com.destroystokyo.paper.config.toml.modules.optimizations.WorldBorder.noChunksPastWorldBorder
++            || this.world.getWorldBorder().isChunkInBounds(chunkX, chunkZ);
++    }
++
++    public void refreshWorldBorderChunks() {
++        if (!com.destroystokyo.paper.config.toml.modules.optimizations.WorldBorder.noChunksPastWorldBorder || this.managedPlayers.isEmpty()) {
++            return;
++        }
++        boolean addedAny = false;
++        for (int idx = 0; idx < this.managedPlayers.size(); ++idx) {
++            EntityPlayer entityplayer = this.managedPlayers.get(idx);
++            int centerX = (int) entityplayer.d >> 4;
++            int centerZ = (int) entityplayer.e >> 4;
++            int viewDistance = entityplayer.getViewDistance();
++            for (int cx = centerX - viewDistance; cx <= centerX + viewDistance; ++cx) {
++                for (int cz = centerZ - viewDistance; cz <= centerZ + viewDistance; ++cz) {
++                    if (this.isChunkAllowedByWorldBorder(cx, cz)) {
++                        PlayerChunk playerchunk = this.c(cx, cz);
++                        if (!playerchunk.d(entityplayer)) {
++                            playerchunk.a(entityplayer);
++                            addedAny = true;
++                        }
++                    }
++                }
++            }
++        }
++        if (addedAny) {
++            this.e();
++        }
++    }
++    // Antarctic end
+     // Paper end
+ 
+     private void e() {
+diff --git a/main/java/net/minecraft/server/WorldBorder.java b/main/java/net/minecraft/server/WorldBorder.java
+index f404894..9499b95 100644
+--- a/main/java/net/minecraft/server/WorldBorder.java
++++ b/main/java/net/minecraft/server/WorldBorder.java
+@@ -34,17 +34,16 @@ public class WorldBorder {
+     }
+ 
+     // Paper start
+-    private final BlockPosition.MutableBlockPosition mutPos = new BlockPosition.MutableBlockPosition();
+-    public boolean isBlockInBounds(int chunkX, int chunkZ) {
+-        BlockPosition.MutableBlockPosition mutPos = new BlockPosition.MutableBlockPosition(); // Dionysus - avoid collisions with other threads
+-        mutPos.setValues(chunkX, 64, chunkZ);
+-        return isInBounds(mutPos);
++    // Antarctic start - zero-alloc vanilla-parity bounds checks
++    public boolean isBlockInBounds(int blockX, int blockZ) {
++        return (double) (blockX + 1) > this.b() && (double) blockX < this.d() && (double) (blockZ + 1) > this.c() && (double) blockZ < this.e();
+     }
+     public boolean isChunkInBounds(int chunkX, int chunkZ) {
+-        BlockPosition.MutableBlockPosition mutPos = new BlockPosition.MutableBlockPosition(); // Dionysus - avoid collisions with other threads
+-        mutPos.setValues(((chunkX << 4) + 15), 64, (chunkZ << 4) + 15);
+-        return isInBounds(mutPos);
++        int xStart = chunkX << 4;
++        int zStart = chunkZ << 4;
++        return (double) (xStart + 15) > this.b() && (double) xStart < this.d() && (double) (zStart + 15) > this.c() && (double) zStart < this.e();
+     }
++    // Antarctic end
+     // Paper end
+ 
+     public boolean isInBounds(ChunkCoordIntPair chunkcoordintpair) {
+@@ -133,6 +132,7 @@ public class WorldBorder {
+             iworldborderlistener.a(this, d0, d1);
+         }
+ 
++        this.refreshPlayerChunksIfNeeded(); // Antarctic - refresh chunks when border moves
+     }
+ 
+     public double getSize() {
+@@ -170,6 +170,7 @@ public class WorldBorder {
+             iworldborderlistener.a(this, d0);
+         }
+ 
++        this.refreshPlayerChunksIfNeeded(); // Antarctic - refresh chunks when border resizes
+     }
+ 
+     public void transitionSizeBetween(double d0, double d1, long i) {
+@@ -185,6 +186,16 @@ public class WorldBorder {
+             iworldborderlistener.a(this, d0, d1, i);
+         }
+ 
++        this.refreshPlayerChunksIfNeeded(); // Antarctic - refresh chunks when border starts resizing
++    }
++
++    private void refreshPlayerChunksIfNeeded() {
++        if (com.destroystokyo.paper.config.toml.modules.optimizations.WorldBorder.noChunksPastWorldBorder && this.world != null) {
++            PlayerChunkMap map = this.world.getPlayerChunkMap();
++            if (map != null) {
++                map.refreshWorldBorderChunks();
++            }
++        }
+     }
+ 
+     protected List<IWorldBorderListener> k() {
+diff --git a/test/java/net/minecraft/server/WorldBorderChunkBoundsTest.java b/test/java/net/minecraft/server/WorldBorderChunkBoundsTest.java
+new file mode 100644
+index 0000000..4e12d3a
+--- /dev/null
++++ b/test/java/net/minecraft/server/WorldBorderChunkBoundsTest.java
+@@ -0,0 +1,187 @@
++package net.minecraft.server;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertNull;
++import static org.junit.Assert.assertTrue;
++
++import java.lang.management.ManagementFactory;
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Random;
++import org.junit.After;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++public class WorldBorderChunkBoundsTest {
++
++    private static Unsafe unsafe;
++
++    private static final class RecordingChunkProvider extends ChunkProviderServer {
++        final List<Long> loadRequests = new ArrayList<>();
++
++        RecordingChunkProvider(WorldServer world) {
++            super(world, null, null);
++        }
++
++        @Override
++        public Chunk getChunkAt(int x, int z, Runnable runnable, boolean generate) {
++            this.loadRequests.add(ChunkCoordIntPair.a(x, z));
++            return null;
++        }
++    }
++
++    @BeforeClass
++    public static void bootstrap() throws Exception {
++        Field field = Unsafe.class.getDeclaredField("theUnsafe");
++        field.setAccessible(true);
++        unsafe = (Unsafe) field.get(null);
++    }
++
++    private boolean prevAsyncCatcher;
++
++    @org.junit.Before
++    public void disableAsyncCatcher() {
++        this.prevAsyncCatcher = org.spigotmc.AsyncCatcher.enabled;
++        org.spigotmc.AsyncCatcher.enabled = false;
++    }
++
++    @After
++    public void resetConfig() {
++        com.destroystokyo.paper.config.toml.modules.optimizations.WorldBorder.noChunksPastWorldBorder = false;
++        org.spigotmc.AsyncCatcher.enabled = this.prevAsyncCatcher;
++    }
++
++    private static void set(Class<?> owner, Object instance, String name, Object value) throws Exception {
++        Field f = owner.getDeclaredField(name);
++        f.setAccessible(true);
++        f.set(instance, value);
++    }
++
++    private static Object get(Class<?> owner, Object instance, String name) throws Exception {
++        Field f = owner.getDeclaredField(name);
++        f.setAccessible(true);
++        return f.get(instance);
++    }
++
++    @Test
++    public void isChunkInBoundsMatchesVanillaChunkPosAcross20kTrials() {
++        WorldBorder border = new WorldBorder();
++        Random rng = new Random(0x5EED1234L);
++        for (int trial = 0; trial < 20_000; ++trial) {
++            double centerX = (rng.nextInt(400) - 200) + rng.nextDouble();
++            double centerZ = (rng.nextInt(400) - 200) + rng.nextDouble();
++            double size = 1.0D + rng.nextInt(256) + rng.nextDouble();
++            border.setCenter(centerX, centerZ);
++            border.setSize(size);
++
++            int cx = (int) Math.floor(centerX / 16.0D) + rng.nextInt(25) - 12;
++            int cz = (int) Math.floor(centerZ / 16.0D) + rng.nextInt(25) - 12;
++            boolean expected = border.isInBounds(new ChunkCoordIntPair(cx, cz));
++            boolean actual = border.isChunkInBounds(cx, cz);
++            assertEquals("chunk parity mismatch at trial=" + trial + " (" + cx + "," + cz + ")", expected, actual);
++
++            int bx = (cx << 4) + rng.nextInt(16);
++            int bz = (cz << 4) + rng.nextInt(16);
++            boolean expectedBlock = border.isInBounds(new BlockPosition(bx, 64, bz));
++            boolean actualBlock = border.isBlockInBounds(bx, bz);
++            assertEquals("block parity mismatch at trial=" + trial + " (" + bx + "," + bz + ")", expectedBlock, actualBlock);
++        }
++    }
++
++    @Test
++    public void boundsChecksAllocateZeroBytes() {
++        WorldBorder border = new WorldBorder();
++        border.setCenter(10.5D, -22.25D);
++        border.setSize(128.0D);
++
++        // Warmup
++        int sink = 0;
++        for (int i = 0; i < 20_000; ++i) {
++            sink += border.isChunkInBounds((i & 31) - 16, ((i >> 5) & 31) - 16) ? 1 : 0;
++            sink += border.isBlockInBounds(i & 255, (i >> 8) & 255) ? 1 : 0;
++        }
++        assertTrue(sink >= 0);
++
++        com.sun.management.ThreadMXBean mx = (com.sun.management.ThreadMXBean) ManagementFactory.getThreadMXBean();
++        long tid = Thread.currentThread().getId();
++        long before = mx.getThreadAllocatedBytes(tid);
++        for (int i = 0; i < 50_000; ++i) {
++            sink += border.isChunkInBounds((i & 31) - 16, ((i >> 5) & 31) - 16) ? 1 : 0;
++            sink += border.isBlockInBounds(i & 255, (i >> 8) & 255) ? 1 : 0;
++        }
++        long after = mx.getThreadAllocatedBytes(tid);
++        assertTrue(sink >= 0);
++        assertEquals("isChunkInBounds/isBlockInBounds must allocate 0 bytes", 0L, after - before);
++    }
++
++    @Test
++    public void gatingPreventsLeakedPlayerChunksAndOutsideLoads() throws Exception {
++        WorldServer world = (WorldServer) unsafe.allocateInstance(WorldServer.class);
++        WorldBorder border = new WorldBorder();
++        border.world = world;
++        border.setCenter(0.0D, 0.0D);
++        border.setSize(32.0D); // chunks (-1..0, -1..0) in bounds; chunks outside [-1, 0] are out of bounds
++        set(World.class, world, "P", border);
++        set(World.class, world, "worldData", unsafe.allocateInstance(WorldData.class));
++        RecordingChunkProvider provider = new RecordingChunkProvider(world);
++        set(World.class, world, "chunkProvider", provider);
++        set(World.class, world, "paperConfig", unsafe.allocateInstance(com.destroystokyo.paper.PaperWorldConfig.class));
++
++        PlayerChunkMap map = (PlayerChunkMap) unsafe.allocateInstance(PlayerChunkMap.class);
++        set(PlayerChunkMap.class, map, "world", world);
++        set(PlayerChunkMap.class, map, "managedPlayers", new ArrayList<EntityPlayer>());
++        set(PlayerChunkMap.class, map, "e", new it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<PlayerChunk>(4096));
++        set(PlayerChunkMap.class, map, "f", new java.util.HashSet<PlayerChunk>());
++        set(PlayerChunkMap.class, map, "g", new java.util.LinkedList<PlayerChunk>());
++        set(PlayerChunkMap.class, map, "h", new java.util.LinkedList<PlayerChunk>());
++        set(PlayerChunkMap.class, map, "i", new ArrayList<PlayerChunk>());
++        set(PlayerChunkMap.class, map, "j", 4);
++        set(WorldServer.class, world, "manager", map);
++
++        EntityPlayer player = (EntityPlayer) unsafe.allocateInstance(EntityPlayer.class);
++        player.locX = 0.0D;
++        player.locZ = 0.0D;
++        set(Entity.class, player, "world", world);
++        player.setViewDistance(4);
++
++        // Enable gating: only chunks in bounds should be created or loaded
++        com.destroystokyo.paper.config.toml.modules.optimizations.WorldBorder.noChunksPastWorldBorder = true;
++        map.addPlayer(player);
++
++        @SuppressWarnings("unchecked")
++        List<PlayerChunk> activeChunks = (List<PlayerChunk>) get(PlayerChunkMap.class, map, "i");
++        assertEquals("only the 4 in-border chunks should be created", 4, activeChunks.size());
++        assertEquals("only the 4 in-border chunks should request loads", 4, provider.loadRequests.size());
++        assertNotNull(map.getChunk(0, 0));
++        assertNull("out-of-border chunk must not create PlayerChunk", map.getChunk(3, 3));
++
++        // Expand border: newly in-bounds chunks within view distance must be added automatically
++        border.setSize(96.0D); // chunks -3..2 in bounds
++        assertNotNull("expanding border must populate newly in-bounds chunk", map.getChunk(2, 2));
++        assertTrue(map.getChunk(2, 2).d(player));
++        assertNull("still out-of-border chunk must not be created", map.getChunk(4, 4));
++
++        // Shrink view distance: must not create out-of-border PlayerChunks on removal
++        int loadsBeforeShrink = provider.loadRequests.size();
++        map.setViewDistance(player, 3, true);
++        player.setViewDistance(3);
++        assertEquals("shrinking view distance must not trigger new chunk loads", loadsBeforeShrink, provider.loadRequests.size());
++        assertNull(map.getChunk(4, 4));
++
++        // Remove player: zero leaked PlayerChunks remain
++        map.removePlayer(player);
++        assertEquals("zero PlayerChunks may leak after player leaves", 0, activeChunks.size());
++
++        // Disable gating (vanilla default): full (2*3+1)^2 = 49 chunks created
++        com.destroystokyo.paper.config.toml.modules.optimizations.WorldBorder.noChunksPastWorldBorder = false;
++        border.setSize(32.0D);
++        map.addPlayer(player);
++        assertEquals("with gating disabled, vanilla creates all 49 chunks in view distance", 49, activeChunks.size());
++        map.removePlayer(player);
++        assertEquals(0, activeChunks.size());
++    }
++}

@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Mon, 23 Nov 2026 10:25:38 +0700
+Subject: [PATCH 8/8] feat: expose World relightChunks and isLightConsistent
+ API
+
+
+diff --git a/main/java/org/bukkit/World.java b/main/java/org/bukkit/World.java
+index d505863..85f641f 100644
+--- a/main/java/org/bukkit/World.java
++++ b/main/java/org/bukkit/World.java
+@@ -54,6 +54,32 @@ public interface World extends PluginMessageRecipient, Metadatable {
+     int getPlayerCount();
+     // Paper end
+ 
++    // Antarctic start - async bulk relight and light consistency API
++    /**
++     * Requests an asynchronous bulk relight of the given chunks.
++     * Must be called from the main server thread. The returned future completes on the main thread
++     * with the number of chunks whose lighting was applied, or 0 if async bulk relighting is disabled.
++     *
++     * @param chunks chunks belonging to this world to relight
++     * @return future completing on the main thread with the number of chunks applied
++     */
++    default java.util.concurrent.CompletableFuture<Integer> relightChunks(Collection<Chunk> chunks) {
++        throw new UnsupportedOperationException("relightChunks is not implemented by " + getClass().getName());
++    }
++
++    /**
++     * Verifies synchronously whether all stored sky and block light cells in the loaded chunk
++     * satisfy vanilla's fixed-point lighting rules against its loaded neighbours.
++     *
++     * @param chunkX chunk X coordinate
++     * @param chunkZ chunk Z coordinate
++     * @return true if the chunk is loaded and light-consistent, false otherwise
++     */
++    default boolean isLightConsistent(int chunkX, int chunkZ) {
++        throw new UnsupportedOperationException("isLightConsistent is not implemented by " + getClass().getName());
++    }
++    // Antarctic end
++
+     /**
+      * Gets the {@link Block} at the given coordinates
+      *

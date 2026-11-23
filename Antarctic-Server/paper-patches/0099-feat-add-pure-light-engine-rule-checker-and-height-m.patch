@@ -1,0 +1,2812 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Thu, 19 Nov 2026 12:59:58 +0700
+Subject: [PATCH 099/115] feat: add pure light engine, rule checker and height
+ map helper
+
+New package me.stella.antarctic.light, with no Minecraft references, so it can run on worker threads and be tested alone. This is commit 1 of the asynchronous relight work (design: Step 11); nothing in the server calls it yet.
+
+LightEngine computes sky and block light of target chunk columns from scratch as the unique fixed point of vanilla 1.12.2's per-cell rule (World.a(BlockPosition, EnumSkyBlock)): a bucket-queue flood fill from sources, level 15 down to 1, treating ring columns as fixed input and absent columns as contributing nothing. A section that does not exist gets an array only when light spilled into it. LightChecker is an independent per-cell transcription of the same rule (7 reads, no flood) that reports cells that are not at the fixed point, skipping cells next to absent columns. HeightMaps derives vanilla height maps from packed cells.
+
+Verification: hand-built scenes with worked values; random scenes compared against a naive iterate-the-rule reference and the checker; the checker's expected() equals the server's own World.a on about 1.5 million cells of random blocks, heights and garbage stored light; the engine equals vanilla's incremental relight for isolated emitters, translucent blocks and their removal, including emitters in the ring; HeightMaps equals Chunk.initLighting. Seeded engine and checker bugs are caught by these tests. Engine cost, measured: about 1.1-1.5 ms and 99 KiB per target chunk for an island-shaped scene, 7-9 ms and 715 KiB for a dense one.
+
+Antarctic - rebuilt from the design of Starlight (Spottedleaf / PaperMC; LGPL-3.0): light as the fixed point of local rules. No code is copied.
+
+diff --git a/main/java/me/stella/antarctic/light/HeightMaps.java b/main/java/me/stella/antarctic/light/HeightMaps.java
+new file mode 100644
+index 0000000..933c0e3
+--- /dev/null
++++ b/main/java/me/stella/antarctic/light/HeightMaps.java
+@@ -0,0 +1,48 @@
++package me.stella.antarctic.light;
++
++/**
++ * Height map derivation from packed cells. Vanilla defines a column's height as one above its highest cell with a
++ * non-zero light opacity (0 for an all-transparent column); cells at or above it see the sky. A relight over blocks that
++ * were written without maintaining the height map (bulk edits) must start from heights derived this way.
++ */
++public final class HeightMaps {
++
++    private HeightMaps() {
++    }
++
++    /**
++     * Derives all 256 heights, index {@code z << 4 | x}.
++     *
++     * @param cells the 16 sections of one column, null for a missing section
++     */
++    public static int[] compute(byte[][] cells) {
++        int[] heights = new int[256];
++
++        for (int localZ = 0; localZ < 16; ++localZ) {
++            for (int localX = 0; localX < 16; ++localX) {
++                heights[localZ << 4 | localX] = column(cells, localX, localZ);
++            }
++        }
++
++        return heights;
++    }
++
++    /** Height of one column: highest cell with opacity &gt; 0, plus one; 0 when there is none. */
++    public static int column(byte[][] cells, int localX, int localZ) {
++        for (int section = LightRules.SECTIONS - 1; section >= 0; --section) {
++            byte[] sectionCells = cells[section];
++
++            if (sectionCells == null) {
++                continue;
++            }
++
++            for (int localY = 15; localY >= 0; --localY) {
++                if (LightRules.opacity(sectionCells[LightRules.cellIndex(localX, localY, localZ)]) != 0) {
++                    return (section << 4) + localY + 1;
++                }
++            }
++        }
++
++        return 0;
++    }
++}
+diff --git a/main/java/me/stella/antarctic/light/LightChecker.java b/main/java/me/stella/antarctic/light/LightChecker.java
+new file mode 100644
+index 0000000..4f7bfea
+--- /dev/null
++++ b/main/java/me/stella/antarctic/light/LightChecker.java
+@@ -0,0 +1,175 @@
++package me.stella.antarctic.light;
++
++import java.util.Arrays;
++
++/**
++ * Checks whether the light stored in a target column satisfies the per-cell rule of {@link LightRules}, i.e. whether it
++ * is the fixed point. This is the "enforcer" verification: it never recomputes or floods, it reads each cell and its six
++ * neighbours (7 reads), so it costs far less than a relight and is written independently of {@link LightEngine}.
++ *
++ * <p>It transcribes vanilla's {@code World.a(BlockPosition, EnumSkyBlock)} exactly, including reading the cell itself for
++ * the neighbour below y = 0 and 15 / 0 above y = 255, so that on any stored data (consistent or not) {@link #expected}
++ * equals what the server's own rule would compute. A cell whose horizontal neighbour column is absent cannot be judged and
++ * is skipped, never reported.
++ */
++public final class LightChecker {
++
++    public enum Scope {
++        /** Every cell of every section 0..15 of the column. */
++        ALL,
++        /** Only cells in the 60 edge columns (local x or z equal to 0 or 15); what an outside change can break. */
++        BORDER
++    }
++
++    /** Outcome of one column check. */
++    public static final class Report {
++
++        private final int checked;
++        private final int skipped;
++        private final int violations;
++        private final int[] positions;
++
++        Report(int checked, int skipped, int violations, int[] positions) {
++            this.checked = checked;
++            this.skipped = skipped;
++            this.violations = violations;
++            this.positions = positions;
++        }
++
++        public int checked() {
++            return this.checked;
++        }
++
++        /** Cells that could not be judged because a horizontal neighbour column is absent. */
++        public int skipped() {
++            return this.skipped;
++        }
++
++        public int violations() {
++            return this.violations;
++        }
++
++        public boolean consistent() {
++            return this.violations == 0;
++        }
++
++        /** The first violating cells, packed with {@link LightRules#packPosition} (sky flag in bit 16). */
++        public int[] positions() {
++            return this.positions.clone();
++        }
++    }
++
++    private LightChecker() {
++    }
++
++    /**
++     * Checks one target column.
++     *
++     * @param maxReported how many violating positions to remember (the count is always exact)
++     */
++    public static Report check(LightRegion region, int chunkX, int chunkZ, Scope scope, int maxReported) {
++        int ci = region.index(chunkX, chunkZ);
++
++        if (ci < 0 || !region.isTarget(ci)) {
++            throw new IllegalArgumentException("chunk " + chunkX + "," + chunkZ + " is not a target column of the region");
++        }
++
++        LightColumn column = region.column(ci);
++        int[] positions = new int[Math.max(0, maxReported)];
++        int reported = 0;
++        int checked = 0;
++        int skipped = 0;
++        int violations = 0;
++
++        for (int type = 0; type < 2; ++type) {
++            boolean sky = type == 0;
++
++            if (sky && !region.hasSkyLight()) {
++                continue;
++            }
++
++            for (int y = 0; y < LightRules.WORLD_HEIGHT; ++y) {
++                for (int localZ = 0; localZ < 16; ++localZ) {
++                    for (int localX = 0; localX < 16; ++localX) {
++                        if (scope == Scope.BORDER && localX != 0 && localX != 15 && localZ != 0 && localZ != 15) {
++                            continue;
++                        }
++
++                        int expected = expected(region, sky, chunkX, chunkZ, localX, y, localZ);
++
++                        if (expected < 0) {
++                            ++skipped;
++                            continue;
++                        }
++
++                        ++checked;
++                        if (column.stored(sky, localX, y, localZ) != expected) {
++                            ++violations;
++                            if (reported < positions.length) {
++                                positions[reported++] = LightRules.packPosition(localX, y, localZ, sky);
++                            }
++                        }
++                    }
++                }
++            }
++        }
++
++        return new Report(checked, skipped, violations, Arrays.copyOf(positions, reported));
++    }
++
++    /**
++     * The light the rule says this cell should have given its neighbours' stored light, or -1 when it cannot be decided
++     * because a horizontal neighbour column is absent from the region (and the answer is not fixed by the cell itself).
++     */
++    public static int expected(LightRegion region, boolean sky, int chunkX, int chunkZ, int localX, int y, int localZ) {
++        LightColumn column = region.column(chunkX, chunkZ);
++
++        if (column == null) {
++            throw new IllegalArgumentException("chunk " + chunkX + "," + chunkZ + " is not in the region");
++        }
++
++        if (sky && y >= column.height(localX, localZ)) {
++            return LightRules.MAX_LIGHT;
++        }
++
++        byte cell = column.cell(localX, y, localZ);
++        int cost = LightRules.cost(cell);
++
++        if (cost >= LightRules.BLOCKED) {
++            return 0;
++        }
++
++        int best = sky ? 0 : LightRules.emission(cell);
++        // above y = 255 vanilla reads the world-edge default (15 sky / 0 block); below y = 0 it reads the cell itself
++        int up = y + 1 > 255 ? (sky ? LightRules.MAX_LIGHT : 0) : column.stored(sky, localX, y + 1, localZ);
++        int down = column.stored(sky, localX, y - 1 < 0 ? 0 : y - 1, localZ);
++
++        best = Math.max(best, Math.max(up, down) - cost);
++
++        boolean unknown = false;
++        int neighbour;
++
++        neighbour = lateral(region, sky, chunkX, chunkZ, localX + 1, y, localZ);
++        unknown |= neighbour < 0;
++        best = Math.max(best, neighbour - cost);
++        neighbour = lateral(region, sky, chunkX, chunkZ, localX - 1, y, localZ);
++        unknown |= neighbour < 0;
++        best = Math.max(best, neighbour - cost);
++        neighbour = lateral(region, sky, chunkX, chunkZ, localX, y, localZ + 1);
++        unknown |= neighbour < 0;
++        best = Math.max(best, neighbour - cost);
++        neighbour = lateral(region, sky, chunkX, chunkZ, localX, y, localZ - 1);
++        unknown |= neighbour < 0;
++        best = Math.max(best, neighbour - cost);
++        return unknown ? -1 : best;
++    }
++
++    /** Stored light of a horizontal neighbour (possibly in the next chunk), or -1 when that column is absent. */
++    private static int lateral(LightRegion region, boolean sky, int chunkX, int chunkZ, int localX, int y, int localZ) {
++        int dx = localX < 0 ? -1 : (localX > 15 ? 1 : 0);
++        int dz = localZ < 0 ? -1 : (localZ > 15 ? 1 : 0);
++        LightColumn column = region.column(chunkX + dx, chunkZ + dz);
++
++        return column == null ? -1 : column.stored(sky, localX & 15, y, localZ & 15);
++    }
++}
+diff --git a/main/java/me/stella/antarctic/light/LightColumn.java b/main/java/me/stella/antarctic/light/LightColumn.java
+new file mode 100644
+index 0000000..541cfd0
+--- /dev/null
++++ b/main/java/me/stella/antarctic/light/LightColumn.java
+@@ -0,0 +1,92 @@
++package me.stella.antarctic.light;
++
++/**
++ * Plain data of one chunk column for the light engine: per-section packed cell bytes, the height map and, optionally,
++ * the light currently stored in each section (vanilla nibble layout).
++ *
++ * <p>A {@code null} entry in the cells means the section does not exist (vanilla's empty section {@code Chunk.a}); it
++ * behaves as all air. A {@code null} stored array means "implicit": sky light reads 15 at or above the column's height
++ * and 0 below it, block light reads 0 (vanilla's {@code Chunk.getBrightness} for a missing section).
++ *
++ * <p>Arrays are held by reference and are never copied or modified by the engine; whoever builds the column (the snapshot
++ * on the main thread) must not change them while an engine call is running.
++ */
++public final class LightColumn {
++
++    private final int[] heightMap;
++    private final byte[][] cells = new byte[LightRules.SECTIONS][];
++    private final byte[][] sky = new byte[LightRules.SECTIONS][];
++    private final byte[][] block = new byte[LightRules.SECTIONS][];
++
++    /** @param heightMap 256 entries, index {@code z << 4 | x}: the lowest y from which a cell can see the sky (0..256) */
++    public LightColumn(int[] heightMap) {
++        if (heightMap.length != 256) {
++            throw new IllegalArgumentException("height map must have 256 entries, not " + heightMap.length);
++        }
++
++        this.heightMap = heightMap;
++    }
++
++    /** Sets the packed cells of an existing section (4096 bytes, index y &lt;&lt; 8 | z &lt;&lt; 4 | x). */
++    public LightColumn setCells(int section, byte[] packedCells) {
++        if (packedCells != null && packedCells.length != LightRules.SECTION_CELLS) {
++            throw new IllegalArgumentException("cells must have 4096 entries, not " + packedCells.length);
++        }
++
++        this.cells[section] = packedCells;
++        return this;
++    }
++
++    /** Sets the stored light of a section; either array may be null for "implicit". */
++    public LightColumn setStored(int section, byte[] skyNibbles, byte[] blockNibbles) {
++        checkNibbles(skyNibbles);
++        checkNibbles(blockNibbles);
++        this.sky[section] = skyNibbles;
++        this.block[section] = blockNibbles;
++        return this;
++    }
++
++    private static void checkNibbles(byte[] nibbles) {
++        if (nibbles != null && nibbles.length != LightRules.NIBBLE_BYTES) {
++            throw new IllegalArgumentException("nibble arrays must have 2048 bytes, not " + nibbles.length);
++        }
++    }
++
++    public int height(int localX, int localZ) {
++        return this.heightMap[localZ << 4 | localX];
++    }
++
++    public int[] heightMap() {
++        return this.heightMap;
++    }
++
++    public byte[] cells(int section) {
++        return this.cells[section];
++    }
++
++    public byte[] storedSky(int section) {
++        return this.sky[section];
++    }
++
++    public byte[] storedBlock(int section) {
++        return this.block[section];
++    }
++
++    /** The packed cell at a column-local position; a missing section reads as air (0). */
++    public byte cell(int localX, int y, int localZ) {
++        byte[] section = this.cells[y >> 4];
++
++        return section == null ? 0 : section[LightRules.cellIndex(localX, y & 15, localZ)];
++    }
++
++    /** The stored light at a column-local position, or the implicit value when the section has no stored array. */
++    public int stored(boolean skyLight, int localX, int y, int localZ) {
++        byte[] nibbles = skyLight ? this.sky[y >> 4] : this.block[y >> 4];
++
++        if (nibbles != null) {
++            return LightRules.getNibble(nibbles, LightRules.cellIndex(localX, y & 15, localZ));
++        }
++
++        return skyLight && y >= this.height(localX, localZ) ? LightRules.MAX_LIGHT : 0;
++    }
++}
+diff --git a/main/java/me/stella/antarctic/light/LightEngine.java b/main/java/me/stella/antarctic/light/LightEngine.java
+new file mode 100644
+index 0000000..4068933
+--- /dev/null
++++ b/main/java/me/stella/antarctic/light/LightEngine.java
+@@ -0,0 +1,368 @@
++package me.stella.antarctic.light;
++
++import java.util.Arrays;
++
++/**
++ * Computes sky and block light of the target columns of a {@link LightRegion} from scratch: the unique fixed point of the
++ * per-cell rule documented in {@link LightRules}. Pure and stateless (every call allocates its own scratch), so any
++ * number of threads may run it concurrently on separate regions.
++ *
++ * <p>How it works: light only ever decreases by at least 1 per cell, so the fixed point is the maximum over all paths from
++ * a source. Sources are emitting cells (block light), cells that see the sky (sky light) and the fixed light of ring
++ * columns. A flood fill that processes level 15 down to 1 raises every cell exactly to its final value the first time it
++ * touches it, because the cost of entering a cell does not depend on where the light came from.
++ *
++ * <p>Ring and absent columns are never written. Absent columns read as 0, so a target cell next to one is lit only from
++ * what is present; callers that care (the relight service) must treat those border cells as unverified.
++ *
++ * <p>Antarctic - rebuilt from the design of Starlight (Spottedleaf / PaperMC; LGPL-3.0): propagate from sources, then take
++ * neighbours' light into account at chunk edges. No code is copied.
++ */
++public final class LightEngine {
++
++    public LightResult relight(LightRegion region) {
++        LightResult result = new LightResult(region);
++
++        if (region.hasSkyLight()) {
++            new Pass(region, true).run(result);
++        }
++
++        new Pass(region, false).run(result);
++        return result;
++    }
++
++    private static final class Pass {
++
++        private final LightRegion region;
++        private final boolean sky;
++        private final int width;
++        private final int depth;
++        private final int blocksX;
++        private final int blocksZ;
++        /** Per target column and section a byte per cell holding the light computed so far; null = still implicit. */
++        private final byte[][] work;
++        private final int[][] queue = new int[16][];
++        private final int[] queued = new int[16];
++        private long raised;
++
++        Pass(LightRegion region, boolean sky) {
++            this.region = region;
++            this.sky = sky;
++            this.width = region.width();
++            this.depth = region.depth();
++            this.blocksX = this.width << 4;
++            this.blocksZ = this.depth << 4;
++            this.work = new byte[region.columnCount() * LightRules.SECTIONS][];
++        }
++
++        void run(LightResult out) {
++            for (int ci = 0; ci < this.region.columnCount(); ++ci) {
++                if (this.region.isTarget(ci)) {
++                    int baseX = ci % this.width << 4;
++                    int baseZ = ci / this.width << 4;
++
++                    if (this.sky) {
++                        this.seedSky(ci, this.region.column(ci), baseX, baseZ);
++                    } else {
++                        this.seedBlock(ci, this.region.column(ci), baseX, baseZ);
++                    }
++                }
++            }
++
++            this.seedFromRing();
++            this.propagate();
++            this.collect(out);
++            out.addRaised(this.raised);
++        }
++
++        // ------------------------------------------------------------------------------------------ storage
++
++        private int implicit(LightColumn column, int y, int localX, int localZ) {
++            return this.sky && y >= column.height(localX, localZ) ? LightRules.MAX_LIGHT : 0;
++        }
++
++        /** Light at region block coordinates; y must be 0..255. Absent columns and anything outside the region read 0. */
++        private int get(int rx, int y, int rz) {
++            if (rx < 0 || rz < 0 || rx >= this.blocksX || rz >= this.blocksZ) {
++                return 0;
++            }
++
++            int ci = (rz >> 4) * this.width + (rx >> 4);
++            LightColumn column = this.region.column(ci);
++
++            if (column == null) {
++                return 0;
++            }
++
++            int localX = rx & 15;
++            int localZ = rz & 15;
++            int section = y >> 4;
++
++            if (this.region.isTarget(ci)) {
++                byte[] light = this.work[ci * LightRules.SECTIONS + section];
++
++                return light != null ? light[LightRules.cellIndex(localX, y & 15, localZ)] : this.implicit(column, y, localX, localZ);
++            }
++
++            return column.stored(this.sky, localX, y, localZ);
++        }
++
++        /** The working array of a target section, created on first write with the implicit values filled in. */
++        private byte[] ensure(int ci, int section) {
++            int key = ci * LightRules.SECTIONS + section;
++            byte[] light = this.work[key];
++
++            if (light == null) {
++                light = new byte[LightRules.SECTION_CELLS];
++                if (this.sky) {
++                    LightColumn column = this.region.column(ci);
++                    int baseY = section << 4;
++
++                    for (int index = 0; index < LightRules.SECTION_CELLS; ++index) {
++                        if (baseY + (index >> 8) >= column.height(index & 15, index >> 4 & 15)) {
++                            light[index] = LightRules.MAX_LIGHT;
++                        }
++                    }
++                }
++
++                this.work[key] = light;
++            }
++
++            return light;
++        }
++
++        private void push(int level, int rx, int y, int rz) {
++            int[] entries = this.queue[level];
++            int size = this.queued[level];
++
++            if (entries == null) {
++                entries = this.queue[level] = new int[256];
++            } else if (size == entries.length) {
++                entries = this.queue[level] = Arrays.copyOf(entries, size << 1);
++            }
++
++            entries[size] = rx | rz << 12 | y << 24;
++            this.queued[level] = size + 1;
++        }
++
++        /** Raises a target cell to {@code candidate} if that is higher than its current value, and queues it. */
++        private void raise(int ci, LightColumn column, int rx, int y, int rz, int candidate) {
++            int localX = rx & 15;
++            int localZ = rz & 15;
++            int section = y >> 4;
++            int index = LightRules.cellIndex(localX, y & 15, localZ);
++            byte[] light = this.work[ci * LightRules.SECTIONS + section];
++            int current = light != null ? light[index] : this.implicit(column, y, localX, localZ);
++
++            if (candidate > current) {
++                if (light == null) {
++                    light = this.ensure(ci, section);
++                }
++
++                light[index] = (byte) candidate;
++                ++this.raised;
++                this.push(candidate, rx, y, rz);
++            }
++        }
++
++        // ---------------------------------------------------------------------------------------- seeding
++
++        private void seedBlock(int ci, LightColumn column, int baseX, int baseZ) {
++            for (int section = 0; section < LightRules.SECTIONS; ++section) {
++                byte[] cells = column.cells(section);
++
++                if (cells == null) {
++                    continue;
++                }
++
++                for (int index = 0; index < LightRules.SECTION_CELLS; ++index) {
++                    int emission = (cells[index] & 0xFF) >>> 4;
++
++                    if (emission > 0) {
++                        this.ensure(ci, section)[index] = (byte) emission;
++                        ++this.raised;
++                        this.push(emission, baseX + (index & 15), section << 4 | index >> 8, baseZ + (index >> 4 & 15));
++                    }
++                }
++            }
++        }
++
++        private void seedSky(int ci, LightColumn column, int baseX, int baseZ) {
++            for (int localZ = 0; localZ < 16; ++localZ) {
++                for (int localX = 0; localX < 16; ++localX) {
++                    int height = column.height(localX, localZ);
++                    int rx = baseX + localX;
++                    int rz = baseZ + localZ;
++
++                    if (height > 255) {
++                        // The whole column is under an opaque-ish top block: vanilla still reads 15 above y = 255.
++                        int cost = LightRules.cost(column.cell(localX, 255, localZ));
++
++                        if (cost < LightRules.BLOCKED) {
++                            this.raise(ci, column, rx, 255, rz, LightRules.MAX_LIGHT - cost);
++                        }
++
++                        continue;
++                    }
++
++                    // Cells at or above the height are sources worth queueing only where they have a non-source neighbour:
++                    // the cell right at the height (the one below it is not a source) and cells beside a taller target column.
++                    int tallest = Math.max(Math.max(this.targetHeight(rx + 1, rz), this.targetHeight(rx - 1, rz)),
++                            Math.max(this.targetHeight(rx, rz + 1), this.targetHeight(rx, rz - 1)));
++                    int from = Math.max(height, 0);
++                    int to = Math.min(255, Math.max(height, tallest - 1));
++
++                    for (int y = from; y <= to; ++y) {
++                        this.push(LightRules.MAX_LIGHT, rx, y, rz);
++                    }
++                }
++            }
++        }
++
++        private int targetHeight(int rx, int rz) {
++            if (rx < 0 || rz < 0 || rx >= this.blocksX || rz >= this.blocksZ) {
++                return 0;
++            }
++
++            int ci = (rz >> 4) * this.width + (rx >> 4);
++
++            return this.region.isTarget(ci) ? this.region.column(ci).height(rx & 15, rz & 15) : 0;
++        }
++
++        /** Ring columns are fixed light sources for the target cells that touch them. */
++        private void seedFromRing() {
++            for (int ci = 0; ci < this.region.columnCount(); ++ci) {
++                if (this.region.isTarget(ci)) {
++                    int cx = ci % this.width;
++                    int cz = ci / this.width;
++
++                    this.pullEdge(ci, cx, cz, -1, 0);
++                    this.pullEdge(ci, cx, cz, 1, 0);
++                    this.pullEdge(ci, cx, cz, 0, -1);
++                    this.pullEdge(ci, cx, cz, 0, 1);
++                }
++            }
++        }
++
++        private void pullEdge(int ci, int cx, int cz, int dx, int dz) {
++            int ncx = cx + dx;
++            int ncz = cz + dz;
++
++            if (ncx < 0 || ncz < 0 || ncx >= this.width || ncz >= this.depth) {
++                return;
++            }
++
++            int nci = ncz * this.width + ncx;
++
++            if (this.region.column(nci) == null || this.region.isTarget(nci)) {
++                return; // absent contributes nothing; another target is reached by the flood fill itself
++            }
++
++            LightColumn column = this.region.column(ci);
++
++            for (int t = 0; t < 16; ++t) {
++                int localX = dx < 0 ? 0 : (dx > 0 ? 15 : t);
++                int localZ = dz < 0 ? 0 : (dz > 0 ? 15 : t);
++                int rx = (cx << 4) + localX;
++                int rz = (cz << 4) + localZ;
++
++                for (int y = 0; y < LightRules.WORLD_HEIGHT; ++y) {
++                    int light = this.get(rx + dx, y, rz + dz);
++
++                    if (light > 1) {
++                        int cost = LightRules.cost(column.cell(localX, y, localZ));
++
++                        if (cost < LightRules.BLOCKED && light - cost > 0) {
++                            this.raise(ci, column, rx, y, rz, light - cost);
++                        }
++                    }
++                }
++            }
++        }
++
++        // ------------------------------------------------------------------------------------- propagation
++
++        private void propagate() {
++            for (int level = 15; level >= 1; --level) {
++                int count = this.queued[level];
++                int[] entries = this.queue[level];
++
++                for (int i = 0; i < count; ++i) {
++                    int packed = entries[i];
++                    int rx = packed & 4095;
++                    int rz = packed >> 12 & 4095;
++                    int y = packed >>> 24;
++
++                    if (this.get(rx, y, rz) != level) {
++                        continue; // raised again after it was queued; handled from its higher bucket
++                    }
++
++                    this.relax(level, rx + 1, y, rz);
++                    this.relax(level, rx - 1, y, rz);
++                    this.relax(level, rx, y, rz + 1);
++                    this.relax(level, rx, y, rz - 1);
++                    if (y < 255) {
++                        this.relax(level, rx, y + 1, rz);
++                    }
++
++                    if (y > 0) {
++                        this.relax(level, rx, y - 1, rz);
++                    }
++                }
++
++                this.queue[level] = null; // new entries only ever go to lower levels
++            }
++        }
++
++        private void relax(int level, int rx, int y, int rz) {
++            if (rx < 0 || rz < 0 || rx >= this.blocksX || rz >= this.blocksZ) {
++                return;
++            }
++
++            int ci = (rz >> 4) * this.width + (rx >> 4);
++
++            if (!this.region.isTarget(ci)) {
++                return; // ring and absent columns are fixed
++            }
++
++            LightColumn column = this.region.column(ci);
++            int cost = LightRules.cost(column.cell(rx & 15, y, rz & 15));
++
++            if (cost < LightRules.BLOCKED && level - cost > 0) {
++                this.raise(ci, column, rx, y, rz, level - cost);
++            }
++        }
++
++        // ---------------------------------------------------------------------------------------- output
++
++        private void collect(LightResult out) {
++            for (int ci = 0; ci < this.region.columnCount(); ++ci) {
++                if (!this.region.isTarget(ci)) {
++                    continue;
++                }
++
++                LightColumn column = this.region.column(ci);
++
++                for (int section = 0; section < LightRules.SECTIONS; ++section) {
++                    byte[] light = this.work[ci * LightRules.SECTIONS + section];
++
++                    if (light == null) {
++                        if (column.cells(section) == null) {
++                            continue; // missing section and nothing spilled into it: the implicit value is right
++                        }
++
++                        light = this.ensure(ci, section);
++                    }
++
++                    byte[] nibbles = new byte[LightRules.NIBBLE_BYTES];
++
++                    for (int i = 0; i < LightRules.NIBBLE_BYTES; ++i) {
++                        nibbles[i] = (byte) (light[i << 1] & 15 | (light[i << 1 | 1] & 15) << 4);
++                    }
++
++                    out.put(this.sky, ci, section, nibbles);
++                }
++            }
++        }
++    }
++}
+diff --git a/main/java/me/stella/antarctic/light/LightRegion.java b/main/java/me/stella/antarctic/light/LightRegion.java
+new file mode 100644
+index 0000000..ff7fa11
+--- /dev/null
++++ b/main/java/me/stella/antarctic/light/LightRegion.java
+@@ -0,0 +1,106 @@
++package me.stella.antarctic.light;
++
++/**
++ * A rectangle of chunk columns handed to the engine. Each column is a <em>target</em> (its light is computed or
++ * checked), a <em>ring</em> column (its stored light is a fixed input that feeds the targets) or absent (not loaded: it
++ * contributes nothing, and cells that need it cannot be judged by the checker).
++ *
++ * <p>Region block coordinates are {@code (chunkX - minChunkX) * 16 + localX}; a region may span at most 256 chunks per axis.
++ */
++public final class LightRegion {
++
++    private final int minChunkX;
++    private final int minChunkZ;
++    private final int width;
++    private final int depth;
++    private final boolean hasSkyLight;
++    private final LightColumn[] columns;
++    private final boolean[] targets;
++
++    public LightRegion(int minChunkX, int minChunkZ, int width, int depth, boolean hasSkyLight) {
++        if (width < 1 || depth < 1 || width > 256 || depth > 256) {
++            throw new IllegalArgumentException("region must be 1..256 chunks per axis: " + width + "x" + depth);
++        }
++
++        this.minChunkX = minChunkX;
++        this.minChunkZ = minChunkZ;
++        this.width = width;
++        this.depth = depth;
++        this.hasSkyLight = hasSkyLight;
++        this.columns = new LightColumn[width * depth];
++        this.targets = new boolean[width * depth];
++    }
++
++    /** Puts a column into the region; {@code target} true computes/checks it, false makes it a fixed ring input. */
++    public LightRegion put(int chunkX, int chunkZ, LightColumn column, boolean target) {
++        int index = this.index(chunkX, chunkZ);
++
++        if (index < 0) {
++            throw new IllegalArgumentException("chunk " + chunkX + "," + chunkZ + " is outside the region");
++        }
++
++        this.columns[index] = column;
++        this.targets[index] = column != null && target;
++        return this;
++    }
++
++    /** Index of a chunk in this region, or -1 when it is outside. */
++    public int index(int chunkX, int chunkZ) {
++        int dx = chunkX - this.minChunkX;
++        int dz = chunkZ - this.minChunkZ;
++
++        return dx < 0 || dz < 0 || dx >= this.width || dz >= this.depth ? -1 : dz * this.width + dx;
++    }
++
++    public int minChunkX() {
++        return this.minChunkX;
++    }
++
++    public int minChunkZ() {
++        return this.minChunkZ;
++    }
++
++    public int width() {
++        return this.width;
++    }
++
++    public int depth() {
++        return this.depth;
++    }
++
++    public boolean hasSkyLight() {
++        return this.hasSkyLight;
++    }
++
++    public int columnCount() {
++        return this.columns.length;
++    }
++
++    public LightColumn column(int index) {
++        return this.columns[index];
++    }
++
++    public boolean isTarget(int index) {
++        return this.targets[index];
++    }
++
++    public int chunkX(int index) {
++        return this.minChunkX + index % this.width;
++    }
++
++    public int chunkZ(int index) {
++        return this.minChunkZ + index / this.width;
++    }
++
++    public LightColumn column(int chunkX, int chunkZ) {
++        int index = this.index(chunkX, chunkZ);
++
++        return index < 0 ? null : this.columns[index];
++    }
++
++    public boolean isTarget(int chunkX, int chunkZ) {
++        int index = this.index(chunkX, chunkZ);
++
++        return index >= 0 && this.targets[index];
++    }
++}
+diff --git a/main/java/me/stella/antarctic/light/LightResult.java b/main/java/me/stella/antarctic/light/LightResult.java
+new file mode 100644
+index 0000000..b05122e
+--- /dev/null
++++ b/main/java/me/stella/antarctic/light/LightResult.java
+@@ -0,0 +1,82 @@
++package me.stella.antarctic.light;
++
++/**
++ * Output of {@link LightEngine#relight}: for every target column and section, the computed light as vanilla-layout nibble
++ * arrays. A {@code null} array means no array is needed: either the column is not a target, or the section does not exist
++ * and the implicit value (sky 15 at or above the height, otherwise 0; block 0) is already correct. A non-null array for a
++ * section that did not exist means the section must be created to hold light that spilled into it.
++ */
++public final class LightResult {
++
++    private final LightRegion region;
++    private final byte[][][] sky;
++    private final byte[][][] block;
++    private long cellsRaised;
++
++    LightResult(LightRegion region) {
++        this.region = region;
++        this.sky = new byte[region.columnCount()][][];
++        this.block = new byte[region.columnCount()][][];
++        for (int i = 0; i < region.columnCount(); ++i) {
++            if (region.isTarget(i)) {
++                this.sky[i] = new byte[LightRules.SECTIONS][];
++                this.block[i] = new byte[LightRules.SECTIONS][];
++            }
++        }
++    }
++
++    void put(boolean skyLight, int columnIndex, int section, byte[] nibbles) {
++        (skyLight ? this.sky : this.block)[columnIndex][section] = nibbles;
++    }
++
++    void addRaised(long cells) {
++        this.cellsRaised += cells;
++    }
++
++    public byte[] sky(int chunkX, int chunkZ, int section) {
++        int index = this.region.index(chunkX, chunkZ);
++
++        return index < 0 || this.sky[index] == null ? null : this.sky[index][section];
++    }
++
++    public byte[] block(int chunkX, int chunkZ, int section) {
++        int index = this.region.index(chunkX, chunkZ);
++
++        return index < 0 || this.block[index] == null ? null : this.block[index][section];
++    }
++
++    public byte[] sky(int columnIndex, int section) {
++        return this.sky[columnIndex] == null ? null : this.sky[columnIndex][section];
++    }
++
++    public byte[] block(int columnIndex, int section) {
++        return this.block[columnIndex] == null ? null : this.block[columnIndex][section];
++    }
++
++    /** Number of cell updates the flood fill performed (a cost measure for tests and benchmarks). */
++    public long cellsRaised() {
++        return this.cellsRaised;
++    }
++
++    /**
++     * Writes this result into the region's target columns as their stored light, simulating an apply. Used by tests and by
++     * the post-apply verification to check a result without touching live chunks.
++     */
++    public void storeInto(LightRegion target) {
++        if (target != this.region) {
++            throw new IllegalArgumentException("result belongs to another region");
++        }
++
++        for (int i = 0; i < this.region.columnCount(); ++i) {
++            if (!this.region.isTarget(i)) {
++                continue;
++            }
++
++            LightColumn column = this.region.column(i);
++
++            for (int s = 0; s < LightRules.SECTIONS; ++s) {
++                column.setStored(s, this.sky[i][s], this.block[i][s]);
++            }
++        }
++    }
++}
+diff --git a/main/java/me/stella/antarctic/light/LightRules.java b/main/java/me/stella/antarctic/light/LightRules.java
+new file mode 100644
+index 0000000..804ad98
+--- /dev/null
++++ b/main/java/me/stella/antarctic/light/LightRules.java
+@@ -0,0 +1,118 @@
++package me.stella.antarctic.light;
++
++/**
++ * Constants, the packed per-cell encoding and nibble helpers shared by the light engine and the consistency checker.
++ * Nothing in this package references Minecraft classes, so it can run on worker threads and be unit-tested alone.
++ *
++ * <p>A cell is one byte: the low nibble is the block's light opacity clamped to 0..15 and the high nibble is its light
++ * emission (0..15). Vanilla 1.12.2's per-cell light rule (World.a(BlockPosition, EnumSkyBlock)) only depends on those
++ * two numbers, so a table of this byte per block state is all a snapshot needs.
++ *
++ * <p>The rule, for a cell with packed value {@code v} and the light {@code L} stored in its six neighbours:
++ * <pre>
++ *   sky light, cell can see the sky (y &gt;= height of its column)  -&gt; 15
++ *   cost c = opacity; if c &gt;= 15 and emission &gt; 0 then c = 1; if c &lt; 1 then c = 1
++ *   c &gt;= 15                                                    -&gt; 0
++ *   otherwise  max(sky ? 0 : emission, max over neighbours of L(n) - c)
++ * </pre>
++ * Neighbours above y = 255 read as 15 for sky light and 0 for block light; below y = 0 the cell reads itself (vanilla
++ * clamps y to 0), which can never change a consistent state because it only subtracts at least 1.
++ *
++ * <p>Antarctic - rebuilt from the design of Starlight (Spottedleaf / PaperMC; LGPL-3.0): light is computed as the fixed
++ * point of local rules. No code is copied.
++ */
++public final class LightRules {
++
++    public static final int MAX_LIGHT = 15;
++    public static final int SECTIONS = 16;
++    public static final int SECTION_CELLS = 4096;
++    public static final int NIBBLE_BYTES = 2048;
++    public static final int WORLD_HEIGHT = 256;
++    /** Cost value meaning "light cannot enter this cell". */
++    public static final int BLOCKED = 15;
++
++    /** Effective cost of entering a cell, indexed by the packed cell byte (0..255). */
++    private static final byte[] COST = new byte[256];
++
++    static {
++        for (int v = 0; v < 256; ++v) {
++            int opacity = v & 15;
++            int emission = v >>> 4;
++            int cost = opacity;
++
++            if (cost >= 15 && emission > 0) {
++                cost = 1;
++            }
++
++            if (cost < 1) {
++                cost = 1;
++            }
++
++            COST[v] = (byte) cost;
++        }
++    }
++
++    private LightRules() {
++    }
++
++    /** Packs a block state's opacity (any int, clamped to 0..15) and emission (clamped to 0..15). */
++    public static byte pack(int opacity, int emission) {
++        int o = opacity < 0 ? 0 : Math.min(opacity, 15);
++        int e = emission < 0 ? 0 : Math.min(emission, 15);
++
++        return (byte) (e << 4 | o);
++    }
++
++    public static int opacity(byte cell) {
++        return cell & 15;
++    }
++
++    public static int emission(byte cell) {
++        return (cell & 0xFF) >>> 4;
++    }
++
++    /** Cost of entering the cell, 1..14, or {@link #BLOCKED} (15) when light cannot enter it. */
++    public static int cost(byte cell) {
++        return COST[cell & 0xFF];
++    }
++
++    /** Index of a cell inside a 16x16x16 section; identical to ChunkSection / NibbleArray (y &lt;&lt; 8 | z &lt;&lt; 4 | x). */
++    public static int cellIndex(int localX, int localY, int localZ) {
++        return localY << 8 | localZ << 4 | localX;
++    }
++
++    /** Reads the nibble at {@code index} of a vanilla-layout nibble array (2048 bytes, low nibble first). */
++    public static int getNibble(byte[] nibbles, int index) {
++        return nibbles[index >> 1] >> ((index & 1) << 2) & 15;
++    }
++
++    public static void setNibble(byte[] nibbles, int index, int value) {
++        int shift = (index & 1) << 2;
++
++        nibbles[index >> 1] = (byte) (nibbles[index >> 1] & ~(15 << shift) | (value & 15) << shift);
++    }
++
++    /**
++     * Packs a chunk-local position the same way as {@code me.stella.antarctic.collection.PendingLightRegistry.pack}, so a
++     * checker report can be fed straight into the deferred-light registry. A test pins both encodings together.
++     */
++    public static int packPosition(int localX, int y, int localZ, boolean sky) {
++        return (sky ? 1 << 16 : 0) | (y & 255) << 8 | (localZ & 15) << 4 | (localX & 15);
++    }
++
++    public static int positionX(int packed) {
++        return packed & 15;
++    }
++
++    public static int positionZ(int packed) {
++        return packed >> 4 & 15;
++    }
++
++    public static int positionY(int packed) {
++        return packed >> 8 & 255;
++    }
++
++    public static boolean positionIsSky(int packed) {
++        return (packed >> 16 & 1) != 0;
++    }
++}
+diff --git a/test/java/me/stella/antarctic/light/HeightMapsTest.java b/test/java/me/stella/antarctic/light/HeightMapsTest.java
+new file mode 100644
+index 0000000..cdba178
+--- /dev/null
++++ b/test/java/me/stella/antarctic/light/HeightMapsTest.java
+@@ -0,0 +1,51 @@
++package me.stella.antarctic.light;
++
++import static org.junit.Assert.assertEquals;
++
++import org.junit.Test;
++
++public class HeightMapsTest {
++
++    @Test
++    public void emptyColumnHasHeightZero() {
++        assertEquals(0, HeightMaps.column(new byte[LightRules.SECTIONS][], 3, 4));
++        for (int h : HeightMaps.compute(new byte[LightRules.SECTIONS][])) {
++            assertEquals(0, h);
++        }
++    }
++
++    @Test
++    public void heightIsOneAboveTheHighestCellWithAnyOpacity() {
++        byte[][] cells = new byte[LightRules.SECTIONS][];
++
++        cells[0] = new byte[LightRules.SECTION_CELLS];
++        cells[3] = new byte[LightRules.SECTION_CELLS];
++        cells[0][LightRules.cellIndex(2, 0, 2)] = LightRules.pack(15, 0);
++        cells[3][LightRules.cellIndex(2, 15, 2)] = LightRules.pack(1, 0); // leaves-like: opacity 1 still counts
++        cells[3][LightRules.cellIndex(5, 4, 6)] = LightRules.pack(0, 14); // an emitter alone does not count
++        assertEquals("section 3 local y 15 is y 63, so height 64", 64, HeightMaps.column(cells, 2, 2));
++        assertEquals(0, HeightMaps.column(cells, 5, 6));
++        assertEquals(0, HeightMaps.column(cells, 0, 0));
++    }
++
++    @Test
++    public void heightCarriesAcrossSectionBoundaries() {
++        // the (section << 4) + localY + 1 sum must not lose the carry when localY is 15
++        for (int section = 0; section < LightRules.SECTIONS; ++section) {
++            byte[][] cells = new byte[LightRules.SECTIONS][];
++
++            cells[section] = new byte[LightRules.SECTION_CELLS];
++            cells[section][LightRules.cellIndex(0, 15, 0)] = LightRules.pack(15, 0);
++            assertEquals(section * 16 + 16, HeightMaps.column(cells, 0, 0));
++        }
++    }
++
++    @Test
++    public void topBlockGivesHeight256() {
++        byte[][] cells = new byte[LightRules.SECTIONS][];
++
++        cells[15] = new byte[LightRules.SECTION_CELLS];
++        cells[15][LightRules.cellIndex(7, 15, 7)] = LightRules.pack(1, 0);
++        assertEquals(256, HeightMaps.column(cells, 7, 7));
++    }
++}
+diff --git a/test/java/me/stella/antarctic/light/LightCheckerTest.java b/test/java/me/stella/antarctic/light/LightCheckerTest.java
+new file mode 100644
+index 0000000..19d888b
+--- /dev/null
++++ b/test/java/me/stella/antarctic/light/LightCheckerTest.java
+@@ -0,0 +1,198 @@
++package me.stella.antarctic.light;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++
++import org.junit.Test;
++
++public class LightCheckerTest {
++
++    private static final LightEngine ENGINE = new LightEngine();
++
++    /** A lit scene: ground, a torch and a roof, centre chunk computed, fully surrounded by ring chunks. */
++    private static LightScene litScene() {
++        LightScene scene = new LightScene(0, 0, 3, 3, true).onlyTarget(1, 1);
++
++        scene.fill(16, 0, 16, 31, 63, 31, 15, 0);
++        scene.fill(18, 70, 18, 29, 70, 29, 15, 0);
++        scene.set(24, 66, 24, 0, 13);
++        scene.deriveHeights();
++        return scene;
++    }
++
++    private static LightRegion relit(LightScene scene) {
++        LightRegion region = scene.region();
++
++        ENGINE.relight(region).storeInto(region);
++        return region;
++    }
++
++    @Test
++    public void anEngineResultIsConsistent() {
++        LightRegion region = relit(litScene());
++        LightChecker.Report report = LightChecker.check(region, 1, 1, LightChecker.Scope.ALL, 8);
++
++        assertTrue(report.consistent());
++        assertEquals(0, report.skipped());
++        assertEquals("every cell, sky and block", 2 * 16 * 16 * 256, report.checked());
++        assertEquals(0, report.positions().length);
++    }
++
++    @Test
++    public void raisingOrLoweringACellIsDetectedAndLocated() {
++        LightScene scene = litScene();
++        LightRegion region = relit(scene);
++        LightColumn column = region.column(1, 1);
++        int torchIndex = LightRules.cellIndex(8, 66 & 15, 8);
++        byte[] block = column.storedBlock(4);
++
++        // lower the torch's own light by one: the torch cell itself and its neighbours become inconsistent
++        LightRules.setNibble(block, torchIndex, 12);
++
++        LightChecker.Report lowered = LightChecker.check(region, 1, 1, LightChecker.Scope.ALL, 100);
++
++        assertFalse(lowered.consistent());
++        assertTrue(contains(lowered.positions(), LightRules.packPosition(8, 66, 8, false)));
++
++        LightRules.setNibble(block, torchIndex, 13);
++        assertTrue(LightChecker.check(region, 1, 1, LightChecker.Scope.ALL, 100).consistent());
++
++        // light a far-away dark air cell: nothing supports it
++        byte[] farBlock = column.storedBlock(4);
++        int far = LightRules.cellIndex(15, 66 & 15, 15);
++
++        LightRules.setNibble(farBlock, far, 5);
++
++        LightChecker.Report raised = LightChecker.check(region, 1, 1, LightChecker.Scope.ALL, 100);
++
++        assertFalse(raised.consistent());
++        assertTrue(contains(raised.positions(), LightRules.packPosition(15, 66, 15, false)));
++    }
++
++    private static boolean contains(int[] positions, int wanted) {
++        for (int position : positions) {
++            if (position == wanted) {
++                return true;
++            }
++        }
++
++        return false;
++    }
++
++    @Test
++    public void theViolationCountIsExactEvenWhenTheListIsCapped() {
++        LightRegion region = relit(litScene());
++        LightColumn column = region.column(1, 1);
++        byte[] block = column.storedBlock(0); // solid ground: any light there is wrong
++
++        for (int i = 0; i < 40; ++i) {
++            LightRules.setNibble(block, LightRules.cellIndex(i & 15, 0, i >> 4), 3);
++        }
++
++        LightChecker.Report report = LightChecker.check(region, 1, 1, LightChecker.Scope.ALL, 5);
++
++        assertEquals(5, report.positions().length);
++        assertTrue(report.violations() >= 40);
++    }
++
++    @Test
++    public void theBorderScopeOnlyLooksAtTheSixtyEdgeColumns() {
++        LightRegion region = relit(litScene());
++        LightChecker.Report report = LightChecker.check(region, 1, 1, LightChecker.Scope.BORDER, 8);
++
++        assertTrue(report.consistent());
++        assertEquals(2 * 60 * 256, report.checked());
++
++        // damage an interior cell: the border scope must not see it, the full scope must
++        LightRules.setNibble(region.column(1, 1).storedBlock(0), LightRules.cellIndex(8, 0, 8), 4);
++        assertTrue(LightChecker.check(region, 1, 1, LightChecker.Scope.BORDER, 8).consistent());
++        assertFalse(LightChecker.check(region, 1, 1, LightChecker.Scope.ALL, 8).consistent());
++
++        // damage an edge cell: both see it
++        LightRules.setNibble(region.column(1, 1).storedBlock(0), LightRules.cellIndex(8, 0, 8), 0);
++        LightRules.setNibble(region.column(1, 1).storedBlock(0), LightRules.cellIndex(0, 0, 8), 4);
++        assertFalse(LightChecker.check(region, 1, 1, LightChecker.Scope.BORDER, 8).consistent());
++    }
++
++    @Test
++    public void cellsNextToAnAbsentColumnAreSkippedNotReported() {
++        LightScene scene = new LightScene(0, 0, 3, 3, false).onlyTarget(1, 1);
++
++        scene.set(24, 64, 24, 0, 14);
++        scene.deriveHeights();
++        scene.absent(0, 1);
++
++        LightRegion region = scene.region();
++
++        ENGINE.relight(region).storeInto(region);
++
++        LightChecker.Report report = LightChecker.check(region, 1, 1, LightChecker.Scope.ALL, 8);
++
++        assertTrue(report.consistent());
++        assertEquals("the 16 x 256 cells on the open side cannot be judged", 16 * 256, report.skipped());
++        assertEquals(16 * 16 * 256 - 16 * 256, report.checked());
++    }
++
++    @Test
++    public void skyAndOpaqueCellsAreDecidedWithoutTheirNeighbours() {
++        // even with an absent neighbour a cell that is a sky source or a plain stone block has a fixed answer
++        LightScene scene = new LightScene(0, 0, 3, 3, true).onlyTarget(1, 1);
++
++        scene.fill(16, 0, 16, 31, 63, 31, 15, 0);
++        scene.deriveHeights();
++        scene.absent(0, 1);
++
++        LightRegion region = scene.region();
++
++        assertEquals("above the height: sky source", 15, LightChecker.expected(region, true, 1, 1, 0, 100, 5));
++        assertEquals("stone", 0, LightChecker.expected(region, true, 1, 1, 0, 10, 5));
++        assertEquals("air at the edge next to the absent column cannot be judged", -1, LightChecker.expected(region, false, 1, 1, 0, 100, 5));
++    }
++
++    @Test
++    public void expectedFollowsTheVanillaQuirksAtTheWorldEdges() {
++        LightScene scene = new LightScene(0, 0, 1, 1, true);
++
++        // opaque caps everywhere except one leaves-like cell, so the only sky light at y = 255 comes from "above the world"
++        for (int x = 0; x < 16; ++x) {
++            for (int z = 0; z < 16; ++z) {
++                scene.set(x, 255, z, 15, 0);
++            }
++        }
++
++        scene.set(3, 255, 3, 1, 0);
++        scene.set(3, 0, 3, 0, 0);
++        scene.set(4, 0, 3, 15, 0);
++        scene.deriveHeights();
++
++        LightRegion region = scene.region();
++
++        assertEquals("above y = 255 reads 15 for sky light: 15 - 1", 14, LightChecker.expected(region, true, 0, 0, 3, 255, 3));
++        assertEquals("above y = 255 reads 0 for block light", 0, LightChecker.expected(region, false, 0, 0, 3, 255, 3));
++
++        // y = 0 reads itself below: with stored 9 and nothing else around, vanilla's rule gives 9 - 1 = 8, not 9
++        region.column(0, 0).setStored(0, null, new byte[LightRules.NIBBLE_BYTES]);
++        LightRules.setNibble(region.column(0, 0).storedBlock(0), LightRules.cellIndex(3, 0, 3), 9);
++        assertEquals(8, LightChecker.expected(region, false, 0, 0, 3, 0, 3));
++    }
++
++    @Test
++    public void anEngineResultIsConsistentWhenTheRegionHasNoSkyLight() {
++        LightScene scene = new LightScene(0, 0, 3, 3, false).onlyTarget(1, 1);
++
++        scene.set(24, 64, 24, 0, 14);
++        scene.deriveHeights();
++
++        LightRegion region = relit(scene);
++        LightChecker.Report report = LightChecker.check(region, 1, 1, LightChecker.Scope.ALL, 8);
++
++        assertTrue(report.consistent());
++        assertEquals("block light only", 16 * 16 * 256, report.checked());
++    }
++
++    @Test(expected = IllegalArgumentException.class)
++    public void checkingARingColumnIsRejected() {
++        LightChecker.check(litScene().region(), 0, 0, LightChecker.Scope.ALL, 1);
++    }
++}
+diff --git a/test/java/me/stella/antarctic/light/LightEngineFuzzTest.java b/test/java/me/stella/antarctic/light/LightEngineFuzzTest.java
+new file mode 100644
+index 0000000..31bb5b5
+--- /dev/null
++++ b/test/java/me/stella/antarctic/light/LightEngineFuzzTest.java
+@@ -0,0 +1,216 @@
++package me.stella.antarctic.light;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertTrue;
++
++import java.util.Random;
++import org.junit.Test;
++
++/**
++ * Random scenes: the engine's flood fill, a naive iterate-the-rule reference and the independent checker must agree. Block
++ * mixes include translucent blocks, opaque emitters and emitting-but-transparent blocks; heights are sometimes derived and
++ * sometimes arbitrary, ring light is random garbage, and some columns are absent or capped at y = 255.
++ */
++public class LightEngineFuzzTest {
++
++    private static final LightEngine ENGINE = new LightEngine();
++
++    /** (opacity, emission) pairs and their weights. */
++    private static final int[][] PALETTE = {
++        {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, // air
++        {15, 0}, {15, 0}, {15, 0}, // stone
++        {3, 0}, {1, 0}, {2, 0}, // water, leaves, ice-like
++        {0, 14}, {0, 7}, {2, 10}, // torch, dim torch, glowing translucent
++        {15, 15}, {15, 1}, {15, 8}, // glowstone, faint opaque emitter, opaque emitter
++        {4, 0}, {14, 0} // slow and almost opaque
++    };
++
++    private static LightScene randomScene(long seed, int width, int depth, boolean sky, boolean allTargets) {
++        Random random = new Random(seed);
++        LightScene scene = new LightScene(-1, -1, width, depth, sky);
++        int firstSection = 1 + random.nextInt(3);
++        int sections = 1 + random.nextInt(3);
++
++        for (int c = 0; c < width * depth; ++c) {
++            int cx = scene.minCx + c % width;
++            int cz = scene.minCz + c / width;
++            boolean edge = cx == scene.minCx || cz == scene.minCz || cx == scene.minCx + width - 1 || cz == scene.minCz + depth - 1;
++
++            if (!allTargets && edge) {
++                scene.ring[c] = true;
++            }
++
++            if (random.nextInt(14) == 0 && edge) {
++                scene.absent[c] = true;
++            }
++
++            for (int s = firstSection; s < firstSection + sections; ++s) {
++                if (random.nextInt(5) == 0) {
++                    continue; // a missing section between existing ones
++                }
++
++                byte[] cells = new byte[LightRules.SECTION_CELLS];
++                int density = 20 + random.nextInt(60); // percent of non-air cells
++
++                for (int i = 0; i < cells.length; ++i) {
++                    int[] block = random.nextInt(100) < density ? PALETTE[random.nextInt(PALETTE.length)] : PALETTE[0];
++
++                    cells[i] = LightRules.pack(block[0], block[1]);
++                }
++
++                scene.cells[c][s] = cells;
++            }
++
++            if (random.nextInt(6) == 0) { // a column capped at the top of the world
++                scene.set(cx << 4 | random.nextInt(16), 255, cz << 4 | random.nextInt(16), random.nextBoolean() ? 15 : 1, 0);
++            }
++        }
++
++        scene.deriveHeights();
++        if (random.nextInt(4) == 0) { // arbitrary heights that do not match the blocks
++            for (int c = 0; c < scene.heights.length; ++c) {
++                for (int i = 0; i < 256; ++i) {
++                    if (random.nextInt(8) == 0) {
++                        scene.heights[c][i] = random.nextInt(130);
++                    }
++                }
++            }
++        }
++
++        // random stored light for ring columns (and garbage in targets, which must be ignored)
++        for (int c = 0; c < scene.heights.length; ++c) {
++            for (int s = 0; s < LightRules.SECTIONS; ++s) {
++                if (scene.ring[c] && scene.cells[c][s] != null || random.nextInt(4) == 0) {
++                    byte[] skyNibbles = new byte[LightRules.NIBBLE_BYTES];
++                    byte[] blockNibbles = new byte[LightRules.NIBBLE_BYTES];
++
++                    random.nextBytes(skyNibbles);
++                    random.nextBytes(blockNibbles);
++                    if (random.nextInt(3) == 0) { // sparse light is more realistic than noise
++                        for (int i = 0; i < skyNibbles.length; ++i) {
++                            if (random.nextInt(6) != 0) {
++                                skyNibbles[i] = 0;
++                                blockNibbles[i] = 0;
++                            }
++                        }
++                    }
++
++                    scene.storedSky[c][s] = skyNibbles;
++                    scene.storedBlock[c][s] = blockNibbles;
++                }
++            }
++        }
++
++        return scene;
++    }
++
++    private static void verify(long seed, LightScene scene) {
++        LightRegion region = scene.region();
++        LightResult result = ENGINE.relight(region);
++        int blocksX = scene.width << 4;
++        int blocksZ = scene.depth << 4;
++
++        for (int type = 0; type < 2; ++type) {
++            boolean sky = type == 0;
++
++            if (sky && !scene.hasSky) {
++                continue;
++            }
++
++            int[] reference = ReferenceSolver.solve(scene, sky);
++
++            for (int rz = 0; rz < blocksZ; ++rz) {
++                for (int rx = 0; rx < blocksX; ++rx) {
++                    int x = (scene.minCx << 4) + rx;
++                    int z = (scene.minCz << 4) + rz;
++                    int c = scene.column(x, z);
++
++                    if (scene.absent[c] || scene.ring[c]) {
++                        continue;
++                    }
++
++                    for (int y = 0; y < LightRules.WORLD_HEIGHT; ++y) {
++                        int expected = ReferenceSolver.at(scene, reference, x, y, z);
++                        int actual = scene.resultLight(result, sky, x, y, z);
++
++                        if (expected != actual) {
++                            throw new AssertionError("seed " + seed + (sky ? " sky" : " block") + " cell " + x + "," + y + "," + z
++                                    + " expected " + expected + " but the engine produced " + actual);
++                        }
++                    }
++                }
++            }
++
++            // a missing section gets an array exactly when something differs from the implicit value
++            for (int c = 0; c < scene.cells.length; ++c) {
++                if (scene.absent[c] || scene.ring[c]) {
++                    continue;
++                }
++
++                for (int s = 0; s < LightRules.SECTIONS; ++s) {
++                    byte[] array = sky ? result.sky(c, s) : result.block(c, s);
++
++                    if (scene.cells[c][s] != null) {
++                        assertTrue("seed " + seed + ": an existing section always gets an array", array != null);
++                        continue;
++                    }
++
++                    boolean differs = false;
++                    int cx = scene.minCx + c % scene.width;
++                    int cz = scene.minCz + c / scene.width;
++
++                    for (int i = 0; i < LightRules.SECTION_CELLS && !differs; ++i) {
++                        int x = (cx << 4) + (i & 15);
++                        int z = (cz << 4) + (i >> 4 & 15);
++                        int y = (s << 4) + (i >> 8);
++                        int implicit = sky && y >= scene.height(x, z) ? 15 : 0;
++
++                        differs = ReferenceSolver.at(scene, reference, x, y, z) != implicit;
++                    }
++
++                    assertEquals("seed " + seed + " column " + c + " section " + s + ": array iff light differs from implicit",
++                            differs, array != null);
++                }
++            }
++        }
++
++        // the result must be consistent according to the independent checker wherever it can judge
++        result.storeInto(region);
++        for (int c = 0; c < region.columnCount(); ++c) {
++            if (region.isTarget(c)) {
++                LightChecker.Report report = LightChecker.check(region, region.chunkX(c), region.chunkZ(c), LightChecker.Scope.ALL, 4);
++
++                assertEquals("seed " + seed + " column " + c + " violations " + java.util.Arrays.toString(report.positions()), 0, report.violations());
++            }
++        }
++    }
++
++    @Test
++    public void centreTargetWithRingMatchesTheReference() {
++        for (long seed = 1; seed <= 10; ++seed) {
++            verify(seed, randomScene(seed, 3, 3, true, false));
++        }
++    }
++
++    @Test
++    public void allTargetRegionsMatchTheReference() {
++        for (long seed = 100; seed <= 108; ++seed) {
++            verify(seed, randomScene(seed, 2, 2, true, true));
++        }
++    }
++
++    @Test
++    public void worldsWithoutSkyLightMatchTheReference() {
++        for (long seed = 200; seed <= 205; ++seed) {
++            verify(seed, randomScene(seed, 3, 3, false, false));
++        }
++    }
++
++    @Test
++    public void theReferenceReallyNeedsManySweepsOnTheseScenes() {
++        // guards the harness: if the reference converged after one pass the comparison above would prove little
++        LightScene scene = randomScene(7, 3, 3, true, false);
++
++        assertTrue(ReferenceSolver.sweepsFor(scene, false) > 3);
++    }
++}
+diff --git a/test/java/me/stella/antarctic/light/LightEnginePerfTest.java b/test/java/me/stella/antarctic/light/LightEnginePerfTest.java
+new file mode 100644
+index 0000000..6691942
+--- /dev/null
++++ b/test/java/me/stella/antarctic/light/LightEnginePerfTest.java
+@@ -0,0 +1,96 @@
++package me.stella.antarctic.light;
++
++import static org.junit.Assert.assertTrue;
++
++import java.lang.management.ManagementFactory;
++import java.util.Arrays;
++import java.util.Random;
++import org.junit.Test;
++
++/**
++ * Diagnostic only: how long the engine takes to relight one target chunk (with its ring) in a sparse island-like scene and
++ * in a dense scene, and what it allocates. Prints the numbers; asserts nothing about speed, because timings on a shared
++ * machine are noise. The service built on top of this engine owns the real performance gate (main-thread time per tick).
++ */
++public class LightEnginePerfTest {
++
++    private static final LightEngine ENGINE = new LightEngine();
++
++    /** Ground of three solid sections, a few trees and torches above: the Skyblock shape. */
++    private static LightScene island(long seed) {
++        Random random = new Random(seed);
++        LightScene scene = new LightScene(0, 0, 3, 3, true).onlyTarget(1, 1);
++
++        scene.fill(0, 0, 0, 47, 47, 47, 15, 0);
++        for (int i = 0; i < 40; ++i) {
++            int x = 16 + random.nextInt(16);
++            int z = 16 + random.nextInt(16);
++
++            scene.fill(x, 48, z, x, 52, z, 15, 0); // trunk
++            scene.fill(x - 1, 51, z - 1, x + 1, 53, z + 1, 1, 0); // leaves
++        }
++
++        for (int i = 0; i < 24; ++i) {
++            scene.set(16 + random.nextInt(16), 48 + random.nextInt(4), 16 + random.nextInt(16), 0, 14);
++        }
++
++        scene.deriveHeights();
++        return scene;
++    }
++
++    /** All sections of the target chunk filled with a random mix, ring chunks the same. */
++    private static LightScene dense(long seed) {
++        Random random = new Random(seed);
++        LightScene scene = new LightScene(0, 0, 3, 3, true).onlyTarget(1, 1);
++
++        for (int c = 0; c < 9; ++c) {
++            for (int s = 0; s < 16; ++s) {
++                byte[] cells = new byte[LightRules.SECTION_CELLS];
++
++                for (int i = 0; i < cells.length; ++i) {
++                    int roll = random.nextInt(100);
++
++                    cells[i] = roll < 55 ? 0 : (roll < 80 ? LightRules.pack(15, 0) : (roll < 95 ? LightRules.pack(2, 0) : LightRules.pack(0, 12)));
++                }
++
++                scene.cells[c][s] = cells;
++            }
++        }
++
++        scene.deriveHeights();
++        return scene;
++    }
++
++    private static void measure(String label, LightScene scene) {
++        com.sun.management.ThreadMXBean threads = (com.sun.management.ThreadMXBean) ManagementFactory.getThreadMXBean();
++        LightRegion region = scene.region();
++        long[] nanos = new long[15];
++        long allocated = 0;
++        long raised = 0;
++
++        for (int i = 0; i < 40; ++i) { // warm-up
++            raised = ENGINE.relight(region).cellsRaised();
++        }
++
++        for (int i = 0; i < nanos.length; ++i) {
++            long a0 = threads.getThreadAllocatedBytes(Thread.currentThread().getId());
++            long t0 = System.nanoTime();
++            LightResult result = ENGINE.relight(region);
++
++            nanos[i] = System.nanoTime() - t0;
++            allocated = threads.getThreadAllocatedBytes(Thread.currentThread().getId()) - a0;
++            raised = result.cellsRaised();
++        }
++
++        Arrays.sort(nanos);
++        System.out.printf("[perf] light engine, %s: median %.2f ms per target chunk (best %.2f ms), %d cell updates, %d KiB allocated%n",
++                label, nanos[nanos.length / 2] / 1.0e6, nanos[0] / 1.0e6, raised, allocated / 1024);
++        assertTrue(nanos[0] > 0);
++    }
++
++    @Test
++    public void reportEngineCostPerTargetChunk() {
++        measure("island (3 solid sections, trees, torches)", island(1));
++        measure("dense (16 sections, 45% non-air)", dense(2));
++    }
++}
+diff --git a/test/java/me/stella/antarctic/light/LightEngineTest.java b/test/java/me/stella/antarctic/light/LightEngineTest.java
+new file mode 100644
+index 0000000..e720cb6
+--- /dev/null
++++ b/test/java/me/stella/antarctic/light/LightEngineTest.java
+@@ -0,0 +1,331 @@
++package me.stella.antarctic.light;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertNull;
++import static org.junit.Assert.assertTrue;
++
++import java.util.Random;
++import org.junit.Test;
++
++/** Hand-built scenes with values worked out by hand; the randomized comparison against a reference is LightEngineFuzzTest. */
++public class LightEngineTest {
++
++    private static final LightEngine ENGINE = new LightEngine();
++
++    private static int manhattan(int x0, int y0, int z0, int x1, int y1, int z1) {
++        return Math.abs(x0 - x1) + Math.abs(y0 - y1) + Math.abs(z0 - z1);
++    }
++
++    /** 3x3 chunks (0..2) with only the centre chunk computed. */
++    private static LightScene centreScene(boolean sky) {
++        return new LightScene(0, 0, 3, 3, sky).onlyTarget(1, 1);
++    }
++
++    @Test
++    public void aTorchInOpenAirFallsOffWithManhattanDistance() {
++        LightScene scene = centreScene(false);
++
++        scene.set(24, 64, 24, 0, 14);
++        scene.deriveHeights();
++
++        LightResult result = ENGINE.relight(scene.region());
++
++        for (int x = 16; x < 32; ++x) {
++            for (int z = 16; z < 32; ++z) {
++                for (int y = 48; y < 80; ++y) {
++                    int expected = Math.max(0, 14 - manhattan(x, y, z, 24, 64, 24));
++
++                    assertEquals("cell " + x + "," + y + "," + z, expected, scene.resultLight(result, false, x, y, z));
++                }
++            }
++        }
++    }
++
++    @Test
++    public void onlySectionsTheLightReachedAreCreated() {
++        LightScene scene = centreScene(false);
++
++        scene.set(24, 64, 24, 0, 14); // section 4 (y 64..79); light reaches y 50..78
++        scene.deriveHeights();
++
++        LightResult result = ENGINE.relight(scene.region());
++
++        assertNull("section 2 (y 32..47) is out of reach and does not exist", result.block(1, 1, 2));
++        assertNotNull("section 3 (y 48..63) receives light and must be created", result.block(1, 1, 3));
++        assertNotNull("section 4 exists", result.block(1, 1, 4));
++        assertNull("y 80 is 16 above the torch, out of reach", result.block(1, 1, 5));
++        assertNull("ring columns are never written", result.block(0, 1, 4));
++        assertNull("ring columns are never written", result.block(1, 0, 4));
++    }
++
++    @Test
++    public void translucentBlocksCostTheirOpacityAndStoneBlocks() {
++        LightScene scene = centreScene(false);
++
++        // a stone tube around a corridor of water-like cells (opacity 3), so light can only travel through the water
++        scene.fill(24, 63, 23, 30, 65, 25, 15, 0);
++        for (int x = 25; x <= 29; ++x) {
++            scene.set(x, 64, 24, 3, 0);
++        }
++
++        scene.set(24, 64, 24, 0, 14); // the torch sits at the mouth of the tube
++        scene.deriveHeights();
++
++        LightResult result = ENGINE.relight(scene.region());
++
++        assertEquals(14, scene.resultLight(result, false, 24, 64, 24));
++        assertEquals("first water cell: 14 - 3", 11, scene.resultLight(result, false, 25, 64, 24));
++        assertEquals(8, scene.resultLight(result, false, 26, 64, 24));
++        assertEquals(5, scene.resultLight(result, false, 27, 64, 24));
++        assertEquals(2, scene.resultLight(result, false, 28, 64, 24));
++        assertEquals("the fifth water cell would be -1", 0, scene.resultLight(result, false, 29, 64, 24));
++        assertEquals("a stone cell is never lit", 0, scene.resultLight(result, false, 25, 65, 24));
++        assertEquals("the open side of the torch is lit normally", 13, scene.resultLight(result, false, 23, 64, 24));
++    }
++
++    @Test
++    public void aTorchInsideAStoneBoxLightsOnlyItsCavity() {
++        LightScene scene = centreScene(false);
++
++        scene.fill(20, 60, 20, 28, 68, 28, 15, 0);
++        scene.fill(21, 61, 21, 27, 67, 27, 0, 0); // hollow 7x7x7
++        scene.set(24, 64, 24, 0, 14);
++        scene.deriveHeights();
++
++        LightResult result = ENGINE.relight(scene.region());
++
++        assertEquals("3 below the torch inside the cavity", 14 - 3, scene.resultLight(result, false, 24, 61, 24));
++        assertEquals("|dx| 3 + |dz| 2 inside the cavity", 14 - 5, scene.resultLight(result, false, 21, 64, 22));
++        assertEquals("the wall around the cavity is dark", 0, scene.resultLight(result, false, 20, 64, 24));
++        assertEquals("outside the box is dark", 0, scene.resultLight(result, false, 29, 64, 24));
++    }
++
++    @Test
++    public void anOpaqueEmitterPassesLightAtCostOneLikeVanilla() {
++        LightScene scene = centreScene(false);
++
++        scene.set(24, 64, 24, 0, 14);
++        scene.set(25, 64, 24, 15, 1); // opaque but emitting 1: vanilla gives it cost 1
++        scene.set(24, 64, 20, 15, 0); // a plain stone block elsewhere stays dark
++        scene.deriveHeights();
++
++        LightResult result = ENGINE.relight(scene.region());
++
++        assertEquals("max(emission 1, 14 - 1)", 13, scene.resultLight(result, false, 25, 64, 24));
++        assertEquals("light continues through it", 12, scene.resultLight(result, false, 26, 64, 24));
++        assertEquals(0, scene.resultLight(result, false, 24, 64, 20));
++    }
++
++    @Test
++    public void lightCrossesChunkBordersBetweenTargets() {
++        LightScene scene = new LightScene(0, 0, 2, 2, false);
++
++        scene.set(15, 64, 15, 0, 15); // the corner where four chunks meet
++        scene.deriveHeights();
++
++        LightResult result = ENGINE.relight(scene.region());
++
++        for (int x = 8; x < 24; ++x) {
++            for (int z = 8; z < 24; ++z) {
++                int expected = Math.max(0, 15 - manhattan(x, 64, z, 15, 64, 15));
++
++                assertEquals("cell " + x + "," + z, expected, scene.resultLight(result, false, x, 64, z));
++            }
++        }
++    }
++
++    @Test
++    public void ringLightIsAFixedInputForTheTargetEdge() {
++        LightScene scene = centreScene(false);
++
++        scene.deriveHeights();
++        scene.storeBlock(15, 64, 24, 15); // the ring chunk (0,1) holds 15 at its last column
++
++        LightResult result = ENGINE.relight(scene.region());
++
++        for (int dx = 0; dx <= 14; ++dx) {
++            assertEquals("distance " + (dx + 1) + " from the ring cell", 15 - (dx + 1), scene.resultLight(result, false, 16 + dx, 64, 24));
++        }
++
++        assertEquals(14 - 1, scene.resultLight(result, false, 16, 65, 24));
++        assertNull("ring light is never rewritten", result.block(0, 1, 4));
++    }
++
++    @Test
++    public void anAbsentNeighbourContributesNothing() {
++        LightScene scene = centreScene(false);
++
++        scene.deriveHeights();
++        scene.storeBlock(15, 64, 24, 15);
++        scene.absent(0, 1);
++
++        LightResult result = ENGINE.relight(scene.region());
++
++        assertEquals(0, scene.resultLight(result, false, 16, 64, 24));
++        assertEquals(0, result.cellsRaised());
++    }
++
++    @Test
++    public void openSkyIsFifteenAboveTheHeightAndSolidGroundIsDark() {
++        LightScene scene = centreScene(true);
++
++        for (int s = 0; s < 4; ++s) {
++            scene.section(1, 1, s);
++        }
++
++        scene.fill(16, 0, 16, 31, 63, 31, 15, 0);
++        scene.deriveHeights();
++
++        LightResult result = ENGINE.relight(scene.region());
++
++        assertEquals(64, scene.height(20, 20));
++        for (int y = 0; y < 64; ++y) {
++            assertEquals(0, scene.resultLight(result, true, 20, y, 20));
++        }
++
++        for (int y = 64; y < 256; ++y) {
++            assertEquals(15, scene.resultLight(result, true, 20, y, 20));
++        }
++
++        assertNull("sections above the ground do not exist and read 15 implicitly", result.sky(1, 1, 4));
++        assertNotNull(result.sky(1, 1, 3));
++        for (byte b : result.sky(1, 1, 3)) {
++            assertEquals("solid ground, all dark", 0, b);
++        }
++    }
++
++    @Test
++    public void skyLightLeaksUnderARoofAndFadesByOnePerBlock() {
++        LightScene scene = new LightScene(0, 0, 3, 3, true);
++
++        scene.fill(0, 0, 0, 47, 63, 47, 15, 0); // ground
++        scene.fill(8, 80, 8, 39, 80, 39, 15, 0); // roof slab y = 80
++        scene.deriveHeights();
++
++        LightResult result = ENGINE.relight(scene.region());
++
++        assertEquals("roof columns end at 81", 81, scene.height(24, 24));
++        assertEquals("open columns end at the ground", 64, scene.height(2, 2));
++        assertEquals("under the roof edge: one step from open air", 14, scene.resultLight(result, true, 8, 70, 24));
++        assertEquals(13, scene.resultLight(result, true, 9, 70, 24));
++        assertEquals("four steps in from x = 7", 10, scene.resultLight(result, true, 12, 70, 24));
++        assertEquals("a corner is fed from two sides but still two steps away", 13, scene.resultLight(result, true, 9, 70, 9));
++        assertEquals("sixteen steps in from the nearest open column, nothing is left", 0, scene.resultLight(result, true, 24, 70, 24));
++        assertNotNull("light spilled into the nonexistent section y 64..79 under the roof, so it is created", result.sky(1, 1, 4));
++        assertNull("above the roof the nonexistent section reads 15 implicitly and needs no array", result.sky(1, 1, 15));
++    }
++
++    @Test
++    public void aColumnCappedAtTheTopOfTheWorldReadsFifteenAboveY255() {
++        // every column has an opaque cap at y = 255 except (5, 5), which has a leaves-like cap: otherwise open columns
++        // beside it would feed sky light in sideways
++        LightScene scene = new LightScene(0, 0, 1, 1, true);
++
++        for (int x = 0; x < 16; ++x) {
++            for (int z = 0; z < 16; ++z) {
++                scene.set(x, 255, z, 15, 0);
++            }
++        }
++
++        scene.set(5, 255, 5, 1, 0);
++        scene.deriveHeights();
++
++        LightResult result = ENGINE.relight(scene.region());
++
++        assertEquals(256, scene.height(5, 5));
++        assertEquals("15 from above minus the cost 1", 14, scene.resultLight(result, true, 5, 255, 5));
++        assertEquals(13, scene.resultLight(result, true, 5, 254, 5));
++        assertEquals(1, scene.resultLight(result, true, 5, 242, 5));
++        assertEquals(0, scene.resultLight(result, true, 5, 241, 5));
++        assertEquals("the opaque caps stay dark", 0, scene.resultLight(result, true, 6, 255, 5));
++        assertEquals("and the light spreads sideways below them", 12, scene.resultLight(result, true, 6, 254, 5));
++        assertNull("section 14 (y 224..239) is out of reach and stays implicit", result.sky(0, 0, 14));
++        assertNotNull(result.sky(0, 0, 15));
++
++        LightScene sealed = new LightScene(0, 0, 1, 1, true);
++
++        for (int x = 0; x < 16; ++x) {
++            for (int z = 0; z < 16; ++z) {
++                sealed.set(x, 255, z, 15, 0);
++            }
++        }
++
++        sealed.deriveHeights();
++
++        LightResult dark = ENGINE.relight(sealed.region());
++
++        assertEquals(0, sealed.resultLight(dark, true, 5, 255, 5));
++        assertEquals(0, sealed.resultLight(dark, true, 5, 254, 5));
++        assertEquals(0, dark.cellsRaised());
++    }
++
++    @Test
++    public void worldsWithoutSkyLightProduceNoSkyArrays() {
++        LightScene scene = centreScene(false);
++
++        scene.set(24, 64, 24, 0, 10);
++        scene.deriveHeights();
++
++        LightResult result = ENGINE.relight(scene.region());
++
++        for (int s = 0; s < LightRules.SECTIONS; ++s) {
++            assertNull(result.sky(1, 1, s));
++        }
++
++        assertNotNull(result.block(1, 1, 4));
++    }
++
++    @Test
++    public void lightAlreadyStoredInTheTargetIsIgnoredBecauseTheResultIsFromScratch() {
++        LightScene clean = centreScene(true);
++        LightScene dirty = centreScene(true);
++        Random random = new Random(11);
++
++        for (LightScene scene : new LightScene[] {clean, dirty}) {
++            scene.fill(16, 0, 16, 31, 40, 31, 15, 0);
++            scene.set(24, 50, 24, 0, 13);
++            scene.deriveHeights();
++        }
++
++        for (int s = 0; s < LightRules.SECTIONS; ++s) {
++            byte[] sky = new byte[LightRules.NIBBLE_BYTES];
++            byte[] block = new byte[LightRules.NIBBLE_BYTES];
++
++            random.nextBytes(sky);
++            random.nextBytes(block);
++            dirty.storedSky[dirty.columnOfChunk(1, 1)][s] = sky;
++            dirty.storedBlock[dirty.columnOfChunk(1, 1)][s] = block;
++        }
++
++        LightResult a = ENGINE.relight(clean.region());
++        LightResult b = ENGINE.relight(dirty.region());
++
++        for (int s = 0; s < LightRules.SECTIONS; ++s) {
++            assertArrayEqualsNullSafe(a.sky(1, 1, s), b.sky(1, 1, s));
++            assertArrayEqualsNullSafe(a.block(1, 1, s), b.block(1, 1, s));
++        }
++    }
++
++    private static void assertArrayEqualsNullSafe(byte[] expected, byte[] actual) {
++        if (expected == null || actual == null) {
++            assertTrue(expected == actual);
++        } else {
++            org.junit.Assert.assertArrayEquals(expected, actual);
++        }
++    }
++
++    @Test
++    public void emptyTargetColumnsComputeNothing() {
++        LightScene scene = centreScene(false);
++
++        scene.deriveHeights();
++
++        LightResult result = ENGINE.relight(scene.region());
++
++        assertEquals(0, result.cellsRaised());
++        for (int s = 0; s < LightRules.SECTIONS; ++s) {
++            assertNull(result.block(1, 1, s));
++        }
++    }
++}
+diff --git a/test/java/me/stella/antarctic/light/LightRulesTest.java b/test/java/me/stella/antarctic/light/LightRulesTest.java
+new file mode 100644
+index 0000000..8f278a3
+--- /dev/null
++++ b/test/java/me/stella/antarctic/light/LightRulesTest.java
+@@ -0,0 +1,97 @@
++package me.stella.antarctic.light;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertTrue;
++
++import java.util.Random;
++import me.stella.antarctic.collection.PendingLightRegistry;
++import org.junit.Test;
++
++public class LightRulesTest {
++
++    /** Vanilla's cost rule written out directly (World.a(BlockPosition, EnumSkyBlock)), for every possible byte. */
++    private static int vanillaCost(int opacity, int emission) {
++        int j = opacity;
++
++        if (j >= 15 && emission > 0) {
++            j = 1;
++        }
++
++        if (j < 1) {
++            j = 1;
++        }
++
++        return j;
++    }
++
++    @Test
++    public void costTableMatchesTheVanillaRuleForEveryCell() {
++        for (int opacity = 0; opacity < 16; ++opacity) {
++            for (int emission = 0; emission < 16; ++emission) {
++                byte cell = LightRules.pack(opacity, emission);
++
++                assertEquals(opacity, LightRules.opacity(cell));
++                assertEquals(emission, LightRules.emission(cell));
++                assertEquals("opacity " + opacity + " emission " + emission, vanillaCost(opacity, emission), LightRules.cost(cell));
++            }
++        }
++    }
++
++    @Test
++    public void packClampsOpacityAndEmissionLikeTheBlockStatesProduceThem() {
++        // vanilla opacity is 0..255 (255 for full cubes) and only "15 or more" matters
++        assertEquals(15, LightRules.opacity(LightRules.pack(255, 0)));
++        assertEquals(15, LightRules.opacity(LightRules.pack(16, 0)));
++        assertEquals(0, LightRules.opacity(LightRules.pack(-3, 0)));
++        assertEquals(15, LightRules.emission(LightRules.pack(0, 99)));
++        assertEquals(0, LightRules.emission(LightRules.pack(0, -1)));
++        assertEquals(LightRules.BLOCKED, LightRules.cost(LightRules.pack(255, 0)));
++        assertEquals("emissive opaque blocks stay passable at cost 1", 1, LightRules.cost(LightRules.pack(255, 7)));
++        assertEquals("zero opacity still costs 1", 1, LightRules.cost(LightRules.pack(0, 0)));
++    }
++
++    @Test
++    public void nibbleHelpersUseTheVanillaLayout() {
++        byte[] nibbles = new byte[LightRules.NIBBLE_BYTES];
++        Random random = new Random(1);
++        int[] expected = new int[LightRules.SECTION_CELLS];
++
++        for (int i = 0; i < expected.length; ++i) {
++            expected[i] = random.nextInt(16);
++            LightRules.setNibble(nibbles, i, expected[i]);
++        }
++
++        for (int i = 0; i < expected.length; ++i) {
++            assertEquals(expected[i], LightRules.getNibble(nibbles, i));
++        }
++
++        // low nibble is the even index, as in net.minecraft.server.NibbleArray
++        byte[] pair = new byte[LightRules.NIBBLE_BYTES];
++
++        LightRules.setNibble(pair, 0, 0xA);
++        LightRules.setNibble(pair, 1, 0x5);
++        assertEquals((byte) 0x5A, pair[0]);
++        assertEquals(1 << 8 | 2 << 4 | 3, LightRules.cellIndex(3, 1, 2));
++    }
++
++    @Test
++    public void positionPackingMatchesThePendingLightRegistry() {
++        for (int x = 0; x < 16; ++x) {
++            for (int z = 0; z < 16; ++z) {
++                for (int y : new int[] {0, 1, 63, 128, 255}) {
++                    for (boolean sky : new boolean[] {false, true}) {
++                        int packed = LightRules.packPosition(x, y, z, sky);
++
++                        assertEquals(PendingLightRegistry.pack(x, y, z, sky), packed);
++                        assertEquals(x, LightRules.positionX(packed));
++                        assertEquals(y, LightRules.positionY(packed));
++                        assertEquals(z, LightRules.positionZ(packed));
++                        assertEquals(sky, LightRules.positionIsSky(packed));
++                    }
++                }
++            }
++        }
++
++        assertTrue(LightRules.packPosition(15, 255, 15, true) > 0);
++    }
++}
+diff --git a/test/java/me/stella/antarctic/light/LightScene.java b/test/java/me/stella/antarctic/light/LightScene.java
+new file mode 100644
+index 0000000..98bf28d
+--- /dev/null
++++ b/test/java/me/stella/antarctic/light/LightScene.java
+@@ -0,0 +1,170 @@
++package me.stella.antarctic.light;
++
++/**
++ * Test helper: a rectangle of chunks addressed with global block coordinates. Everything is air with implicit light until
++ * set. Columns are targets unless marked ring or absent.
++ */
++final class LightScene {
++
++    final int minCx;
++    final int minCz;
++    final int width;
++    final int depth;
++    final boolean hasSky;
++    final byte[][][] cells;
++    final int[][] heights;
++    final byte[][][] storedSky;
++    final byte[][][] storedBlock;
++    final boolean[] ring;
++    final boolean[] absent;
++
++    LightScene(int minCx, int minCz, int width, int depth, boolean hasSky) {
++        this.minCx = minCx;
++        this.minCz = minCz;
++        this.width = width;
++        this.depth = depth;
++        this.hasSky = hasSky;
++        int n = width * depth;
++        this.cells = new byte[n][LightRules.SECTIONS][];
++        this.storedSky = new byte[n][LightRules.SECTIONS][];
++        this.storedBlock = new byte[n][LightRules.SECTIONS][];
++        this.heights = new int[n][256];
++        this.ring = new boolean[n];
++        this.absent = new boolean[n];
++    }
++
++    int column(int x, int z) {
++        return ((z >> 4) - this.minCz) * this.width + ((x >> 4) - this.minCx);
++    }
++
++    int columnOfChunk(int cx, int cz) {
++        return (cz - this.minCz) * this.width + (cx - this.minCx);
++    }
++
++    LightScene ring(int cx, int cz) {
++        this.ring[this.columnOfChunk(cx, cz)] = true;
++        return this;
++    }
++
++    LightScene absent(int cx, int cz) {
++        this.absent[this.columnOfChunk(cx, cz)] = true;
++        return this;
++    }
++
++    /** Makes every column ring except the given target chunk. */
++    LightScene onlyTarget(int cx, int cz) {
++        for (int i = 0; i < this.ring.length; ++i) {
++            this.ring[i] = true;
++        }
++
++        this.ring[this.columnOfChunk(cx, cz)] = false;
++        return this;
++    }
++
++    void set(int x, int y, int z, int opacity, int emission) {
++        int c = this.column(x, z);
++        int s = y >> 4;
++
++        if (this.cells[c][s] == null) {
++            this.cells[c][s] = new byte[LightRules.SECTION_CELLS];
++        }
++
++        this.cells[c][s][LightRules.cellIndex(x & 15, y & 15, z & 15)] = LightRules.pack(opacity, emission);
++    }
++
++    /** Creates the section as an all-air existing section. */
++    void section(int cx, int cz, int s) {
++        int c = this.columnOfChunk(cx, cz);
++
++        if (this.cells[c][s] == null) {
++            this.cells[c][s] = new byte[LightRules.SECTION_CELLS];
++        }
++    }
++
++    byte cell(int x, int y, int z) {
++        byte[] section = this.cells[this.column(x, z)][y >> 4];
++
++        return section == null ? 0 : section[LightRules.cellIndex(x & 15, y & 15, z & 15)];
++    }
++
++    void fill(int x0, int y0, int z0, int x1, int y1, int z1, int opacity, int emission) {
++        for (int x = x0; x <= x1; ++x) {
++            for (int y = y0; y <= y1; ++y) {
++                for (int z = z0; z <= z1; ++z) {
++                    this.set(x, y, z, opacity, emission);
++                }
++            }
++        }
++    }
++
++    void storeBlock(int x, int y, int z, int value) {
++        int c = this.column(x, z);
++        int s = y >> 4;
++
++        if (this.storedBlock[c][s] == null) {
++            this.storedBlock[c][s] = new byte[LightRules.NIBBLE_BYTES];
++        }
++
++        LightRules.setNibble(this.storedBlock[c][s], LightRules.cellIndex(x & 15, y & 15, z & 15), value);
++    }
++
++    void storeSky(int x, int y, int z, int value) {
++        int c = this.column(x, z);
++        int s = y >> 4;
++
++        if (this.storedSky[c][s] == null) {
++            this.storedSky[c][s] = new byte[LightRules.NIBBLE_BYTES];
++        }
++
++        LightRules.setNibble(this.storedSky[c][s], LightRules.cellIndex(x & 15, y & 15, z & 15), value);
++    }
++
++    void deriveHeights() {
++        for (int c = 0; c < this.cells.length; ++c) {
++            System.arraycopy(HeightMaps.compute(this.cells[c]), 0, this.heights[c], 0, 256);
++        }
++    }
++
++    void setHeight(int x, int z, int height) {
++        this.heights[this.column(x, z)][(z & 15) << 4 | x & 15] = height;
++    }
++
++    int height(int x, int z) {
++        return this.heights[this.column(x, z)][(z & 15) << 4 | x & 15];
++    }
++
++    LightRegion region() {
++        LightRegion region = new LightRegion(this.minCx, this.minCz, this.width, this.depth, this.hasSky);
++
++        for (int c = 0; c < this.cells.length; ++c) {
++            if (this.absent[c]) {
++                continue;
++            }
++
++            LightColumn column = new LightColumn(this.heights[c]);
++
++            for (int s = 0; s < LightRules.SECTIONS; ++s) {
++                column.setCells(s, this.cells[c][s]);
++                column.setStored(s, this.storedSky[c][s], this.storedBlock[c][s]);
++            }
++
++            region.put(this.minCx + c % this.width, this.minCz + c / this.width, column, !this.ring[c]);
++        }
++
++        return region;
++    }
++
++    // ------------------------------------------------------------------------ reading engine output
++
++    /** Light of a cell after the engine ran, following the result's "null = implicit" convention. */
++    int resultLight(LightResult result, boolean sky, int x, int y, int z) {
++        int c = this.column(x, z);
++        byte[] nibbles = sky ? result.sky(c, y >> 4) : result.block(c, y >> 4);
++
++        if (nibbles != null) {
++            return LightRules.getNibble(nibbles, LightRules.cellIndex(x & 15, y & 15, z & 15));
++        }
++
++        return sky && y >= this.height(x, z) ? 15 : 0;
++    }
++}
+diff --git a/test/java/me/stella/antarctic/light/ReferenceSolver.java b/test/java/me/stella/antarctic/light/ReferenceSolver.java
+new file mode 100644
+index 0000000..00c8797
+--- /dev/null
++++ b/test/java/me/stella/antarctic/light/ReferenceSolver.java
+@@ -0,0 +1,161 @@
++package me.stella.antarctic.light;
++
++/**
++ * Deliberately naive third implementation of the light rule for tests: start every target cell at 0 and apply the rule in
++ * place until nothing changes. The rule only ever raises a value from below, so this reaches the same unique fixed point
++ * as the engine, using none of its code and none of the checker's.
++ */
++final class ReferenceSolver {
++
++    private final LightScene scene;
++    private final boolean sky;
++    private final int blocksX;
++    private final int blocksZ;
++    private final int[] light;
++    private int sweeps;
++
++    private ReferenceSolver(LightScene scene, boolean sky) {
++        this.scene = scene;
++        this.sky = sky;
++        this.blocksX = scene.width << 4;
++        this.blocksZ = scene.depth << 4;
++        this.light = new int[LightRules.WORLD_HEIGHT * this.blocksX * this.blocksZ];
++    }
++
++    static int[] solve(LightScene scene, boolean sky) {
++        ReferenceSolver solver = new ReferenceSolver(scene, sky);
++
++        solver.run();
++        return solver.light;
++    }
++
++    static int sweepsFor(LightScene scene, boolean sky) {
++        ReferenceSolver solver = new ReferenceSolver(scene, sky);
++
++        solver.run();
++        return solver.sweeps;
++    }
++
++    static int at(LightScene scene, int[] solved, int x, int y, int z) {
++        int blocksX = scene.width << 4;
++        int blocksZ = scene.depth << 4;
++        int rx = x - (scene.minCx << 4);
++        int rz = z - (scene.minCz << 4);
++
++        return solved[(y * blocksZ + rz) * blocksX + rx];
++    }
++
++    private int index(int rx, int y, int rz) {
++        return (y * this.blocksZ + rz) * this.blocksX + rx;
++    }
++
++    private int columnAt(int rx, int rz) {
++        return (rz >> 4) * this.scene.width + (rx >> 4);
++    }
++
++    private void run() {
++        // ring columns hold their stored light for the whole run
++        for (int rz = 0; rz < this.blocksZ; ++rz) {
++            for (int rx = 0; rx < this.blocksX; ++rx) {
++                int c = this.columnAt(rx, rz);
++
++                if (this.scene.absent[c] || !this.scene.ring[c]) {
++                    continue;
++                }
++
++                for (int y = 0; y < LightRules.WORLD_HEIGHT; ++y) {
++                    this.light[this.index(rx, y, rz)] = this.ringValue(c, rx & 15, y, rz & 15);
++                }
++            }
++        }
++
++        boolean changed = true;
++
++        while (changed) {
++            changed = false;
++            ++this.sweeps;
++            for (int rz = 0; rz < this.blocksZ; ++rz) {
++                for (int rx = 0; rx < this.blocksX; ++rx) {
++                    int c = this.columnAt(rx, rz);
++
++                    if (this.scene.absent[c] || this.scene.ring[c]) {
++                        continue;
++                    }
++
++                    for (int y = 0; y < LightRules.WORLD_HEIGHT; ++y) {
++                        int value = this.rule(c, rx, y, rz);
++
++                        if (value != this.light[this.index(rx, y, rz)]) {
++                            this.light[this.index(rx, y, rz)] = value;
++                            changed = true;
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    private int ringValue(int c, int localX, int y, int localZ) {
++        byte[] nibbles = this.sky ? this.scene.storedSky[c][y >> 4] : this.scene.storedBlock[c][y >> 4];
++
++        if (nibbles != null) {
++            int i = (y & 15) << 8 | localZ << 4 | localX;
++
++            return (nibbles[i >> 1] >> ((i & 1) * 4)) & 15;
++        }
++
++        return this.sky && y >= this.scene.heights[c][localZ << 4 | localX] ? 15 : 0;
++    }
++
++    private int neighbour(int rx, int y, int rz) {
++        if (y > 255) {
++            return this.sky ? 15 : 0;
++        }
++
++        if (y < 0 || rx < 0 || rz < 0 || rx >= this.blocksX || rz >= this.blocksZ || this.scene.absent[this.columnAt(rx, rz)]) {
++            return 0;
++        }
++
++        return this.light[this.index(rx, y, rz)];
++    }
++
++    private int rule(int c, int rx, int y, int rz) {
++        int localX = rx & 15;
++        int localZ = rz & 15;
++
++        if (this.sky && y >= this.scene.heights[c][localZ << 4 | localX]) {
++            return 15;
++        }
++
++        byte[] section = this.scene.cells[c][y >> 4];
++        int v = section == null ? 0 : section[(y & 15) << 8 | localZ << 4 | localX] & 0xFF;
++        int opacity = v & 15;
++        int emission = v >> 4;
++        int cost = opacity;
++
++        if (cost >= 15 && emission > 0) {
++            cost = 1;
++        }
++
++        if (cost < 1) {
++            cost = 1;
++        }
++
++        if (cost >= 15) {
++            return 0;
++        }
++
++        int best = this.sky ? 0 : emission;
++
++        best = Math.max(best, this.neighbour(rx + 1, y, rz) - cost);
++        best = Math.max(best, this.neighbour(rx - 1, y, rz) - cost);
++        best = Math.max(best, this.neighbour(rx, y, rz + 1) - cost);
++        best = Math.max(best, this.neighbour(rx, y, rz - 1) - cost);
++        best = Math.max(best, this.neighbour(rx, y + 1, rz) - cost);
++        if (y > 0) {
++            best = Math.max(best, this.neighbour(rx, y - 1, rz) - cost);
++        }
++
++        return best;
++    }
++}
+diff --git a/test/java/net/minecraft/server/LightEngineNmsParityTest.java b/test/java/net/minecraft/server/LightEngineNmsParityTest.java
+new file mode 100644
+index 0000000..19a6c17
+--- /dev/null
++++ b/test/java/net/minecraft/server/LightEngineNmsParityTest.java
+@@ -0,0 +1,393 @@
++package net.minecraft.server;
++
++import static org.junit.Assert.assertArrayEquals;
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertTrue;
++
++import java.lang.reflect.Method;
++import java.util.Random;
++import me.stella.antarctic.light.HeightMaps;
++import me.stella.antarctic.light.LightChecker;
++import me.stella.antarctic.light.LightColumn;
++import me.stella.antarctic.light.LightEngine;
++import me.stella.antarctic.light.LightRegion;
++import me.stella.antarctic.light.LightResult;
++import me.stella.antarctic.light.LightRules;
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++/**
++ * Ties the pure light engine to the real server:
++ * <ul>
++ * <li>{@link LightChecker#expected} must equal the server's own rule, {@code World.a(BlockPosition, EnumSkyBlock)}, for every
++ * cell on arbitrary (even nonsensical) stored light and arbitrary blocks and heights;</li>
++ * <li>the engine's from-scratch result must equal vanilla's incremental result wherever vanilla is path independent (isolated
++ * light sources far apart, and their removal);</li>
++ * <li>{@link HeightMaps} must match {@code Chunk.initLighting}.</li>
++ * </ul>
++ * The stub world holds chunks -2..1; chunks -1..0 are the targets, the outer ring is the fixed input.
++ */
++public class LightEngineNmsParityTest {
++
++    private static final LightEngine ENGINE = new LightEngine();
++
++    private static IBlockData[] palette() {
++        return new IBlockData[] {
++            Blocks.AIR.getBlockData(), Blocks.AIR.getBlockData(), Blocks.AIR.getBlockData(), Blocks.AIR.getBlockData(),
++            Blocks.STONE.getBlockData(), Blocks.STONE.getBlockData(), Blocks.GLASS.getBlockData(), Blocks.LEAVES.getBlockData(),
++            Blocks.WATER.getBlockData(), Blocks.ICE.getBlockData(), Blocks.WEB.getBlockData(), Blocks.LAVA.getBlockData(),
++            Blocks.TORCH.getBlockData(), Blocks.REDSTONE_TORCH.getBlockData(), Blocks.GLOWSTONE.getBlockData(),
++            Blocks.SEA_LANTERN.getBlockData(), Blocks.LIT_REDSTONE_LAMP.getBlockData(), Blocks.ENDER_CHEST.getBlockData(),
++            Blocks.BEACON.getBlockData()
++        };
++    }
++
++    @BeforeClass
++    public static void bootstrap() throws Exception {
++        LightPropagationParityTest.bootstrap();
++    }
++
++    private static WorldServer world(long seed) throws Exception {
++        return LightPropagationParityTest.buildWorld(seed, new LightPropagationParityTest.StubProvider[1]);
++    }
++
++    private static boolean isTarget(int cx, int cz) {
++        return cx >= -1 && cx <= 0 && cz >= -1 && cz <= 0;
++    }
++
++    /** Copies chunks -2..1 into a region; chunks -1..0 are targets. */
++    static LightRegion snapshot(WorldServer world) {
++        LightRegion region = new LightRegion(-2, -2, 4, 4, true);
++
++        for (int cx = -2; cx <= 1; ++cx) {
++            for (int cz = -2; cz <= 1; ++cz) {
++                Chunk chunk = world.getChunkIfLoaded(cx, cz);
++                LightColumn column = new LightColumn(chunk.heightMap.clone());
++                ChunkSection[] sections = chunk.getSections();
++
++                for (int s = 0; s < 16; ++s) {
++                    ChunkSection section = sections[s];
++
++                    if (section == Chunk.a) {
++                        continue;
++                    }
++
++                    byte[] cells = new byte[LightRules.SECTION_CELLS];
++
++                    for (int y = 0; y < 16; ++y) {
++                        for (int z = 0; z < 16; ++z) {
++                            for (int x = 0; x < 16; ++x) {
++                                IBlockData state = section.getType(x, y, z);
++
++                                cells[LightRules.cellIndex(x, y, z)] = LightRules.pack(state.c(), state.d());
++                            }
++                        }
++                    }
++
++                    column.setCells(s, cells);
++                    column.setStored(s, section.getSkyLightArray().asBytes().clone(), section.getEmittedLightArray().asBytes().clone());
++                }
++
++                region.put(cx, cz, column, isTarget(cx, cz));
++            }
++        }
++
++        return region;
++    }
++
++    private static void randomizeBlocks(WorldServer world, Random random) {
++        IBlockData[] palette = palette();
++
++        for (int cx = -1; cx <= 0; ++cx) {
++            for (int cz = -1; cz <= 0; ++cz) {
++                for (int x = 0; x < 16; ++x) {
++                    for (int z = 0; z < 16; ++z) {
++                        for (int y = 0; y < 72; ++y) { // from the very bottom: y = 0 cells read themselves below
++                            if (random.nextInt(100) < 30) {
++                                LightPropagationParityTest.setBlock(world, cx * 16 + x, y, cz * 16 + z, palette[random.nextInt(palette.length)]);
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    /** Vanilla's definition, read straight from the live sections (independent of HeightMaps). */
++    private static void deriveHeights(WorldServer world) {
++        for (int cx = -1; cx <= 0; ++cx) {
++            for (int cz = -1; cz <= 0; ++cz) {
++                Chunk chunk = world.getChunkIfLoaded(cx, cz);
++
++                for (int z = 0; z < 16; ++z) {
++                    for (int x = 0; x < 16; ++x) {
++                        int height = 0;
++
++                        for (int y = 255; y >= 0 && height == 0; --y) {
++                            if (chunk.getSections()[y >> 4].getType(x, y & 15, z).c() != 0) {
++                                height = y + 1;
++                            }
++                        }
++
++                        chunk.heightMap[z << 4 | x] = height;
++                    }
++                }
++            }
++        }
++    }
++
++    private static void randomizeStoredLight(WorldServer world, Random random) {
++        for (int cx = -2; cx <= 1; ++cx) {
++            for (int cz = -2; cz <= 1; ++cz) {
++                for (ChunkSection section : world.getChunkIfLoaded(cx, cz).getSections()) {
++                    random.nextBytes(section.getSkyLightArray().asBytes());
++                    random.nextBytes(section.getEmittedLightArray().asBytes());
++                }
++            }
++        }
++    }
++
++    @Test
++    public void expectedEqualsTheServersOwnRuleOnArbitraryBlocksHeightsAndStoredLight() throws Exception {
++        Method rule = World.class.getDeclaredMethod("a", BlockPosition.class, EnumSkyBlock.class);
++
++        rule.setAccessible(true);
++        for (long seed = 1; seed <= 3; ++seed) {
++            WorldServer world = world(seed);
++            Random random = new Random(seed * 31);
++
++            randomizeBlocks(world, random);
++            if (seed == 1) {
++                deriveHeights(world); // consistent heights
++            } else if (seed == 3) { // arbitrary heights, nothing to do with the blocks
++                for (int cx = -1; cx <= 0; ++cx) {
++                    for (int cz = -1; cz <= 0; ++cz) {
++                        for (int i = 0; i < 256; ++i) {
++                            world.getChunkIfLoaded(cx, cz).heightMap[i] = random.nextInt(140);
++                        }
++                    }
++                }
++            } // seed 2 keeps buildWorld's heights, which no longer match the random blocks either
++
++            randomizeStoredLight(world, random);
++
++            LightRegion region = snapshot(world);
++            int compared = 0;
++
++            for (int cx = -1; cx <= 0; ++cx) {
++                for (int cz = -1; cz <= 0; ++cz) {
++                    for (int y = 0; y < 256; ++y) {
++                        for (int lz = 0; lz < 16; ++lz) {
++                            for (int lx = 0; lx < 16; ++lx) {
++                                for (int type = 0; type < 2; ++type) {
++                                    boolean sky = type == 0;
++                                    int vanilla = (Integer) rule.invoke(world, new BlockPosition(cx * 16 + lx, y, cz * 16 + lz),
++                                            sky ? EnumSkyBlock.SKY : EnumSkyBlock.BLOCK);
++                                    int mine = LightChecker.expected(region, sky, cx, cz, lx, y, lz);
++
++                                    if (vanilla != mine) {
++                                        throw new AssertionError("seed " + seed + (sky ? " sky" : " block") + " cell "
++                                                + (cx * 16 + lx) + "," + y + "," + (cz * 16 + lz) + ": server rule " + vanilla + ", checker " + mine);
++                                    }
++
++                                    ++compared;
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++
++            assertEquals(4 * 256 * 256 * 2, compared);
++        }
++    }
++
++    private static void assertEngineMatchesStoredLight(WorldServer world, String context) {
++        LightRegion region = snapshot(world);
++        LightResult result = ENGINE.relight(region);
++
++        for (int cx = -1; cx <= 0; ++cx) {
++            for (int cz = -1; cz <= 0; ++cz) {
++                ChunkSection[] sections = world.getChunkIfLoaded(cx, cz).getSections();
++
++                for (int s = 0; s < 16; ++s) {
++                    for (int type = 0; type < 2; ++type) {
++                        boolean sky = type == 0;
++                        byte[] vanilla = (sky ? sections[s].getSkyLightArray() : sections[s].getEmittedLightArray()).asBytes();
++                        byte[] engine = sky ? result.sky(cx, cz, s) : result.block(cx, cz, s);
++
++                        assertNotNull(context + ": existing sections always get an array", engine);
++                        if (!java.util.Arrays.equals(vanilla, engine)) {
++                            for (int i = 0; i < LightRules.SECTION_CELLS; ++i) {
++                                if (LightRules.getNibble(vanilla, i) != LightRules.getNibble(engine, i)) {
++                                    throw new AssertionError(context + (sky ? " sky" : " block") + " chunk " + cx + "," + cz + " section " + s
++                                            + " cell x" + (i & 15) + " y" + ((s << 4) + (i >> 8)) + " z" + (i >> 4 & 15)
++                                            + ": vanilla " + LightRules.getNibble(vanilla, i) + ", engine " + LightRules.getNibble(engine, i));
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    @Test
++    public void aFreshStubWorldIsAlreadyTheFixedPointTheEngineComputes() throws Exception {
++        assertEngineMatchesStoredLight(world(5), "fresh world");
++    }
++
++    /** Number of block-light cells above zero in the stub world; guards that the parity scenes really contain light. */
++    private static int litBlockCells(WorldServer world) {
++        int lit = 0;
++
++        for (int cx = -2; cx <= 1; ++cx) {
++            for (int cz = -2; cz <= 1; ++cz) {
++                for (ChunkSection section : world.getChunkIfLoaded(cx, cz).getSections()) {
++                    for (int i = 0; i < LightRules.SECTION_CELLS; ++i) {
++                        if (LightRules.getNibble(section.getEmittedLightArray().asBytes(), i) > 0) {
++                            ++lit;
++                        }
++                    }
++                }
++            }
++        }
++
++        return lit;
++    }
++
++    private static IBlockData[] emitters() {
++        return new IBlockData[] {Blocks.TORCH.getBlockData(), Blocks.GLOWSTONE.getBlockData(), Blocks.SEA_LANTERN.getBlockData(),
++            Blocks.LIT_REDSTONE_LAMP.getBlockData(), Blocks.ENDER_CHEST.getBlockData(), Blocks.REDSTONE_TORCH.getBlockData()};
++    }
++
++    /**
++     * Fills the air above the ground around a spot with translucent blocks (opacity 0..3). Heights stay as built, so every cell
++     * above the ground still reads as sky source and the stub world remains a fixed point for sky light; only block light
++     * has to find its way through them.
++     */
++    private static void sprinkleTranslucent(WorldServer world, Random random, int centreX, int centreZ) {
++        IBlockData[] translucent = {Blocks.LEAVES.getBlockData(), Blocks.WATER.getBlockData(), Blocks.ICE.getBlockData(),
++            Blocks.WEB.getBlockData(), Blocks.GLASS.getBlockData()};
++
++        for (int dx = -7; dx <= 7; ++dx) {
++            for (int dz = -7; dz <= 7; ++dz) {
++                int x = centreX + dx;
++                int z = centreZ + dz;
++                int ground = world.getChunkIfLoaded(x >> 4, z >> 4).heightMap[(z & 15) << 4 | x & 15];
++
++                for (int dy = 0; dy < 6; ++dy) {
++                    if (random.nextInt(100) < 30) {
++                        LightPropagationParityTest.setBlock(world, x, ground + dy, z, translucent[random.nextInt(translucent.length)]);
++                    }
++                }
++            }
++        }
++    }
++
++    /** Places one emitter per spot on the first air cell above the ground and lets vanilla relight each incrementally. */
++    private static BlockPosition[] placeAndRelight(WorldServer world, Random random, int[][] spots, boolean withTranslucent) {
++        BlockPosition[] placed = new BlockPosition[spots.length];
++        IBlockData[] emitters = emitters();
++
++        if (withTranslucent) {
++            for (int[] spot : spots) {
++                sprinkleTranslucent(world, random, spot[0], spot[1]);
++            }
++        }
++
++        for (int i = 0; i < spots.length; ++i) {
++            int x = spots[i][0];
++            int z = spots[i][1];
++            int y = world.getChunkIfLoaded(x >> 4, z >> 4).heightMap[(z & 15) << 4 | x & 15]; // first air cell above the ground
++
++            placed[i] = new BlockPosition(x, y, z);
++            LightPropagationParityTest.setBlock(world, x, y, z, emitters[random.nextInt(emitters.length)]);
++            world.w(placed[i]);
++        }
++
++        return placed;
++    }
++
++    private static void removeAndRelight(WorldServer world, BlockPosition[] placed) {
++        for (BlockPosition position : placed) {
++            LightPropagationParityTest.setBlock(world, position.getX(), position.getY(), position.getZ(), Blocks.AIR.getBlockData());
++            world.w(position);
++        }
++    }
++
++    @Test
++    public void isolatedEmittersInTheTargetsMatchVanillasIncrementalRelightAndTheirRemoval() throws Exception {
++        // Pairwise Manhattan distance of at least 30 (twice the largest light radius of 14, plus slack) means no two emitters
++        // overlap, so vanilla's incremental relight is exact for each. All spots keep their light inside chunks -2..1:
++        // the stub world has nothing beyond, and a flood fill reaching it would try to load a chunk.
++        int[][] spots = {{-16, -16}, {15, 15}, {-16, 15}, {15, -16}, {0, 0}};
++
++        for (long seed = 1; seed <= 6; ++seed) {
++            WorldServer world = world(seed);
++            Random random = new Random(seed);
++            int count = 1 + (int) (seed % 5);
++            int[][] chosen = new int[count][];
++
++            for (int i = 0; i < count; ++i) {
++                chosen[i] = spots[(int) ((seed + i) % spots.length)];
++            }
++
++            BlockPosition[] placed = placeAndRelight(world, random, chosen, seed % 2 == 0);
++
++            assertTrue("vanilla must have lit something for the comparison to mean anything", litBlockCells(world) > 150 * count / 2);
++            assertEngineMatchesStoredLight(world, "seed " + seed + " after placing " + count);
++            removeAndRelight(world, placed);
++            assertEquals("vanilla's removal pass clears everything", 0, litBlockCells(world));
++            assertEngineMatchesStoredLight(world, "seed " + seed + " after removing");
++        }
++    }
++
++    @Test
++    public void emittersInTheRingLightTheTargetEdgesLikeVanilla() throws Exception {
++        // chunks -2 and 1 are ring chunks here: the engine must pull their light into the target edge cells
++        int[][] spots = {{-17, 0}, {16, 5}};
++
++        for (long seed = 1; seed <= 3; ++seed) {
++            WorldServer world = world(seed + 40);
++            BlockPosition[] placed = placeAndRelight(world, new Random(seed), spots, seed != 2);
++
++            assertTrue(litBlockCells(world) > 150);
++            assertEngineMatchesStoredLight(world, "ring emitters, seed " + seed);
++            removeAndRelight(world, placed);
++            assertEquals(0, litBlockCells(world));
++            assertEngineMatchesStoredLight(world, "ring emitters removed, seed " + seed);
++        }
++    }
++
++    @Test
++    public void heightMapsMatchChunkInitLighting() throws Exception {
++        for (long seed = 1; seed <= 3; ++seed) {
++            WorldServer world = world(seed);
++
++            randomizeBlocks(world, new Random(seed));
++
++            Chunk chunk = world.getChunkIfLoaded(0, 0);
++            LightRegion region = snapshot(world);
++            int[] expected = new int[256];
++
++            for (int z = 0; z < 16; ++z) {
++                for (int x = 0; x < 16; ++x) {
++                    byte[][] cells = new byte[16][];
++
++                    for (int s = 0; s < 16; ++s) {
++                        cells[s] = region.column(0, 0).cells(s);
++                    }
++
++                    expected[z << 4 | x] = HeightMaps.column(cells, x, z);
++                }
++            }
++
++            LightPropagationParityTest.set(Chunk.class, chunk, "h", new int[256]); // the precipitation map; Unsafe-built chunks have none
++            chunk.initLighting();
++            assertArrayEquals("seed " + seed, chunk.heightMap, expected);
++            assertTrue(expected[0] > 0);
++        }
++    }
++}

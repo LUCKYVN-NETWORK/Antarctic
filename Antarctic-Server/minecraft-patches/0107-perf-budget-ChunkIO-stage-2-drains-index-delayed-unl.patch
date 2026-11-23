@@ -1,0 +1,839 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Mon, 23 Nov 2026 10:06:00 +0700
+Subject: [PATCH 107/115] perf: budget ChunkIO stage-2 drains, index delayed
+ unloads and PlayerChunkMap lists
+
+
+diff --git a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+index f34a10a..e5723d0 100644
+--- a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
++++ b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+@@ -14,6 +14,7 @@ import com.destroystokyo.paper.config.toml.modules.misc.Privacy;
+ import com.destroystokyo.paper.config.toml.modules.misc.Rebrand;
+ import com.destroystokyo.paper.config.toml.modules.network.Deflate;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.ArmourStands;
++import com.destroystokyo.paper.config.toml.modules.optimizations.ChunkLoading;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Pathfinder;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Projectiles;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Suffocation;
+@@ -52,7 +53,7 @@ public final class AntarcticTomlConfig {
+             new Rebrand(), new Privacy(),
+             new Deflate(),
+             new VirtualThreads(), new AsyncPlayerDataSaving(),
+-            new Pathfinder(), new Suffocation(), new Projectiles(), new ArmourStands(), new WorldBorder(), new SunBurn(), new Rails(), new Physics(), new Lighting(),
++            new Pathfinder(), new Suffocation(), new Projectiles(), new ArmourStands(), new WorldBorder(), new ChunkLoading(), new SunBurn(), new Rails(), new Physics(), new Lighting(),
+             new MergeChecks(), new ChunkOverloadDupe(), new Collisions(),
+             new MapDecorations(), new Books());
+     private static final YamlConfiguration yamlFacade = new YamlConfiguration();
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/ChunkLoading.java b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/ChunkLoading.java
+new file mode 100644
+index 0000000..8ec5496
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/ChunkLoading.java
+@@ -0,0 +1,34 @@
++package com.destroystokyo.paper.config.toml.modules.optimizations;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++
++public class ChunkLoading implements IConfigModule {
++
++    @ConfigInfo(baseName = "max-stage2-millis-per-tick", comments = "Maximum wall-clock milliseconds spent per tick finalizing asynchronously loaded chunks (ChunkIO Stage 2) on the main thread.\nAlways processes at least one chunk per tick for forward progress.\nSet to 0 to disable the time budget (vanilla/Paper parity default). Values like 8-12 help smooth join and teleport storms.")
++    public static int maxStage2MillisPerTick = 0;
++
++    @ConfigInfo(baseName = "max-stage2-chunk-loads-per-tick", comments = "Maximum number of asynchronously loaded chunks finalized (ChunkIO Stage 2) per tick on the main thread.\nAlways processes at least one chunk per tick for forward progress.\nSet to 0 for unlimited (vanilla/Paper parity default).")
++    public static int maxStage2ChunkLoadsPerTick = 0;
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.OPTIMIZATIONS;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "chunk-loading";
++    }
++
++    @Override
++    public void onLoaded(com.electronwill.nightconfig.core.file.CommentedFileConfig config) {
++        if (maxStage2MillisPerTick < 0) {
++            throw new IllegalArgumentException("optimizations.chunk-loading.max-stage2-millis-per-tick must be >= 0");
++        }
++        if (maxStage2ChunkLoadsPerTick < 0) {
++            throw new IllegalArgumentException("optimizations.chunk-loading.max-stage2-chunk-loads-per-tick must be >= 0");
++        }
++    }
++}
+diff --git a/main/java/net/minecraft/server/ChunkProviderServer.java b/main/java/net/minecraft/server/ChunkProviderServer.java
+index 7a7afb6..68109eb 100644
+--- a/main/java/net/minecraft/server/ChunkProviderServer.java
++++ b/main/java/net/minecraft/server/ChunkProviderServer.java
+@@ -29,6 +29,7 @@ public class ChunkProviderServer implements IChunkProvider {
+ 
+     private static final Logger a = LogManager.getLogger();
+     public final LongSet unloadQueue = new LongOpenHashSet();
++    private final it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap delayedUnloads = new it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap(); // Antarctic - O(1) index of chunks scheduled for delayed unload
+     public final ChunkGenerator chunkGenerator;
+     private final IChunkLoader chunkLoader;
+     // Paper start - chunk save stats
+@@ -370,17 +371,26 @@ public class ChunkProviderServer implements IChunkProvider {
+                 activityAccountant.endActivity(); // Spigot
+             }
+             // Paper start - delayed chunk unloads
+-            long now = System.currentTimeMillis();
++            // Antarctic start - iterate only indexed delayedUnloads instead of scanning all loaded chunks every tick
+             long unloadAfter = world.paperConfig.delayChunkUnloadsBy;
+-            if (unloadAfter > 0) {
+-                //noinspection Convert2streamapi
+-                for (Chunk chunk : chunks.values()) {
+-                    if (chunk.scheduledForUnload != null && now - chunk.scheduledForUnload > unloadAfter) {
++            if (unloadAfter > 0 && !this.delayedUnloads.isEmpty()) {
++                long now = System.currentTimeMillis();
++                ObjectIterator<it.unimi.dsi.fastutil.longs.Long2LongMap.Entry> delayedIter = this.delayedUnloads.long2LongEntrySet().fastIterator();
++                while (delayedIter.hasNext()) {
++                    it.unimi.dsi.fastutil.longs.Long2LongMap.Entry entry = delayedIter.next();
++                    Chunk chunk = this.chunks.get(entry.getLongKey());
++                    if (chunk == null || chunk.scheduledForUnload == null) {
++                        delayedIter.remove();
++                        continue;
++                    }
++                    if (now - entry.getLongValue() > unloadAfter) {
+                         chunk.scheduledForUnload = null;
++                        delayedIter.remove();
+                         unload(chunk);
+                     }
+                 }
+             }
++            // Antarctic end
+             // Paper end
+ 
+             this.chunkLoader.b();
+@@ -389,6 +399,20 @@ public class ChunkProviderServer implements IChunkProvider {
+         return false;
+     }
+ 
++    // Antarctic start - maintain delayedUnloads index in sync with chunk.scheduledForUnload
++    void scheduleDelayedUnload(Chunk chunk, long now) {
++        chunk.scheduledForUnload = now;
++        this.delayedUnloads.put(chunk.chunkKey, now);
++    }
++
++    void cancelDelayedUnload(Chunk chunk) {
++        if (chunk.scheduledForUnload != null) {
++            chunk.scheduledForUnload = null;
++            this.delayedUnloads.remove(chunk.chunkKey);
++        }
++    }
++    // Antarctic end
++
+     // CraftBukkit start
+     public boolean unloadChunk(Chunk chunk, boolean save) {
+         ChunkUnloadEvent event = new ChunkUnloadEvent(chunk.bukkitChunk, save);
+@@ -397,6 +421,7 @@ public class ChunkProviderServer implements IChunkProvider {
+             return false;
+         }
+         save = event.isSaveChunk();
++        this.cancelDelayedUnload(chunk); // Antarctic
+         chunk.lightingQueue.processUnload(); // Paper
+ 
+         // Update neighbor counts
+diff --git a/main/java/net/minecraft/server/PlayerChunk.java b/main/java/net/minecraft/server/PlayerChunk.java
+index b65e617..460f0da 100644
+--- a/main/java/net/minecraft/server/PlayerChunk.java
++++ b/main/java/net/minecraft/server/PlayerChunk.java
+@@ -25,6 +25,11 @@ public class PlayerChunk {
+     private int h;
+     private long i;
+     private boolean done;
++    // Antarctic start - intrusive list indices for O(1) PlayerChunkMap removals
++    int antarcticAllIdx = -1;
++    int antarcticSendIdx = -1;
++    int antarcticLoadIdx = -1;
++    // Antarctic end
+ 
+     // CraftBukkit start - add fields
+     boolean chunkExists; // Paper
+@@ -39,7 +44,7 @@ public class PlayerChunk {
+     // Paper start - delay chunk unloads
+     public final void markChunkUsed() {
+         if (chunk != null && chunk.scheduledForUnload != null) {
+-            chunk.scheduledForUnload = null;
++            this.playerChunkMap.getWorld().getChunkProviderServer().cancelDelayedUnload(chunk); // Antarctic - sync delayedUnloads index
+         }
+     }
+     // Paper end
+diff --git a/main/java/net/minecraft/server/PlayerChunkMap.java b/main/java/net/minecraft/server/PlayerChunkMap.java
+index 00d8586..7e17e91 100644
+--- a/main/java/net/minecraft/server/PlayerChunkMap.java
++++ b/main/java/net/minecraft/server/PlayerChunkMap.java
+@@ -44,9 +44,9 @@ public class PlayerChunkMap {
+     private final List<EntityPlayer> managedPlayers = Lists.newArrayList();
+     private final Long2ObjectMap<PlayerChunk> e = new Long2ObjectOpenHashMap(4096);
+     private final Set<PlayerChunk> f = Sets.newHashSet();
+-    private final List<PlayerChunk> g = Lists.newLinkedList();
+-    private final List<PlayerChunk> h = Lists.newLinkedList();
+-    private final List<PlayerChunk> i = Lists.newArrayList();
++    private final List<PlayerChunk> g = new it.unimi.dsi.fastutil.objects.ObjectArrayList<PlayerChunk>(); // Antarctic - O(1) indexed list
++    private final List<PlayerChunk> h = new it.unimi.dsi.fastutil.objects.ObjectArrayList<PlayerChunk>(); // Antarctic - O(1) indexed list
++    private final List<PlayerChunk> i = new it.unimi.dsi.fastutil.objects.ObjectArrayList<PlayerChunk>(); // Antarctic - O(1) indexed list
+     private int j;public int getViewDistance() { return j; } // Paper OBFHELPER
+     private long k;
+     private boolean l = true;
+@@ -143,6 +143,9 @@ public class PlayerChunkMap {
+                     return this.a((PlayerChunk) object, (PlayerChunk) object1);
+                 }
+             });
++            for (int idx = 0, len = this.h.size(); idx < len; ++idx) { // Antarctic - refresh intrusive indices after sort
++                this.h.get(idx).antarcticLoadIdx = idx;
++            }
+             } // Paper timing
+         }
+ 
+@@ -158,6 +161,9 @@ public class PlayerChunkMap {
+                     return this.a((PlayerChunk) object, (PlayerChunk) object1);
+                 }
+             });
++            for (int idx = 0, len = this.g.size(); idx < len; ++idx) { // Antarctic - refresh intrusive indices after sort
++                this.g.get(idx).antarcticSendIdx = idx;
++            }
+             } // Paper timing
+         }
+ 
+@@ -169,35 +175,61 @@ public class PlayerChunkMap {
+             int chunkGensAllowed = world.paperConfig.maxChunkGensPerTick; // Paper
+             // Spigot end
+ 
+-            Iterator iterator1 = this.h.iterator();
+-
+-            while (iterator1.hasNext()) {
+-                PlayerChunk playerchunk1 = (PlayerChunk) iterator1.next();
++            // Antarctic start - order-preserving linear compaction instead of O(N) iterator.remove shifts
++            int read = 0;
++            int write = 0;
++            int size = this.h.size();
++            while (read < size) {
++                PlayerChunk playerchunk1 = this.h.get(read++);
++                boolean removeEntry = false;
+ 
+                 if (playerchunk1.f() == null) {
+                     boolean flag = playerchunk1.a(PlayerChunkMap.b);
+                     // Paper start
+                     if (flag && !playerchunk1.chunkExists && chunkGensAllowed-- <= 0) {
++                        if (write != read - 1) {
++                            this.h.set(write, playerchunk1);
++                        }
++                        playerchunk1.antarcticLoadIdx = write++;
+                         continue;
+                     }
+                     // Paper end
+ 
+                     if (playerchunk1.a(flag)) {
+-                        iterator1.remove();
++                        removeEntry = true;
+                         if (playerchunk1.b()) {
+-                            this.g.remove(playerchunk1);
++                            this.removeFromSendList(playerchunk1);
+                         }
+ 
+                         if (activityAccountant.activityTimeIsExhausted()) { // Spigot
++                            playerchunk1.antarcticLoadIdx = -1;
+                             break;
+                         }
+                     }
+                 // CraftBukkit start - SPIGOT-2891: remove once chunk has been provided
+                 } else {
+-                    iterator1.remove();
++                    removeEntry = true;
+                 }
+                 // CraftBukkit end
++
++                if (removeEntry) {
++                    playerchunk1.antarcticLoadIdx = -1;
++                } else {
++                    if (write != read - 1) {
++                        this.h.set(write, playerchunk1);
++                    }
++                    playerchunk1.antarcticLoadIdx = write++;
++                }
++            }
++            if (write != read) {
++                while (read < size) {
++                    PlayerChunk rem = this.h.get(read++);
++                    this.h.set(write, rem);
++                    rem.antarcticLoadIdx = write++;
++                }
++                this.truncateList(this.h, write);
+             }
++            // Antarctic end
+ 
+             activityAccountant.endActivity(); // Spigot
+             } // Paper timing
+@@ -206,19 +238,35 @@ public class PlayerChunkMap {
+         if (!this.g.isEmpty()) {
+             j = world.paperConfig.maxChunkSendsPerTick; // Paper
+             try (Timing ignored = world.timings.doChunkMapPendingSendToPlayers.startTiming()) { // Paper
+-            Iterator iterator2 = this.g.iterator();
+-
+-            while (iterator2.hasNext()) {
+-                PlayerChunk playerchunk2 = (PlayerChunk) iterator2.next();
++            // Antarctic start - order-preserving linear compaction instead of O(N) iterator.remove shifts
++            int read = 0;
++            int write = 0;
++            int size = this.g.size();
++            while (read < size) {
++                PlayerChunk playerchunk2 = this.g.get(read++);
+ 
+                 if (playerchunk2.b()) {
+-                    iterator2.remove();
++                    playerchunk2.antarcticSendIdx = -1;
+                     --j;
+                     if (j < 0) {
+                         break;
+                     }
++                } else {
++                    if (write != read - 1) {
++                        this.g.set(write, playerchunk2);
++                    }
++                    playerchunk2.antarcticSendIdx = write++;
+                 }
+             }
++            if (write != read) {
++                while (read < size) {
++                    PlayerChunk rem = this.g.get(read++);
++                    this.g.set(write, rem);
++                    rem.antarcticSendIdx = write++;
++                }
++                this.truncateList(this.g, write);
++            }
++            // Antarctic end
+             } // Paper timing
+         }
+ 
+@@ -252,14 +300,19 @@ public class PlayerChunkMap {
+         if (playerchunk == null) {
+             playerchunk = new PlayerChunk(this, i, j);
+             this.e.put(k, playerchunk);
++            // Antarctic start - track intrusive indices for O(1) swap-remove
++            playerchunk.antarcticAllIdx = this.i.size();
+             this.i.add(playerchunk);
+             if (playerchunk.f() == null) {
++                playerchunk.antarcticLoadIdx = this.h.size();
+                 this.h.add(playerchunk);
+             }
+ 
+             if (!playerchunk.b()) {
++                playerchunk.antarcticSendIdx = this.g.size();
+                 this.g.add(playerchunk);
+             }
++            // Antarctic end
+         }
+ 
+         return playerchunk;
+@@ -528,10 +581,12 @@ public class PlayerChunkMap {
+ 
+         playerchunk.c();
+         this.e.remove(i);
+-        this.i.remove(playerchunk);
++        // Antarctic start - O(1) swap-remove on i, g, h instead of linear list scans
++        this.removeFromAllList(playerchunk);
+         this.f.remove(playerchunk);
+-        this.g.remove(playerchunk);
+-        this.h.remove(playerchunk);
++        this.removeFromSendList(playerchunk);
++        this.removeFromLoadList(playerchunk);
++        // Antarctic end
+         Chunk chunk = playerchunk.f();
+ 
+         if (chunk != null) {
+@@ -539,13 +594,85 @@ public class PlayerChunkMap {
+             if (world.paperConfig.delayChunkUnloadsBy <= 0) {
+                 this.getWorld().getChunkProviderServer().unload(chunk);
+             } else {
+-                chunk.scheduledForUnload = System.currentTimeMillis();
++                this.getWorld().getChunkProviderServer().scheduleDelayedUnload(chunk, System.currentTimeMillis()); // Antarctic
+             }
+             // Paper end
+         }
+ 
+     }
+ 
++    // Antarctic start - O(1) intrusive swap-remove helpers
++    private void removeFromAllList(PlayerChunk pc) {
++        int idx = pc.antarcticAllIdx;
++        int size = this.i.size();
++        if (idx < 0 || idx >= size || this.i.get(idx) != pc) {
++            idx = this.i.indexOf(pc);
++            if (idx < 0) {
++                pc.antarcticAllIdx = -1;
++                return;
++            }
++        }
++        pc.antarcticAllIdx = -1;
++        int lastIdx = size - 1;
++        if (idx < lastIdx) {
++            PlayerChunk last = this.i.get(lastIdx);
++            this.i.set(idx, last);
++            last.antarcticAllIdx = idx;
++        }
++        this.i.remove(lastIdx);
++    }
++
++    private void removeFromSendList(PlayerChunk pc) {
++        int idx = pc.antarcticSendIdx;
++        int size = this.g.size();
++        if (idx < 0 || idx >= size || this.g.get(idx) != pc) {
++            idx = this.g.indexOf(pc);
++            if (idx < 0) {
++                pc.antarcticSendIdx = -1;
++                return;
++            }
++        }
++        pc.antarcticSendIdx = -1;
++        int lastIdx = size - 1;
++        if (idx < lastIdx) {
++            PlayerChunk last = this.g.get(lastIdx);
++            this.g.set(idx, last);
++            last.antarcticSendIdx = idx;
++        }
++        this.g.remove(lastIdx);
++    }
++
++    private void removeFromLoadList(PlayerChunk pc) {
++        int idx = pc.antarcticLoadIdx;
++        int size = this.h.size();
++        if (idx < 0 || idx >= size || this.h.get(idx) != pc) {
++            idx = this.h.indexOf(pc);
++            if (idx < 0) {
++                pc.antarcticLoadIdx = -1;
++                return;
++            }
++        }
++        pc.antarcticLoadIdx = -1;
++        int lastIdx = size - 1;
++        if (idx < lastIdx) {
++            PlayerChunk last = this.h.get(lastIdx);
++            this.h.set(idx, last);
++            last.antarcticLoadIdx = idx;
++        }
++        this.h.remove(lastIdx);
++    }
++
++    private void truncateList(List<PlayerChunk> list, int newSize) {
++        if (list instanceof it.unimi.dsi.fastutil.objects.ObjectArrayList) {
++            ((it.unimi.dsi.fastutil.objects.ObjectArrayList<PlayerChunk>) list).removeElements(newSize, list.size());
++        } else {
++            for (int k = list.size() - 1; k >= newSize; --k) {
++                list.remove(k);
++            }
++        }
++    }
++    // Antarctic end
++
+     // CraftBukkit start - Sorter to load nearby chunks first
+     private static class ChunkCoordComparator implements java.util.Comparator<ChunkCoordIntPair> {
+         private int x;
+diff --git a/main/java/org/bukkit/craftbukkit/chunkio/ChunkIOExecutor.java b/main/java/org/bukkit/craftbukkit/chunkio/ChunkIOExecutor.java
+index f50d55c..eb9a5c9 100644
+--- a/main/java/org/bukkit/craftbukkit/chunkio/ChunkIOExecutor.java
++++ b/main/java/org/bukkit/craftbukkit/chunkio/ChunkIOExecutor.java
+@@ -28,13 +28,20 @@ public class ChunkIOExecutor {
+     }
+ 
+     public static void adjustPoolSize(int players) {
+-        int size = Math.max(BASE_THREADS, (int) Math.ceil(players / PLAYERS_PER_THREAD));
+-        instance.setActiveThreads(size);
++        instance.setActiveThreads(computePoolSize(players, BASE_THREADS));
++    }
++
++    // Antarctic start - fix integer division truncation in pool sizing and wire optional Stage-2 budget
++    public static int computePoolSize(int players, int baseThreads) {
++        return Math.max(baseThreads, (int) Math.ceil(players / (double) PLAYERS_PER_THREAD));
+     }
+ 
+     public static void tick() {
+-        instance.finishActive();
++        int maxTasks = com.destroystokyo.paper.config.toml.modules.optimizations.ChunkLoading.maxStage2ChunkLoadsPerTick;
++        long maxNanos = com.destroystokyo.paper.config.toml.modules.optimizations.ChunkLoading.maxStage2MillisPerTick * 1_000_000L;
++        instance.finishActive(maxTasks, maxNanos);
+     }
++    // Antarctic end
+ 
+     // Paper start
+     public static boolean hasQueuedChunkLoad(World world, int x, int z) {
+diff --git a/main/java/org/bukkit/craftbukkit/util/AsynchronousExecutor.java b/main/java/org/bukkit/craftbukkit/util/AsynchronousExecutor.java
+index cf1258c..b59ac9b 100644
+--- a/main/java/org/bukkit/craftbukkit/util/AsynchronousExecutor.java
++++ b/main/java/org/bukkit/craftbukkit/util/AsynchronousExecutor.java
+@@ -348,6 +348,40 @@ public final class AsynchronousExecutor<P, T, C, E extends Throwable> {
+         }
+     }
+ 
++    // Antarctic start - budgeted Stage-2 drain (always processes at least 1 task for forward progress)
++    public int finishActive(final int maxTasks, final long maxNanos) throws E {
++        final Queue<Task> finished = this.finished;
++        int processed = 0;
++        if (maxTasks <= 0 && maxNanos <= 0L) {
++            while (!finished.isEmpty()) {
++                Task task = finished.poll();
++                if (task == null) {
++                    break;
++                }
++                task.finish();
++                processed++;
++            }
++            return processed;
++        }
++        final long deadline = maxNanos > 0L ? System.nanoTime() + maxNanos : 0L;
++        while (!finished.isEmpty()) {
++            Task task = finished.poll();
++            if (task == null) {
++                break;
++            }
++            task.finish();
++            processed++;
++            if (maxTasks > 0 && processed >= maxTasks) {
++                break;
++            }
++            if (maxNanos > 0L && System.nanoTime() >= deadline) {
++                break;
++            }
++        }
++        return processed;
++    }
++    // Antarctic end
++
+     public void setActiveThreads(final int coreSize) {
+         pool.setCorePoolSize(coreSize);
+     }
+diff --git a/test/java/net/minecraft/server/ChunkLoadingScalingTest.java b/test/java/net/minecraft/server/ChunkLoadingScalingTest.java
+new file mode 100644
+index 0000000..30e68a4
+--- /dev/null
++++ b/test/java/net/minecraft/server/ChunkLoadingScalingTest.java
+@@ -0,0 +1,324 @@
++package net.minecraft.server;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertNull;
++import static org.junit.Assert.assertTrue;
++
++import com.destroystokyo.paper.config.toml.modules.optimizations.ChunkLoading;
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicInteger;
++import org.bukkit.craftbukkit.chunkio.ChunkIOExecutor;
++import org.bukkit.craftbukkit.util.AsynchronousExecutor;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++public class ChunkLoadingScalingTest {
++
++    private static Unsafe unsafe;
++    private boolean prevAsyncCatcher;
++
++    @BeforeClass
++    public static void bootstrap() throws Exception {
++        Field uf = Unsafe.class.getDeclaredField("theUnsafe");
++        uf.setAccessible(true);
++        unsafe = (Unsafe) uf.get(null);
++    }
++
++    @Before
++    public void disableAsyncCatcher() {
++        this.prevAsyncCatcher = org.spigotmc.AsyncCatcher.enabled;
++        org.spigotmc.AsyncCatcher.enabled = false;
++    }
++
++    @After
++    public void restoreDefaults() {
++        ChunkLoading.maxStage2MillisPerTick = 0;
++        ChunkLoading.maxStage2ChunkLoadsPerTick = 0;
++        org.spigotmc.AsyncCatcher.enabled = this.prevAsyncCatcher;
++    }
++
++    @Test
++    public void configDefaultsPreserveVanillaParity() {
++        assertEquals(0, ChunkLoading.maxStage2MillisPerTick);
++        assertEquals(0, ChunkLoading.maxStage2ChunkLoadsPerTick);
++    }
++
++    @Test
++    public void adjustPoolSizeFixesIntegerTruncation() {
++        assertEquals(2, ChunkIOExecutor.computePoolSize(0, 2));
++        assertEquals(2, ChunkIOExecutor.computePoolSize(50, 2));
++        assertEquals(2, ChunkIOExecutor.computePoolSize(100, 2));
++        assertEquals(3, ChunkIOExecutor.computePoolSize(101, 2));
++        assertEquals(3, ChunkIOExecutor.computePoolSize(150, 2));
++        assertEquals(4, ChunkIOExecutor.computePoolSize(151, 2));
++        assertEquals(2, ChunkIOExecutor.computePoolSize(51, 1));
++    }
++
++    @Test
++    public void stage2BudgetLimitsWorkPerTickAndGuaranteesForwardProgress() throws Exception {
++        AtomicInteger stage2Count = new AtomicInteger();
++        CountDownLatch stage1Done = new CountDownLatch(12);
++        AsynchronousExecutor<Integer, Integer, Runnable, RuntimeException> exec =
++            new AsynchronousExecutor<>(new AsynchronousExecutor.CallBackProvider<Integer, Integer, Runnable, RuntimeException>() {
++                @Override
++                public Integer callStage1(Integer parameter) {
++                    stage1Done.countDown();
++                    return parameter * 2;
++                }
++
++                @Override
++                public void callStage2(Integer parameter, Integer object) {
++                    stage2Count.incrementAndGet();
++                }
++
++                @Override
++                public void callStage3(Integer parameter, Integer object, Runnable callback) {
++                    callback.run();
++                }
++
++                @Override
++                public Thread newThread(Runnable r) {
++                    Thread t = new Thread(r, "stage2-budget-test");
++                    t.setDaemon(true);
++                    return t;
++                }
++            }, 2);
++
++        AtomicInteger callbacks = new AtomicInteger();
++        for (int i = 0; i < 12; ++i) {
++            exec.add(i, callbacks::incrementAndGet);
++        }
++        assertTrue(stage1Done.await(5, TimeUnit.SECONDS));
++        // Brief spin until all tasks are enqueued in finished
++        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
++        int drained = 0;
++        while (drained < 12 && System.nanoTime() < deadline) {
++            int batch = exec.finishActive(4, 0L);
++            assertTrue("task count cap must never exceed 4 per tick", batch <= 4);
++            drained += batch;
++            if (batch == 0) {
++                Thread.sleep(1);
++            }
++        }
++        assertEquals(12, drained);
++        assertEquals(12, stage2Count.get());
++        assertEquals(12, callbacks.get());
++
++        // Time budget of 1 ns must still process at least 1 task (forward progress guarantee)
++        CountDownLatch oneDone = new CountDownLatch(3);
++        AsynchronousExecutor<Integer, Integer, Runnable, RuntimeException> exec2 =
++            new AsynchronousExecutor<>(new AsynchronousExecutor.CallBackProvider<Integer, Integer, Runnable, RuntimeException>() {
++                @Override
++                public Integer callStage1(Integer parameter) {
++                    oneDone.countDown();
++                    return parameter;
++                }
++
++                @Override
++                public void callStage2(Integer parameter, Integer object) {
++                }
++
++                @Override
++                public void callStage3(Integer parameter, Integer object, Runnable callback) {
++                }
++
++                @Override
++                public Thread newThread(Runnable r) {
++                    Thread t = new Thread(r, "stage2-progress-test");
++                    t.setDaemon(true);
++                    return t;
++                }
++            }, 1);
++        for (int i = 0; i < 3; ++i) {
++            exec2.add(i, () -> {});
++        }
++        assertTrue(oneDone.await(5, TimeUnit.SECONDS));
++        int processed = 0;
++        long d2 = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
++        while (processed == 0 && System.nanoTime() < d2) {
++            processed = exec2.finishActive(0, 1L);
++            if (processed == 0) {
++                Thread.sleep(1);
++            }
++        }
++        assertEquals("tiny nano budget must still make forward progress of 1 task", 1, processed);
++    }
++
++    @Test
++    public void indexedDelayedUnloadsMatchParityAndBeatFullChunkScan() throws Exception {
++        WorldServer world = (WorldServer) unsafe.allocateInstance(WorldServer.class);
++        com.destroystokyo.paper.PaperWorldConfig paperConfig =
++            (com.destroystokyo.paper.PaperWorldConfig) unsafe.allocateInstance(com.destroystokyo.paper.PaperWorldConfig.class);
++        paperConfig.delayChunkUnloadsBy = 10_000L;
++        LightPropagationParityTest.set(World.class, world, "paperConfig", paperConfig);
++        WorldProvider wp = (WorldProvider) unsafe.allocateInstance(WorldProviderNormal.class);
++        LightPropagationParityTest.set(WorldProvider.class, wp, "b", world);
++        world.worldProvider = wp;
++        WorldData wd = (WorldData) unsafe.allocateInstance(WorldData.class);
++        LightPropagationParityTest.set(WorldData.class, wd, "c", 100_000);
++        LightPropagationParityTest.set(WorldData.class, wd, "e", 100_000);
++        LightPropagationParityTest.set(World.class, world, "worldData", wd);
++        LightPropagationParityTest.set(World.class, world, "P", new WorldBorder());
++        world.keepSpawnInMemory = false;
++        world.savingDisabled = false;
++
++        IChunkLoader noopLoader = new IChunkLoader() {
++            @Override public Chunk a(World w, int x, int z) { return null; }
++            @Override public void saveChunk(World w, Chunk c, boolean u) {}
++            @Override public void b() {}
++            @Override public void c() {}
++            @Override public boolean chunkExists(int x, int z) { return false; }
++        };
++        ChunkProviderServer cps = new ChunkProviderServer(world, noopLoader, null);
++
++        // Populate 8,000 loaded chunks; only 12 scheduled for delayed unload (6 expired, 6 still waiting)
++        long now = System.currentTimeMillis();
++        List<Chunk> expiredChunks = new ArrayList<>();
++        List<Chunk> waitingChunks = new ArrayList<>();
++        for (int cx = 0; cx < 80; ++cx) {
++            for (int cz = 0; cz < 100; ++cz) {
++                Chunk c = (Chunk) unsafe.allocateInstance(Chunk.class);
++                LightPropagationParityTest.set(Chunk.class, c, "locX", cx);
++                LightPropagationParityTest.set(Chunk.class, c, "locZ", cz);
++                c.chunkKey = ChunkCoordIntPair.a(cx, cz);
++                cps.chunks.put(c.chunkKey, c);
++                if (cx == 0 && cz < 6) {
++                    cps.scheduleDelayedUnload(c, now - 20_000L);
++                    expiredChunks.add(c);
++                } else if (cx == 1 && cz < 6) {
++                    cps.scheduleDelayedUnload(c, now + 60_000L);
++                    waitingChunks.add(c);
++                }
++            }
++        }
++
++        // Cancel one expired chunk before tick -> must NOT be unloaded
++        Chunk cancelled = expiredChunks.remove(0);
++        cps.cancelDelayedUnload(cancelled);
++        assertNull(cancelled.scheduledForUnload);
++
++        cps.unloadChunks();
++        assertFalse("cancelled chunk must not enter unloadQueue", cancelled.d);
++        for (Chunk exp : expiredChunks) {
++            assertTrue("expired chunk must enter unloadQueue", exp.d);
++            assertNull("expired chunk must clear scheduledForUnload", exp.scheduledForUnload);
++        }
++        for (Chunk wait : waitingChunks) {
++            assertFalse("not-yet-expired chunk must stay loaded", wait.d);
++            assertTrue(wait.scheduledForUnload != null);
++        }
++
++        // Perf comparison: indexed unloadChunks() vs scanning all 8,000 chunks across 2,000 ticks
++        cps.unloadQueue.clear();
++        for (int i = 0; i < 200; ++i) {
++            cps.unloadChunks();
++        }
++        long t0 = System.nanoTime();
++        for (int i = 0; i < 2_000; ++i) {
++            cps.unloadChunks();
++        }
++        long indexedNanos = System.nanoTime() - t0;
++
++        int sink = 0;
++        long t1 = System.nanoTime();
++        for (int i = 0; i < 2_000; ++i) {
++            long cur = System.currentTimeMillis();
++            for (Chunk chunk : cps.chunks.values()) {
++                if (chunk.scheduledForUnload != null && cur - chunk.scheduledForUnload > 10_000L) {
++                    sink++;
++                }
++            }
++        }
++        long scanNanos = System.nanoTime() - t1;
++        assertEquals(0, sink);
++        System.out.println("[perf] delayed-unload scan (8k chunks x 2k ticks): fullScan=" + (scanNanos / 1000) + "us indexed="
++            + (indexedNanos / 1000) + "us ratio=" + (scanNanos / Math.max(1, indexedNanos)) + "x");
++        assertTrue("indexed delayed-unload scan must be at least 10x faster than full scan", indexedNanos * 10 < scanNanos);
++    }
++
++    @Test
++    public void playerChunkMapSwapRemoveMaintainsIndicesAndBeatsLinearRemoval() throws Exception {
++        WorldServer world = (WorldServer) unsafe.allocateInstance(WorldServer.class);
++        com.destroystokyo.paper.PaperWorldConfig paperConfig =
++            (com.destroystokyo.paper.PaperWorldConfig) unsafe.allocateInstance(com.destroystokyo.paper.PaperWorldConfig.class);
++        LightPropagationParityTest.set(World.class, world, "paperConfig", paperConfig);
++        WorldBorder border = new WorldBorder();
++        border.world = world;
++        LightPropagationParityTest.set(World.class, world, "P", border);
++        LightPropagationParityTest.set(World.class, world, "worldData", unsafe.allocateInstance(WorldData.class));
++
++        ChunkProviderServer stubCps = new ChunkProviderServer(world, null, null) {
++            @Override
++            public Chunk getChunkAt(int x, int z, Runnable runnable, boolean generate) {
++                return null;
++            }
++        };
++        LightPropagationParityTest.set(World.class, world, "chunkProvider", stubCps);
++
++        PlayerChunkMap map = (PlayerChunkMap) unsafe.allocateInstance(PlayerChunkMap.class);
++        LightPropagationParityTest.set(PlayerChunkMap.class, map, "world", world);
++        LightPropagationParityTest.set(PlayerChunkMap.class, map, "managedPlayers", new ArrayList<EntityPlayer>());
++        LightPropagationParityTest.set(PlayerChunkMap.class, map, "e", new it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<PlayerChunk>(4096));
++        LightPropagationParityTest.set(PlayerChunkMap.class, map, "f", new java.util.HashSet<PlayerChunk>());
++        LightPropagationParityTest.set(PlayerChunkMap.class, map, "g", new it.unimi.dsi.fastutil.objects.ObjectArrayList<PlayerChunk>());
++        LightPropagationParityTest.set(PlayerChunkMap.class, map, "h", new it.unimi.dsi.fastutil.objects.ObjectArrayList<PlayerChunk>());
++        LightPropagationParityTest.set(PlayerChunkMap.class, map, "i", new it.unimi.dsi.fastutil.objects.ObjectArrayList<PlayerChunk>());
++        LightPropagationParityTest.set(PlayerChunkMap.class, map, "j", 10);
++
++        // Add 2,500 PlayerChunks via private c(x, z), then remove them all in shuffled order via b(pc)
++        java.lang.reflect.Method cMethod = PlayerChunkMap.class.getDeclaredMethod("c", int.class, int.class);
++        cMethod.setAccessible(true);
++
++        long swapRemoveNanos = Long.MAX_VALUE;
++        long linearNanos = Long.MAX_VALUE;
++        for (int round = 0; round < 3; ++round) {
++            List<PlayerChunk> created = new ArrayList<>(2500);
++            for (int x = 0; x < 50; ++x) {
++                for (int z = 0; z < 50; ++z) {
++                    created.add((PlayerChunk) cMethod.invoke(map, x, z));
++                }
++            }
++            List<PlayerChunk> shuffled = new ArrayList<>(created);
++            java.util.Collections.shuffle(shuffled, new java.util.Random(42 + round));
++
++            long t0 = System.nanoTime();
++            for (PlayerChunk pc : shuffled) {
++                map.b(pc);
++            }
++            swapRemoveNanos = Math.min(swapRemoveNanos, System.nanoTime() - t0);
++
++            ArrayList<PlayerChunk> linearI = new ArrayList<>(created);
++            java.util.LinkedList<PlayerChunk> linearG = new java.util.LinkedList<>(created);
++            java.util.LinkedList<PlayerChunk> linearH = new java.util.LinkedList<>(created);
++            long t1 = System.nanoTime();
++            for (PlayerChunk pc : shuffled) {
++                linearI.remove(pc);
++                linearG.remove(pc);
++                linearH.remove(pc);
++            }
++            linearNanos = Math.min(linearNanos, System.nanoTime() - t1);
++        }
++
++        Field iField = PlayerChunkMap.class.getDeclaredField("i");
++        Field gField = PlayerChunkMap.class.getDeclaredField("g");
++        Field hField = PlayerChunkMap.class.getDeclaredField("h");
++        iField.setAccessible(true);
++        gField.setAccessible(true);
++        hField.setAccessible(true);
++        assertEquals(0, ((List<?>) iField.get(map)).size());
++        assertEquals(0, ((List<?>) gField.get(map)).size());
++        assertEquals(0, ((List<?>) hField.get(map)).size());
++
++        System.out.println("[perf] PlayerChunkMap remove 2.5k entries (shuffled): linear=" + (linearNanos / 1000) + "us swapRemove="
++            + (swapRemoveNanos / 1000) + "us ratio=" + (linearNanos / Math.max(1, swapRemoveNanos)) + "x");
++        assertTrue("intrusive swap-remove must be at least 3x faster than linear removal", swapRemoveNanos * 3 < linearNanos);
++    }
++}

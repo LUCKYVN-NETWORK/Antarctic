@@ -1,0 +1,181 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Mon, 23 Nov 2026 10:21:11 +0700
+Subject: [PATCH 112/115] feat: add T-bulk deferred light threshold trigger
+ into RelightService
+
+
+diff --git a/main/java/me/stella/antarctic/collection/PendingLightRegistry.java b/main/java/me/stella/antarctic/collection/PendingLightRegistry.java
+index 19e00e7..ec3e0d1 100644
+--- a/main/java/me/stella/antarctic/collection/PendingLightRegistry.java
++++ b/main/java/me/stella/antarctic/collection/PendingLightRegistry.java
+@@ -103,6 +103,14 @@ public final class PendingLightRegistry {
+         return !this.pending.isEmpty() && this.pending.containsKey(chunkKey);
+     }
+ 
++    public int pendingCount(long chunkKey) {
++        if (this.pending.isEmpty()) {
++            return 0;
++        }
++        IntLinkedOpenHashSet set = this.pending.get(chunkKey);
++        return set == null ? 0 : set.size();
++    }
++
+     /** Queue a chunk for replay if it has entries and is not already queued. */
+     public void markReady(long chunkKey) {
+         if (this.pending.containsKey(chunkKey) && !this.queued.containsKey(chunkKey)) {
+diff --git a/main/java/net/minecraft/server/World.java b/main/java/net/minecraft/server/World.java
+index 23c17f9..23bdfb2 100644
+--- a/main/java/net/minecraft/server/World.java
++++ b/main/java/net/minecraft/server/World.java
+@@ -2572,7 +2572,18 @@ public abstract class World implements IBlockAccess {
+                 Chunk candidate = dx == 0 && dz == 0 ? chunk : this.getChunkIfLoaded(chunk.locX + dx, chunk.locZ + dz);
+ 
+                 if (candidate != null && this.pendingLight.hasPending(candidate.chunkKey) && candidate.areNeighborsLoaded(1)) {
+-                    this.pendingLight.markReady(candidate.chunkKey);
++                    // Antarctic start - T-bulk: promote large per-chunk deferred backlogs into one async bulk relight
++                    int bulkThreshold = com.destroystokyo.paper.config.toml.modules.optimizations.Lighting.autoRelightDeferredThreshold;
++                    if (bulkThreshold > 0
++                        && com.destroystokyo.paper.config.toml.modules.optimizations.Lighting.asyncBulkRelight
++                        && this instanceof WorldServer
++                        && this.pendingLight.pendingCount(candidate.chunkKey) > bulkThreshold) {
++                        this.pendingLight.clearChunk(candidate.chunkKey);
++                        ((WorldServer) this).relightChunks(new long[]{candidate.chunkKey});
++                    } else {
++                        this.pendingLight.markReady(candidate.chunkKey);
++                    }
++                    // Antarctic end
+                 }
+             }
+         }
+diff --git a/test/java/net/minecraft/server/RelightBulkTriggerTest.java b/test/java/net/minecraft/server/RelightBulkTriggerTest.java
+new file mode 100644
+index 0000000..1d5b466
+--- /dev/null
++++ b/test/java/net/minecraft/server/RelightBulkTriggerTest.java
+@@ -0,0 +1,125 @@
++package net.minecraft.server;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++
++import com.destroystokyo.paper.config.toml.modules.optimizations.Lighting;
++import java.util.concurrent.TimeUnit;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++/**
++ * T-bulk trigger: when a chunk accumulates more than auto-relight-deferred-threshold deferred light checks in
++ * PendingLightRegistry and its 3x3 neighbourhood completes, those checks are promoted into one async RelightService pass.
++ */
++public class RelightBulkTriggerTest {
++
++    private static final int ONLY_SELF = 0x1 << 12;
++    private boolean prevAsyncCatcher;
++    private WorldServer activeWorld;
++
++    @BeforeClass
++    public static void bootstrap() throws Exception {
++        LightPropagationParityTest.bootstrap();
++    }
++
++    @Before
++    public void setUp() {
++        this.prevAsyncCatcher = org.spigotmc.AsyncCatcher.enabled;
++        org.spigotmc.AsyncCatcher.enabled = false;
++        Lighting.deferLightUpdates = true;
++        Lighting.asyncBulkRelight = true;
++        Lighting.asyncRelightThreads = 1;
++        Lighting.autoRelightDeferredThreshold = 16;
++        Lighting.relightSnapshotBudgetMs = 50;
++        Lighting.relightApplyBudgetMs = 50;
++    }
++
++    @After
++    public void tearDown() {
++        if (this.activeWorld != null) {
++            this.activeWorld.shutdownRelightService();
++            this.activeWorld = null;
++        }
++        Lighting.deferLightUpdates = true;
++        Lighting.asyncBulkRelight = false;
++        Lighting.asyncRelightThreads = 0;
++        Lighting.autoRelightDeferredThreshold = 512;
++        Lighting.relightSnapshotBudgetMs = 5;
++        Lighting.relightApplyBudgetMs = 2;
++        org.spigotmc.AsyncCatcher.enabled = this.prevAsyncCatcher;
++    }
++
++    private WorldServer makeWorld(long seed) throws Exception {
++        LightPropagationParityTest.StubProvider[] p = new LightPropagationParityTest.StubProvider[1];
++        WorldServer world = LightPropagationParityTest.buildWorld(seed, p);
++        LightPropagationParityTest.set(World.class, world, "chunkPacketBlockController",
++            com.destroystokyo.paper.antixray.ChunkPacketBlockController.NO_OPERATION_INSTANCE);
++        for (int cx = -2; cx <= 1; ++cx) {
++            for (int cz = -2; cz <= 1; ++cz) {
++                Chunk c = world.getChunkIfLoaded(cx, cz);
++                LightPropagationParityTest.set(Chunk.class, c, "locX", cx);
++                LightPropagationParityTest.set(Chunk.class, c, "locZ", cz);
++            }
++        }
++        this.activeWorld = world;
++        return world;
++    }
++
++    @Test
++    public void backlogAboveThresholdPromotesToSingleAsyncRelight() throws Exception {
++        WorldServer world = makeWorld(701L);
++        Chunk target = world.getChunkIfLoaded(0, 0);
++        LightPropagationParityTest.set(Chunk.class, target, "neighbors", ONLY_SELF);
++
++        // Place 20 torches -> 40 deferred checks (sky + block), well above threshold=16
++        for (int i = 0; i < 10; ++i) {
++            for (int j = 0; j < 2; ++j) {
++                BlockPosition pos = new BlockPosition(i + 2, 40, j + 2);
++                LightPropagationParityTest.setBlock(world, pos.getX(), pos.getY(), pos.getZ(), Blocks.TORCH.getBlockData());
++                assertFalse(world.w(pos));
++            }
++        }
++        assertEquals(40, world.pendingLight.pendingCount(target.chunkKey));
++
++        // Neighbors finish loading -> T-bulk clears all 40 deferred entries and queues one async relight
++        LightPropagationParityTest.set(Chunk.class, target, "neighbors", -1);
++        world.onChunkNeighborsLinked(target);
++        assertEquals("T-bulk must clear promoted chunk from PendingLightRegistry", 0, world.pendingLight.pendingCount(target.chunkKey));
++        RelightService service = world.getRelightServiceIfPresent();
++        assertTrue("RelightService must have pending tile for promoted chunk", service != null && service.isPending(target.chunkKey));
++
++        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
++        while (service.isPending(target.chunkKey) && System.nanoTime() < deadline) {
++            service.tick();
++            if (service.isPending(target.chunkKey)) Thread.sleep(1);
++        }
++        assertFalse(service.isPending(target.chunkKey));
++        assertEquals(14, world.getBrightness(EnumSkyBlock.BLOCK, 2, 40, 2));
++        assertTrue(world.isLightConsistent(0, 0));
++    }
++
++    @Test
++    public void backlogAtOrBelowThresholdOrDisabledStaysInDeferredReplay() throws Exception {
++        WorldServer world = makeWorld(702L);
++        Chunk target = world.getChunkIfLoaded(0, 0);
++        LightPropagationParityTest.set(Chunk.class, target, "neighbors", ONLY_SELF);
++
++        // 4 torches = 8 checks <= threshold 16 -> stays on incremental deferred replay path
++        for (int i = 0; i < 4; ++i) {
++            BlockPosition pos = new BlockPosition(i + 2, 40, 2);
++            LightPropagationParityTest.setBlock(world, pos.getX(), pos.getY(), pos.getZ(), Blocks.TORCH.getBlockData());
++            world.w(pos);
++        }
++        assertEquals(8, world.pendingLight.pendingCount(target.chunkKey));
++
++        LightPropagationParityTest.set(Chunk.class, target, "neighbors", -1);
++        world.onChunkNeighborsLinked(target);
++        assertEquals("small backlog must remain in PendingLightRegistry", 8, world.pendingLight.pendingCount(target.chunkKey));
++        assertEquals(8, world.drainDeferredLight(100));
++        assertEquals(14, world.getBrightness(EnumSkyBlock.BLOCK, 2, 40, 2));
++    }
++}

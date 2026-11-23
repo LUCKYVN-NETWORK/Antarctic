@@ -1,0 +1,435 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Mon, 23 Nov 2026 09:46:34 +0700
+Subject: [PATCH 105/115] perf: skip BlockRedstoneEvent creation when no
+ listeners are registered
+
+
+diff --git a/main/java/com/destroystokyo/paper/util/RedstoneWireTurbo.java b/main/java/com/destroystokyo/paper/util/RedstoneWireTurbo.java
+index f794276..67065c2 100644
+--- a/main/java/com/destroystokyo/paper/util/RedstoneWireTurbo.java
++++ b/main/java/com/destroystokyo/paper/util/RedstoneWireTurbo.java
+@@ -879,7 +879,7 @@ public class RedstoneWireTurbo {
+ 
+         // egg82's amendment
+         // Adding Bukkit's BlockRedstoneEvent - er.. event.
+-        if (i != j) {
++        if (i != j && BlockRedstoneEvent.getHandlerList().getRegisteredListeners().length != 0) { // Antarctic - short-circuit when no listeners
+             BlockRedstoneEvent event = new BlockRedstoneEvent(worldIn.getWorld().getBlockAt(upd.self.getX(), upd.self.getY(), upd.self.getZ()), i, j);
+             worldIn.getServer().getPluginManager().callEvent(event);
+             j = event.getNewCurrent();
+diff --git a/main/java/net/minecraft/server/BlockDaylightDetector.java b/main/java/net/minecraft/server/BlockDaylightDetector.java
+index 32ffe42..c62709a 100644
+--- a/main/java/net/minecraft/server/BlockDaylightDetector.java
++++ b/main/java/net/minecraft/server/BlockDaylightDetector.java
+@@ -45,7 +45,7 @@ public class BlockDaylightDetector extends BlockTileEntity {
+ 
+             i = MathHelper.clamp(i, 0, 15);
+             if (((Integer) iblockdata.get(BlockDaylightDetector.POWER)).intValue() != i) {
+-                i = org.bukkit.craftbukkit.event.CraftEventFactory.callRedstoneChange(world, blockposition.getX(), blockposition.getY(), blockposition.getZ(), ((Integer) iblockdata.get(POWER)), i).getNewCurrent(); // CraftBukkit - Call BlockRedstoneEvent
++                i = org.bukkit.craftbukkit.event.CraftEventFactory.callRedstoneChangeCurrent(world, blockposition.getX(), blockposition.getY(), blockposition.getZ(), ((Integer) iblockdata.get(POWER)), i); // CraftBukkit - Call BlockRedstoneEvent // Antarctic
+                 world.setTypeAndData(blockposition, iblockdata.set(BlockDaylightDetector.POWER, Integer.valueOf(i)), 3);
+             }
+ 
+diff --git a/main/java/net/minecraft/server/BlockDiodeAbstract.java b/main/java/net/minecraft/server/BlockDiodeAbstract.java
+index 8a84e3d..c91c18e 100644
+--- a/main/java/net/minecraft/server/BlockDiodeAbstract.java
++++ b/main/java/net/minecraft/server/BlockDiodeAbstract.java
+@@ -38,14 +38,14 @@ public abstract class BlockDiodeAbstract extends BlockFacingHorizontal {
+ 
+             if (this.d && !flag) {
+                 // CraftBukkit start
+-                if (CraftEventFactory.callRedstoneChange(world, blockposition.getX(), blockposition.getY(), blockposition.getZ(), 15, 0).getNewCurrent() != 0) {
++                if (CraftEventFactory.callRedstoneChangeCurrent(world, blockposition.getX(), blockposition.getY(), blockposition.getZ(), 15, 0) != 0) { // Antarctic
+                     return;
+                 }
+                 // CraftBukkit end
+                 world.setTypeAndData(blockposition, this.z(iblockdata), 2);
+             } else if (!this.d) {
+                 // CraftBukkit start
+-                if (CraftEventFactory.callRedstoneChange(world, blockposition.getX(), blockposition.getY(), blockposition.getZ(), 0, 15).getNewCurrent() != 15) {
++                if (CraftEventFactory.callRedstoneChangeCurrent(world, blockposition.getX(), blockposition.getY(), blockposition.getZ(), 0, 15) != 15) { // Antarctic
+                     return;
+                 }
+                 // CraftBukkit end
+diff --git a/main/java/net/minecraft/server/BlockObserver.java b/main/java/net/minecraft/server/BlockObserver.java
+index 5836a76..ccb69af 100644
+--- a/main/java/net/minecraft/server/BlockObserver.java
++++ b/main/java/net/minecraft/server/BlockObserver.java
+@@ -28,14 +28,14 @@ public class BlockObserver extends BlockDirectional {
+     public void b(World world, BlockPosition blockposition, IBlockData iblockdata, Random random) {
+         if (((Boolean) iblockdata.get(BlockObserver.a)).booleanValue()) {
+             // Paper start
+-            if (CraftEventFactory.callRedstoneChange(world, blockposition.getX(), blockposition.getY(), blockposition.getZ(), 15, 0).getNewCurrent() != 0) {
++            if (CraftEventFactory.callRedstoneChangeCurrent(world, blockposition.getX(), blockposition.getY(), blockposition.getZ(), 15, 0) != 0) { // Antarctic
+                 return;
+             }
+             // Paper end
+             world.setTypeAndData(blockposition, iblockdata.set(BlockObserver.a, Boolean.valueOf(false)), 2);
+         } else {
+             // Paper start
+-            if (CraftEventFactory.callRedstoneChange(world, blockposition.getX(), blockposition.getY(), blockposition.getZ(), 0, 15).getNewCurrent() != 15) {
++            if (CraftEventFactory.callRedstoneChangeCurrent(world, blockposition.getX(), blockposition.getY(), blockposition.getZ(), 0, 15) != 15) { // Antarctic
+                 return;
+             }
+             // Paper end
+diff --git a/main/java/net/minecraft/server/BlockPoweredRail.java b/main/java/net/minecraft/server/BlockPoweredRail.java
+index ec616b8..e217521 100644
+--- a/main/java/net/minecraft/server/BlockPoweredRail.java
++++ b/main/java/net/minecraft/server/BlockPoweredRail.java
+@@ -176,7 +176,7 @@ public class BlockPoweredRail extends BlockMinecartTrackAbstract {
+         if (flag1 != flag) {
+             // CraftBukkit start
+             int power = (Boolean)iblockdata.get(POWERED) ? 15 : 0;
+-            int newPower = CraftEventFactory.callRedstoneChange(world, blockposition.getX(), blockposition.getY(), blockposition.getZ(), power, 15 - power).getNewCurrent();
++            int newPower = CraftEventFactory.callRedstoneChangeCurrent(world, blockposition.getX(), blockposition.getY(), blockposition.getZ(), power, 15 - power); // Antarctic
+             if (newPower == power) {
+                 return;
+             }
+diff --git a/main/java/net/minecraft/server/BlockRedstoneComparator.java b/main/java/net/minecraft/server/BlockRedstoneComparator.java
+index 04d973d..0f66baa 100644
+--- a/main/java/net/minecraft/server/BlockRedstoneComparator.java
++++ b/main/java/net/minecraft/server/BlockRedstoneComparator.java
+@@ -166,14 +166,14 @@ public class BlockRedstoneComparator extends BlockDiodeAbstract implements ITile
+ 
+             if (flag1 && !flag) {
+                 // Paper start
+-                if (CraftEventFactory.callRedstoneChange(world, blockposition.getX(), blockposition.getY(), blockposition.getZ(), 15, 0).getNewCurrent() != 0) {
++                if (CraftEventFactory.callRedstoneChangeCurrent(world, blockposition.getX(), blockposition.getY(), blockposition.getZ(), 15, 0) != 0) { // Antarctic
+                     return;
+                 }
+                 // Paper end
+                 world.setTypeAndData(blockposition, iblockdata.set(BlockRedstoneComparator.POWERED, Boolean.valueOf(false)), 2);
+             } else if (!flag1 && flag) {
+                 // Paper start
+-                if (CraftEventFactory.callRedstoneChange(world, blockposition.getX(), blockposition.getY(), blockposition.getZ(), 0, 15).getNewCurrent() != 15) {
++                if (CraftEventFactory.callRedstoneChangeCurrent(world, blockposition.getX(), blockposition.getY(), blockposition.getZ(), 0, 15) != 15) { // Antarctic
+                     return;
+                 }
+                 // Paper end
+diff --git a/main/java/net/minecraft/server/BlockRedstoneLamp.java b/main/java/net/minecraft/server/BlockRedstoneLamp.java
+index 0484130..406023a 100644
+--- a/main/java/net/minecraft/server/BlockRedstoneLamp.java
++++ b/main/java/net/minecraft/server/BlockRedstoneLamp.java
+@@ -21,14 +21,14 @@ public class BlockRedstoneLamp extends Block {
+         if (!world.isClientSide) {
+             if (this.a && !world.isBlockIndirectlyPowered(blockposition)) {
+                 // CraftBukkit start
+-                if (CraftEventFactory.callRedstoneChange(world, blockposition.getX(), blockposition.getY(), blockposition.getZ(), 15, 0).getNewCurrent() != 0) {
++                if (CraftEventFactory.callRedstoneChangeCurrent(world, blockposition.getX(), blockposition.getY(), blockposition.getZ(), 15, 0) != 0) { // Antarctic
+                     return;
+                 }
+                 // CraftBukkit end
+                 world.setTypeAndData(blockposition, Blocks.REDSTONE_LAMP.getBlockData(), 2);
+             } else if (!this.a && world.isBlockIndirectlyPowered(blockposition)) {
+                 // CraftBukkit start
+-                if (CraftEventFactory.callRedstoneChange(world, blockposition.getX(), blockposition.getY(), blockposition.getZ(), 0, 15).getNewCurrent() != 15) {
++                if (CraftEventFactory.callRedstoneChangeCurrent(world, blockposition.getX(), blockposition.getY(), blockposition.getZ(), 0, 15) != 15) { // Antarctic
+                     return;
+                 }
+                 // CraftBukkit end
+@@ -44,7 +44,7 @@ public class BlockRedstoneLamp extends Block {
+                 world.a(blockposition, (Block) this, 4);
+             } else if (!this.a && world.isBlockIndirectlyPowered(blockposition)) {
+                 // CraftBukkit start
+-                if (CraftEventFactory.callRedstoneChange(world, blockposition.getX(), blockposition.getY(), blockposition.getZ(), 0, 15).getNewCurrent() != 15) {
++                if (CraftEventFactory.callRedstoneChangeCurrent(world, blockposition.getX(), blockposition.getY(), blockposition.getZ(), 0, 15) != 15) { // Antarctic
+                     return;
+                 }
+                 // CraftBukkit end
+@@ -58,7 +58,7 @@ public class BlockRedstoneLamp extends Block {
+         if (!world.isClientSide) {
+             if (this.a && !world.isBlockIndirectlyPowered(blockposition)) {
+                 // CraftBukkit start
+-                if (CraftEventFactory.callRedstoneChange(world, blockposition.getX(), blockposition.getY(), blockposition.getZ(), 15, 0).getNewCurrent() != 0) {
++                if (CraftEventFactory.callRedstoneChangeCurrent(world, blockposition.getX(), blockposition.getY(), blockposition.getZ(), 15, 0) != 0) { // Antarctic
+                     return;
+                 }
+                 // CraftBukkit end
+diff --git a/main/java/net/minecraft/server/BlockRedstoneTorch.java b/main/java/net/minecraft/server/BlockRedstoneTorch.java
+index 66543c1..1a7b26e 100644
+--- a/main/java/net/minecraft/server/BlockRedstoneTorch.java
++++ b/main/java/net/minecraft/server/BlockRedstoneTorch.java
+@@ -102,23 +102,15 @@ public class BlockRedstoneTorch extends BlockTorch {
+         }
+         // Paper end
+ 
+-        // CraftBukkit start
+-        org.bukkit.plugin.PluginManager manager = world.getServer().getPluginManager();
+-        org.bukkit.block.Block block = world.getWorld().getBlockAt(blockposition.getX(), blockposition.getY(), blockposition.getZ());
++        // CraftBukkit start // Antarctic - defer CraftBlock and BlockRedstoneEvent allocation until state changes and listeners exist
+         int oldCurrent = this.isOn ? 15 : 0;
+-
+-        BlockRedstoneEvent event = new BlockRedstoneEvent(block, oldCurrent, oldCurrent);
+         // CraftBukkit end
+ 
+         if (this.isOn) {
+             if (flag) {
+                 // CraftBukkit start
+-                if (oldCurrent != 0) {
+-                    event.setNewCurrent(0);
+-                    manager.callEvent(event);
+-                    if (event.getNewCurrent() != 0) {
+-                        return;
+-                    }
++                if (oldCurrent != 0 && org.bukkit.craftbukkit.event.CraftEventFactory.callRedstoneChangeCurrent(world, blockposition.getX(), blockposition.getY(), blockposition.getZ(), oldCurrent, 0) != 0) {
++                    return;
+                 }
+                 // CraftBukkit end
+                 world.setTypeAndData(blockposition, Blocks.UNLIT_REDSTONE_TORCH.getBlockData().set(BlockRedstoneTorch.FACING, iblockdata.get(BlockRedstoneTorch.FACING)), 3);
+@@ -138,12 +130,8 @@ public class BlockRedstoneTorch extends BlockTorch {
+             }
+         } else if (!flag && !this.a(world, blockposition, false)) {
+             // CraftBukkit start
+-            if (oldCurrent != 15) {
+-                event.setNewCurrent(15);
+-                manager.callEvent(event);
+-                if (event.getNewCurrent() != 15) {
+-                    return;
+-                }
++            if (oldCurrent != 15 && org.bukkit.craftbukkit.event.CraftEventFactory.callRedstoneChangeCurrent(world, blockposition.getX(), blockposition.getY(), blockposition.getZ(), oldCurrent, 15) != 15) {
++                return;
+             }
+             // CraftBukkit end
+             world.setTypeAndData(blockposition, Blocks.REDSTONE_TORCH.getBlockData().set(BlockRedstoneTorch.FACING, iblockdata.get(BlockRedstoneTorch.FACING)), 3);
+diff --git a/main/java/net/minecraft/server/BlockRedstoneWire.java b/main/java/net/minecraft/server/BlockRedstoneWire.java
+index 87f7dbc..4d31990 100644
+--- a/main/java/net/minecraft/server/BlockRedstoneWire.java
++++ b/main/java/net/minecraft/server/BlockRedstoneWire.java
+@@ -302,7 +302,7 @@ public class BlockRedstoneWire extends Block {
+         }
+ 
+         // CraftBukkit start
+-        if (i != j) {
++        if (i != j && BlockRedstoneEvent.getHandlerList().getRegisteredListeners().length != 0) { // Antarctic - short-circuit when no listeners
+             BlockRedstoneEvent event = new BlockRedstoneEvent(world.getWorld().getBlockAt(blockposition.getX(), blockposition.getY(), blockposition.getZ()), i, j);
+             world.getServer().getPluginManager().callEvent(event);
+ 
+diff --git a/main/java/net/minecraft/server/TileEntityChest.java b/main/java/net/minecraft/server/TileEntityChest.java
+index 52568db..73e52f8 100644
+--- a/main/java/net/minecraft/server/TileEntityChest.java
++++ b/main/java/net/minecraft/server/TileEntityChest.java
+@@ -318,7 +318,7 @@ public class TileEntityChest extends TileEntityLootable { // Paper - Remove ITic
+                 int newPower = Math.max(0, Math.min(15, this.l));
+ 
+                 if (oldPower != newPower) {
+-                    org.bukkit.craftbukkit.event.CraftEventFactory.callRedstoneChange(world, position.getX(), position.getY(), position.getZ(), oldPower, newPower);
++                    org.bukkit.craftbukkit.event.CraftEventFactory.callRedstoneChangeCurrent(world, position.getX(), position.getY(), position.getZ(), oldPower, newPower); // Antarctic
+                 }
+             }
+             // CraftBukkit end
+@@ -370,7 +370,7 @@ public class TileEntityChest extends TileEntityLootable { // Paper - Remove ITic
+                 int newPower = Math.max(0, Math.min(15, this.l));
+ 
+                 if (oldPower != newPower) {
+-                    org.bukkit.craftbukkit.event.CraftEventFactory.callRedstoneChange(world, position.getX(), position.getY(), position.getZ(), oldPower, newPower);
++                    org.bukkit.craftbukkit.event.CraftEventFactory.callRedstoneChangeCurrent(world, position.getX(), position.getY(), position.getZ(), oldPower, newPower); // Antarctic
+                 }
+                 this.world.applyPhysics(this.position.down(), this.getBlock(), false);
+             }
+diff --git a/main/java/org/bukkit/craftbukkit/event/CraftEventFactory.java b/main/java/org/bukkit/craftbukkit/event/CraftEventFactory.java
+index 835f143..cc00742 100644
+--- a/main/java/org/bukkit/craftbukkit/event/CraftEventFactory.java
++++ b/main/java/org/bukkit/craftbukkit/event/CraftEventFactory.java
+@@ -893,6 +893,17 @@ public class CraftEventFactory {
+         return event;
+     }
+ 
++    // Antarctic start - avoid CraftBlock and BlockRedstoneEvent allocations when no listeners are registered
++    public static int callRedstoneChangeCurrent(World world, int x, int y, int z, int oldCurrent, int newCurrent) {
++        if (BlockRedstoneEvent.getHandlerList().getRegisteredListeners().length == 0) {
++            return newCurrent;
++        }
++        BlockRedstoneEvent event = new BlockRedstoneEvent(world.getWorld().getBlockAt(x, y, z), oldCurrent, newCurrent);
++        world.getServer().getPluginManager().callEvent(event);
++        return event.getNewCurrent();
++    }
++    // Antarctic end
++
+     public static NotePlayEvent callNotePlayEvent(World world, int x, int y, int z, byte instrument, byte note) {
+         NotePlayEvent event = new NotePlayEvent(world.getWorld().getBlockAt(x, y, z), org.bukkit.Instrument.getByType(instrument), new org.bukkit.Note(note));
+         world.getServer().getPluginManager().callEvent(event);
+diff --git a/test/java/net/minecraft/server/RedstoneEventShortCircuitTest.java b/test/java/net/minecraft/server/RedstoneEventShortCircuitTest.java
+new file mode 100644
+index 0000000..7621b66
+--- /dev/null
++++ b/test/java/net/minecraft/server/RedstoneEventShortCircuitTest.java
+@@ -0,0 +1,178 @@
++package net.minecraft.server;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertTrue;
++
++import java.lang.management.ManagementFactory;
++import java.lang.reflect.Field;
++import java.util.concurrent.atomic.AtomicInteger;
++import org.bukkit.craftbukkit.event.CraftEventFactory;
++import org.bukkit.event.EventPriority;
++import org.bukkit.event.Listener;
++import org.bukkit.event.block.BlockRedstoneEvent;
++import org.bukkit.plugin.Plugin;
++import org.bukkit.plugin.RegisteredListener;
++import org.bukkit.plugin.SimplePluginManager;
++import org.junit.After;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++public class RedstoneEventShortCircuitTest {
++
++    private static Unsafe unsafe;
++    private RegisteredListener registeredListener;
++
++    private static final class StubCraftWorld extends org.bukkit.craftbukkit.CraftWorld {
++        StubCraftWorld() {
++            super(null, null, null);
++        }
++
++        @Override
++        public org.bukkit.block.Block getBlockAt(int x, int y, int z) {
++            return (org.bukkit.block.Block) java.lang.reflect.Proxy.newProxyInstance(
++                org.bukkit.block.Block.class.getClassLoader(),
++                new Class<?>[]{org.bukkit.block.Block.class},
++                (proxy, method, args) -> {
++                    if ("getX".equals(method.getName())) return x;
++                    if ("getY".equals(method.getName())) return y;
++                    if ("getZ".equals(method.getName())) return z;
++                    return null;
++                }
++            );
++        }
++    }
++
++    private static final class StubEventWorld extends WorldServer {
++        org.bukkit.craftbukkit.CraftWorld stubWorld;
++        org.bukkit.craftbukkit.CraftServer stubServer;
++
++        StubEventWorld() {
++            super(null, null, null, 0, null, null, null);
++        }
++
++        @Override
++        public org.bukkit.craftbukkit.CraftWorld getWorld() {
++            return this.stubWorld;
++        }
++
++        @Override
++        public org.bukkit.craftbukkit.CraftServer getServer() {
++            return this.stubServer;
++        }
++    }
++
++    @BeforeClass
++    public static void bootstrap() throws Exception {
++        LightPropagationParityTest.bootstrap();
++        Field uf = Unsafe.class.getDeclaredField("theUnsafe");
++        uf.setAccessible(true);
++        unsafe = (Unsafe) uf.get(null);
++    }
++
++    @After
++    public void cleanup() {
++        if (this.registeredListener != null) {
++            BlockRedstoneEvent.getHandlerList().unregister(this.registeredListener);
++            this.registeredListener = null;
++        }
++    }
++
++    private static StubEventWorld makeWorld() throws Exception {
++        StubEventWorld world = (StubEventWorld) unsafe.allocateInstance(StubEventWorld.class);
++        world.stubWorld = (org.bukkit.craftbukkit.CraftWorld) unsafe.allocateInstance(StubCraftWorld.class);
++        world.stubServer = (org.bukkit.craftbukkit.CraftServer) unsafe.allocateInstance(org.bukkit.craftbukkit.CraftServer.class);
++        LightPropagationParityTest.set(org.bukkit.craftbukkit.CraftServer.class, world.stubServer, "pluginManager", new SimplePluginManager(null, null));
++        return world;
++    }
++
++    @Test
++    public void zeroListenerPathAllocatesZeroBytesAndBeatsFullEventDispatch() throws Exception {
++        assertEquals(0, BlockRedstoneEvent.getHandlerList().getRegisteredListeners().length);
++        StubEventWorld world = makeWorld();
++
++        // Warmup
++        int sink = 0;
++        for (int i = 0; i < 50_000; ++i) {
++            sink += CraftEventFactory.callRedstoneChangeCurrent(world, 1, 64, 1, 0, i & 15);
++            sink += CraftEventFactory.callRedstoneChange(world, 1, 64, 1, 0, i & 15).getNewCurrent();
++        }
++        assertTrue(sink > 0);
++
++        com.sun.management.ThreadMXBean mx = (com.sun.management.ThreadMXBean) ManagementFactory.getThreadMXBean();
++        long tid = Thread.currentThread().getId();
++
++        long fastNanos = Long.MAX_VALUE;
++        long oldNanos = Long.MAX_VALUE;
++        long allocFast = Long.MAX_VALUE;
++        long allocOld = 0L;
++        for (int round = 0; round < 3; ++round) {
++            long allocBeforeFast = mx.getThreadAllocatedBytes(tid);
++            long t0 = System.nanoTime();
++            for (int i = 0; i < 500_000; ++i) {
++                sink += CraftEventFactory.callRedstoneChangeCurrent(world, 1, 64, 1, 0, i & 15);
++            }
++            long fn = System.nanoTime() - t0;
++            long af = mx.getThreadAllocatedBytes(tid) - allocBeforeFast;
++            fastNanos = Math.min(fastNanos, fn);
++            allocFast = Math.min(allocFast, af);
++
++            long allocBeforeOld = mx.getThreadAllocatedBytes(tid);
++            long t1 = System.nanoTime();
++            for (int i = 0; i < 500_000; ++i) {
++                sink += CraftEventFactory.callRedstoneChange(world, 1, 64, 1, 0, i & 15).getNewCurrent();
++            }
++            long on = System.nanoTime() - t1;
++            long ao = mx.getThreadAllocatedBytes(tid) - allocBeforeOld;
++            oldNanos = Math.min(oldNanos, on);
++            allocOld = Math.max(allocOld, ao);
++        }
++
++        assertTrue(sink > 0);
++        System.out.println("[perf] BlockRedstoneEvent 500k calls: old=" + (oldNanos / 1000) + "us (" + (allocOld / 1024) + " KiB) fast="
++            + (fastNanos / 1000) + "us (" + (allocFast / 1024) + " KiB)");
++        assertTrue("zero-listener fast path must allocate ~0 bytes, got " + allocFast, allocFast <= 1024L);
++        assertTrue("baseline path allocates significant event/block garbage", allocOld > 10 * 1024 * 1024);
++        assertTrue("zero-listener fast path should be at least 3x faster than full dispatch", fastNanos * 3 < oldNanos);
++    }
++
++    @Test
++    public void registeredListenerOverridesCurrentAndUnregisterRestoresFastPath() throws Exception {
++        StubEventWorld world = makeWorld();
++        AtomicInteger calls = new AtomicInteger();
++        Plugin dummyPlugin = (Plugin) java.lang.reflect.Proxy.newProxyInstance(
++            Plugin.class.getClassLoader(),
++            new Class<?>[]{Plugin.class},
++            (proxy, method, args) -> {
++                if ("isEnabled".equals(method.getName())) return true;
++                if ("getName".equals(method.getName())) return "RedstoneShortCircuitTest";
++                return null;
++            }
++        );
++
++        this.registeredListener = new RegisteredListener(
++            new Listener() {},
++            (listener, event) -> {
++                if (event instanceof BlockRedstoneEvent) {
++                    calls.incrementAndGet();
++                    ((BlockRedstoneEvent) event).setNewCurrent(9);
++                }
++            },
++            EventPriority.NORMAL,
++            dummyPlugin,
++            false
++        );
++
++        assertEquals(15, CraftEventFactory.callRedstoneChangeCurrent(world, 2, 64, 3, 0, 15));
++        assertEquals(0, calls.get());
++
++        BlockRedstoneEvent.getHandlerList().register(this.registeredListener);
++        assertEquals("registered listener override must be honored", 9, CraftEventFactory.callRedstoneChangeCurrent(world, 2, 64, 3, 0, 15));
++        assertEquals(1, calls.get());
++
++        BlockRedstoneEvent.getHandlerList().unregister(this.registeredListener);
++        this.registeredListener = null;
++        assertEquals(15, CraftEventFactory.callRedstoneChangeCurrent(world, 2, 64, 3, 0, 15));
++        assertEquals(1, calls.get());
++    }
++}

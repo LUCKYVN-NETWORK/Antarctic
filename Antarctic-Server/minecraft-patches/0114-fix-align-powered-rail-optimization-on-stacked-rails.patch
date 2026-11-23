@@ -1,0 +1,506 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Mon, 23 Nov 2026 10:40:56 +0700
+Subject: [PATCH 114/115] fix: align powered rail optimization on stacked rails
+ with parity and perf tests
+
+
+diff --git a/main/java/net/minecraft/server/BlockPoweredRail.java b/main/java/net/minecraft/server/BlockPoweredRail.java
+index e217521..0f53f8e 100644
+--- a/main/java/net/minecraft/server/BlockPoweredRail.java
++++ b/main/java/net/minecraft/server/BlockPoweredRail.java
+@@ -114,53 +114,201 @@ public class BlockPoweredRail extends BlockMinecartTrackAbstract {
+         }
+     }
+ 
+-    // Leaf start - Rail Optimization (backport of Leaf MC 0233 / Leaf 0025)
+-    private boolean findPoweredRailSignalOptimized(World world, BlockPosition pos, IBlockData data, boolean forward) {
++    // Leaf start - Rail Optimization (backport of Leaf MC 0233 / Leaf 0025; Antarctic stacked-rail parity + zero-alloc chunk-cached power check)
++    private static final EnumDirection[] ANTARCTIC_POWER_DIRS = {
++        EnumDirection.DOWN, EnumDirection.UP, EnumDirection.NORTH, EnumDirection.SOUTH, EnumDirection.WEST, EnumDirection.EAST
++    };
++
++    private static boolean isShapeCompatible(boolean eastWest, BlockMinecartTrackAbstract.EnumTrackPosition candidate) {
++        if (eastWest) {
++            return candidate != BlockMinecartTrackAbstract.EnumTrackPosition.NORTH_SOUTH
++                    && candidate != BlockMinecartTrackAbstract.EnumTrackPosition.ASCENDING_NORTH
++                    && candidate != BlockMinecartTrackAbstract.EnumTrackPosition.ASCENDING_SOUTH;
++        }
++        return candidate != BlockMinecartTrackAbstract.EnumTrackPosition.EAST_WEST
++                && candidate != BlockMinecartTrackAbstract.EnumTrackPosition.ASCENDING_EAST
++                && candidate != BlockMinecartTrackAbstract.EnumTrackPosition.ASCENDING_WEST;
++    }
++
++    private static IBlockData getBlockFast(World world, ChunkProviderServer cps, Chunk cachedChunk, int cachedChunkX, int cachedChunkZ,
++                                           int x, int y, int z, BlockPosition.MutableBlockPosition cursor) {
++        if (y < 0 || y >= 256) {
++            return Blocks.AIR.getBlockData();
++        }
++        int chX = x >> 4;
++        int chZ = z >> 4;
++        if (chX == cachedChunkX && chZ == cachedChunkZ && cachedChunk != null) {
++            return cachedChunk.getBlockData(x, y, z);
++        }
++        Chunk c = cps.getChunkIfLoaded(chX, chZ);
++        if (c != null) {
++            return c.getBlockData(x, y, z);
++        }
++        cursor.c(x, y, z);
++        return world.getType(cursor);
++    }
++
++    private static boolean isIndirectlyPoweredFast(World world, ChunkProviderServer cps, Chunk cachedChunk, int cachedChunkX, int cachedChunkZ,
++                                                   int x, int y, int z, BlockPosition.MutableBlockPosition cursor) {
++        for (int i = 0; i < 6; ++i) {
++            EnumDirection dir = ANTARCTIC_POWER_DIRS[i];
++            int nx = x + dir.getAdjacentX();
++            int ny = y + dir.getAdjacentY();
++            int nz = z + dir.getAdjacentZ();
++            IBlockData data = getBlockFast(world, cps, cachedChunk, cachedChunkX, cachedChunkZ, nx, ny, nz, cursor);
++            if (data.l()) {
++                // Solid cube: check strong power from its 6 neighbors (matches World.getBlockPower)
++                for (int j = 0; j < 6; ++j) {
++                    EnumDirection sDir = ANTARCTIC_POWER_DIRS[j];
++                    int sx = nx + sDir.getAdjacentX();
++                    int sy = ny + sDir.getAdjacentY();
++                    int sz = nz + sDir.getAdjacentZ();
++                    IBlockData sData = getBlockFast(world, cps, cachedChunk, cachedChunkX, cachedChunkZ, sx, sy, sz, cursor);
++                    if (sData.m()) {
++                        cursor.c(sx, sy, sz);
++                        if (sData.b(world, cursor, sDir) > 0) {
++                            return true;
++                        }
++                    }
++                }
++            } else if (data.m()) {
++                cursor.c(nx, ny, nz);
++                if (data.a((IBlockAccess) world, cursor, dir) > 0) {
++                    return true;
++                }
++            }
++        }
++        return false;
++    }
++
++    boolean findPoweredRailSignalOptimized(World world, BlockPosition pos, IBlockData data, boolean forward) {
+         BlockMinecartTrackAbstract.EnumTrackPosition shape = (BlockMinecartTrackAbstract.EnumTrackPosition) data.get(BlockPoweredRail.SHAPE);
+-        if (shape != BlockMinecartTrackAbstract.EnumTrackPosition.NORTH_SOUTH && shape != BlockMinecartTrackAbstract.EnumTrackPosition.EAST_WEST) {
++        boolean eastWest = (shape == BlockMinecartTrackAbstract.EnumTrackPosition.EAST_WEST);
++        if (!eastWest && shape != BlockMinecartTrackAbstract.EnumTrackPosition.NORTH_SOUTH) {
+             return this.a(world, pos, data, forward, 0);
+         }
+-        int dx = (shape == BlockMinecartTrackAbstract.EnumTrackPosition.EAST_WEST) ? (forward ? -1 : 1) : 0;
+-        int dz = (shape == BlockMinecartTrackAbstract.EnumTrackPosition.NORTH_SOUTH) ? (forward ? 1 : -1) : 0;
+-        BlockPosition.PooledBlockPosition pooledPos = BlockPosition.PooledBlockPosition.s();
+-        try {
+-            int cx = pos.getX();
+-            int cy = pos.getY();
+-            int cz = pos.getZ();
+-            for (int dist = 0; dist < 8; ++dist) {
+-                cx += dx;
+-                cz += dz;
+-                pooledPos.f(cx, cy, cz);
+-                IBlockData neighbor = world.getType(pooledPos);
+-                if (neighbor.getBlock() != this) {
+-                    pooledPos.f(cx, cy - 1, cz);
+-                    neighbor = world.getType(pooledPos);
+-                    if (neighbor.getBlock() != this) {
+-                        return false;
+-                    }
+-                    cy -= 1;
++        int dx = eastWest ? (forward ? -1 : 1) : 0;
++        int dz = eastWest ? 0 : (forward ? 1 : -1);
++        int startX = pos.getX();
++        int startY = pos.getY();
++        int startZ = pos.getZ();
++        int cx = startX;
++        int cy = startY;
++        int cz = startZ;
++        ChunkProviderServer cps = (!world.captureTreeGeneration && !world.captureBlockStates && world.chunkProvider instanceof ChunkProviderServer)
++                ? (ChunkProviderServer) world.chunkProvider
++                : null;
++        Chunk cachedChunk = null;
++        int cachedChunkX = Integer.MIN_VALUE;
++        int cachedChunkZ = Integer.MIN_VALUE;
++        BlockPosition.MutableBlockPosition cursor = new BlockPosition.MutableBlockPosition(cx, cy, cz);
++        int primaryMask = 0;
++        int dropPacked = 0;
++        for (int dist = 0; dist < 8; ++dist) {
++            cx += dx;
++            cz += dz;
++            IBlockData neighbor;
++            if (cps != null) {
++                int chX = cx >> 4;
++                int chZ = cz >> 4;
++                if (chX != cachedChunkX || chZ != cachedChunkZ) {
++                    cachedChunk = cps.getChunkIfLoaded(chX, chZ);
++                    cachedChunkX = chX;
++                    cachedChunkZ = chZ;
+                 }
++                if (cachedChunk != null && cy >= 0 && cy < 256) {
++                    neighbor = cachedChunk.getBlockData(cx, cy, cz);
++                } else {
++                    cursor.c(cx, cy, cz);
++                    neighbor = world.getType(cursor);
++                }
++            } else {
++                cursor.c(cx, cy, cz);
++                neighbor = world.getType(cursor);
++            }
++            if (neighbor.getBlock() == this) {
+                 BlockMinecartTrackAbstract.EnumTrackPosition nShape = (BlockMinecartTrackAbstract.EnumTrackPosition) neighbor.get(BlockPoweredRail.SHAPE);
+-                if (shape == BlockMinecartTrackAbstract.EnumTrackPosition.EAST_WEST && (nShape == BlockMinecartTrackAbstract.EnumTrackPosition.NORTH_SOUTH || nShape == BlockMinecartTrackAbstract.EnumTrackPosition.ASCENDING_NORTH || nShape == BlockMinecartTrackAbstract.EnumTrackPosition.ASCENDING_SOUTH)) {
+-                    return false;
++                if (isShapeCompatible(eastWest, nShape) && ((Boolean) neighbor.get(BlockPoweredRail.POWERED)).booleanValue()) {
++                    if (cps != null
++                            ? isIndirectlyPoweredFast(world, cps, cachedChunk, cachedChunkX, cachedChunkZ, cx, cy, cz, cursor)
++                            : world.isBlockIndirectlyPowered(cursor.c(cx, cy, cz))) {
++                        return true;
++                    }
++                    if (!nShape.c()) {
++                        primaryMask |= (1 << dist);
++                        dropPacked |= ((startY - cy) << (dist * 3));
++                        continue;
++                    }
++                    cursor.c(cx, cy, cz);
++                    if (this.a(world, cursor.h(), neighbor, forward, dist + 1)) {
++                        return true;
++                    }
+                 }
+-                if (shape == BlockMinecartTrackAbstract.EnumTrackPosition.NORTH_SOUTH && (nShape == BlockMinecartTrackAbstract.EnumTrackPosition.EAST_WEST || nShape == BlockMinecartTrackAbstract.EnumTrackPosition.ASCENDING_EAST || nShape == BlockMinecartTrackAbstract.EnumTrackPosition.ASCENDING_WEST)) {
+-                    return false;
++            }
++            // Primary (cx, cy, cz) did not yield power; match vanilla flag1 fallback to (cx, cy - 1, cz)
++            int lowerY = cy - 1;
++            IBlockData lower;
++            if (cachedChunk != null && (cx >> 4) == cachedChunkX && (cz >> 4) == cachedChunkZ && lowerY >= 0 && lowerY < 256) {
++                lower = cachedChunk.getBlockData(cx, lowerY, cz);
++            } else {
++                cursor.c(cx, lowerY, cz);
++                lower = world.getType(cursor);
++            }
++            if (lower.getBlock() != this) {
++                break;
++            }
++            BlockMinecartTrackAbstract.EnumTrackPosition lowerShape = (BlockMinecartTrackAbstract.EnumTrackPosition) lower.get(BlockPoweredRail.SHAPE);
++            if (!isShapeCompatible(eastWest, lowerShape) || !((Boolean) lower.get(BlockPoweredRail.POWERED)).booleanValue()) {
++                break;
++            }
++            if (cps != null
++                    ? isIndirectlyPoweredFast(world, cps, cachedChunk, cachedChunkX, cachedChunkZ, cx, lowerY, cz, cursor)
++                    : world.isBlockIndirectlyPowered(cursor.c(cx, lowerY, cz))) {
++                return true;
++            }
++            if (lowerShape.c()) {
++                cursor.c(cx, lowerY, cz);
++                if (this.a(world, cursor.h(), lower, forward, dist + 1)) {
++                    return true;
+                 }
+-                if (!((Boolean) neighbor.get(BlockPoweredRail.POWERED)).booleanValue()) {
+-                    return false;
++                break;
++            }
++            cy = lowerY;
++        }
++        // Unwind primary steps innermost-first to check any stacked rail at (bx, stepY - 1, bz)
++        while (primaryMask != 0) {
++            int back = 31 - Integer.numberOfLeadingZeros(primaryMask);
++            primaryMask &= ~(1 << back);
++            int by = startY - ((dropPacked >>> (back * 3)) & 7) - 1;
++            int bx = startX + (back + 1) * dx;
++            int bz = startZ + (back + 1) * dz;
++            IBlockData stacked;
++            if (cps != null) {
++                int chX = bx >> 4;
++                int chZ = bz >> 4;
++                if (chX != cachedChunkX || chZ != cachedChunkZ) {
++                    cachedChunk = cps.getChunkIfLoaded(chX, chZ);
++                    cachedChunkX = chX;
++                    cachedChunkZ = chZ;
+                 }
+-                if (world.isBlockIndirectlyPowered(pooledPos)) {
+-                    return true;
++                if (cachedChunk != null && by >= 0 && by < 256) {
++                    stacked = cachedChunk.getBlockData(bx, by, bz);
++                } else {
++                    cursor.c(bx, by, bz);
++                    stacked = world.getType(cursor);
+                 }
+-                if (nShape.c()) {
+-                    return this.a(world, pooledPos.h(), neighbor, forward, dist + 1);
++            } else {
++                cursor.c(bx, by, bz);
++                stacked = world.getType(cursor);
++            }
++            if (stacked.getBlock() == this) {
++                cursor.c(bx, by, bz);
++                if (this.a(world, cursor.h(), forward, back, shape)) {
++                    return true;
+                 }
+             }
+-            return false;
+-        } finally {
+-            pooledPos.t();
+         }
++        return false;
+     }
+     // Leaf end
+ 
+diff --git a/test/java/net/minecraft/server/PoweredRailTest.java b/test/java/net/minecraft/server/PoweredRailTest.java
+index 65034d7..0c46504 100644
+--- a/test/java/net/minecraft/server/PoweredRailTest.java
++++ b/test/java/net/minecraft/server/PoweredRailTest.java
+@@ -1,13 +1,253 @@
+ package net.minecraft.server;
+ 
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Rails;
++import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
++import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
++import java.lang.reflect.Field;
++import java.util.Random;
+ import org.junit.Assert;
++import org.junit.BeforeClass;
+ import org.junit.Test;
++import sun.misc.Unsafe;
+ 
+ public class PoweredRailTest {
+ 
++    private static Unsafe unsafe;
++    private static BlockPoweredRail rail;
++    private static final BlockMinecartTrackAbstract.EnumTrackPosition[] VALID_SHAPES = {
++        BlockMinecartTrackAbstract.EnumTrackPosition.NORTH_SOUTH,
++        BlockMinecartTrackAbstract.EnumTrackPosition.EAST_WEST,
++        BlockMinecartTrackAbstract.EnumTrackPosition.ASCENDING_EAST,
++        BlockMinecartTrackAbstract.EnumTrackPosition.ASCENDING_WEST,
++        BlockMinecartTrackAbstract.EnumTrackPosition.ASCENDING_NORTH,
++        BlockMinecartTrackAbstract.EnumTrackPosition.ASCENDING_SOUTH
++    };
++
++    private static final class RailTestWorld extends World {
++        final Long2ObjectOpenHashMap<IBlockData> blocks = new Long2ObjectOpenHashMap<IBlockData>();
++        final LongOpenHashSet indirectPower = new LongOpenHashSet();
++        IBlockData air;
++
++        RailTestWorld() {
++            super(null, null, null, null, false, null, null);
++        }
++
++        void clear() {
++            this.blocks.clear();
++            this.indirectPower.clear();
++        }
++
++        void set(int x, int y, int z, IBlockData data) {
++            this.blocks.put(new BlockPosition(x, y, z).asLong(), data);
++        }
++
++        void power(int x, int y, int z) {
++            this.indirectPower.add(new BlockPosition(x, y, z).asLong());
++        }
++
++        @Override
++        public IBlockData getType(BlockPosition pos) {
++            IBlockData d = this.blocks.get(pos.asLong());
++            return d != null ? d : this.air;
++        }
++
++        @Override
++        public boolean isBlockIndirectlyPowered(BlockPosition pos) {
++            return this.indirectPower.contains(pos.asLong());
++        }
++
++        @Override
++        protected IChunkProvider n() {
++            return null;
++        }
++
++        @Override
++        protected boolean isChunkLoaded(int i, int j, boolean flag) {
++            return true;
++        }
++    }
++
++    @BeforeClass
++    public static void bootstrap() throws Exception {
++        LightPropagationParityTest.bootstrap();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        unsafe = (Unsafe) f.get(null);
++        rail = (BlockPoweredRail) Blocks.GOLDEN_RAIL;
++    }
++
++    private static RailTestWorld newWorld() throws Exception {
++        RailTestWorld w = (RailTestWorld) unsafe.allocateInstance(RailTestWorld.class);
++        Field bf = RailTestWorld.class.getDeclaredField("blocks");
++        bf.setAccessible(true);
++        bf.set(w, new Long2ObjectOpenHashMap<IBlockData>());
++        Field pf = RailTestWorld.class.getDeclaredField("indirectPower");
++        pf.setAccessible(true);
++        pf.set(w, new LongOpenHashSet());
++        w.air = Blocks.AIR.getBlockData();
++        return w;
++    }
++
++    private static IBlockData railState(BlockMinecartTrackAbstract.EnumTrackPosition shape, boolean powered) {
++        return rail.getBlockData().set(BlockPoweredRail.SHAPE, shape).set(BlockPoweredRail.POWERED, powered);
++    }
++
+     @Test
+     public void testPoweredRailOptimizationDefaultFalse() {
+         Assert.assertFalse("Rails.optimizePoweredRails must default to false for strict vanilla parity", Rails.optimizePoweredRails);
+     }
++
++    @Test
++    public void testStackedRailParityEdgeCases() throws Exception {
++        RailTestWorld w = newWorld();
++        BlockPosition origin = new BlockPosition(0, 64, 0);
++        IBlockData originData = railState(BlockMinecartTrackAbstract.EnumTrackPosition.NORTH_SOUTH, true);
++
++        // Case 1: unpowered rail at (0, 64, 1) stacked above powered indirectly-powered rail at (0, 63, 1)
++        w.set(0, 64, 0, originData);
++        w.set(0, 64, 1, railState(BlockMinecartTrackAbstract.EnumTrackPosition.NORTH_SOUTH, false));
++        w.set(0, 63, 1, railState(BlockMinecartTrackAbstract.EnumTrackPosition.NORTH_SOUTH, true));
++        w.power(0, 63, 1);
++        Assert.assertTrue("vanilla must fall back to y-1", rail.a(w, origin, originData, true, 0));
++        Assert.assertEquals(rail.a(w, origin, originData, true, 0), rail.findPoweredRailSignalOptimized(w, origin, originData, true));
++
++        // Case 2: perpendicular rail at (0, 64, 1) stacked above compatible powered rail at (0, 63, 1)
++        w.clear();
++        w.set(0, 64, 0, originData);
++        w.set(0, 64, 1, railState(BlockMinecartTrackAbstract.EnumTrackPosition.EAST_WEST, true));
++        w.set(0, 63, 1, railState(BlockMinecartTrackAbstract.EnumTrackPosition.NORTH_SOUTH, true));
++        w.power(0, 63, 1);
++        Assert.assertTrue(rail.a(w, origin, originData, true, 0));
++        Assert.assertEquals(rail.a(w, origin, originData, true, 0), rail.findPoweredRailSignalOptimized(w, origin, originData, true));
++
++        // Case 3: dead-end primary chain of 4 flat powered rails with powered rail stacked underneath step 1
++        w.clear();
++        w.set(0, 64, 0, originData);
++        w.set(0, 64, 1, railState(BlockMinecartTrackAbstract.EnumTrackPosition.NORTH_SOUTH, true));
++        w.set(0, 64, 2, railState(BlockMinecartTrackAbstract.EnumTrackPosition.NORTH_SOUTH, true));
++        w.set(0, 64, 3, railState(BlockMinecartTrackAbstract.EnumTrackPosition.NORTH_SOUTH, true));
++        w.set(0, 63, 2, railState(BlockMinecartTrackAbstract.EnumTrackPosition.NORTH_SOUTH, true));
++        w.set(0, 63, 3, railState(BlockMinecartTrackAbstract.EnumTrackPosition.NORTH_SOUTH, true));
++        w.power(0, 63, 3);
++        Assert.assertTrue("vanilla backtracks primary chain into stacked rail", rail.a(w, origin, originData, true, 0));
++        Assert.assertEquals(rail.a(w, origin, originData, true, 0), rail.findPoweredRailSignalOptimized(w, origin, originData, true));
++
++        // Case 4: dead-end ascending rail at primary with powered rail underneath
++        w.clear();
++        w.set(0, 64, 0, originData);
++        w.set(0, 64, 1, railState(BlockMinecartTrackAbstract.EnumTrackPosition.ASCENDING_SOUTH, true));
++        w.set(0, 63, 1, railState(BlockMinecartTrackAbstract.EnumTrackPosition.NORTH_SOUTH, true));
++        w.power(0, 63, 1);
++        Assert.assertTrue(rail.a(w, origin, originData, true, 0));
++        Assert.assertEquals(rail.a(w, origin, originData, true, 0), rail.findPoweredRailSignalOptimized(w, origin, originData, true));
++    }
++
++    @Test
++    public void testRandomizedTenThousandTrackParityIncludingStackedRails() throws Exception {
++        RailTestWorld w = newWorld();
++        Random rng = new Random(0x5A17_1122L);
++        BlockPosition origin = new BlockPosition(0, 64, 0);
++        int trueCount = 0;
++
++        for (int trial = 0; trial < 10_000; ++trial) {
++            w.clear();
++            BlockMinecartTrackAbstract.EnumTrackPosition originShape = VALID_SHAPES[rng.nextInt(VALID_SHAPES.length)];
++            boolean forward = rng.nextBoolean();
++            IBlockData originData = railState(originShape, true);
++            w.set(0, 64, 0, originData);
++
++            boolean ew = originShape == BlockMinecartTrackAbstract.EnumTrackPosition.EAST_WEST
++                    || originShape == BlockMinecartTrackAbstract.EnumTrackPosition.ASCENDING_EAST
++                    || originShape == BlockMinecartTrackAbstract.EnumTrackPosition.ASCENDING_WEST;
++
++            // Populate dense 10x9 vertical slice along the axis (including vertically stacked plugin rails)
++            for (int step = -9; step <= 9; ++step) {
++                if (step == 0) continue;
++                for (int dy = -6; dy <= 4; ++dy) {
++                    if (rng.nextInt(100) < 42) {
++                        int x = ew ? step : 0;
++                        int z = ew ? 0 : step;
++                        BlockMinecartTrackAbstract.EnumTrackPosition s = VALID_SHAPES[rng.nextInt(VALID_SHAPES.length)];
++                        boolean powered = rng.nextInt(100) < 72;
++                        w.set(x, 64 + dy, z, railState(s, powered));
++                        if (rng.nextInt(100) < 25) {
++                            w.power(x, 64 + dy, z);
++                        }
++                    }
++                }
++            }
++
++            boolean vanilla = rail.a(w, origin, originData, forward, 0);
++            boolean optimized = rail.findPoweredRailSignalOptimized(w, origin, originData, forward);
++            if (vanilla) {
++                trueCount++;
++            }
++            Assert.assertEquals("parity mismatch on trial " + trial + " shape=" + originShape + " forward=" + forward, vanilla, optimized);
++        }
++        Assert.assertTrue("random suite must exercise both powered and unpowered outcomes (trueCount=" + trueCount + ")", trueCount > 500 && trueCount < 9500);
++    }
++
++    @Test
++    public void testOptimizedPoweredRailPerformance() throws Exception {
++        LightPropagationParityTest.StubProvider[] p = new LightPropagationParityTest.StubProvider[1];
++        WorldServer w = LightPropagationParityTest.buildWorld(515L, p);
++        BlockPosition origin = new BlockPosition(2, 64, 2);
++        IBlockData flat = railState(BlockMinecartTrackAbstract.EnumTrackPosition.NORTH_SOUTH, true);
++        // 8-block flat powered chain on real chunks ending in a redstone block beneath step 8
++        for (int z = 2; z <= 10; ++z) {
++            LightPropagationParityTest.setBlock(w, 2, 63, z, Blocks.STONE.getBlockData());
++            LightPropagationParityTest.setBlock(w, 2, 64, z, flat);
++        }
++        LightPropagationParityTest.setBlock(w, 2, 63, 10, Blocks.REDSTONE_BLOCK.getBlockData());
++        Assert.assertTrue(rail.a(w, origin, flat, true, 0));
++        Assert.assertTrue(rail.findPoweredRailSignalOptimized(w, origin, flat, true));
++
++        // Warmup for C2
++        int sink = 0;
++        for (int i = 0; i < 20_000; ++i) {
++            if (rail.a(w, origin, flat, true, 0)) sink++;
++            if (rail.findPoweredRailSignalOptimized(w, origin, flat, true)) sink++;
++        }
++
++        com.sun.management.ThreadMXBean mx = (com.sun.management.ThreadMXBean) java.lang.management.ManagementFactory.getThreadMXBean();
++        long tid = Thread.currentThread().getId();
++        final int iterations = 100_000;
++        long vanillaNs = Long.MAX_VALUE;
++        long optNs = Long.MAX_VALUE;
++        long vanillaAlloc = 0L;
++        long optAlloc = Long.MAX_VALUE;
++        for (int round = 0; round < 3; ++round) {
++            long a0 = mx.getThreadAllocatedBytes(tid);
++            long t0 = System.nanoTime();
++            for (int i = 0; i < iterations; ++i) {
++                if (rail.a(w, origin, flat, true, 0)) sink++;
++            }
++            vanillaNs = Math.min(vanillaNs, System.nanoTime() - t0);
++            vanillaAlloc = Math.max(vanillaAlloc, mx.getThreadAllocatedBytes(tid) - a0);
++
++            long a1 = mx.getThreadAllocatedBytes(tid);
++            long t1 = System.nanoTime();
++            for (int i = 0; i < iterations; ++i) {
++                if (rail.findPoweredRailSignalOptimized(w, origin, flat, true)) sink++;
++            }
++            optNs = Math.min(optNs, System.nanoTime() - t1);
++            optAlloc = Math.min(optAlloc, mx.getThreadAllocatedBytes(tid) - a1);
++        }
++
++        // Also test strong power conducted through STONE from a REDSTONE_TORCH underneath
++        LightPropagationParityTest.setBlock(w, 2, 63, 10, Blocks.STONE.getBlockData());
++        Assert.assertFalse(rail.a(w, origin, flat, true, 0));
++        Assert.assertFalse(rail.findPoweredRailSignalOptimized(w, origin, flat, true));
++        LightPropagationParityTest.setBlock(w, 2, 62, 10, Blocks.REDSTONE_TORCH.getBlockData());
++        Assert.assertTrue("strong power through stone block must be detected", rail.a(w, origin, flat, true, 0));
++        Assert.assertTrue("fast power check must match strong power through stone", rail.findPoweredRailSignalOptimized(w, origin, flat, true));
++        LightPropagationParityTest.setBlock(w, 2, 62, 10, Blocks.AIR.getBlockData());
++        LightPropagationParityTest.setBlock(w, 2, 63, 10, Blocks.REDSTONE_BLOCK.getBlockData());
++
++        double speedup = (double) vanillaNs / (double) Math.max(1L, optNs);
++        System.out.printf("PoweredRailPerf (real WorldServer 8-block flat chain, %d iters): vanilla=%.2f ms (%d KiB), optimized=%.2f ms (%d KiB), speedup=%.2fx (sink=%d)%n",
++            iterations, vanillaNs / 1e6, vanillaAlloc / 1024, optNs / 1e6, optAlloc / 1024, speedup, sink);
++        Assert.assertTrue("optimized powered rail search must be faster than vanilla (speedup=" + speedup + "x)", optNs < vanillaNs);
++        Assert.assertTrue("optimized powered rail search must allocate >= 50x less than vanilla (opt=" + optAlloc + " vs vanilla=" + vanillaAlloc + ")", optAlloc * 50 < vanillaAlloc);
++    }
+ }

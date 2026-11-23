@@ -103,6 +103,14 @@ public final class PendingLightRegistry {
         return !this.pending.isEmpty() && this.pending.containsKey(chunkKey);
     }
 
+    public int pendingCount(long chunkKey) {
+        if (this.pending.isEmpty()) {
+            return 0;
+        }
+        IntLinkedOpenHashSet set = this.pending.get(chunkKey);
+        return set == null ? 0 : set.size();
+    }
+
     /** Queue a chunk for replay if it has entries and is not already queued. */
     public void markReady(long chunkKey) {
         if (this.pending.containsKey(chunkKey) && !this.queued.containsKey(chunkKey)) {

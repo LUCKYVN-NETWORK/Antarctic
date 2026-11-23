@@ -1,0 +1,1071 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Mon, 23 Nov 2026 10:14:05 +0700
+Subject: [PATCH 109/115] feat: add async relight service, palette versioning,
+ snapshotter, applier and config
+
+
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/Lighting.java b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/Lighting.java
+index 76b2533..e90aaca 100644
+--- a/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/Lighting.java
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/Lighting.java
+@@ -15,6 +15,30 @@ public class Lighting implements IConfigModule {
+     @ConfigInfo(baseName = "deferred-light-max-entries", comments = "Maximum number of deferred light checks remembered per world. Further checks are dropped (as vanilla drops all of them). Must be positive. Default 262144.")
+     public static int deferredLightMaxEntries = 262144;
+ 
++    @ConfigInfo(baseName = "async-bulk-relight", comments = "Master toggle for the asynchronous bulk relight service and post-apply light enforcer.\nComputes the exact fixed-point lighting off the main thread on immutable snapshots. Default false.")
++    public static boolean asyncBulkRelight = false;
++
++    @ConfigInfo(baseName = "async-relight-threads", comments = "Worker thread count per world for async relight. 0 = auto (clamp(availableProcessors / 2, 1, 4)). Default 0.")
++    public static int asyncRelightThreads = 0;
++
++    @ConfigInfo(baseName = "relight-snapshot-budget-ms", comments = "Maximum main-thread milliseconds per world per tick spent snapshotting chunks for async relight. Must be positive. Default 5.")
++    public static int relightSnapshotBudgetMs = 5;
++
++    @ConfigInfo(baseName = "relight-apply-budget-ms", comments = "Maximum main-thread milliseconds per world per tick spent applying and verifying finished async relight results. Must be positive. Default 2.")
++    public static int relightApplyBudgetMs = 2;
++
++    @ConfigInfo(baseName = "auto-relight-deferred-threshold", comments = "When a chunk accumulates more than this many deferred light checks in PendingLightRegistry, convert them into one async relight request (T-bulk). Set 0 to disable. Default 512.")
++    public static int autoRelightDeferredThreshold = 512;
++
++    @ConfigInfo(baseName = "verify-after-relight", comments = "Run automatic border shell verification (LightChecker.Scope.BORDER) after every async relight apply and repair any boundary inconsistencies through PendingLightRegistry. Default true.")
++    public static boolean verifyAfterRelight = true;
++
++    @ConfigInfo(baseName = "max-relight-chunks-per-request", comments = "Maximum number of chunks accepted in a single World#relightChunks API request. Must be positive. Default 4096.")
++    public static int maxRelightChunksPerRequest = 4096;
++
++    @ConfigInfo(baseName = "save-after-relight", comments = "When true, relit chunks become immediately eligible for the next incremental autosave slot instead of waiting for auto-save-interval. Default false.")
++    public static boolean saveAfterRelight = false;
++
+     @Override
+     public EnumConfigCategory getCategory() {
+         return EnumConfigCategory.OPTIMIZATIONS;
+@@ -33,5 +57,20 @@ public class Lighting implements IConfigModule {
+         if (deferredLightMaxEntries < 1) {
+             throw new IllegalArgumentException("optimizations.lighting.deferred-light-max-entries must be positive");
+         }
++        if (asyncRelightThreads < 0) {
++            throw new IllegalArgumentException("optimizations.lighting.async-relight-threads must be >= 0");
++        }
++        if (relightSnapshotBudgetMs < 1) {
++            throw new IllegalArgumentException("optimizations.lighting.relight-snapshot-budget-ms must be positive");
++        }
++        if (relightApplyBudgetMs < 1) {
++            throw new IllegalArgumentException("optimizations.lighting.relight-apply-budget-ms must be positive");
++        }
++        if (autoRelightDeferredThreshold < 0) {
++            throw new IllegalArgumentException("optimizations.lighting.auto-relight-deferred-threshold must be >= 0");
++        }
++        if (maxRelightChunksPerRequest < 1) {
++            throw new IllegalArgumentException("optimizations.lighting.max-relight-chunks-per-request must be positive");
++        }
+     }
+ }
+diff --git a/main/java/net/minecraft/server/DataPaletteBlock.java b/main/java/net/minecraft/server/DataPaletteBlock.java
+index 67784b4..b0ce100 100644
+--- a/main/java/net/minecraft/server/DataPaletteBlock.java
++++ b/main/java/net/minecraft/server/DataPaletteBlock.java
+@@ -14,6 +14,7 @@ public class DataPaletteBlock implements DataPaletteExpandable {
+     protected DataPalette c; protected DataPalette getDataPalette() { return this.c; } // Paper - Anti-Xray - OBFHELPER
+     private int e; private int getBitsPerValue() { return this.e; } // Paper - Anti-Xray - OBFHELPER
+     private final IBlockData[] predefinedBlockData; // Paper - Anti-Xray - Add predefined block data
++    public int antarcticVersion; // Antarctic - incremented on block writes so async relight snapshots can detect staleness
+ 
+     // Paper start - Anti-Xray - Support default constructor
+     public DataPaletteBlock() {
+@@ -103,8 +104,24 @@ public class DataPaletteBlock implements DataPaletteExpandable {
+         int j = this.c.a(iblockdata);
+ 
+         this.b.a(i, j);
++        ++this.antarcticVersion; // Antarctic - invalidate in-flight light snapshots on any block write
+     }
+ 
++    // Antarctic start - fast section cell packer for LightEngine snapshots (main thread)
++    public void packLightCells(byte[] out) {
++        for (int i = 0; i < 4096; ++i) {
++            IBlockData data = this.a(i);
++            if (data != DataPaletteBlock.a) {
++                int opacity = data.c();
++                int emission = data.d();
++                if ((opacity | emission) != 0) {
++                    out[i] = me.stella.antarctic.light.LightRules.pack(opacity, emission);
++                }
++            }
++        }
++    }
++    // Antarctic end
++
+     public IBlockData a(int i, int j, int k) {
+         return this.a(b(i, j, k));
+     }
+diff --git a/main/java/net/minecraft/server/MinecraftServer.java b/main/java/net/minecraft/server/MinecraftServer.java
+index 6b9154a..8db83e3 100644
+--- a/main/java/net/minecraft/server/MinecraftServer.java
++++ b/main/java/net/minecraft/server/MinecraftServer.java
+@@ -518,6 +518,12 @@ public abstract class MinecraftServer implements ICommandListener, Runnable, IAs
+             this.saveChunks(false);
+             aworldserver = this.worldServer;
+             i = aworldserver.length;
++            for (j = 0; j < i; ++j) { // Antarctic - shut down async relight workers after world saves complete
++                worldserver = aworldserver[j];
++                if (worldserver != null) {
++                    worldserver.shutdownRelightService();
++                }
++            }
+ 
+             /* CraftBukkit start - Handled in saveChunks
+             for (j = 0; j < i; ++j) {
+diff --git a/main/java/net/minecraft/server/RelightService.java b/main/java/net/minecraft/server/RelightService.java
+new file mode 100644
+index 0000000..a19b221
+--- /dev/null
++++ b/main/java/net/minecraft/server/RelightService.java
+@@ -0,0 +1,606 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.config.toml.modules.optimizations.Lighting;
++import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
++import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
++import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
++import it.unimi.dsi.fastutil.longs.LongArrayList;
++import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
++import java.util.ArrayDeque;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.List;
++import java.util.concurrent.CompletableFuture;
++import java.util.concurrent.ConcurrentLinkedQueue;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.ThreadFactory;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicInteger;
++import me.stella.antarctic.light.HeightMaps;
++import me.stella.antarctic.light.LightColumn;
++import me.stella.antarctic.light.LightEngine;
++import me.stella.antarctic.light.LightRegion;
++import me.stella.antarctic.light.LightResult;
++import me.stella.antarctic.light.LightRules;
++import org.apache.logging.log4j.LogManager;
++import org.apache.logging.log4j.Logger;
++
++/**
++ * Per-world main-thread coordinator for asynchronous bulk relighting.
++ *
++ * <p>Architecture: requests are partitioned into 8x8 chunk tiles, snapshotted on the main thread within
++ * {@link Lighting#relightSnapshotBudgetMs}, computed on immutable {@link LightRegion} copies by a small platform-thread
++ * worker pool (never touching live NMS structures off-thread), and applied strictly in sequence-number order on the main
++ * thread within {@link Lighting#relightApplyBudgetMs}. Every target chunk is validated against chunk identity, section
++ * identity, palette identity, and {@link DataPaletteBlock#antarcticVersion} before writing nibbles; mismatches resubmit
++ * once and then fall back to the synchronous engine on the main thread.
++ *
++ * <p>Antarctic - rebuilt from the design of Starlight (Spottedleaf / PaperMC; LGPL-3.0). No code is copied.
++ */
++public final class RelightService {
++
++    private static final Logger LOGGER = LogManager.getLogger();
++    private static final int TILE_SHIFT = 3; // 8x8 chunk tiles
++
++    private final WorldServer world;
++    private final LightEngine engine = new LightEngine();
++    private final LightEngine.Scratch mainThreadScratch = new LightEngine.Scratch();
++    private final ThreadLocal<LightEngine.Scratch> workerScratch = ThreadLocal.withInitial(LightEngine.Scratch::new);
++    private final int poolSize;
++    private final ExecutorService workers;
++
++    private final ArrayDeque<PendingTile> queuedTiles = new ArrayDeque<>();
++    private final ConcurrentLinkedQueue<TileResult> completedQueue = new ConcurrentLinkedQueue<>();
++    private final Long2ObjectOpenHashMap<TileResult> readyBySeq = new Long2ObjectOpenHashMap<>();
++    private final Long2LongOpenHashMap latestSnapshottedSeq = new Long2LongOpenHashMap();
++    private final Long2IntOpenHashMap pendingChunkCounts = new Long2IntOpenHashMap();
++
++    private long nextSeq = 1L;
++    private long nextApplySeq = 1L;
++    private int inFlightTiles = 0;
++    private boolean shutdown = false;
++
++    public RelightService(WorldServer world) {
++        this.world = world;
++        this.latestSnapshottedSeq.defaultReturnValue(-1L);
++        this.pendingChunkCounts.defaultReturnValue(0);
++        int configured = Lighting.asyncRelightThreads;
++        this.poolSize = configured > 0 ? configured : Math.max(1, Math.min(4, Runtime.getRuntime().availableProcessors() / 2));
++        final String worldName = world.worldData != null && world.worldData.getName() != null ? world.worldData.getName() : "world";
++        final AtomicInteger counter = new AtomicInteger(1);
++        this.workers = Executors.newFixedThreadPool(this.poolSize, new ThreadFactory() {
++            @Override
++            public Thread newThread(Runnable r) {
++                Thread t = new Thread(r, "Antarctic-Relight-" + worldName + "-" + counter.getAndIncrement());
++                t.setDaemon(true);
++                return t;
++            }
++        });
++    }
++
++    /**
++     * Submits a batch of chunk keys (packed via {@link ChunkCoordIntPair#a(int, int)}) for asynchronous relight.
++     * Main-thread only. The returned future completes on the main thread with the number of chunks applied.
++     */
++    public CompletableFuture<Integer> submit(long[] chunkKeys) {
++        org.spigotmc.AsyncCatcher.catchOp("Async relight submission");
++        if (this.shutdown) {
++            CompletableFuture<Integer> failed = new CompletableFuture<>();
++            failed.completeExceptionally(new IllegalStateException("RelightService is shut down"));
++            return failed;
++        }
++        if (chunkKeys == null || chunkKeys.length == 0) {
++            return CompletableFuture.completedFuture(0);
++        }
++        if (chunkKeys.length > Lighting.maxRelightChunksPerRequest) {
++            CompletableFuture<Integer> failed = new CompletableFuture<>();
++            failed.completeExceptionally(new IllegalArgumentException(
++                "Relight request of " + chunkKeys.length + " chunks exceeds limit " + Lighting.maxRelightChunksPerRequest));
++            return failed;
++        }
++
++        // Deduplicate and partition into 8x8 tiles
++        LongOpenHashSet seen = new LongOpenHashSet(chunkKeys.length);
++        Long2ObjectOpenHashMap<LongArrayList> byTile = new Long2ObjectOpenHashMap<>();
++        for (long key : chunkKeys) {
++            if (!seen.add(key)) {
++                continue;
++            }
++            int cx = (int) key;
++            int cz = (int) (key >>> 32);
++            long tileKey = ChunkCoordIntPair.a(Math.floorDiv(cx, 1 << TILE_SHIFT), Math.floorDiv(cz, 1 << TILE_SHIFT));
++            LongArrayList list = byTile.get(tileKey);
++            if (list == null) {
++                list = new LongArrayList(8);
++                byTile.put(tileKey, list);
++            }
++            list.add(key);
++        }
++
++        RequestState request = new RequestState(byTile.size());
++        for (LongArrayList tileChunks : byTile.values()) {
++            long[] keys = tileChunks.toLongArray();
++            long seq = this.nextSeq++;
++            this.incrementPending(keys);
++            this.queuedTiles.addLast(new PendingTile(seq, keys, request, 0));
++        }
++        return request.future;
++    }
++
++    /** True if the chunk currently has any relight queued, snapshotted, in flight, or awaiting apply. */
++    public boolean isPending(long chunkKey) {
++        return this.pendingChunkCounts.get(chunkKey) > 0;
++    }
++
++    public int pendingTileCount() {
++        return this.queuedTiles.size() + this.inFlightTiles + this.readyBySeq.size();
++    }
++
++    /** Main-thread tick: applies completed tiles in strict sequence order, then snapshots queued tiles within budgets. */
++    public void tick() {
++        if (this.shutdown) {
++            return;
++        }
++        this.applyCompletedWithinBudget();
++        this.snapshotQueuedWithinBudget();
++    }
++
++    private void snapshotQueuedWithinBudget() {
++        int maxInFlight = this.poolSize * 2;
++        if (this.queuedTiles.isEmpty() || this.inFlightTiles >= maxInFlight) {
++            return;
++        }
++        long deadline = System.nanoTime() + Lighting.relightSnapshotBudgetMs * 1_000_000L;
++        int snapshotted = 0;
++        while (!this.queuedTiles.isEmpty() && this.inFlightTiles < maxInFlight) {
++            if (snapshotted > 0 && System.nanoTime() >= deadline) {
++                break;
++            }
++            PendingTile tile = this.queuedTiles.pollFirst();
++            TileSnapshot snapshot = this.buildTileSnapshot(tile);
++            snapshotted++;
++            if (snapshot == null) {
++                // No loaded chunks in this tile: post empty result immediately so sequence ordering stays contiguous
++                this.completedQueue.add(new TileResult(tile, null, null, null));
++                continue;
++            }
++            this.inFlightTiles++;
++            this.workers.execute(() -> {
++                LightResult result = null;
++                Throwable error = null;
++                try {
++                    result = this.engine.relight(snapshot.region, this.workerScratch.get());
++                } catch (Throwable t) {
++                    error = t;
++                }
++                this.completedQueue.add(new TileResult(tile, snapshot, result, error));
++            });
++        }
++    }
++
++    private TileSnapshot buildTileSnapshot(PendingTile tile) {
++        int minX = Integer.MAX_VALUE;
++        int maxX = Integer.MIN_VALUE;
++        int minZ = Integer.MAX_VALUE;
++        int maxZ = Integer.MIN_VALUE;
++
++        List<TargetChunkSnapshot> targets = new ArrayList<>(tile.chunkKeys.length);
++        LongOpenHashSet targetKeySet = new LongOpenHashSet(tile.chunkKeys.length);
++        for (long key : tile.chunkKeys) {
++            int cx = (int) key;
++            int cz = (int) (key >>> 32);
++            Chunk chunk = this.world.getChunkIfLoaded(cx, cz);
++            if (chunk == null) {
++                continue;
++            }
++            if (cx < minX) minX = cx;
++            if (cx > maxX) maxX = cx;
++            if (cz < minZ) minZ = cz;
++            if (cz > maxZ) maxZ = cz;
++            targetKeySet.add(key);
++
++            TargetChunkSnapshot snap = snapshotTargetChunk(chunk, cx, cz, key);
++            targets.add(snap);
++            // Record supersession watermark at snapshot time (Design §5.4)
++            long prev = this.latestSnapshottedSeq.get(key);
++            if (tile.seq > prev) {
++                this.latestSnapshottedSeq.put(key, tile.seq);
++            }
++        }
++        if (targets.isEmpty()) {
++            return null;
++        }
++
++        // Expand by 1-chunk ring on all 4 sides
++        int regionMinX = minX - 1;
++        int regionMinZ = minZ - 1;
++        int width = (maxX - minX) + 3;
++        int depth = (maxZ - minZ) + 3;
++        boolean hasSky = this.world.worldProvider != null && this.world.worldProvider.m();
++        LightRegion region = new LightRegion(regionMinX, regionMinZ, width, depth, hasSky);
++
++        for (TargetChunkSnapshot snap : targets) {
++            region.put(snap.cx, snap.cz, snap.column, true);
++        }
++
++        // Populate 1-chunk ring around target bounding box with immutable light copies
++        for (int cx = regionMinX; cx < regionMinX + width; ++cx) {
++            for (int cz = regionMinZ; cz < regionMinZ + depth; ++cz) {
++                long key = ChunkCoordIntPair.a(cx, cz);
++                if (targetKeySet.contains(key)) {
++                    continue;
++                }
++                Chunk ringChunk = this.world.getChunkIfLoaded(cx, cz);
++                if (ringChunk != null) {
++                    region.put(cx, cz, snapshotRingChunk(ringChunk, hasSky), false);
++                }
++            }
++        }
++
++        return new TileSnapshot(region, targets);
++    }
++
++    private static TargetChunkSnapshot snapshotTargetChunk(Chunk chunk, int cx, int cz, long key) {
++        ChunkSection[] liveSections = chunk.getSections();
++        ChunkSection[] snapSections = new ChunkSection[LightRules.SECTIONS];
++        DataPaletteBlock[] snapPalettes = new DataPaletteBlock[LightRules.SECTIONS];
++        int[] snapVersions = new int[LightRules.SECTIONS];
++        byte[][] packedCells = new byte[LightRules.SECTIONS][];
++
++        for (int s = 0; s < LightRules.SECTIONS; ++s) {
++            ChunkSection sec = liveSections[s];
++            snapSections[s] = sec;
++            if (sec != Chunk.a) {
++                DataPaletteBlock blocks = sec.getBlocks();
++                snapPalettes[s] = blocks;
++                snapVersions[s] = blocks.antarcticVersion;
++                byte[] cells = new byte[LightRules.SECTION_CELLS];
++                blocks.packLightCells(cells);
++                packedCells[s] = cells;
++            }
++        }
++
++        int[] heights = HeightMaps.compute(packedCells);
++        LightColumn column = new LightColumn(heights);
++        for (int s = 0; s < LightRules.SECTIONS; ++s) {
++            if (packedCells[s] != null) {
++                column.setCells(s, packedCells[s]);
++            }
++        }
++        return new TargetChunkSnapshot(chunk, cx, cz, key, snapSections, snapPalettes, snapVersions, heights, column);
++    }
++
++    private static LightColumn snapshotRingChunk(Chunk chunk, boolean hasSky) {
++        int[] heightCopy = chunk.r().clone();
++        LightColumn column = new LightColumn(heightCopy);
++        ChunkSection[] sections = chunk.getSections();
++        for (int s = 0; s < LightRules.SECTIONS; ++s) {
++            ChunkSection sec = sections[s];
++            if (sec != Chunk.a) {
++                byte[] sky = hasSky && sec.getSkyLightArray() != null ? sec.getSkyLightArray().asBytes().clone() : null;
++                byte[] block = sec.getEmittedLightArray() != null ? sec.getEmittedLightArray().asBytes().clone() : null;
++                column.setStored(s, sky, block);
++            }
++        }
++        return column;
++    }
++
++    private void applyCompletedWithinBudget() {
++        TileResult polled;
++        while ((polled = this.completedQueue.poll()) != null) {
++            if (polled.snapshot != null) {
++                this.inFlightTiles = Math.max(0, this.inFlightTiles - 1);
++            }
++            this.readyBySeq.put(polled.tile.seq, polled);
++        }
++
++        long deadline = System.nanoTime() + Lighting.relightApplyBudgetMs * 1_000_000L;
++        int appliedTiles = 0;
++        while (this.readyBySeq.containsKey(this.nextApplySeq)) {
++            if (appliedTiles > 0 && System.nanoTime() >= deadline) {
++                break;
++            }
++            TileResult tr = this.readyBySeq.remove(this.nextApplySeq++);
++            this.processTileResult(tr);
++            appliedTiles++;
++        }
++    }
++
++    private void processTileResult(TileResult tr) {
++        PendingTile tile = tr.tile;
++        try {
++            if (tr.snapshot == null) {
++                tile.request.onTileFinished(0);
++                return;
++            }
++
++            LightResult result = tr.result;
++            if (tr.error != null) {
++                LOGGER.warn("Async relight worker failed for tile seq={}; running synchronous fallback", tile.seq, tr.error);
++                try {
++                    result = this.engine.relight(tr.snapshot.region, this.mainThreadScratch);
++                } catch (Throwable syncErr) {
++                    LOGGER.error("Synchronous relight fallback failed for tile seq={}", tile.seq, syncErr);
++                    tile.request.onTileFinished(0);
++                    return;
++                }
++            }
++
++            int appliedInTile = 0;
++            LongArrayList toRetry = null;
++            boolean hasSky = this.world.worldProvider != null && this.world.worldProvider.m();
++
++            for (TargetChunkSnapshot snap : tr.snapshot.targets) {
++                // §5.5 Never touch an unloaded or replaced chunk
++                Chunk live = this.world.getChunkIfLoaded(snap.cx, snap.cz);
++                if (live != snap.chunk) {
++                    continue;
++                }
++                // §5.4 Supersession: drop older result if a newer snapshot for this chunk has already been taken
++                if (this.latestSnapshottedSeq.get(snap.key) > tile.seq) {
++                    continue;
++                }
++
++                // §5.2 Validate section/palette identity and version counter
++                if (!matchesSnapshot(live, snap)) {
++                    if (tile.retries == 0) {
++                        if (toRetry == null) {
++                            toRetry = new LongArrayList(4);
++                        }
++                        toRetry.add(snap.key);
++                    } else {
++                        // Second mismatch: deterministic synchronous fallback on main thread
++                        if (this.applySingleChunkSync(live, snap.cx, snap.cz, hasSky)) {
++                            appliedInTile++;
++                        }
++                    }
++                    continue;
++                }
++
++                this.writeLightToChunk(live, snap.cx, snap.cz, snap.heights, result, hasSky);
++                this.onChunkApplied(live, snap.cx, snap.cz);
++                appliedInTile++;
++            }
++
++            if (toRetry != null && !toRetry.isEmpty()) {
++                long[] retryKeys = toRetry.toLongArray();
++                long retrySeq = this.nextSeq++;
++                tile.request.addRetryTile();
++                this.incrementPending(retryKeys);
++                this.queuedTiles.addLast(new PendingTile(retrySeq, retryKeys, tile.request, tile.retries + 1));
++            }
++            tile.request.onTileFinished(appliedInTile);
++        } finally {
++            this.decrementPending(tile.chunkKeys, tile.seq);
++        }
++    }
++
++    private boolean applySingleChunkSync(Chunk live, int cx, int cz, boolean hasSky) {
++        try {
++            long key = ChunkCoordIntPair.a(cx, cz);
++            TargetChunkSnapshot fresh = snapshotTargetChunk(live, cx, cz, key);
++            LightRegion region = new LightRegion(cx - 1, cz - 1, 3, 3, hasSky);
++            region.put(cx, cz, fresh.column, true);
++            for (int dx = -1; dx <= 1; ++dx) {
++                for (int dz = -1; dz <= 1; ++dz) {
++                    if (dx == 0 && dz == 0) continue;
++                    Chunk ring = this.world.getChunkIfLoaded(cx + dx, cz + dz);
++                    if (ring != null) {
++                        region.put(cx + dx, cz + dz, snapshotRingChunk(ring, hasSky), false);
++                    }
++                }
++            }
++            LightResult syncResult = this.engine.relight(region, this.mainThreadScratch);
++            this.writeLightToChunk(live, cx, cz, fresh.heights, syncResult, hasSky);
++            this.onChunkApplied(live, cx, cz);
++            return true;
++        } catch (Throwable t) {
++            LOGGER.error("Synchronous relight fallback failed for chunk {},{}", cx, cz, t);
++            return false;
++        }
++    }
++
++    private void writeLightToChunk(Chunk live, int cx, int cz, int[] computedHeights, LightResult result, boolean hasSky) {
++        // Clarification 1: write recomputed HeightMaps back to Chunk.r() if stale
++        int[] liveHeights = live.r();
++        if (liveHeights != null && liveHeights.length == 256) {
++            int minHeight = Integer.MAX_VALUE;
++            boolean heightChanged = false;
++            for (int i = 0; i < 256; ++i) {
++                int h = computedHeights[i];
++                if (h < minHeight) {
++                    minHeight = h;
++                }
++                if (liveHeights[i] != h) {
++                    liveHeights[i] = h;
++                    heightChanged = true;
++                }
++            }
++            if (heightChanged) {
++                live.f(true);
++            }
++        }
++
++        // Clarification 2: write nibbles and instantiate missing sections directly without Chunk.initLighting()
++        ChunkSection[] sections = live.getSections();
++        for (int s = 0; s < LightRules.SECTIONS; ++s) {
++            byte[] skyNibbles = hasSky ? result.sky(cx, cz, s) : null;
++            byte[] blockNibbles = result.block(cx, cz, s);
++            if (skyNibbles == null && blockNibbles == null) {
++                continue;
++            }
++            ChunkSection sec = sections[s];
++            if (sec == Chunk.a) {
++                IBlockData[] predefined = this.world.chunkPacketBlockController != null
++                    ? this.world.chunkPacketBlockController.getPredefinedBlockData(live, s)
++                    : null;
++                sec = new ChunkSection(s << 4, hasSky, predefined);
++                sections[s] = sec;
++            }
++            if (blockNibbles != null) {
++                NibbleArray emitted = sec.getEmittedLightArray();
++                if (emitted != null && emitted.asBytes().length == blockNibbles.length) {
++                    System.arraycopy(blockNibbles, 0, emitted.asBytes(), 0, blockNibbles.length);
++                } else {
++                    sec.a(new NibbleArray(blockNibbles.clone()));
++                }
++            }
++            if (hasSky && skyNibbles != null) {
++                NibbleArray skyArr = sec.getSkyLightArray();
++                if (skyArr != null && skyArr.asBytes().length == skyNibbles.length) {
++                    System.arraycopy(skyNibbles, 0, skyArr.asBytes(), 0, skyNibbles.length);
++                } else {
++                    sec.b(new NibbleArray(skyNibbles.clone()));
++                }
++            }
++        }
++
++        // Clarification 3: mark dirty and lit=true so relit chunks exit the Chunk.o() per-tick retry loop
++        live.f(true);
++        live.e(true);
++        if (Lighting.saveAfterRelight) {
++            live.setLastSaved(0L);
++        }
++    }
++
++    /** Hook invoked on main thread immediately after a chunk's light is written (wired to LightChecker verifier in Commit C3). */
++    void onChunkApplied(Chunk live, int cx, int cz) {
++    }
++
++    private static boolean matchesSnapshot(Chunk live, TargetChunkSnapshot snap) {
++        ChunkSection[] sections = live.getSections();
++        for (int s = 0; s < LightRules.SECTIONS; ++s) {
++            ChunkSection liveSec = sections[s];
++            if (liveSec != snap.sections[s]) {
++                return false;
++            }
++            if (liveSec != Chunk.a) {
++                DataPaletteBlock liveBlocks = liveSec.getBlocks();
++                if (liveBlocks != snap.palettes[s] || liveBlocks.antarcticVersion != snap.versions[s]) {
++                    return false;
++                }
++            }
++        }
++        return true;
++    }
++
++    private void incrementPending(long[] keys) {
++        for (long key : keys) {
++            this.pendingChunkCounts.addTo(key, 1);
++        }
++    }
++
++    private void decrementPending(long[] keys, long completedSeq) {
++        for (long key : keys) {
++            int rem = this.pendingChunkCounts.addTo(key, -1) - 1;
++            if (rem <= 0) {
++                this.pendingChunkCounts.remove(key);
++                if (this.latestSnapshottedSeq.get(key) <= completedSeq) {
++                    this.latestSnapshottedSeq.remove(key);
++                }
++            }
++        }
++    }
++
++    public void shutdown() {
++        this.shutdown = true;
++        this.workers.shutdownNow();
++        try {
++            this.workers.awaitTermination(2L, TimeUnit.SECONDS);
++        } catch (InterruptedException e) {
++            Thread.currentThread().interrupt();
++        }
++        this.queuedTiles.clear();
++        this.completedQueue.clear();
++        this.readyBySeq.clear();
++        this.pendingChunkCounts.clear();
++        this.latestSnapshottedSeq.clear();
++    }
++
++    // ----------------------------------------------------------------------------- internal state records
++
++    private static final class RequestState {
++        final CompletableFuture<Integer> future = new CompletableFuture<>();
++        int remainingTiles;
++        int appliedChunks;
++
++        RequestState(int tiles) {
++            this.remainingTiles = tiles;
++        }
++
++        void addRetryTile() {
++            this.remainingTiles++;
++        }
++
++        void onTileFinished(int applied) {
++            this.appliedChunks += applied;
++            if (--this.remainingTiles <= 0 && !this.future.isDone()) {
++                this.future.complete(this.appliedChunks);
++            }
++        }
++    }
++
++    private static final class PendingTile {
++        final long seq;
++        final long[] chunkKeys;
++        final RequestState request;
++        final int retries;
++
++        PendingTile(long seq, long[] chunkKeys, RequestState request, int retries) {
++            this.seq = seq;
++            this.chunkKeys = chunkKeys;
++            this.request = request;
++            this.retries = retries;
++        }
++    }
++
++    private static final class TargetChunkSnapshot {
++        final Chunk chunk;
++        final int cx;
++        final int cz;
++        final long key;
++        final ChunkSection[] sections;
++        final DataPaletteBlock[] palettes;
++        final int[] versions;
++        final int[] heights;
++        final LightColumn column;
++
++        TargetChunkSnapshot(Chunk chunk, int cx, int cz, long key, ChunkSection[] sections,
++                            DataPaletteBlock[] palettes, int[] versions, int[] heights, LightColumn column) {
++            this.chunk = chunk;
++            this.cx = cx;
++            this.cz = cz;
++            this.key = key;
++            this.sections = sections;
++            this.palettes = palettes;
++            this.versions = versions;
++            this.heights = heights;
++            this.column = column;
++        }
++    }
++
++    private static final class TileSnapshot {
++        final LightRegion region;
++        final List<TargetChunkSnapshot> targets;
++
++        TileSnapshot(LightRegion region, List<TargetChunkSnapshot> targets) {
++            this.region = region;
++            this.targets = targets;
++        }
++    }
++
++    private static final class TileResult {
++        final PendingTile tile;
++        final TileSnapshot snapshot;
++        final LightResult result;
++        final Throwable error;
++
++        TileResult(PendingTile tile, TileSnapshot snapshot, LightResult result, Throwable error) {
++            this.tile = tile;
++            this.snapshot = snapshot;
++            this.result = result;
++            this.error = error;
++        }
++    }
++}
+diff --git a/main/java/net/minecraft/server/WorldServer.java b/main/java/net/minecraft/server/WorldServer.java
+index fffb8eb..5c0b8a1 100644
+--- a/main/java/net/minecraft/server/WorldServer.java
++++ b/main/java/net/minecraft/server/WorldServer.java
+@@ -65,6 +65,7 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+     private final me.stella.antarctic.collection.MultiplicitySet<NextTickListEntry> currentTickBatch = new me.stella.antarctic.collection.MultiplicitySet<NextTickListEntry>(); // Antarctic - O(1) mirror of W for isBlockTickPending checks
+     private final BlockPosition.MutableBlockPosition antarcticTickProbePos = new BlockPosition.MutableBlockPosition(); // Antarctic - zero-alloc tick probe
+     private final NextTickListEntry antarcticTickProbe = NextTickListEntry.createProbe(this.antarcticTickProbePos); // Antarctic
++    private RelightService relightService; // Antarctic - lazy async bulk relight service (active only when optimizations.lighting.async-bulk-relight=true)
+ 
+     // CraftBukkit start
+     private static Throwable getAddToWorldStackTrace(Entity entity) {
+@@ -342,6 +343,9 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+         timings.chunkTicks.stopTiming(); // Paper
+         this.methodProfiler.c("chunkMap");
+         timings.doChunkMap.startTiming(); // Spigot
++        if (this.relightService != null) { // Antarctic - apply finished async relights before deferred replay & flush
++            this.relightService.tick();
++        }
+         if (com.destroystokyo.paper.config.toml.modules.optimizations.Lighting.deferLightUpdates) { // Antarctic
+             this.drainDeferredLight(com.destroystokyo.paper.config.toml.modules.optimizations.Lighting.deferredLightUpdatesPerTick);
+         }
+@@ -740,6 +744,39 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+         this.emptyTime = 0;
+     }
+ 
++    // Antarctic start - async bulk relight service accessors and shutdown
++    @Nullable
++    public RelightService getRelightService() {
++        if (!com.destroystokyo.paper.config.toml.modules.optimizations.Lighting.asyncBulkRelight) {
++            return null;
++        }
++        if (this.relightService == null) {
++            this.relightService = new RelightService(this);
++        }
++        return this.relightService;
++    }
++
++    @Nullable
++    public RelightService getRelightServiceIfPresent() {
++        return this.relightService;
++    }
++
++    public java.util.concurrent.CompletableFuture<Integer> relightChunks(long[] chunkKeys) {
++        RelightService service = this.getRelightService();
++        if (service == null) {
++            return java.util.concurrent.CompletableFuture.completedFuture(0);
++        }
++        return service.submit(chunkKeys);
++    }
++
++    public void shutdownRelightService() {
++        if (this.relightService != null) {
++            this.relightService.shutdown();
++            this.relightService = null;
++        }
++    }
++    // Antarctic end
++
+     public boolean a(boolean flag) {
+         if (this.worldData.getType() == WorldType.DEBUG_ALL_BLOCK_STATES) {
+             return false;
+diff --git a/main/java/org/bukkit/craftbukkit/CraftServer.java b/main/java/org/bukkit/craftbukkit/CraftServer.java
+index 22120f4..99c1861 100644
+--- a/main/java/org/bukkit/craftbukkit/CraftServer.java
++++ b/main/java/org/bukkit/craftbukkit/CraftServer.java
+@@ -1085,6 +1085,7 @@ public final class CraftServer implements Server {
+                 getLogger().log(Level.SEVERE, null, ex);
+             }
+         }
++        handle.shutdownRelightService(); // Antarctic - stop async relight workers on world unload
+ 
+         worlds.remove(world.getName().toLowerCase(java.util.Locale.ENGLISH));
+         worldsByUUID.remove(world.getUID()); // Leaf - remove from UUID map
+diff --git a/test/java/net/minecraft/server/RelightServiceTest.java b/test/java/net/minecraft/server/RelightServiceTest.java
+new file mode 100644
+index 0000000..2411b0f
+--- /dev/null
++++ b/test/java/net/minecraft/server/RelightServiceTest.java
+@@ -0,0 +1,262 @@
++package net.minecraft.server;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertNull;
++import static org.junit.Assert.assertTrue;
++
++import com.destroystokyo.paper.config.toml.modules.optimizations.Lighting;
++import java.util.concurrent.CompletableFuture;
++import java.util.concurrent.TimeUnit;
++import me.stella.antarctic.light.LightChecker;
++import me.stella.antarctic.light.LightColumn;
++import me.stella.antarctic.light.LightRegion;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++/**
++ * Tests T4 (ordering, version mismatch retry + sync fallback, supersession, unload drop), T7 (empty section creation),
++ * T8 (concurrent main-thread edits during worker compute), T9 (toggle off), HeightMap write-back, and main-thread cost.
++ */
++public class RelightServiceTest {
++
++    private boolean prevAsyncCatcher;
++    private WorldServer activeWorld;
++
++    @BeforeClass
++    public static void bootstrap() throws Exception {
++        LightPropagationParityTest.bootstrap();
++    }
++
++    @Before
++    public void setUp() {
++        this.prevAsyncCatcher = org.spigotmc.AsyncCatcher.enabled;
++        org.spigotmc.AsyncCatcher.enabled = false;
++        Lighting.asyncBulkRelight = true;
++        Lighting.asyncRelightThreads = 2;
++        Lighting.relightSnapshotBudgetMs = 50;
++        Lighting.relightApplyBudgetMs = 50;
++        Lighting.verifyAfterRelight = true;
++        Lighting.maxRelightChunksPerRequest = 4096;
++        Lighting.saveAfterRelight = false;
++    }
++
++    @After
++    public void tearDown() {
++        if (this.activeWorld != null) {
++            this.activeWorld.shutdownRelightService();
++            this.activeWorld = null;
++        }
++        Lighting.asyncBulkRelight = false;
++        Lighting.asyncRelightThreads = 0;
++        Lighting.relightSnapshotBudgetMs = 5;
++        Lighting.relightApplyBudgetMs = 2;
++        Lighting.verifyAfterRelight = true;
++        Lighting.maxRelightChunksPerRequest = 4096;
++        Lighting.saveAfterRelight = false;
++        org.spigotmc.AsyncCatcher.enabled = this.prevAsyncCatcher;
++    }
++
++    private WorldServer makeWorld(long seed, LightPropagationParityTest.StubProvider[] providerOut) throws Exception {
++        WorldServer world = LightPropagationParityTest.buildWorld(seed, providerOut);
++        LightPropagationParityTest.set(World.class, world, "chunkPacketBlockController",
++            com.destroystokyo.paper.antixray.ChunkPacketBlockController.NO_OPERATION_INSTANCE);
++        for (int cx = -2; cx <= 1; ++cx) {
++            for (int cz = -2; cz <= 1; ++cz) {
++                Chunk c = world.getChunkIfLoaded(cx, cz);
++                LightPropagationParityTest.set(Chunk.class, c, "locX", cx);
++                LightPropagationParityTest.set(Chunk.class, c, "locZ", cz);
++            }
++        }
++        this.activeWorld = world;
++        return world;
++    }
++
++    private static int driveUntilDone(RelightService service, CompletableFuture<Integer> future) throws Exception {
++        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
++        while (!future.isDone() && System.nanoTime() < deadline) {
++            service.tick();
++            if (!future.isDone()) {
++                Thread.sleep(1);
++            }
++        }
++        assertTrue("relight future must complete within timeout", future.isDone());
++        return future.get();
++    }
++
++    @Test
++    public void toggleOffCreatesNoServiceAndReturnsZero() throws Exception {
++        Lighting.asyncBulkRelight = false;
++        LightPropagationParityTest.StubProvider[] p = new LightPropagationParityTest.StubProvider[1];
++        WorldServer world = makeWorld(1L, p);
++        assertNull(world.getRelightService());
++        assertEquals(Integer.valueOf(0), world.relightChunks(new long[]{ChunkCoordIntPair.a(0, 0)}).get());
++    }
++
++    @Test
++    public void requestExceedingMaxLimitFailsCleanly() throws Exception {
++        Lighting.maxRelightChunksPerRequest = 4;
++        LightPropagationParityTest.StubProvider[] p = new LightPropagationParityTest.StubProvider[1];
++        WorldServer world = makeWorld(2L, p);
++        CompletableFuture<Integer> future = world.relightChunks(new long[]{1, 2, 3, 4, 5});
++        assertTrue(future.isCompletedExceptionally());
++    }
++
++    @Test
++    public void asyncRelightFixesStaleHeightMapAndEmptySectionSpillWithoutInitLighting() throws Exception {
++        LightPropagationParityTest.StubProvider[] p = new LightPropagationParityTest.StubProvider[1];
++        WorldServer world = makeWorld(3L, p);
++        Chunk c = world.getChunkIfLoaded(0, 0);
++
++        // Clear all sections >= 2 to Chunk.a (null), place a glowstone at top of section 1 (y=31) so light spills into section 2!
++        for (int s = 2; s < 16; ++s) {
++            c.getSections()[s] = Chunk.a;
++        }
++        LightPropagationParityTest.setBlock(world, 8, 31, 8, Blocks.GLOWSTONE.getBlockData());
++        // Corrupt the HeightMap (like bulk schematic writers in SuperiorWorld) and mark lit=false
++        c.r()[8 << 4 | 8] = 0;
++        c.e(false);
++
++        RelightService service = world.getRelightService();
++        assertNotNull(service);
++        CompletableFuture<Integer> future = service.submit(new long[]{ChunkCoordIntPair.a(0, 0)});
++        int applied = driveUntilDone(service, future);
++        assertEquals(1, applied);
++
++        // Clarification 1: HeightMap repaired
++        assertEquals("stale HeightMap must be repaired on apply", 32, c.r()[8 << 4 | 8]);
++        // Clarification 2: section 2 created for spilled light, higher untouched sections remain Chunk.a (T7)
++        assertNotNull("section 2 must be created for spilled light", c.getSections()[2]);
++        assertEquals(15, world.getBrightness(EnumSkyBlock.BLOCK, 8, 31, 8));
++        assertEquals(14, world.getBrightness(EnumSkyBlock.BLOCK, 8, 32, 8));
++        assertNull("untouched empty section 15 must remain Chunk.a", c.getSections()[15]);
++        // Clarification 3: chunk marked lit=true
++        assertTrue("relit chunk must be marked lit=true", c.v());
++    }
++
++    @Test
++    public void unloadedChunkIsNeverTouchedOnApply() throws Exception {
++        LightPropagationParityTest.StubProvider[] p = new LightPropagationParityTest.StubProvider[1];
++        WorldServer world = makeWorld(4L, p);
++        Chunk target = world.getChunkIfLoaded(0, 0);
++        LightPropagationParityTest.setBlock(world, 5, 40, 5, Blocks.GLOWSTONE.getBlockData());
++
++        RelightService service = world.getRelightService();
++        CompletableFuture<Integer> future = service.submit(new long[]{ChunkCoordIntPair.a(0, 0)});
++        // Snapshot the tile, then immediately unload the chunk before apply runs
++        service.tick();
++        p[0].chunks.remove(ChunkCoordIntPair.a(0, 0));
++
++        int applied = driveUntilDone(service, future);
++        assertEquals("unloaded chunk must be dropped and not counted as applied", 0, applied);
++        assertEquals("unloaded chunk light array must not be mutated", 0, target.getSections()[2].getEmittedLightArray().a(5, 40 & 15, 5));
++    }
++
++    @Test
++    public void concurrentMainThreadEditsConvergeWithZeroExceptions() throws Exception {
++        LightPropagationParityTest.StubProvider[] p = new LightPropagationParityTest.StubProvider[1];
++        WorldServer world = makeWorld(5L, p);
++        RelightService service = world.getRelightService();
++
++        long[] keys = new long[]{
++            ChunkCoordIntPair.a(-1, -1), ChunkCoordIntPair.a(0, -1),
++            ChunkCoordIntPair.a(-1, 0), ChunkCoordIntPair.a(0, 0)
++        };
++
++        // Submit initial relight, mutate blocks while workers run (triggering version-mismatch retry / sync fallback)
++        LightPropagationParityTest.setBlock(world, 4, 40, 4, Blocks.GLOWSTONE.getBlockData());
++        CompletableFuture<Integer> f1 = service.submit(keys);
++        service.tick(); // snapshot f1
++        // Mutate block in chunk (0, 0) mid-flight -> increments DataPaletteBlock.antarcticVersion
++        LightPropagationParityTest.setBlock(world, 4, 40, 4, Blocks.AIR.getBlockData());
++        LightPropagationParityTest.setBlock(world, 10, 40, 10, Blocks.TORCH.getBlockData());
++
++        int applied = driveUntilDone(service, f1);
++        assertEquals("all 4 chunks must converge via retry or sync fallback", 4, applied);
++        // Torch at (10, 40, 10) has emission 14; Manhattan distance to (4, 40, 4) is 12 -> exact light = 14 - 12 = 2 (glowstone's 15 is gone)
++        assertEquals("removed glowstone must leave only torch light (14 - 12 = 2)", 2, world.getBrightness(EnumSkyBlock.BLOCK, 4, 40, 4));
++        assertEquals("newly placed torch must have exact light 14", 14, world.getBrightness(EnumSkyBlock.BLOCK, 10, 40, 10));
++    }
++
++    @Test
++    public void asyncBulkRelightCutsMainThreadWorkVsInlineWorldChecks() throws Exception {
++        LightPropagationParityTest.StubProvider[] pInline = new LightPropagationParityTest.StubProvider[1];
++        LightPropagationParityTest.StubProvider[] pAsync = new LightPropagationParityTest.StubProvider[1];
++        WorldServer inlineWorld = makeWorld(99L, pInline);
++        WorldServer asyncWorld = LightPropagationParityTest.buildWorld(99L, pAsync);
++        LightPropagationParityTest.set(World.class, asyncWorld, "chunkPacketBlockController",
++            com.destroystokyo.paper.antixray.ChunkPacketBlockController.NO_OPERATION_INSTANCE);
++        for (int cx = -2; cx <= 1; ++cx) {
++            for (int cz = -2; cz <= 1; ++cz) {
++                Chunk c = asyncWorld.getChunkIfLoaded(cx, cz);
++                LightPropagationParityTest.set(Chunk.class, c, "locX", cx);
++                LightPropagationParityTest.set(Chunk.class, c, "locZ", cz);
++            }
++        }
++
++        // Paste 256 glowstone blocks across 4 chunks (-1..0, -1..0)
++        BlockPosition[] placed = new BlockPosition[256];
++        int idx = 0;
++        for (int x = -16; x < 16; x += 2) {
++            for (int z = -16; z < 16; z += 2) {
++                placed[idx++] = new BlockPosition(x, 40, z);
++                LightPropagationParityTest.setBlock(inlineWorld, x, 40, z, Blocks.GLOWSTONE.getBlockData());
++                LightPropagationParityTest.setBlock(asyncWorld, x, 40, z, Blocks.GLOWSTONE.getBlockData());
++            }
++        }
++
++        long tInline0 = System.nanoTime();
++        for (BlockPosition bp : placed) {
++            inlineWorld.w(bp);
++        }
++        long inlineMainNanos = System.nanoTime() - tInline0;
++
++        RelightService service = asyncWorld.getRelightService();
++        long[] keys = {
++            ChunkCoordIntPair.a(-1, -1), ChunkCoordIntPair.a(0, -1),
++            ChunkCoordIntPair.a(-1, 0), ChunkCoordIntPair.a(0, 0)
++        };
++        long asyncMainNanos = 0L;
++        long tSub0 = System.nanoTime();
++        CompletableFuture<Integer> future = service.submit(keys);
++        asyncMainNanos += System.nanoTime() - tSub0;
++        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
++        while (!future.isDone() && System.nanoTime() < deadline) {
++            long tTick0 = System.nanoTime();
++            service.tick();
++            asyncMainNanos += System.nanoTime() - tTick0;
++            if (!future.isDone()) {
++                Thread.sleep(1);
++            }
++        }
++        assertTrue(future.isDone());
++        assertEquals(Integer.valueOf(4), future.get());
++        asyncWorld.shutdownRelightService();
++
++        System.out.printf("[perf] 256-glowstone 4-chunk bulk paste main-thread time: inline=%.2f ms, async=%.2f ms (%.1fx less main-thread work)%n",
++            inlineMainNanos / 1.0e6, asyncMainNanos / 1.0e6, (double) inlineMainNanos / Math.max(1L, asyncMainNanos));
++        assertTrue("async relight must spend less main-thread time than 256 inline World.w checks", asyncMainNanos < inlineMainNanos);
++    }
++
++    @Test
++    public void overlappingRequestsNeverLetOlderResultOverwriteNewer() throws Exception {
++        LightPropagationParityTest.StubProvider[] p = new LightPropagationParityTest.StubProvider[1];
++        WorldServer world = makeWorld(6L, p);
++        RelightService service = world.getRelightService();
++
++        // Request 1 sees glowstone at (6, 40, 6)
++        LightPropagationParityTest.setBlock(world, 6, 40, 6, Blocks.GLOWSTONE.getBlockData());
++        CompletableFuture<Integer> f1 = service.submit(new long[]{ChunkCoordIntPair.a(0, 0)});
++        service.tick(); // snapshots f1
++
++        // Now remove glowstone and submit Request 2 before f1 applies
++        LightPropagationParityTest.setBlock(world, 6, 40, 6, Blocks.AIR.getBlockData());
++        CompletableFuture<Integer> f2 = service.submit(new long[]{ChunkCoordIntPair.a(0, 0)});
++
++        driveUntilDone(service, CompletableFuture.allOf(f1, f2).thenApply(v -> 0));
++        assertEquals("newer request (air) must win over older request (glowstone)", 0, world.getBrightness(EnumSkyBlock.BLOCK, 6, 40, 6));
++    }
++}

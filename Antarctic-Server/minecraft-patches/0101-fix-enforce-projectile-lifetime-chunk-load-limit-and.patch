@@ -1,0 +1,262 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Mon, 23 Nov 2026 09:27:56 +0700
+Subject: [PATCH 101/115] fix: enforce projectile lifetime chunk load limit and
+ per-world tick cap
+
+
+diff --git a/main/java/net/minecraft/server/EntityProjectile.java b/main/java/net/minecraft/server/EntityProjectile.java
+index cff7d12..efefd42 100644
+--- a/main/java/net/minecraft/server/EntityProjectile.java
++++ b/main/java/net/minecraft/server/EntityProjectile.java
+@@ -297,31 +297,47 @@ public abstract class EntityProjectile extends Entity implements IProjectile {
+     }
+ 
+     // Antarctic start - reduce projectile chunk loading
+-    private static int loadedThisTick = 0;
+-    private static int loadedTick;
+-
+     private int loadedLifetime = 0;
++    private int antarcticLastChunkX = Integer.MIN_VALUE;
++    private int antarcticLastChunkZ = Integer.MIN_VALUE;
++
+     @Override
+     public void setPosition(double x, double y, double z) {
+-        int currentTick = net.minecraft.server.MinecraftServer.currentTick;
+-        if (loadedTick != currentTick) {
+-            loadedTick = currentTick;
+-            loadedThisTick = 0;
+-        }
+-        int previousX = MathHelper.floor(this.locX) >> 4, previousZ = MathHelper.floor(this.locZ) >> 4;
+-        int newX = MathHelper.floor(x) >> 4, newZ = MathHelper.floor(z) >> 4;
+-        if (previousX != newX || previousZ != newZ) {
+-            boolean isLoaded = ((net.minecraft.server.ChunkProviderServer) this.world.getChunkProvider()).isLoaded(newX, newZ);
+-            if (!isLoaded) {
+-                if (EntityProjectile.loadedThisTick > com.destroystokyo.paper.config.toml.modules.optimizations.Projectiles.maxLoadsPerTick) {
+-                    if (++this.loadedLifetime > com.destroystokyo.paper.config.toml.modules.optimizations.Projectiles.maxLoadsPerProjectile) {
+-                        this.die();
++        int newX = MathHelper.floor(x) >> 4;
++        int newZ = MathHelper.floor(z) >> 4;
++        if (this.world != null && !this.world.isClientSide && (this.antarcticLastChunkX != newX || this.antarcticLastChunkZ != newZ)) {
++            IChunkProvider provider = this.world.getChunkProvider();
++            if (provider instanceof ChunkProviderServer && !((ChunkProviderServer) provider).isLoaded(newX, newZ)) {
++                int currentTick = MinecraftServer.currentTick;
++                if (this.world.projectileChunkLoadsTick != currentTick) {
++                    this.world.projectileChunkLoadsTick = currentTick;
++                    this.world.projectileChunkLoadsThisTick = 0;
++                }
++                int maxPerProjectile = Math.max(0, com.destroystokyo.paper.config.toml.modules.optimizations.Projectiles.maxLoadsPerProjectile);
++                if (this.loadedLifetime >= maxPerProjectile) {
++                    if (this.antarcticLastChunkX != Integer.MIN_VALUE && this.locX == x && this.locZ == z) {
++                        this.locX = this.lastX;
++                        this.locY = this.lastY;
++                        this.locZ = this.lastZ;
++                    }
++                    this.die();
++                    return;
++                }
++                int maxPerTick = Math.max(0, com.destroystokyo.paper.config.toml.modules.optimizations.Projectiles.maxLoadsPerTick);
++                if (this.world.projectileChunkLoadsThisTick >= maxPerTick) {
++                    if (this.antarcticLastChunkX != Integer.MIN_VALUE && this.locX == x && this.locZ == z) {
++                        this.locX = this.lastX;
++                        this.locY = this.lastY;
++                        this.locZ = this.lastZ;
+                     }
+                     return;
+                 }
+-                EntityProjectile.loadedThisTick++;
++                this.world.projectileChunkLoadsThisTick++;
++                this.loadedLifetime++;
+             }
+         }
++        this.antarcticLastChunkX = newX;
++        this.antarcticLastChunkZ = newZ;
+         super.setPosition(x, y, z);
+     }
+     // Antarctic end
+diff --git a/main/java/net/minecraft/server/World.java b/main/java/net/minecraft/server/World.java
+index b331c75..3df9f79 100644
+--- a/main/java/net/minecraft/server/World.java
++++ b/main/java/net/minecraft/server/World.java
+@@ -157,6 +157,8 @@ public abstract class World implements IBlockAccess {
+     private int tileTickPosition;
+     public final Map<Explosion.CacheKey, Float> explosionDensityCache = new HashMap<>(); // Paper - Optimize explosions
+     public java.util.ArrayDeque<BlockRedstoneTorch.RedstoneUpdateInfo> redstoneUpdateInfos; // Paper - Move from Map in BlockRedstoneTorch to here
++    int projectileChunkLoadsTick = Integer.MIN_VALUE; // Antarctic - per-world projectile chunk load cap
++    int projectileChunkLoadsThisTick = 0; // Antarctic
+ 
+     public CraftWorld getWorld() {
+         return this.world;
+diff --git a/test/java/net/minecraft/server/ProjectileChunkLoadTest.java b/test/java/net/minecraft/server/ProjectileChunkLoadTest.java
+new file mode 100644
+index 0000000..f29f9af
+--- /dev/null
++++ b/test/java/net/minecraft/server/ProjectileChunkLoadTest.java
+@@ -0,0 +1,167 @@
++package net.minecraft.server;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++
++import com.destroystokyo.paper.config.toml.modules.optimizations.Projectiles;
++import java.lang.reflect.Field;
++import org.junit.After;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++public class ProjectileChunkLoadTest {
++
++    private static Unsafe unsafe;
++
++    private static final class StubChunkProvider extends ChunkProviderServer {
++        StubChunkProvider(WorldServer world) {
++            super(world, null, null);
++        }
++
++        void markLoaded(int cx, int cz) throws Exception {
++            Chunk chunk = (Chunk) unsafe.allocateInstance(Chunk.class);
++            this.chunks.put(ChunkCoordIntPair.a(cx, cz), chunk);
++        }
++    }
++
++    private static final class DummyProjectile extends EntityProjectile {
++        DummyProjectile(World world) {
++            super(world);
++        }
++
++        @Override
++        protected void a(MovingObjectPosition movingobjectposition) {
++        }
++    }
++
++    @BeforeClass
++    public static void bootstrap() throws Exception {
++        Field field = Unsafe.class.getDeclaredField("theUnsafe");
++        field.setAccessible(true);
++        unsafe = (Unsafe) field.get(null);
++    }
++
++    @After
++    public void restoreDefaults() {
++        Projectiles.maxLoadsPerTick = 10;
++        Projectiles.maxLoadsPerProjectile = 10;
++    }
++
++    private static void set(Class<?> owner, Object instance, String name, Object value) throws Exception {
++        Field f = owner.getDeclaredField(name);
++        f.setAccessible(true);
++        f.set(instance, value);
++    }
++
++    private static WorldServer makeWorld(StubChunkProvider[] providerOut) throws Exception {
++        WorldServer world = (WorldServer) unsafe.allocateInstance(WorldServer.class);
++        set(World.class, world, "isClientSide", false);
++        world.projectileChunkLoadsTick = Integer.MIN_VALUE;
++        world.projectileChunkLoadsThisTick = 0;
++        StubChunkProvider provider = new StubChunkProvider(world);
++        provider.markLoaded(0, 0);
++        set(World.class, world, "chunkProvider", provider);
++        providerOut[0] = provider;
++        return world;
++    }
++
++    private static DummyProjectile makeProjectile(WorldServer world) throws Exception {
++        DummyProjectile p = (DummyProjectile) unsafe.allocateInstance(DummyProjectile.class);
++        set(Entity.class, p, "world", world);
++        p.width = 0.25F;
++        p.length = 0.25F;
++        set(EntityProjectile.class, p, "antarcticLastChunkX", Integer.MIN_VALUE);
++        set(EntityProjectile.class, p, "antarcticLastChunkZ", Integer.MIN_VALUE);
++        p.setPosition(8.0D, 64.0D, 8.0D); // in loaded chunk (0, 0)
++        return p;
++    }
++
++    @Test
++    public void singleProjectileDiesAfterExactLifetimeLimitEvenDuringFlightPattern() throws Exception {
++        Projectiles.maxLoadsPerTick = 10;
++        Projectiles.maxLoadsPerProjectile = 10;
++        StubChunkProvider[] providerOut = new StubChunkProvider[1];
++        WorldServer world = makeWorld(providerOut);
++        DummyProjectile p = makeProjectile(world);
++
++        int movedIntoUnloaded = 0;
++        for (int tick = 1; tick <= 50; ++tick) {
++            MinecraftServer.currentTick = tick;
++            if (p.dead) {
++                break;
++            }
++            // Simulate EntityProjectile.B_() mutating locX before setPosition(locX, locY, locZ)
++            p.lastX = p.locX;
++            p.lastY = p.locY;
++            p.lastZ = p.locZ;
++            p.locX = tick * 16.0D + 8.0D;
++            p.setPosition(p.locX, p.locY, p.locZ);
++            if (!p.dead && (MathHelper.floor(p.locX) >> 4) == tick) {
++                movedIntoUnloaded++;
++            }
++        }
++
++        assertTrue("projectile must die after reaching maxLoadsPerProjectile", p.dead);
++        assertEquals("projectile must load exactly maxLoadsPerProjectile unloaded chunks", 10, movedIntoUnloaded);
++        assertEquals("blocked move must keep dying projectile in last loaded chunk", 10, MathHelper.floor(p.locX) >> 4);
++    }
++
++    @Test
++    public void perTickLimitHasNoOffByOneAndDoesNotStarveOtherWorlds() throws Exception {
++        Projectiles.maxLoadsPerTick = 5;
++        Projectiles.maxLoadsPerProjectile = 10;
++        StubChunkProvider[] providerA = new StubChunkProvider[1];
++        StubChunkProvider[] providerB = new StubChunkProvider[1];
++        WorldServer worldA = makeWorld(providerA);
++        WorldServer worldB = makeWorld(providerB);
++
++        MinecraftServer.currentTick = 500;
++        int allowedA = 0;
++        for (int i = 1; i <= 12; ++i) {
++            DummyProjectile p = makeProjectile(worldA);
++            p.lastX = p.locX;
++            p.lastY = p.locY;
++            p.lastZ = p.locZ;
++            p.locX = i * 16.0D + 8.0D;
++            p.setPosition(p.locX, p.locY, p.locZ);
++            if ((MathHelper.floor(p.locX) >> 4) == i) {
++                allowedA++;
++            }
++            assertFalse("per-tick cap alone must not kill projectile", p.dead);
++        }
++        assertEquals("exact per-tick cap without +1 off-by-one", 5, allowedA);
++        assertEquals(5, worldA.projectileChunkLoadsThisTick);
++
++        // World B must still have its full independent budget on the same tick
++        int allowedB = 0;
++        for (int i = 1; i <= 8; ++i) {
++            DummyProjectile p = makeProjectile(worldB);
++            p.setPosition(i * 16.0D + 8.0D, 64.0D, 8.0D);
++            if ((MathHelper.floor(p.locX) >> 4) == i) {
++                allowedB++;
++            }
++        }
++        assertEquals("world B must have independent per-world tick cap", 5, allowedB);
++    }
++
++    @Test
++    public void zeroLimitsPreventAllUnloadedChunkLoads() throws Exception {
++        Projectiles.maxLoadsPerTick = 0;
++        Projectiles.maxLoadsPerProjectile = 0;
++        StubChunkProvider[] providerOut = new StubChunkProvider[1];
++        WorldServer world = makeWorld(providerOut);
++        DummyProjectile p = makeProjectile(world);
++
++        MinecraftServer.currentTick = 600;
++        p.lastX = p.locX;
++        p.lastY = p.locY;
++        p.lastZ = p.locZ;
++        p.locX = 24.0D;
++        p.setPosition(p.locX, p.locY, p.locZ);
++
++        assertTrue(p.dead);
++        assertEquals(0, MathHelper.floor(p.locX) >> 4);
++    }
++}

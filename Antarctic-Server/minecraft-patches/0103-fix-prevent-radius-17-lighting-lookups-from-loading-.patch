@@ -1,0 +1,248 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Mon, 23 Nov 2026 09:34:52 +0700
+Subject: [PATCH 103/115] fix: prevent radius-17 lighting lookups from loading
+ unloaded chunks
+
+
+diff --git a/main/java/net/minecraft/server/Chunk.java b/main/java/net/minecraft/server/Chunk.java
+index a8a5200..3a98e6f 100644
+--- a/main/java/net/minecraft/server/Chunk.java
++++ b/main/java/net/minecraft/server/Chunk.java
+@@ -1347,6 +1347,8 @@ public class Chunk {
+         this.x = 0;
+     }
+ 
++    private static final EnumDirection[] ANTARCTIC_DIRECTIONS = EnumDirection.values(); // Antarctic - avoid values() array clone in Chunk.n()
++
+     public void n() {
+         if (this.x < 4096) {
+             BlockPosition blockposition = new BlockPosition(this.locX << 4, 0, this.locZ << 4);
+@@ -1367,14 +1369,15 @@ public class Chunk {
+                     boolean flag = i1 == 0 || i1 == 15 || k == 0 || k == 15 || l == 0 || l == 15;
+ 
+                     if (this.sections[j] == Chunk.a && flag || this.sections[j] != Chunk.a && this.sections[j].getType(k, i1, l).getMaterial() == Material.AIR) {
+-                        EnumDirection[] aenumdirection = EnumDirection.values();
++                        EnumDirection[] aenumdirection = ANTARCTIC_DIRECTIONS; // Antarctic
+                         int j1 = aenumdirection.length;
+ 
+                         for (int k1 = 0; k1 < j1; ++k1) {
+                             EnumDirection enumdirection = aenumdirection[k1];
+                             BlockPosition blockposition2 = blockposition1.shift(enumdirection);
++                            IBlockData neighborData = this.world.getTypeIfLoaded(blockposition2); // Antarctic - avoid sync chunk load
+ 
+-                            if (this.world.getType(blockposition2).d() > 0) {
++                            if (neighborData != null && neighborData.d() > 0) {
+                                 this.world.w(blockposition2);
+                             }
+                         }
+@@ -1391,16 +1394,19 @@ public class Chunk {
+         world.timings.lightChunk.startTiming(); // Paper
+         this.done = true;
+         this.lit = true;
+-        BlockPosition blockposition = new BlockPosition(this.locX << 4, 0, this.locZ << 4);
+ 
+         if (this.world.worldProvider.m()) {
+-            if (this.world.areChunksLoadedBetween(blockposition.a(-1, 0, -1), blockposition.a(16, this.world.getSeaLevel(), 16))) {
+-                label42:
+-                for (int i = 0; i < 16; ++i) {
+-                    for (int j = 0; j < 16; ++j) {
+-                        if (!this.e(i, j)) {
+-                            this.lit = false;
+-                            break label42;
++            // Antarctic start - zero-alloc 3x3 neighbor check and empty-void fast path
++            if (this.areNeighborsLoaded(1)) {
++                BlockPosition blockposition = new BlockPosition(this.locX << 4, 0, this.locZ << 4);
++                if (this.y() != null) {
++                    label42:
++                    for (int i = 0; i < 16; ++i) {
++                        for (int j = 0; j < 16; ++j) {
++                            if (!this.e(i, j)) {
++                                this.lit = false;
++                                break label42;
++                            }
+                         }
+                     }
+                 }
+@@ -1420,6 +1426,7 @@ public class Chunk {
+             } else {
+                 this.lit = false;
+             }
++            // Antarctic end
+         }
+ 
+         world.timings.lightChunk.stopTiming(); // Paper
+diff --git a/main/java/net/minecraft/server/World.java b/main/java/net/minecraft/server/World.java
+index 3df9f79..99c561e 100644
+--- a/main/java/net/minecraft/server/World.java
++++ b/main/java/net/minecraft/server/World.java
+@@ -2497,10 +2497,21 @@ public abstract class World implements IBlockAccess {
+     }
+ 
+     private int a(BlockPosition blockposition, EnumSkyBlock enumskyblock) {
+-        if (enumskyblock == EnumSkyBlock.SKY && this.h(blockposition)) {
++        // Antarctic start - avoid synchronous chunk loads at radius 17 and reuse single chunk lookup
++        int x = blockposition.getX();
++        int y = blockposition.getY();
++        int z = blockposition.getZ();
++        Chunk chunk = this.getChunkIfLoaded(x >> 4, z >> 4);
++        if (chunk == null) {
++            return enumskyblock.c;
++        }
++        if (enumskyblock == EnumSkyBlock.SKY && chunk.c(blockposition)) {
+             return 15;
+         } else {
+-            IBlockData iblockdata = this.getType(blockposition);
++            IBlockData iblockdata = this.captureTreeGeneration ? this.getCapturedBlockType(x, y, z) : null;
++            if (iblockdata == null) {
++                iblockdata = chunk.getBlockData(x, y, z);
++            }
+             int i = enumskyblock == EnumSkyBlock.SKY ? 0 : iblockdata.d();
+             int j = iblockdata.c();
+ 
+@@ -2517,10 +2528,6 @@ public abstract class World implements IBlockAccess {
+             } else if (i >= 14) {
+                 return i;
+             } else {
+-                // Antarctic start - ints and the cached direction array instead of a pooled position and values()
+-                int x = blockposition.getX();
+-                int y = blockposition.getY();
+-                int z = blockposition.getZ();
+                 EnumDirection[] aenumdirection = LIGHT_DIRECTIONS;
+                 int k = aenumdirection.length;
+ 
+@@ -2538,9 +2545,9 @@ public abstract class World implements IBlockAccess {
+                 }
+ 
+                 return i;
+-                // Antarctic end
+             }
+         }
++        // Antarctic end
+     }
+ 
+     // Antarctic start - deferred light checks (see PendingLightRegistry)
+@@ -2642,7 +2649,11 @@ public abstract class World implements IBlockAccess {
+                                     int i5 = k2 + enumdirection.getAdjacentZ();
+ 
+                                     blockposition_pooledblockposition.f(k4, l4, i5);
+-                                    int j5 = Math.max(1, this.getType(blockposition_pooledblockposition).c());
++                                    IBlockData antarctic$neighborData = this.getTypeIfLoaded(blockposition_pooledblockposition); // Antarctic - do not sync-load cx+/-2 at radius 17
++                                    if (antarctic$neighborData == null) {
++                                        continue;
++                                    }
++                                    int j5 = Math.max(1, antarctic$neighborData.c());
+ 
+                                     l2 = this.getBrightness(enumskyblock, k4, l4, i5); // Antarctic
+                                     if (l2 == l3 - j5 && j < this.J.length) {
+diff --git a/test/java/net/minecraft/server/LightBorderNoSyncLoadTest.java b/test/java/net/minecraft/server/LightBorderNoSyncLoadTest.java
+new file mode 100644
+index 0000000..35ac741
+--- /dev/null
++++ b/test/java/net/minecraft/server/LightBorderNoSyncLoadTest.java
+@@ -0,0 +1,105 @@
++package net.minecraft.server;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++public class LightBorderNoSyncLoadTest {
++
++    @BeforeClass
++    public static void bootstrap() throws Exception {
++        LightPropagationParityTest.bootstrap();
++    }
++
++    /**
++     * Round 2 simulation reproducer: with only the 3x3 chunks (-1..1, -1..1) loaded (chunk cx=-2 unloaded),
++     * removing a glowstone at x=0 while an unlit light trail reaches x=-15 (distance 15, radius-17 darkening/relight
++     * probes x=-16 in cx=-2) must never trigger a synchronous chunk load on cx=-2.
++     */
++    @Test
++    public void radius17BorderDarkeningAndRelightNeverLoadsUnloadedChunk() throws Exception {
++        LightPropagationParityTest.StubProvider[] providerOut = new LightPropagationParityTest.StubProvider[1];
++        WorldServer world = LightPropagationParityTest.buildWorld(42L, providerOut);
++
++        // Unload all cx == -2 chunks so only the 3x3 around (0, 0) plus (+1) exist, matching areNeighborsLoaded(1) == true
++        for (int cz = -2; cz <= 1; ++cz) {
++            providerOut[0].chunks.remove(ChunkCoordIntPair.a(-2, cz));
++        }
++
++        // Place glowstone at (0, 40, 0) (above all random stone pillars) and populate its light first
++        BlockPosition glowstonePos = new BlockPosition(0, 40, 0);
++        LightPropagationParityTest.setBlock(world, 0, 40, 0, Blocks.GLOWSTONE.getBlockData());
++
++        assertTrue(world.c(EnumSkyBlock.BLOCK, glowstonePos));
++        assertEquals(15, world.getBrightness(EnumSkyBlock.BLOCK, 0, 40, 0));
++        assertEquals(1, world.getBrightness(EnumSkyBlock.BLOCK, -14, 40, 0));
++
++        // Now place an unlit torch at (-15, 40, 0) and remove the glowstone:
++        // darkening reaches x=-15 (distance 15), relight lights the torch at x=-15 and probes x=-16 (cx=-2)
++        LightPropagationParityTest.setBlock(world, -15, 40, 0, Blocks.TORCH.getBlockData());
++        LightPropagationParityTest.setBlock(world, 0, 40, 0, Blocks.AIR.getBlockData());
++        // This previously called World.getType(-16, 40, 0) -> originalGetChunkAt(-2, 0) -> AssertionError!
++        assertTrue(world.c(EnumSkyBlock.BLOCK, glowstonePos));
++        assertTrue(world.c(EnumSkyBlock.SKY, glowstonePos));
++
++        // Ensure torch at (-15, 40, 0) shines properly on the loaded chunk without loading cx=-2
++        assertEquals(14, world.getBrightness(EnumSkyBlock.BLOCK, -15, 40, 0));
++        assertEquals(13, world.getBrightness(EnumSkyBlock.BLOCK, -14, 40, 0));
++
++        // Chunk.n() border relight scan on chunk (-1, 0) must also never load cx=-2
++        Chunk borderChunk = world.getChunkIfLoaded(-1, 0);
++        LightPropagationParityTest.set(Chunk.class, borderChunk, "locX", -1);
++        LightPropagationParityTest.set(Chunk.class, borderChunk, "locZ", 0);
++        borderChunk.m(); // reset x = 0
++        for (int step = 0; step < 32; ++step) {
++            borderChunk.n();
++        }
++    }
++
++    @Test
++    public void chunkCheckLightUnloadedNeighborAndEmptyVoidFastPath() throws Exception {
++        LightPropagationParityTest.StubProvider[] providerOut = new LightPropagationParityTest.StubProvider[1];
++        WorldServer world = LightPropagationParityTest.buildWorld(77L, providerOut);
++        // Allocate minimal WorldTimingsHandler with a no-op Timing for Chunk.o()
++        java.lang.reflect.Field uf = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
++        uf.setAccessible(true);
++        sun.misc.Unsafe u = (sun.misc.Unsafe) uf.get(null);
++        co.aikar.timings.WorldTimingsHandler handler = (co.aikar.timings.WorldTimingsHandler) u.allocateInstance(co.aikar.timings.WorldTimingsHandler.class);
++        LightPropagationParityTest.set(co.aikar.timings.WorldTimingsHandler.class, handler, "lightChunk", co.aikar.timings.NullTimingHandler.NULL);
++        LightPropagationParityTest.set(World.class, world, "timings", handler);
++        LightPropagationParityTest.set(World.class, world, "chunkPacketBlockController", com.destroystokyo.paper.antixray.ChunkPacketBlockController.NO_OPERATION_INSTANCE);
++
++        // Configure chunk (0, 0) as pure void (all sections == Chunk.a)
++        Chunk center = world.getChunkIfLoaded(0, 0);
++        LightPropagationParityTest.set(Chunk.class, center, "locX", 0);
++        LightPropagationParityTest.set(Chunk.class, center, "locZ", 0);
++        LightPropagationParityTest.set(Chunk.class, center, "sections", new ChunkSection[16]);
++        LightPropagationParityTest.set(Chunk.class, center, "h", new int[256]);
++        LightPropagationParityTest.set(Chunk.class, center, "i", new boolean[256]);
++        LightPropagationParityTest.set(Chunk.class, center, "v", 0);
++
++        // 1. When 3x3 neighbors are NOT loaded, Chunk.o() must leave lit=false without throwing or loading chunks
++        LightPropagationParityTest.set(Chunk.class, center, "neighbors", 0x1 << 12);
++        center.e(false);
++        center.o();
++        assertFalse("missing neighbors must keep lit=false", center.v());
++
++        // 2. When 3x3 neighbors ARE loaded, pure-void fast path must complete and mark lit=true
++        for (int cx = -1; cx <= 1; ++cx) {
++            for (int cz = -1; cz <= 1; ++cz) {
++                Chunk c = world.getChunkIfLoaded(cx, cz);
++                LightPropagationParityTest.set(Chunk.class, c, "locX", cx);
++                LightPropagationParityTest.set(Chunk.class, c, "locZ", cz);
++                LightPropagationParityTest.set(Chunk.class, c, "h", new int[256]);
++                LightPropagationParityTest.set(Chunk.class, c, "i", new boolean[256]);
++                LightPropagationParityTest.set(Chunk.class, c, "neighbors", -1);
++                c.d(true); // done = true
++            }
++        }
++        center.o();
++        assertTrue("pure-void chunk with 3x3 neighbors loaded must become lit=true", center.v());
++    }
++}

@@ -1,0 +1,414 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Mon, 23 Nov 2026 09:29:56 +0700
+Subject: [PATCH 102/115] fix: ref-count region file cache eviction and honor
+ configured cache size
+
+
+diff --git a/main/java/net/minecraft/server/RegionFile.java b/main/java/net/minecraft/server/RegionFile.java
+index 320903a..dc14567 100644
+--- a/main/java/net/minecraft/server/RegionFile.java
++++ b/main/java/net/minecraft/server/RegionFile.java
+@@ -35,6 +35,53 @@ public class RegionFile {
+     private List<Boolean> f;
+     private int g;
+     private long h;
++    // Antarctic start - ref-counted eviction so concurrent I/O cannot hit closed handles
++    private int activeRefs = 0;
++    private boolean evicted = false;
++    private boolean closed = false;
++
++    synchronized boolean tryAcquire() {
++        if (this.closed) {
++            return false;
++        }
++        this.activeRefs++;
++        return true;
++    }
++
++    synchronized void release() throws IOException {
++        if (this.activeRefs > 0) {
++            this.activeRefs--;
++        }
++        if (this.evicted && this.activeRefs == 0 && !this.closed) {
++            this.closeInternal();
++        }
++    }
++
++    synchronized boolean tryEvictIfIdle() throws IOException {
++        if (this.activeRefs > 0) {
++            return false;
++        }
++        this.evicted = true;
++        if (!this.closed) {
++            this.closeInternal();
++        }
++        return true;
++    }
++
++    synchronized void markEvicted() throws IOException {
++        this.evicted = true;
++        if (this.activeRefs == 0 && !this.closed) {
++            this.closeInternal();
++        }
++    }
++
++    private void closeInternal() throws IOException {
++        this.closed = true;
++        if (this.c != null) {
++            this.c.close();
++        }
++    }
++    // Antarctic end
+ 
+     public RegionFile(File file) {
+         this.b = file;
+@@ -307,11 +354,10 @@ public class RegionFile {
+         this.c.writeInt(k);
+     }
+ 
+-    public void c() throws IOException {
+-        if (this.c != null) {
+-            this.c.close();
++    public synchronized void c() throws IOException {
++        if (!this.closed) {
++            this.closeInternal();
+         }
+-
+     }
+ 
+     // Paper start
+diff --git a/main/java/net/minecraft/server/RegionFileCache.java b/main/java/net/minecraft/server/RegionFileCache.java
+index daa7e99..232b2f3 100644
+--- a/main/java/net/minecraft/server/RegionFileCache.java
++++ b/main/java/net/minecraft/server/RegionFileCache.java
+@@ -28,7 +28,7 @@ public class RegionFileCache {
+                 file1.mkdirs();
+             }
+ 
+-            if (RegionFileCache.a.size() >= PaperConfig.regionFileCacheSize) { // Paper
++            if (RegionFileCache.a.size() >= Math.max(1, PaperConfig.regionFileCacheSize)) { // Paper // Antarctic
+                 trimCache(); // Paper
+             }
+ 
+@@ -47,9 +47,11 @@ public class RegionFileCache {
+         if (regionfile != null) {
+             return regionfile;
+         } else if (file1.exists() && file2.exists()) {
+-            if (RegionFileCache.a.size() >= 256) {
+-                a();
++            // Antarctic start - honor configured cache size with LRU trim instead of full cache wipe at 256
++            if (RegionFileCache.a.size() >= Math.max(1, PaperConfig.regionFileCacheSize)) {
++                trimCache();
+             }
++            // Antarctic end
+ 
+             RegionFile regionfile1 = new RegionFile(file2);
+ 
+@@ -60,19 +62,69 @@ public class RegionFileCache {
+         }
+     }
+ 
++    // Antarctic start - atomic acquire helpers for ref-counted concurrent I/O
++    private static synchronized RegionFile acquireRegionFile(File file, int i, int j) {
++        RegionFile regionfile = a(file, i, j);
++        regionfile.tryAcquire();
++        return regionfile;
++    }
++
++    private static synchronized RegionFile acquireExistingRegionFile(File file, int i, int j) {
++        RegionFile regionfile = b(file, i, j);
++        if (regionfile != null && !regionfile.tryAcquire()) {
++            return null;
++        }
++        return regionfile;
++    }
++
++    private static void releaseRegionFile(RegionFile regionfile) {
++        if (regionfile != null) {
++            try {
++                regionfile.release();
++            } catch (IOException ioexception) {
++                ioexception.printStackTrace();
++                ServerInternalException.reportInternalException(ioexception);
++            }
++        }
++    }
++    // Antarctic end
++
+     // Paper Start
+     private static synchronized void trimCache() {
++        int maxCacheSize = Math.max(1, PaperConfig.regionFileCacheSize);
++        int toEvict = RegionFileCache.a.size() - maxCacheSize + 1;
++        if (toEvict <= 0) {
++            return;
++        }
++        // Antarctic start - prefer evicting idle LRU entries first, then defer-close any still-active entries
+         Iterator<Map.Entry<File, RegionFile>> itr = RegionFileCache.a.entrySet().iterator();
+-        int count = RegionFileCache.a.size() - PaperConfig.regionFileCacheSize;
+-        while (count-- >= 0 && itr.hasNext()) {
++        while (toEvict > 0 && itr.hasNext()) {
+             try {
+-                itr.next().getValue().c();
++                if (itr.next().getValue().tryEvictIfIdle()) {
++                    itr.remove();
++                    toEvict--;
++                }
+             } catch (IOException ioexception) {
+                 ioexception.printStackTrace();
+                 ServerInternalException.reportInternalException(ioexception);
++                itr.remove();
++                toEvict--;
+             }
+-            itr.remove();
+         }
++        if (toEvict > 0) {
++            itr = RegionFileCache.a.entrySet().iterator();
++            while (toEvict > 0 && itr.hasNext()) {
++                try {
++                    itr.next().getValue().markEvicted();
++                } catch (IOException ioexception) {
++                    ioexception.printStackTrace();
++                    ServerInternalException.reportInternalException(ioexception);
++                }
++                itr.remove();
++                toEvict--;
++            }
++        }
++        // Antarctic end
+     }
+     private static void printOversizedLog(String msg, File file, int x, int z) {
+         org.apache.logging.log4j.LogManager.getLogger().fatal(msg + " (" + file.toString().replaceAll(".+[\\\\/]", "") + " - " + x + "," + z + ") Go clean it up to remove this message. /minecraft:tp " + (x<<4)+" 128 "+(z<<4) + " - DO NOT REPORT THIS TO PAPER - You may ask for help on Discord, but do not file an issue. These error messages can not be removed.");
+@@ -94,8 +146,9 @@ public class RegionFileCache {
+     }
+ 
+     private static void writeRegion(File file, int x, int z, NBTTagCompound nbttagcompound) throws IOException {
+-        RegionFile regionfile = getRegionFile(file, x, z);
++        RegionFile regionfile = acquireRegionFile(file, x, z); // Antarctic - ref-counted acquire
+ 
++        try { // Antarctic
+         DataOutputStream out = regionfile.getWriteStream(x & 31, z & 31);
+         try {
+             NBTCompressedStreamTools.writeNBT(nbttagcompound, out);
+@@ -130,6 +183,9 @@ public class RegionFileCache {
+             e.printStackTrace();
+             throw e;
+         }
++        } finally {
++            releaseRegionFile(regionfile); // Antarctic
++        }
+ 
+     }
+ 
+@@ -217,7 +273,7 @@ public class RegionFileCache {
+ 
+             try {
+                 if (regionfile != null) {
+-                    regionfile.c();
++                    regionfile.markEvicted(); // Antarctic - defer close if an async I/O holds a ref
+                 }
+             } catch (IOException ioexception) {
+                 ioexception.printStackTrace();
+@@ -230,21 +286,25 @@ public class RegionFileCache {
+ 
+     // CraftBukkit start - call sites hoisted for synchronization
+     public static NBTTagCompound d(File file, int i, int j) throws IOException { // Paper - remove synchronization
+-        RegionFile regionfile = a(file, i, j);
+-        // Paper start
+-        if (regionfile.isOversized(i, j)) {
+-            printOversizedLog("Loading Oversized Chunk!", file, i, j);
+-            return readOversizedChunk(regionfile, i, j);
+-        }
+-        // Paper end
++        RegionFile regionfile = acquireRegionFile(file, i, j); // Antarctic - ref-counted acquire
++        try {
++            // Paper start
++            if (regionfile.isOversized(i, j)) {
++                printOversizedLog("Loading Oversized Chunk!", file, i, j);
++                return readOversizedChunk(regionfile, i, j);
++            }
++            // Paper end
+ 
+-        DataInputStream datainputstream = regionfile.a(i & 31, j & 31);
++            DataInputStream datainputstream = regionfile.a(i & 31, j & 31);
+ 
+-        if (datainputstream == null) {
+-            return null;
+-        }
++            if (datainputstream == null) {
++                return null;
++            }
+ 
+-        return NBTCompressedStreamTools.a(datainputstream);
++            return NBTCompressedStreamTools.a(datainputstream);
++        } finally {
++            releaseRegionFile(regionfile); // Antarctic
++        }
+     }
+ 
+     public static void e(File file, int i, int j, NBTTagCompound nbttagcompound) throws IOException { // Paper - remove synchronization
+@@ -260,8 +320,14 @@ public class RegionFileCache {
+     // CraftBukkit end
+ 
+     public static boolean chunkExists(File file, int i, int j) { // Paper - remove synchronization
+-        RegionFile regionfile = b(file, i, j);
+-
+-        return regionfile != null ? regionfile.c(i & 31, j & 31) : false;
++        RegionFile regionfile = acquireExistingRegionFile(file, i, j); // Antarctic - ref-counted acquire
++        if (regionfile == null) {
++            return false;
++        }
++        try {
++            return regionfile.c(i & 31, j & 31);
++        } finally {
++            releaseRegionFile(regionfile); // Antarctic
++        }
+     }
+ }
+diff --git a/test/java/net/minecraft/server/RegionFileCacheConcurrencyTest.java b/test/java/net/minecraft/server/RegionFileCacheConcurrencyTest.java
+new file mode 100644
+index 0000000..84c030a
+--- /dev/null
++++ b/test/java/net/minecraft/server/RegionFileCacheConcurrencyTest.java
+@@ -0,0 +1,141 @@
++package net.minecraft.server;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertTrue;
++
++import com.destroystokyo.paper.PaperConfig;
++import java.io.File;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Random;
++import java.util.concurrent.Callable;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.Future;
++import java.util.concurrent.atomic.AtomicInteger;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Test;
++
++public class RegionFileCacheConcurrencyTest {
++
++    private int prevCacheSize;
++    private Path tempWorldDir;
++
++    @Before
++    public void setUp() throws Exception {
++        this.prevCacheSize = PaperConfig.regionFileCacheSize;
++        RegionFileCache.a();
++        this.tempWorldDir = Files.createTempDirectory("antarctic-rfc-test-");
++    }
++
++    @After
++    public void tearDown() throws Exception {
++        RegionFileCache.a();
++        PaperConfig.regionFileCacheSize = this.prevCacheSize;
++        if (this.tempWorldDir != null && Files.exists(this.tempWorldDir)) {
++            Files.walk(this.tempWorldDir)
++                .sorted(java.util.Comparator.reverseOrder())
++                .map(Path::toFile)
++                .forEach(File::delete);
++        }
++    }
++
++    private static NBTTagCompound makeChunkTag(int rx, int rz) {
++        NBTTagCompound root = new NBTTagCompound();
++        NBTTagCompound level = new NBTTagCompound();
++        level.setInt("xPos", rx << 5);
++        level.setInt("zPos", rz << 5);
++        level.setInt("Marker", rx * 1000 + rz);
++        root.set("Level", level);
++        return root;
++    }
++
++    @Test
++    public void chunkExistsHonorsConfiguredCacheSizeWithoutFullWipe() throws Exception {
++        PaperConfig.regionFileCacheSize = 8;
++        File worldDir = this.tempWorldDir.toFile();
++
++        // Populate 20 distinct region files
++        for (int r = 0; r < 20; ++r) {
++            RegionFileCache.e(worldDir, r << 5, 0, makeChunkTag(r, 0));
++        }
++        assertTrue("cache size must stay bounded by PaperConfig.regionFileCacheSize", RegionFileCache.a.size() <= 8);
++
++        // Repeatedly probe via chunkExists (which uses RegionFileCache.b): must stay at 8, never wipe to 1
++        for (int r = 0; r < 20; ++r) {
++            assertTrue(RegionFileCache.chunkExists(worldDir, r << 5, 0));
++            assertEquals("b() must LRU-trim to cacheSize instead of full wipe", 8, RegionFileCache.a.size());
++        }
++    }
++
++    @Test
++    public void concurrentReadsWritesAndExistsSufferZeroCloseRaces() throws Exception {
++        // Tiny cache forces aggressive eviction on nearly every operation across 24 region files
++        PaperConfig.regionFileCacheSize = 4;
++        File worldDir = this.tempWorldDir.toFile();
++        final int regionCount = 24;
++
++        for (int r = 0; r < regionCount; ++r) {
++            RegionFileCache.e(worldDir, r << 5, 0, makeChunkTag(r, 0));
++        }
++
++        ExecutorService pool = Executors.newFixedThreadPool(5);
++        AtomicInteger readCount = new AtomicInteger();
++        AtomicInteger existsCount = new AtomicInteger();
++        List<Callable<Void>> tasks = new ArrayList<>();
++
++        // 3 concurrent reader threads (ChunkIOExecutor simulation)
++        for (int t = 0; t < 3; ++t) {
++            final int seed = 100 + t;
++            tasks.add(() -> {
++                Random rng = new Random(seed);
++                for (int i = 0; i < 150; ++i) {
++                    int r = rng.nextInt(regionCount);
++                    NBTTagCompound tag = RegionFileCache.d(worldDir, r << 5, 0);
++                    assertNotNull("concurrent read must not fail or return null", tag);
++                    assertEquals(r * 1000, tag.getCompound("Level").getInt("Marker"));
++                    readCount.incrementAndGet();
++                }
++                return null;
++            });
++        }
++
++        // 1 concurrent chunkExists thread (RegionFileCache.b path)
++        tasks.add(() -> {
++            Random rng = new Random(200);
++            for (int i = 0; i < 200; ++i) {
++                int r = rng.nextInt(regionCount);
++                assertTrue(RegionFileCache.chunkExists(worldDir, r << 5, 0));
++                existsCount.incrementAndGet();
++            }
++            return null;
++        });
++
++        // 1 concurrent writer thread (FileIOThread simulation)
++        tasks.add(() -> {
++            Random rng = new Random(300);
++            for (int i = 0; i < 60; ++i) {
++                int r = rng.nextInt(regionCount);
++                RegionFileCache.e(worldDir, r << 5, 0, makeChunkTag(r, 0));
++            }
++            return null;
++        });
++
++        try {
++            List<Future<Void>> futures = pool.invokeAll(tasks);
++            for (Future<Void> f : futures) {
++                f.get(); // rethrows any IOException / ClosedChannelException / assertion failure
++            }
++        } finally {
++            pool.shutdownNow();
++        }
++
++        assertEquals(450, readCount.get());
++        assertEquals(200, existsCount.get());
++        assertTrue("cache size must remain bounded after stress", RegionFileCache.a.size() <= 4);
++    }
++}

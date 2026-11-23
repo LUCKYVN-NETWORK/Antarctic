@@ -1,0 +1,164 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Mon, 23 Nov 2026 10:25:38 +0700
+Subject: [PATCH 113/115] feat: implement CraftWorld relightChunks and
+ isLightConsistent API
+
+
+diff --git a/main/java/org/bukkit/craftbukkit/CraftWorld.java b/main/java/org/bukkit/craftbukkit/CraftWorld.java
+index afb141c..7ac78ff 100644
+--- a/main/java/org/bukkit/craftbukkit/CraftWorld.java
++++ b/main/java/org/bukkit/craftbukkit/CraftWorld.java
+@@ -284,6 +284,29 @@ public class CraftWorld implements World {
+         return chunk != null;
+     }
+ 
++    // Antarctic start - async bulk relight and light consistency API
++    @Override
++    public java.util.concurrent.CompletableFuture<Integer> relightChunks(Collection<Chunk> chunks) {
++        Validate.notNull(chunks, "Chunks collection cannot be null");
++        if (chunks.isEmpty()) {
++            return java.util.concurrent.CompletableFuture.completedFuture(0);
++        }
++        long[] keys = new long[chunks.size()];
++        int idx = 0;
++        for (Chunk chunk : chunks) {
++            Validate.notNull(chunk, "Chunk in relight collection cannot be null");
++            Validate.isTrue(chunk.getWorld() == this, "Chunk (" + chunk.getX() + "," + chunk.getZ() + ") does not belong to world " + this.getName());
++            keys[idx++] = ChunkCoordIntPair.a(chunk.getX(), chunk.getZ());
++        }
++        return this.world.relightChunks(keys);
++    }
++
++    @Override
++    public boolean isLightConsistent(int chunkX, int chunkZ) {
++        return this.world.isLightConsistent(chunkX, chunkZ);
++    }
++    // Antarctic end
++
+     public boolean refreshChunk(int x, int z) {
+         if (!isChunkLoaded(x, z)) {
+             return false;
+diff --git a/test/java/net/minecraft/server/CraftWorldRelightApiTest.java b/test/java/net/minecraft/server/CraftWorldRelightApiTest.java
+new file mode 100644
+index 0000000..efdf9f6
+--- /dev/null
++++ b/test/java/net/minecraft/server/CraftWorldRelightApiTest.java
+@@ -0,0 +1,117 @@
++package net.minecraft.server;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++import static org.junit.Assert.fail;
++
++import com.destroystokyo.paper.config.toml.modules.optimizations.Lighting;
++import java.lang.reflect.Field;
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.concurrent.CompletableFuture;
++import java.util.concurrent.TimeUnit;
++import org.bukkit.craftbukkit.CraftChunk;
++import org.bukkit.craftbukkit.CraftWorld;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++public class CraftWorldRelightApiTest {
++
++    private static Unsafe unsafe;
++    private boolean prevAsyncCatcher;
++    private WorldServer activeWorld;
++
++    @BeforeClass
++    public static void bootstrap() throws Exception {
++        LightPropagationParityTest.bootstrap();
++        Field uf = Unsafe.class.getDeclaredField("theUnsafe");
++        uf.setAccessible(true);
++        unsafe = (Unsafe) uf.get(null);
++    }
++
++    @Before
++    public void setUp() {
++        this.prevAsyncCatcher = org.spigotmc.AsyncCatcher.enabled;
++        org.spigotmc.AsyncCatcher.enabled = false;
++        Lighting.asyncBulkRelight = true;
++        Lighting.asyncRelightThreads = 1;
++        Lighting.relightSnapshotBudgetMs = 50;
++        Lighting.relightApplyBudgetMs = 50;
++    }
++
++    @After
++    public void tearDown() {
++        if (this.activeWorld != null) {
++            this.activeWorld.shutdownRelightService();
++            this.activeWorld = null;
++        }
++        Lighting.asyncBulkRelight = false;
++        Lighting.asyncRelightThreads = 0;
++        Lighting.relightSnapshotBudgetMs = 5;
++        Lighting.relightApplyBudgetMs = 2;
++        org.spigotmc.AsyncCatcher.enabled = this.prevAsyncCatcher;
++    }
++
++    @Test
++    public void craftWorldRelightChunksAndIsLightConsistentWorkEndToEnd() throws Exception {
++        LightPropagationParityTest.StubProvider[] p = new LightPropagationParityTest.StubProvider[1];
++        WorldServer nmsWorld = LightPropagationParityTest.buildWorld(801L, p);
++        this.activeWorld = nmsWorld;
++        LightPropagationParityTest.set(World.class, nmsWorld, "worldData",
++            new WorldData(new WorldSettings(0L, EnumGamemode.SURVIVAL, false, false, WorldType.FLAT), "test"));
++        LightPropagationParityTest.set(World.class, nmsWorld, "chunkPacketBlockController",
++            com.destroystokyo.paper.antixray.ChunkPacketBlockController.NO_OPERATION_INSTANCE);
++
++        CraftWorld craftWorld = (CraftWorld) unsafe.allocateInstance(CraftWorld.class);
++        LightPropagationParityTest.set(CraftWorld.class, craftWorld, "world", nmsWorld);
++        LightPropagationParityTest.set(World.class, nmsWorld, "world", craftWorld);
++
++        for (int cx = -2; cx <= 1; ++cx) {
++            for (int cz = -2; cz <= 1; ++cz) {
++                Chunk c = nmsWorld.getChunkIfLoaded(cx, cz);
++                LightPropagationParityTest.set(Chunk.class, c, "locX", cx);
++                LightPropagationParityTest.set(Chunk.class, c, "locZ", cz);
++                c.bukkitChunk = new CraftChunk(c);
++            }
++        }
++
++        // Corrupt light by placing a glowstone without updating light
++        LightPropagationParityTest.setBlock(nmsWorld, 6, 40, 6, Blocks.GLOWSTONE.getBlockData());
++        assertFalse("unlit glowstone makes chunk inconsistent", craftWorld.isLightConsistent(0, 0));
++
++        // Empty collection completes immediately with 0
++        assertEquals(Integer.valueOf(0), craftWorld.relightChunks(Collections.emptyList()).get());
++
++        // Foreign chunk is rejected
++        CraftWorld otherWorld = (CraftWorld) unsafe.allocateInstance(CraftWorld.class);
++        org.bukkit.Chunk foreignChunk = (org.bukkit.Chunk) java.lang.reflect.Proxy.newProxyInstance(
++            org.bukkit.Chunk.class.getClassLoader(),
++            new Class<?>[]{org.bukkit.Chunk.class},
++            (proxy, method, args) -> "getWorld".equals(method.getName()) ? otherWorld : ("getX".equals(method.getName()) || "getZ".equals(method.getName()) ? 0 : null)
++        );
++        try {
++            craftWorld.relightChunks(Collections.singletonList(foreignChunk));
++            fail("chunk from another world must throw IllegalArgumentException");
++        } catch (IllegalArgumentException expected) {
++            // expected
++        }
++
++        // Relight chunk (0,0) through Bukkit World API
++        org.bukkit.Chunk bukkitChunk = nmsWorld.getChunkIfLoaded(0, 0).bukkitChunk;
++        CompletableFuture<Integer> future = craftWorld.relightChunks(Arrays.asList(bukkitChunk, bukkitChunk));
++        RelightService service = nmsWorld.getRelightService();
++        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
++        while (!future.isDone() && System.nanoTime() < deadline) {
++            service.tick();
++            if (!future.isDone()) Thread.sleep(1);
++        }
++        assertTrue(future.isDone());
++        assertEquals("deduplicated request applies 1 chunk", Integer.valueOf(1), future.get());
++        assertEquals(15, nmsWorld.getBrightness(EnumSkyBlock.BLOCK, 6, 40, 6));
++        assertTrue("chunk must be light-consistent after Bukkit relightChunks", craftWorld.isLightConsistent(0, 0));
++    }
++}

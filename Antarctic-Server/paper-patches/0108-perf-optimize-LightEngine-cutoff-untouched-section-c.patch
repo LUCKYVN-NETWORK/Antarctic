@@ -1,0 +1,396 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Mon, 23 Nov 2026 10:08:39 +0700
+Subject: [PATCH 108/115] perf: optimize LightEngine cutoff, untouched-section
+ collect and LightChecker pruning
+
+
+diff --git a/main/java/me/stella/antarctic/light/LightChecker.java b/main/java/me/stella/antarctic/light/LightChecker.java
+index 4f7bfea..0a87800 100644
+--- a/main/java/me/stella/antarctic/light/LightChecker.java
++++ b/main/java/me/stella/antarctic/light/LightChecker.java
+@@ -75,6 +75,37 @@ public final class LightChecker {
+         }
+ 
+         LightColumn column = region.column(ci);
++        LightColumn west = region.column(chunkX - 1, chunkZ);
++        LightColumn east = region.column(chunkX + 1, chunkZ);
++        LightColumn north = region.column(chunkX, chunkZ - 1);
++        LightColumn south = region.column(chunkX, chunkZ + 1);
++
++        // Above (maxActiveSection + 2) << 4, all 5 columns have null cells, null stored nibbles, and y >= height:
++        // sky light is guaranteed consistent (15 == 15) and block light is guaranteed consistent (0 == 0, or skipped next to absent neighbour).
++        int maxActive = highestActiveSection(column);
++        maxActive = Math.max(maxActive, highestActiveSection(west));
++        maxActive = Math.max(maxActive, highestActiveSection(east));
++        maxActive = Math.max(maxActive, highestActiveSection(north));
++        maxActive = Math.max(maxActive, highestActiveSection(south));
++        int maxY = maxActive < 0 ? 0 : Math.min(LightRules.WORLD_HEIGHT, (maxActive + 2) << 4);
++        int prunedLayers = LightRules.WORLD_HEIGHT - maxY;
++
++        int colsInScope = scope == Scope.BORDER ? 60 : 256;
++        int blockSkippedPerEmptyLayer = 0;
++        if (prunedLayers > 0 && (west == null || east == null || north == null || south == null)) {
++            for (int localZ = 0; localZ < 16; ++localZ) {
++                for (int localX = 0; localX < 16; ++localX) {
++                    if (scope == Scope.BORDER && localX != 0 && localX != 15 && localZ != 0 && localZ != 15) {
++                        continue;
++                    }
++                    if ((localX == 0 && west == null) || (localX == 15 && east == null)
++                            || (localZ == 0 && north == null) || (localZ == 15 && south == null)) {
++                        ++blockSkippedPerEmptyLayer;
++                    }
++                }
++            }
++        }
++
+         int[] positions = new int[Math.max(0, maxReported)];
+         int reported = 0;
+         int checked = 0;
+@@ -88,7 +119,7 @@ public final class LightChecker {
+                 continue;
+             }
+ 
+-            for (int y = 0; y < LightRules.WORLD_HEIGHT; ++y) {
++            for (int y = 0; y < maxY; ++y) {
+                 for (int localZ = 0; localZ < 16; ++localZ) {
+                     for (int localX = 0; localX < 16; ++localX) {
+                         if (scope == Scope.BORDER && localX != 0 && localX != 15 && localZ != 0 && localZ != 15) {
+@@ -112,11 +143,48 @@ public final class LightChecker {
+                     }
+                 }
+             }
++
++            if (prunedLayers > 0) {
++                if (sky) {
++                    // For y >= maxY >= height, expected() returns MAX_LIGHT before checking lateral neighbours.
++                    checked += colsInScope * prunedLayers;
++                } else {
++                    skipped += blockSkippedPerEmptyLayer * prunedLayers;
++                    checked += (colsInScope - blockSkippedPerEmptyLayer) * prunedLayers;
++                }
++            }
+         }
+ 
+         return new Report(checked, skipped, violations, Arrays.copyOf(positions, reported));
+     }
+ 
++    private static int highestActiveSection(LightColumn col) {
++        if (col == null) {
++            return -1;
++        }
++        int highest = -1;
++        for (int s = LightRules.SECTIONS - 1; s >= 0; --s) {
++            if (col.cells(s) != null || col.storedBlock(s) != null || col.storedSky(s) != null) {
++                highest = s;
++                break;
++            }
++        }
++        int[] hm = col.heightMap();
++        int maxH = 0;
++        for (int i = 0; i < 256; ++i) {
++            if (hm[i] > maxH) {
++                maxH = hm[i];
++            }
++        }
++        if (maxH > 0) {
++            int heightSection = (maxH - 1) >> 4;
++            if (heightSection > highest) {
++                highest = heightSection;
++            }
++        }
++        return highest;
++    }
++
+     /**
+      * The light the rule says this cell should have given its neighbours' stored light, or -1 when it cannot be decided
+      * because a horizontal neighbour column is absent from the region (and the answer is not fixed by the cell itself).
+diff --git a/main/java/me/stella/antarctic/light/LightEngine.java b/main/java/me/stella/antarctic/light/LightEngine.java
+index 4068933..a25c09d 100644
+--- a/main/java/me/stella/antarctic/light/LightEngine.java
++++ b/main/java/me/stella/antarctic/light/LightEngine.java
+@@ -4,13 +4,14 @@ import java.util.Arrays;
+ 
+ /**
+  * Computes sky and block light of the target columns of a {@link LightRegion} from scratch: the unique fixed point of the
+- * per-cell rule documented in {@link LightRules}. Pure and stateless (every call allocates its own scratch), so any
+- * number of threads may run it concurrently on separate regions.
++ * per-cell rule documented in {@link LightRules}. Pure and stateless (every call allocates its own scratch, or uses a
++ * caller-owned worker-local {@link Scratch}), so any number of threads may run it concurrently on separate regions.
+  *
+  * <p>How it works: light only ever decreases by at least 1 per cell, so the fixed point is the maximum over all paths from
+  * a source. Sources are emitting cells (block light), cells that see the sky (sky light) and the fixed light of ring
+- * columns. A flood fill that processes level 15 down to 1 raises every cell exactly to its final value the first time it
+- * touches it, because the cost of entering a cell does not depend on where the light came from.
++ * columns. A flood fill that processes level 15 down to 2 raises every cell exactly to its final value the first time it
++ * touches it, because the cost of entering a cell does not depend on where the light came from and level 1 can never
++ * propagate further (cost >= 1).
+  *
+  * <p>Ring and absent columns are never written. Absent columns read as 0, so a target cell next to one is lit only from
+  * what is present; callers that care (the relight service) must treat those border cells as unverified.
+@@ -20,14 +21,28 @@ import java.util.Arrays;
+  */
+ public final class LightEngine {
+ 
++    /**
++     * Reusable worker-local BFS bucket scratch. Pools only the {@code int[16][]} level queues (reset by zeroing counts,
++     * never {@code Arrays.fill}-ing working arrays so TLAB allocation stays fast in young gen). Not thread-safe; keep one
++     * instance per worker thread.
++     */
++    public static final class Scratch {
++        final int[][] queue = new int[16][];
++        final int[] queued = new int[16];
++    }
++
+     public LightResult relight(LightRegion region) {
++        return this.relight(region, null);
++    }
++
++    public LightResult relight(LightRegion region, Scratch scratch) {
+         LightResult result = new LightResult(region);
+ 
+         if (region.hasSkyLight()) {
+-            new Pass(region, true).run(result);
++            new Pass(region, true, scratch).run(result);
+         }
+ 
+-        new Pass(region, false).run(result);
++        new Pass(region, false, scratch).run(result);
+         return result;
+     }
+ 
+@@ -41,11 +56,12 @@ public final class LightEngine {
+         private final int blocksZ;
+         /** Per target column and section a byte per cell holding the light computed so far; null = still implicit. */
+         private final byte[][] work;
+-        private final int[][] queue = new int[16][];
+-        private final int[] queued = new int[16];
++        private final int[][] queue;
++        private final int[] queued;
++        private final boolean reusableQueue;
+         private long raised;
+ 
+-        Pass(LightRegion region, boolean sky) {
++        Pass(LightRegion region, boolean sky, Scratch scratch) {
+             this.region = region;
+             this.sky = sky;
+             this.width = region.width();
+@@ -53,6 +69,16 @@ public final class LightEngine {
+             this.blocksX = this.width << 4;
+             this.blocksZ = this.depth << 4;
+             this.work = new byte[region.columnCount() * LightRules.SECTIONS][];
++            if (scratch != null) {
++                this.queue = scratch.queue;
++                this.queued = scratch.queued;
++                Arrays.fill(this.queued, 0);
++                this.reusableQueue = true;
++            } else {
++                this.queue = new int[16][];
++                this.queued = new int[16];
++                this.reusableQueue = false;
++            }
+         }
+ 
+         void run(LightResult out) {
+@@ -145,7 +171,7 @@ public final class LightEngine {
+             this.queued[level] = size + 1;
+         }
+ 
+-        /** Raises a target cell to {@code candidate} if that is higher than its current value, and queues it. */
++        /** Raises a target cell to {@code candidate} if that is higher than its current value, and queues it when > 1. */
+         private void raise(int ci, LightColumn column, int rx, int y, int rz, int candidate) {
+             int localX = rx & 15;
+             int localZ = rz & 15;
+@@ -161,7 +187,9 @@ public final class LightEngine {
+ 
+                 light[index] = (byte) candidate;
+                 ++this.raised;
+-                this.push(candidate, rx, y, rz);
++                if (candidate > 1) {
++                    this.push(candidate, rx, y, rz);
++                }
+             }
+         }
+ 
+@@ -181,7 +209,9 @@ public final class LightEngine {
+                     if (emission > 0) {
+                         this.ensure(ci, section)[index] = (byte) emission;
+                         ++this.raised;
+-                        this.push(emission, baseX + (index & 15), section << 4 | index >> 8, baseZ + (index >> 4 & 15));
++                        if (emission > 1) {
++                            this.push(emission, baseX + (index & 15), section << 4 | index >> 8, baseZ + (index >> 4 & 15));
++                        }
+                     }
+                 }
+             }
+@@ -283,7 +313,8 @@ public final class LightEngine {
+         // ------------------------------------------------------------------------------------- propagation
+ 
+         private void propagate() {
+-            for (int level = 15; level >= 1; --level) {
++            // Level 1 cells can never raise any neighbour since LightRules.cost >= 1.
++            for (int level = 15; level >= 2; --level) {
+                 int count = this.queued[level];
+                 int[] entries = this.queue[level];
+ 
+@@ -310,7 +341,11 @@ public final class LightEngine {
+                     }
+                 }
+ 
+-                this.queue[level] = null; // new entries only ever go to lower levels
++                if (this.reusableQueue) {
++                    this.queued[level] = 0;
++                } else {
++                    this.queue[level] = null; // new entries only ever go to lower levels
++                }
+             }
+         }
+ 
+@@ -342,6 +377,9 @@ public final class LightEngine {
+                 }
+ 
+                 LightColumn column = this.region.column(ci);
++                int minH = Integer.MAX_VALUE;
++                int maxH = Integer.MIN_VALUE;
++                boolean heightsComputed = false;
+ 
+                 for (int section = 0; section < LightRules.SECTIONS; ++section) {
+                     byte[] light = this.work[ci * LightRules.SECTIONS + section];
+@@ -351,7 +389,44 @@ public final class LightEngine {
+                             continue; // missing section and nothing spilled into it: the implicit value is right
+                         }
+ 
+-                        light = this.ensure(ci, section);
++                        // Untouched existing section: emit packed nibbles directly without allocating a 4 KiB work array.
++                        byte[] nibbles = new byte[LightRules.NIBBLE_BYTES];
++                        if (this.sky) {
++                            if (!heightsComputed) {
++                                int[] hm = column.heightMap();
++                                for (int idx = 0; idx < 256; ++idx) {
++                                    int h = hm[idx];
++                                    if (h < minH) {
++                                        minH = h;
++                                    }
++                                    if (h > maxH) {
++                                        maxH = h;
++                                    }
++                                }
++                                heightsComputed = true;
++                            }
++                            int baseY = section << 4;
++                            if (baseY >= maxH) {
++                                Arrays.fill(nibbles, (byte) 0xFF);
++                            } else if (baseY + 15 >= minH) {
++                                int[] hm = column.heightMap();
++                                for (int ly = 0; ly < 16; ++ly) {
++                                    int y = baseY + ly;
++                                    int rowBase = ly << 7;
++                                    for (int lz = 0; lz < 16; ++lz) {
++                                        int hBase = lz << 4;
++                                        int byteBase = rowBase | (lz << 3);
++                                        for (int lx = 0; lx < 16; lx += 2) {
++                                            int lo = y >= hm[hBase | lx] ? 15 : 0;
++                                            int hi = y >= hm[hBase | (lx + 1)] ? 15 : 0;
++                                            nibbles[byteBase | (lx >> 1)] = (byte) (lo | (hi << 4));
++                                        }
++                                    }
++                                }
++                            }
++                        }
++                        out.put(this.sky, ci, section, nibbles);
++                        continue;
+                     }
+ 
+                     byte[] nibbles = new byte[LightRules.NIBBLE_BYTES];
+diff --git a/test/java/me/stella/antarctic/light/LightCheckerTest.java b/test/java/me/stella/antarctic/light/LightCheckerTest.java
+index 19d888b..9cc39d1 100644
+--- a/test/java/me/stella/antarctic/light/LightCheckerTest.java
++++ b/test/java/me/stella/antarctic/light/LightCheckerTest.java
+@@ -115,6 +115,53 @@ public class LightCheckerTest {
+         assertFalse(LightChecker.check(region, 1, 1, LightChecker.Scope.BORDER, 8).consistent());
+     }
+ 
++    @Test
++    public void emissionOneAndScratchReuseMatchStatelessAndPassChecker() {
++        LightScene scene = new LightScene(0, 0, 3, 3, true).onlyTarget(1, 1);
++        scene.fill(16, 0, 16, 31, 0, 31, 15, 0); // bedrock floor at y=0
++        scene.set(20, 1, 20, 0, 1); // emission=1 (brown mushroom) at y=1
++        scene.set(22, 255, 22, 0, 1); // emission=1 at y=255
++        scene.deriveHeights();
++
++        LightRegion regionStateless = scene.region();
++        LightRegion regionScratch = scene.region();
++        LightResult r1 = ENGINE.relight(regionStateless);
++        LightEngine.Scratch scratch = new LightEngine.Scratch();
++        ENGINE.relight(regionScratch, scratch); // prime scratch
++        LightResult r2 = ENGINE.relight(regionScratch, scratch);
++
++        assertEquals(r1.cellsRaised(), r2.cellsRaised());
++        for (int s = 0; s < LightRules.SECTIONS; ++s) {
++            org.junit.Assert.assertArrayEquals("sky section " + s, r1.sky(1, 1, s), r2.sky(1, 1, s));
++            org.junit.Assert.assertArrayEquals("block section " + s, r1.block(1, 1, s), r2.block(1, 1, s));
++        }
++
++        r2.storeInto(regionScratch);
++        assertEquals(1, regionScratch.column(1, 1).stored(false, 4, 1, 4));
++        assertEquals(0, regionScratch.column(1, 1).stored(false, 5, 1, 4));
++        assertEquals(1, regionScratch.column(1, 1).stored(false, 6, 255, 6));
++        assertTrue(LightChecker.check(regionScratch, 1, 1, LightChecker.Scope.ALL, 16).consistent());
++    }
++
++    @Test
++    public void prunedCheckerMatchesFullScanCountsWithAbsentNeighboursAndStaleHeightMap() {
++        // Pure void with one absent horizontal neighbour: tests pruned-layer checked/skipped accounting
++        LightScene voidScene = new LightScene(0, 0, 3, 3, true).onlyTarget(1, 1);
++        voidScene.absent(0, 1); // west neighbour missing
++        voidScene.deriveHeights();
++        LightRegion voidRegion = voidScene.region();
++        LightChecker.Report allReport = LightChecker.check(voidRegion, 1, 1, LightChecker.Scope.ALL, 8);
++        assertTrue(allReport.consistent());
++        assertEquals("sky all 256*256 + block (256-16)*256", 256 * 256 + 240 * 256, allReport.checked());
++        assertEquals("block west edge 16*256 skipped", 16 * 256, allReport.skipped());
++
++        // Stale heightmap on an otherwise empty column must still be checked up to maxH
++        LightRegion stale = new LightScene(0, 0, 3, 3, true).onlyTarget(1, 1).region();
++        stale.column(1, 1).heightMap()[0] = 120; // stale height=120 with no storedSky -> sky=0 below 120 vs neighbour 15
++        LightChecker.Report staleReport = LightChecker.check(stale, 1, 1, LightChecker.Scope.ALL, 16);
++        assertFalse("pruned checker must still detect violations caused by stale high heightmap", staleReport.consistent());
++    }
++
+     @Test
+     public void cellsNextToAnAbsentColumnAreSkippedNotReported() {
+         LightScene scene = new LightScene(0, 0, 3, 3, false).onlyTarget(1, 1);
+diff --git a/test/java/me/stella/antarctic/light/LightEnginePerfTest.java b/test/java/me/stella/antarctic/light/LightEnginePerfTest.java
+index 6691942..54801f1 100644
+--- a/test/java/me/stella/antarctic/light/LightEnginePerfTest.java
++++ b/test/java/me/stella/antarctic/light/LightEnginePerfTest.java
+@@ -83,8 +83,28 @@ public class LightEnginePerfTest {
+         }
+ 
+         Arrays.sort(nanos);
+-        System.out.printf("[perf] light engine, %s: median %.2f ms per target chunk (best %.2f ms), %d cell updates, %d KiB allocated%n",
++        System.out.printf("[perf] light engine (stateless), %s: median %.2f ms per target chunk (best %.2f ms), %d cell updates, %d KiB allocated%n",
+                 label, nanos[nanos.length / 2] / 1.0e6, nanos[0] / 1.0e6, raised, allocated / 1024);
++
++        LightEngine.Scratch scratch = new LightEngine.Scratch();
++        for (int i = 0; i < 40; ++i) {
++            raised = ENGINE.relight(region, scratch).cellsRaised();
++        }
++        long[] scratchNanos = new long[15];
++        long scratchAlloc = 0;
++        for (int i = 0; i < scratchNanos.length; ++i) {
++            long a0 = threads.getThreadAllocatedBytes(Thread.currentThread().getId());
++            long t0 = System.nanoTime();
++            LightResult result = ENGINE.relight(region, scratch);
++
++            scratchNanos[i] = System.nanoTime() - t0;
++            scratchAlloc = threads.getThreadAllocatedBytes(Thread.currentThread().getId()) - a0;
++            raised = result.cellsRaised();
++        }
++        Arrays.sort(scratchNanos);
++        System.out.printf("[perf] light engine (scratch), %s: median %.2f ms per target chunk (best %.2f ms), %d cell updates, %d KiB allocated%n",
++                label, scratchNanos[scratchNanos.length / 2] / 1.0e6, scratchNanos[0] / 1.0e6, raised, scratchAlloc / 1024);
++        assertTrue("scratch reuse must allocate less than stateless on " + label, scratchAlloc < allocated);
+         assertTrue(nanos[0] > 0);
+     }
+ 

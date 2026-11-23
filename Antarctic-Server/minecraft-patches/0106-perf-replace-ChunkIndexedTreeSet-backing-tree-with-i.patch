@@ -1,0 +1,555 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Mon, 23 Nov 2026 09:57:43 +0700
+Subject: [PATCH 106/115] perf: replace ChunkIndexedTreeSet backing tree with
+ intrusive heap and array buckets
+
+
+diff --git a/main/java/me/stella/antarctic/collection/ChunkIndexedTreeSet.java b/main/java/me/stella/antarctic/collection/ChunkIndexedTreeSet.java
+index a54def1..3b6505e 100644
+--- a/main/java/me/stella/antarctic/collection/ChunkIndexedTreeSet.java
++++ b/main/java/me/stella/antarctic/collection/ChunkIndexedTreeSet.java
+@@ -6,27 +6,20 @@ import it.unimi.dsi.fastutil.objects.ObjectArrayList;
+ import it.unimi.dsi.fastutil.objects.ObjectOpenHashSet;
+ 
+ import java.util.ArrayList;
++import java.util.Arrays;
+ import java.util.List;
+-import java.util.TreeSet;
++import java.util.NoSuchElementException;
+ 
+ /**
+  * An ordered, hash-deduplicated set that additionally indexes its elements by the 16x16 chunk column that
+  * contains them, so "everything inside this block-coordinate box" no longer scans the whole set.
+  *
+- * <p>Designed for the world's scheduled block tick list: it replaces a {@code HashTreeSet} (hash set for
+- * {@code contains}, tree set for ordering) whose chunk-save query walked every pending tick in the world.
+- * Not thread safe; callers are main-thread confined.
++ * <p>Backed by an array-based binary min-heap (eliminating {@code TreeMap.Entry} allocations and red-black pointer
++ * chasing), {@link ObjectArrayList} per-chunk buckets with O(1) swap-remove when elements implement {@link Indexed},
++ * and an {@link ObjectOpenHashSet} for O(1) {@code equals}/{@code hashCode} deduplication (preserving vanilla's
++ * {@code Block.isEqualTo} family equality).
+  *
+- * <p>Semantics that matter for vanilla parity:
+- * <ul>
+- *   <li>{@link #contains(Object)} uses {@code equals}/{@code hashCode} (as the old hash set did).</li>
+- *   <li>{@link #first()} and the order of {@link #collect} results follow {@code compareTo} (as the old tree set did).</li>
+- *   <li>{@link #add(Comparable)} refuses an element that is {@code equals} to one already present, which is
+- *       exactly what every caller used to enforce with a {@code contains} check before {@code add}.</li>
+- * </ul>
+- *
+- * <p>Antarctic - original work; the per-chunk indexing idea is the same one modern Paper uses for its scheduled
+- * tick lists (Spottedleaf / PaperMC).
++ * <p>Not thread safe; callers are main-thread confined.
+  */
+ public final class ChunkIndexedTreeSet<E extends Comparable<? super E>> {
+ 
+@@ -37,10 +30,22 @@ public final class ChunkIndexedTreeSet<E extends Comparable<? super E>> {
+         int blockZ(E element);
+     }
+ 
++    /** Optional intrusive index handle enabling O(log n) arbitrary heap removal and O(1) swap-remove in chunk buckets. */
++    public interface Indexed {
++        int antarcticHeapIndex();
++
++        void antarcticHeapIndex(int idx);
++
++        int antarcticBucketIndex();
++
++        void antarcticBucketIndex(int idx);
++    }
++
+     private final Locator<E> locator;
+     private final ObjectOpenHashSet<E> hash = new ObjectOpenHashSet<E>();
+-    private final TreeSet<E> tree = new TreeSet<E>();
+-    private final Long2ObjectOpenHashMap<ObjectOpenHashSet<E>> buckets = new Long2ObjectOpenHashMap<ObjectOpenHashSet<E>>();
++    private Object[] heap = new Object[64];
++    private int heapSize = 0;
++    private final Long2ObjectOpenHashMap<ObjectArrayList<E>> buckets = new Long2ObjectOpenHashMap<ObjectArrayList<E>>();
+     private final ObjectArrayList<E> scratch = new ObjectArrayList<E>();
+ 
+     public ChunkIndexedTreeSet(Locator<E> locator) {
+@@ -56,7 +61,7 @@ public final class ChunkIndexedTreeSet<E extends Comparable<? super E>> {
+     }
+ 
+     public boolean isEmpty() {
+-        return this.hash.isEmpty();
++        return this.heapSize == 0;
+     }
+ 
+     public boolean contains(Object element) {
+@@ -68,27 +73,33 @@ public final class ChunkIndexedTreeSet<E extends Comparable<? super E>> {
+         if (!this.hash.add(element)) {
+             return false;
+         }
+-        this.tree.add(element);
++        this.heapInsert(element);
+         long key = chunkKey(this.locator.blockX(element) >> 4, this.locator.blockZ(element) >> 4);
+-        ObjectOpenHashSet<E> bucket = this.buckets.get(key);
++        ObjectArrayList<E> bucket = this.buckets.get(key);
+         if (bucket == null) {
+-            bucket = new ObjectOpenHashSet<E>(4);
++            bucket = new ObjectArrayList<E>(4);
+             this.buckets.put(key, bucket);
+         }
++        int bucketIdx = bucket.size();
+         bucket.add(element);
++        if (element instanceof Indexed) {
++            ((Indexed) element).antarcticBucketIndex(bucketIdx);
++        }
+         return true;
+     }
+ 
+     /** @return true if an element was removed */
+     public boolean remove(E element) {
+-        if (!this.hash.remove(element)) {
++        E stored = this.hash.get(element);
++        if (stored == null) {
+             return false;
+         }
+-        this.tree.remove(element);
+-        long key = chunkKey(this.locator.blockX(element) >> 4, this.locator.blockZ(element) >> 4);
+-        ObjectOpenHashSet<E> bucket = this.buckets.get(key);
++        this.hash.remove(stored);
++        this.heapRemove(stored);
++        long key = chunkKey(this.locator.blockX(stored) >> 4, this.locator.blockZ(stored) >> 4);
++        ObjectArrayList<E> bucket = this.buckets.get(key);
+         if (bucket != null) {
+-            bucket.remove(element);
++            this.bucketRemove(bucket, stored);
+             if (bucket.isEmpty()) {
+                 this.buckets.remove(key);
+             }
+@@ -96,14 +107,27 @@ public final class ChunkIndexedTreeSet<E extends Comparable<? super E>> {
+         return true;
+     }
+ 
+-    /** @throws java.util.NoSuchElementException when empty, like the old tree set */
++    /** @throws NoSuchElementException when empty, like the old tree set */
++    @SuppressWarnings("unchecked")
+     public E first() {
+-        return this.tree.first();
++        if (this.heapSize == 0) {
++            throw new NoSuchElementException();
++        }
++        return (E) this.heap[0];
+     }
+ 
+     public void clear() {
++        for (int i = 0; i < this.heapSize; ++i) {
++            Object obj = this.heap[i];
++            if (obj instanceof Indexed) {
++                Indexed indexed = (Indexed) obj;
++                indexed.antarcticHeapIndex(-1);
++                indexed.antarcticBucketIndex(-1);
++            }
++            this.heap[i] = null;
++        }
++        this.heapSize = 0;
+         this.hash.clear();
+-        this.tree.clear();
+         this.buckets.clear();
+     }
+ 
+@@ -128,7 +152,7 @@ public final class ChunkIndexedTreeSet<E extends Comparable<? super E>> {
+         if (span <= this.buckets.size()) {
+             for (int cx = chunkMinX; cx <= chunkMaxX; ++cx) {
+                 for (int cz = chunkMinZ; cz <= chunkMaxZ; ++cz) {
+-                    ObjectOpenHashSet<E> bucket = this.buckets.get(chunkKey(cx, cz));
++                    ObjectArrayList<E> bucket = this.buckets.get(chunkKey(cx, cz));
+                     if (bucket != null) {
+                         this.gather(bucket, minX, minZ, maxX, maxZ);
+                     }
+@@ -136,7 +160,7 @@ public final class ChunkIndexedTreeSet<E extends Comparable<? super E>> {
+             }
+         } else {
+             // The box covers more chunk columns than exist; walk the populated buckets instead.
+-            for (Long2ObjectMap.Entry<ObjectOpenHashSet<E>> entry : this.buckets.long2ObjectEntrySet()) {
++            for (Long2ObjectMap.Entry<ObjectArrayList<E>> entry : this.buckets.long2ObjectEntrySet()) {
+                 long key = entry.getLongKey();
+                 int cx = (int) key;
+                 int cz = (int) (key >>> 32);
+@@ -165,8 +189,9 @@ public final class ChunkIndexedTreeSet<E extends Comparable<? super E>> {
+         return result;
+     }
+ 
+-    private void gather(ObjectOpenHashSet<E> bucket, int minX, int minZ, int maxX, int maxZ) {
+-        for (E element : bucket) {
++    private void gather(ObjectArrayList<E> bucket, int minX, int minZ, int maxX, int maxZ) {
++        for (int i = 0, len = bucket.size(); i < len; ++i) {
++            E element = bucket.get(i);
+             int x = this.locator.blockX(element);
+             if (x >= minX && x < maxX) {
+                 int z = this.locator.blockZ(element);
+@@ -176,4 +201,141 @@ public final class ChunkIndexedTreeSet<E extends Comparable<? super E>> {
+             }
+         }
+     }
++
++    // --------------------------------------------------------------------------------- binary min-heap
++
++    private void heapInsert(E element) {
++        int idx = this.heapSize;
++        if (idx == this.heap.length) {
++            this.heap = Arrays.copyOf(this.heap, idx << 1);
++        }
++        this.heapSize = idx + 1;
++        this.siftUp(idx, element);
++    }
++
++    @SuppressWarnings("unchecked")
++    private void heapRemove(E element) {
++        int idx = -1;
++        if (element instanceof Indexed) {
++            int candidate = ((Indexed) element).antarcticHeapIndex();
++            if (candidate >= 0 && candidate < this.heapSize && this.heap[candidate] == element) {
++                idx = candidate;
++            }
++        } else if (this.heapSize > 0 && this.heap[0] == element) {
++            idx = 0;
++        }
++        if (idx < 0) {
++            for (int i = 0; i < this.heapSize; ++i) {
++                if (this.heap[i] == element) {
++                    idx = i;
++                    break;
++                }
++            }
++        }
++        if (idx < 0) {
++            return;
++        }
++        if (element instanceof Indexed) {
++            ((Indexed) element).antarcticHeapIndex(-1);
++        }
++        int lastIdx = --this.heapSize;
++        E last = (E) this.heap[lastIdx];
++        this.heap[lastIdx] = null;
++        if (idx < lastIdx) {
++            int parentIdx = (idx - 1) >>> 1;
++            if (idx > 0 && last.compareTo((E) this.heap[parentIdx]) < 0) {
++                this.siftUp(idx, last);
++            } else {
++                this.siftDown(idx, last);
++            }
++        }
++    }
++
++    @SuppressWarnings("unchecked")
++    private void siftUp(int idx, E element) {
++        Object[] arr = this.heap;
++        while (idx > 0) {
++            int parentIdx = (idx - 1) >>> 1;
++            E parent = (E) arr[parentIdx];
++            if (element.compareTo(parent) >= 0) {
++                break;
++            }
++            arr[idx] = parent;
++            if (parent instanceof Indexed) {
++                ((Indexed) parent).antarcticHeapIndex(idx);
++            }
++            idx = parentIdx;
++        }
++        arr[idx] = element;
++        if (element instanceof Indexed) {
++            ((Indexed) element).antarcticHeapIndex(idx);
++        }
++    }
++
++    @SuppressWarnings("unchecked")
++    private void siftDown(int idx, E element) {
++        Object[] arr = this.heap;
++        int size = this.heapSize;
++        int half = size >>> 1;
++        while (idx < half) {
++            int childIdx = (idx << 1) + 1;
++            E child = (E) arr[childIdx];
++            int rightIdx = childIdx + 1;
++            if (rightIdx < size) {
++                E right = (E) arr[rightIdx];
++                if (right.compareTo(child) < 0) {
++                    childIdx = rightIdx;
++                    child = right;
++                }
++            }
++            if (element.compareTo(child) <= 0) {
++                break;
++            }
++            arr[idx] = child;
++            if (child instanceof Indexed) {
++                ((Indexed) child).antarcticHeapIndex(idx);
++            }
++            idx = childIdx;
++        }
++        arr[idx] = element;
++        if (element instanceof Indexed) {
++            ((Indexed) element).antarcticHeapIndex(idx);
++        }
++    }
++
++    // ----------------------------------------------------------------------------- O(1) bucket remove
++
++    private void bucketRemove(ObjectArrayList<E> bucket, E element) {
++        int size = bucket.size();
++        int idx = -1;
++        if (element instanceof Indexed) {
++            int candidate = ((Indexed) element).antarcticBucketIndex();
++            if (candidate >= 0 && candidate < size && bucket.get(candidate) == element) {
++                idx = candidate;
++            }
++        }
++        if (idx < 0) {
++            for (int i = 0; i < size; ++i) {
++                if (bucket.get(i) == element) {
++                    idx = i;
++                    break;
++                }
++            }
++        }
++        if (idx < 0) {
++            return;
++        }
++        if (element instanceof Indexed) {
++            ((Indexed) element).antarcticBucketIndex(-1);
++        }
++        int lastIdx = size - 1;
++        if (idx < lastIdx) {
++            E last = bucket.get(lastIdx);
++            bucket.set(idx, last);
++            if (last instanceof Indexed) {
++                ((Indexed) last).antarcticBucketIndex(idx);
++            }
++        }
++        bucket.remove(lastIdx);
++    }
+ }
+diff --git a/main/java/net/minecraft/server/NextTickListEntry.java b/main/java/net/minecraft/server/NextTickListEntry.java
+new file mode 100644
+index 0000000..527df9b
+--- /dev/null
++++ b/main/java/net/minecraft/server/NextTickListEntry.java
+@@ -0,0 +1,98 @@
++package net.minecraft.server;
++
++import me.stella.antarctic.collection.ChunkIndexedTreeSet;
++
++public class NextTickListEntry implements Comparable<NextTickListEntry>, ChunkIndexedTreeSet.Indexed {
++
++    private static long d;
++    private Block e; // Antarctic - non-final for reusable zero-alloc probe
++    public final BlockPosition a;
++    public long b;
++    public int c;
++    private final long f;
++    // Antarctic start - intrusive heap & chunk-bucket indices for ChunkIndexedTreeSet
++    private int antarcticHeapIdx = -1;
++    private int antarcticBucketIdx = -1;
++    // Antarctic end
++
++    public NextTickListEntry(BlockPosition blockposition, Block block) {
++        this.f = (long) (NextTickListEntry.d++);
++        this.a = blockposition.h();
++        this.e = block;
++    }
++
++    // Antarctic start - reusable probe constructor (does not allocate BlockPosition copy or increment sequence id)
++    private NextTickListEntry(BlockPosition.MutableBlockPosition probePos) {
++        this.f = -1L;
++        this.a = probePos;
++        this.e = null;
++    }
++
++    static NextTickListEntry createProbe(BlockPosition.MutableBlockPosition probePos) {
++        return new NextTickListEntry(probePos);
++    }
++
++    void setProbeBlock(Block block) {
++        this.e = block;
++    }
++
++    @Override
++    public int antarcticHeapIndex() {
++        return this.antarcticHeapIdx;
++    }
++
++    @Override
++    public void antarcticHeapIndex(int idx) {
++        this.antarcticHeapIdx = idx;
++    }
++
++    @Override
++    public int antarcticBucketIndex() {
++        return this.antarcticBucketIdx;
++    }
++
++    @Override
++    public void antarcticBucketIndex(int idx) {
++        this.antarcticBucketIdx = idx;
++    }
++    // Antarctic end
++
++    public boolean equals(Object object) {
++        if (!(object instanceof NextTickListEntry)) {
++            return false;
++        } else {
++            NextTickListEntry nextticklistentry = (NextTickListEntry) object;
++
++            return this.a.equals(nextticklistentry.a) && Block.a(this.e, nextticklistentry.e);
++        }
++    }
++
++    public int hashCode() {
++        return this.a.hashCode();
++    }
++
++    public NextTickListEntry a(long i) {
++        this.b = i;
++        return this;
++    }
++
++    public void a(int i) {
++        this.c = i;
++    }
++
++    public int a(NextTickListEntry nextticklistentry) {
++        return this.b < nextticklistentry.b ? -1 : (this.b > nextticklistentry.b ? 1 : (this.c != nextticklistentry.c ? this.c - nextticklistentry.c : (this.f < nextticklistentry.f ? -1 : (this.f > nextticklistentry.f ? 1 : 0))));
++    }
++
++    public String toString() {
++        return Block.getId(this.e) + ": " + this.a + ", " + this.b + ", " + this.c + ", " + this.f;
++    }
++
++    public Block a() {
++        return this.e;
++    }
++
++    public int compareTo(NextTickListEntry object) {
++        return this.a(object);
++    }
++}
+diff --git a/main/java/net/minecraft/server/WorldServer.java b/main/java/net/minecraft/server/WorldServer.java
+index deccb7a..fffb8eb 100644
+--- a/main/java/net/minecraft/server/WorldServer.java
++++ b/main/java/net/minecraft/server/WorldServer.java
+@@ -63,6 +63,8 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+     private int V;
+     private final List<NextTickListEntry> W = Lists.newArrayList();
+     private final me.stella.antarctic.collection.MultiplicitySet<NextTickListEntry> currentTickBatch = new me.stella.antarctic.collection.MultiplicitySet<NextTickListEntry>(); // Antarctic - O(1) mirror of W for isBlockTickPending checks
++    private final BlockPosition.MutableBlockPosition antarcticTickProbePos = new BlockPosition.MutableBlockPosition(); // Antarctic - zero-alloc tick probe
++    private final NextTickListEntry antarcticTickProbe = NextTickListEntry.createProbe(this.antarcticTickProbePos); // Antarctic
+ 
+     // CraftBukkit start
+     private static Throwable getAddToWorldStackTrace(Entity entity) {
+@@ -605,15 +607,19 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+     }
+ 
+     public boolean a(BlockPosition blockposition, Block block) {
+-        NextTickListEntry nextticklistentry = new NextTickListEntry(blockposition, block);
+-
+-        return this.currentTickBatch.contains(nextticklistentry); // Antarctic - was W.contains (linear scan)
++        // Antarctic start - zero-alloc probe without bumping NextTickListEntry sequence counter
++        this.antarcticTickProbePos.c(blockposition.getX(), blockposition.getY(), blockposition.getZ());
++        this.antarcticTickProbe.setProbeBlock(block);
++        return this.currentTickBatch.contains(this.antarcticTickProbe);
++        // Antarctic end
+     }
+ 
+     public boolean b(BlockPosition blockposition, Block block) {
+-        NextTickListEntry nextticklistentry = new NextTickListEntry(blockposition, block);
+-
+-        return this.nextTickList.contains(nextticklistentry); // CraftBukkit
++        // Antarctic start - zero-alloc probe without bumping NextTickListEntry sequence counter
++        this.antarcticTickProbePos.c(blockposition.getX(), blockposition.getY(), blockposition.getZ());
++        this.antarcticTickProbe.setProbeBlock(block);
++        return this.nextTickList.contains(this.antarcticTickProbe);
++        // Antarctic end
+     }
+ 
+     public void a(BlockPosition blockposition, Block block, int i) {
+@@ -783,7 +789,7 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+                     this.currentTickBatch.removeOne(nextticklistentry); // Antarctic
+                     boolean flag1 = false;
+ 
+-                    if (this.areChunksLoadedBetween(nextticklistentry.a.a(0, 0, 0), nextticklistentry.a.a(0, 0, 0))) {
++                    if (this.isLoaded(nextticklistentry.a)) { // Antarctic - avoid allocating two BlockPositions per ticked block
+                         IBlockData iblockdata = this.getType(nextticklistentry.a);
+                         co.aikar.timings.Timing timing = iblockdata.getBlock().getTiming(); // Paper
+                         timing.startTiming(); // Paper
+@@ -817,20 +823,26 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+ 
+     @Nullable
+     public List<NextTickListEntry> a(Chunk chunk, boolean flag) {
+-        ChunkCoordIntPair chunkcoordintpair = chunk.k();
+-        int i = (chunkcoordintpair.x << 4) - 2;
++        // Antarctic start - avoid allocating ChunkCoordIntPair and StructureBoundingBox on every chunk save
++        int i = (chunk.locX << 4) - 2;
+         int j = i + 16 + 2;
+-        int k = (chunkcoordintpair.z << 4) - 2;
++        int k = (chunk.locZ << 4) - 2;
+         int l = k + 16 + 2;
+ 
+-        return this.a(new StructureBoundingBox(i, 0, k, j, 256, l), flag);
++        return this.collectPendingTicks(i, k, j, l, flag);
++        // Antarctic end
+     }
+ 
+     @Nullable
+     public List<NextTickListEntry> a(StructureBoundingBox structureboundingbox, boolean flag) {
++        return this.collectPendingTicks(structureboundingbox.a, structureboundingbox.c, structureboundingbox.d, structureboundingbox.f, flag);
++    }
++
++    @Nullable
++    private List<NextTickListEntry> collectPendingTicks(int minX, int minZ, int maxX, int maxZ, boolean flag) {
+         // Antarctic start - answer from the per-chunk index instead of walking every pending tick; same matches, same order
+         // (scheduled ticks in compareTo order, then the batch currently being ticked in list order), same half-open bounds.
+-        List<NextTickListEntry> arraylist = this.nextTickList.collect(structureboundingbox.a, structureboundingbox.c, structureboundingbox.d, structureboundingbox.f, flag);
++        List<NextTickListEntry> arraylist = this.nextTickList.collect(minX, minZ, maxX, maxZ, flag);
+ 
+         if (!this.W.isEmpty()) { // only non-empty while scheduled ticks are being processed
+             Iterator iterator = this.W.iterator();
+@@ -839,7 +851,7 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+                 NextTickListEntry nextticklistentry = (NextTickListEntry) iterator.next();
+                 BlockPosition blockposition = nextticklistentry.a;
+ 
+-                if (blockposition.getX() >= structureboundingbox.a && blockposition.getX() < structureboundingbox.d && blockposition.getZ() >= structureboundingbox.c && blockposition.getZ() < structureboundingbox.f) {
++                if (blockposition.getX() >= minX && blockposition.getX() < maxX && blockposition.getZ() >= minZ && blockposition.getZ() < maxZ) {
+                     if (flag) {
+                         iterator.remove();
+                         this.currentTickBatch.removeOne(nextticklistentry);
+diff --git a/test/java/net/minecraft/server/ScheduledTickIndexParityTest.java b/test/java/net/minecraft/server/ScheduledTickIndexParityTest.java
+index 6b0e70a..b6437d2 100644
+--- a/test/java/net/minecraft/server/ScheduledTickIndexParityTest.java
++++ b/test/java/net/minecraft/server/ScheduledTickIndexParityTest.java
+@@ -135,6 +135,32 @@ public class ScheduledTickIndexParityTest {
+         assertEquals(-16, box.f);
+     }
+ 
++    @Test
++    public void associatedBlockFamilyEqualityMatchesVanilla() {
++        ChunkIndexedTreeSet<NextTickListEntry> set = new ChunkIndexedTreeSet<NextTickListEntry>(LOCATOR);
++        BlockPosition pos = new BlockPosition(10, 64, -5);
++        NextTickListEntry litTorch = new NextTickListEntry(pos, Blocks.REDSTONE_TORCH);
++        litTorch.a(100L);
++        NextTickListEntry unlitTorch = new NextTickListEntry(pos, Blocks.UNLIT_REDSTONE_TORCH);
++        unlitTorch.a(105L);
++
++        assertTrue(set.add(litTorch));
++        assertTrue("Block.isEqualTo family equality must treat REDSTONE_TORCH and UNLIT_REDSTONE_TORCH as equal", set.contains(unlitTorch));
++        assertTrue(!set.add(unlitTorch));
++        assertEquals(1, set.size());
++        assertSame(litTorch, set.first());
++
++        // Removing via an equal-but-distinct associated-block probe must cleanly remove the stored entry
++        BlockPosition.MutableBlockPosition probePos = new BlockPosition.MutableBlockPosition(10, 64, -5);
++        NextTickListEntry probe = NextTickListEntry.createProbe(probePos);
++        probe.setProbeBlock(Blocks.UNLIT_REDSTONE_TORCH);
++        assertTrue(set.contains(probe));
++        assertTrue(set.remove(probe));
++        assertTrue(set.isEmpty());
++        assertEquals(-1, litTorch.antarcticHeapIndex());
++        assertEquals(-1, litTorch.antarcticBucketIndex());
++    }
++
+     @Test
+     public void randomizedOperationsMatchTheOldImplementation() {
+         for (long seed = 1; seed <= 25; ++seed) {
