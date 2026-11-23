@@ -1,0 +1,209 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 01:15:23 +0700
+Subject: [PATCH 141/141] fix: harden async playerdata saving shutdown, cloning
+ and reload
+
+
+diff --git a/main/java/net/minecraft/server/EntityHuman.java b/main/java/net/minecraft/server/EntityHuman.java
+index aa0b27f..2f01ed4 100644
+--- a/main/java/net/minecraft/server/EntityHuman.java
++++ b/main/java/net/minecraft/server/EntityHuman.java
+@@ -730,11 +730,11 @@ public abstract class EntityHuman extends EntityLiving {
+         this.abilities.a(nbttagcompound);
+         nbttagcompound.set("EnderItems", this.enderChest.i());
+         if (!this.getShoulderEntityLeft().isEmpty()) {
+-            nbttagcompound.set("ShoulderEntityLeft", this.getShoulderEntityLeft());
++            nbttagcompound.set("ShoulderEntityLeft", this.getShoulderEntityLeft().g()); // Antarctic - deep clone for async playerdata serialization safety
+         }
+ 
+         if (!this.getShoulderEntityRight().isEmpty()) {
+-            nbttagcompound.set("ShoulderEntityRight", this.getShoulderEntityRight());
++            nbttagcompound.set("ShoulderEntityRight", this.getShoulderEntityRight().g()); // Antarctic - deep clone for async playerdata serialization safety
+         }
+         nbttagcompound.setString("SpawnWorld", spawnWorld); // CraftBukkit - fixes bed spawns for multiworld worlds
+ 
+diff --git a/main/java/net/minecraft/server/WorldNBTStorage.java b/main/java/net/minecraft/server/WorldNBTStorage.java
+index f3f8e79..5ca1a02 100644
+--- a/main/java/net/minecraft/server/WorldNBTStorage.java
++++ b/main/java/net/minecraft/server/WorldNBTStorage.java
+@@ -72,12 +72,28 @@ public class WorldNBTStorage implements IDataManager, IPlayerFileData {
+         while (!pendingSaves.isEmpty() && System.currentTimeMillis() < deadline) {
+             CompletableFuture<?>[] futures = pendingSaves.values().toArray(new CompletableFuture[0]);
+             if (futures.length == 0) break;
+-            try {
+-                CompletableFuture.allOf(futures).get(Math.max(1, deadline - System.currentTimeMillis()), TimeUnit.MILLISECONDS);
+-            } catch (Exception e) {
+-                b.error("Failed to await all pending player data saves", e);
++            // Antarctic start - await every future independently so one failure never abandons remaining saves on shutdown
++            boolean timedOut = false;
++            for (CompletableFuture<?> future : futures) {
++                long remaining = deadline - System.currentTimeMillis();
++                if (remaining <= 0L) {
++                    timedOut = true;
++                    break;
++                }
++                try {
++                    future.get(remaining, TimeUnit.MILLISECONDS);
++                } catch (java.util.concurrent.TimeoutException e) {
++                    b.error("Timed out awaiting pending player data save", e);
++                    timedOut = true;
++                    break;
++                } catch (Exception e) {
++                    b.error("A pending player data save completed exceptionally", e);
++                }
++            }
++            if (timedOut) {
+                 break;
+             }
++            // Antarctic end
+         }
+     }
+     private final File baseDir;
+@@ -208,42 +224,49 @@ public class WorldNBTStorage implements IDataManager, IPlayerFileData {
+             File file = new File(this.playerDir, entityhuman.bn() + ".dat.tmp");
+             File file1 = new File(this.playerDir, entityhuman.bn() + ".dat");
+ 
++            final UUID uuid = entityhuman.getUniqueID();
+             if (!com.destroystokyo.paper.config.toml.modules.concurrency.AsyncPlayerDataSaving.enabled) {
++                // Antarctic - drain any in-flight async save for this UUID before writing synchronously to .dat.tmp
++                if (pendingSaves.containsKey(uuid)) {
++                    awaitPendingSave(uuid);
++                }
+                 this.savePlayerDataToFile(nbttagcompound, file, file1, entityhuman.getName());
+                 return;
+             }
+ 
+-            final UUID uuid = entityhuman.getUniqueID();
+             final String name = entityhuman.getName();
+             final CompletableFuture<Void> currentSave = new CompletableFuture<>();
++            final Runnable saveTask = () -> {
++                try {
++                    this.savePlayerDataToFile(nbttagcompound, file, file1, name);
++                    currentSave.complete(null);
++                } catch (Throwable t) {
++                    WorldNBTStorage.b.error("Failed to save player data asynchronously for {}", name, t);
++                    currentSave.completeExceptionally(t);
++                } finally {
++                    pendingSaves.remove(uuid, currentSave);
++                }
++            };
+ 
+             pendingSaves.compute(uuid, (key, previousSave) -> {
+                 if (previousSave == null || previousSave.isDone()) {
+-                    asyncSaveExecutor.execute(() -> {
++                    try {
++                        asyncSaveExecutor.execute(saveTask);
++                    } catch (Throwable submitError) {
++                        WorldNBTStorage.b.error("Failed to submit async player data save for {}", name, submitError);
++                        currentSave.completeExceptionally(submitError);
++                        return null;
++                    }
++                } else {
++                    previousSave.whenComplete((res, err) -> {
+                         try {
+-                            this.savePlayerDataToFile(nbttagcompound, file, file1, name);
+-                            currentSave.complete(null);
+-                        } catch (Throwable t) {
+-                            WorldNBTStorage.b.error("Failed to save player data asynchronously for {}", name, t);
+-                            currentSave.completeExceptionally(t);
+-                        } finally {
++                            asyncSaveExecutor.execute(saveTask);
++                        } catch (Throwable submitError) {
++                            WorldNBTStorage.b.error("Failed to submit chained async player data save for {}", name, submitError);
++                            currentSave.completeExceptionally(submitError);
+                             pendingSaves.remove(uuid, currentSave);
+                         }
+                     });
+-                } else {
+-                    previousSave.whenComplete((res, err) -> {
+-                        asyncSaveExecutor.execute(() -> {
+-                            try {
+-                                this.savePlayerDataToFile(nbttagcompound, file, file1, name);
+-                                currentSave.complete(null);
+-                            } catch (Throwable t) {
+-                                WorldNBTStorage.b.error("Failed to save player data asynchronously for {}", name, t);
+-                                currentSave.completeExceptionally(t);
+-                            } finally {
+-                                pendingSaves.remove(uuid, currentSave);
+-                            }
+-                        });
+-                    });
+                 }
+                 return currentSave;
+             });
+diff --git a/test/java/net/minecraft/server/AsyncPlayerDataHardeningTest.java b/test/java/net/minecraft/server/AsyncPlayerDataHardeningTest.java
+new file mode 100644
+index 0000000..25a53ee
+--- /dev/null
++++ b/test/java/net/minecraft/server/AsyncPlayerDataHardeningTest.java
+@@ -0,0 +1,69 @@
++package net.minecraft.server;
++
++import java.lang.reflect.Field;
++import java.util.UUID;
++import java.util.concurrent.CompletableFuture;
++import java.util.concurrent.ConcurrentMap;
++import java.util.concurrent.atomic.AtomicBoolean;
++import org.junit.Assert;
++import org.junit.Test;
++
++public class AsyncPlayerDataHardeningTest {
++
++    @SuppressWarnings("unchecked")
++    @Test
++    public void testAwaitAllPendingSavesWaitsForHealthyFuturesEvenWhenOneFails() throws Exception {
++        Field pendingField = WorldNBTStorage.class.getDeclaredField("pendingSaves");
++        pendingField.setAccessible(true);
++        ConcurrentMap<UUID, CompletableFuture<Void>> pending =
++                (ConcurrentMap<UUID, CompletableFuture<Void>>) pendingField.get(null);
++
++        UUID failedId = UUID.randomUUID();
++        UUID slowId = UUID.randomUUID();
++        CompletableFuture<Void> failedFuture = new CompletableFuture<>();
++        CompletableFuture<Void> slowFuture = new CompletableFuture<>();
++        AtomicBoolean slowFinished = new AtomicBoolean(false);
++
++        pending.put(failedId, failedFuture);
++        pending.put(slowId, slowFuture);
++
++        try {
++            // Fail the first future immediately, complete the second future after 150ms
++            failedFuture.completeExceptionally(new RuntimeException("simulated disk failure"));
++            pending.remove(failedId, failedFuture);
++            Thread completer = new Thread(() -> {
++                try {
++                    Thread.sleep(150L);
++                } catch (InterruptedException ignored) {
++                    Thread.currentThread().interrupt();
++                }
++                slowFinished.set(true);
++                slowFuture.complete(null);
++                pending.remove(slowId, slowFuture);
++            });
++            completer.setDaemon(true);
++            completer.start();
++
++            // Put failedFuture back right before awaitAllPendingSaves so it encounters the failed future first
++            pending.put(failedId, failedFuture);
++            Thread remover = new Thread(() -> {
++                try {
++                    Thread.sleep(50L);
++                } catch (InterruptedException ignored) {
++                    Thread.currentThread().interrupt();
++                }
++                pending.remove(failedId, failedFuture);
++            });
++            remover.setDaemon(true);
++            remover.start();
++
++            WorldNBTStorage.awaitAllPendingSaves();
++
++            Assert.assertTrue("awaitAllPendingSaves must still wait for slowFuture after failedFuture throws", slowFinished.get());
++            Assert.assertTrue("slowFuture must be completed before awaitAllPendingSaves returns", slowFuture.isDone());
++        } finally {
++            pending.remove(failedId);
++            pending.remove(slowId);
++        }
++    }
++}
