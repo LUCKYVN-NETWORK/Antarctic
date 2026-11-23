@@ -1,0 +1,286 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 01:03:14 +0700
+Subject: [PATCH 137/137] fix: preserve RelightService heightMapMinimum, resend
+ and shutdown
+
+
+diff --git a/main/java/net/minecraft/server/Chunk.java b/main/java/net/minecraft/server/Chunk.java
+index a608f4a..dc6da26 100644
+--- a/main/java/net/minecraft/server/Chunk.java
++++ b/main/java/net/minecraft/server/Chunk.java
+@@ -758,6 +758,10 @@ public class Chunk {
+     public boolean canSeeSky(int x, int y, int z) {
+         return y >= this.heightMap[(z & 15) << 4 | (x & 15)];
+     }
++
++    void setHeightMapMinimum(int minHeight) {
++        this.v = minHeight;
++    }
+     // Antarctic end
+ 
+     public void a(Entity entity) {
+diff --git a/main/java/net/minecraft/server/ChunkProviderServer.java b/main/java/net/minecraft/server/ChunkProviderServer.java
+index 68109eb..3026741 100644
+--- a/main/java/net/minecraft/server/ChunkProviderServer.java
++++ b/main/java/net/minecraft/server/ChunkProviderServer.java
+@@ -438,7 +438,16 @@ public class ChunkProviderServer implements IChunkProvider {
+                 }
+             }
+         }
+-        this.world.pendingLight.clearChunk(chunk.chunkKey); // Antarctic - drop deferred light checks of the unloading chunk
++        // Antarctic start - persist pending deferred light marker before clearing, and clear relight non-convergence tracking
++        if (this.world.pendingLight.hasPending(chunk.chunkKey)) {
++            chunk.antarcticLightPending = true;
++        }
++        this.world.pendingLight.clearChunk(chunk.chunkKey);
++        RelightService relightService = this.world.getRelightServiceIfPresent();
++        if (relightService != null) {
++            relightService.onChunkUnload(chunk.chunkKey);
++        }
++        // Antarctic end
+         // Moved from unloadChunks above
+         chunk.removeEntities();
+         if (save) {
+diff --git a/main/java/net/minecraft/server/ChunkRegionLoader.java b/main/java/net/minecraft/server/ChunkRegionLoader.java
+index 1f6955b..8dc06d2 100644
+--- a/main/java/net/minecraft/server/ChunkRegionLoader.java
++++ b/main/java/net/minecraft/server/ChunkRegionLoader.java
+@@ -310,6 +310,9 @@ public class ChunkRegionLoader implements IChunkLoader, IAsyncChunkSaver {
+         if (chunk.antarcticLightPending) {
+             return true;
+         }
++        if (world != null && world.pendingLight != null && world.pendingLight.hasPending(chunk.chunkKey)) {
++            return true;
++        }
+         if (world instanceof WorldServer) {
+             RelightService service = ((WorldServer) world).getRelightServiceIfPresent();
+             return service != null && service.isPending(chunk.chunkKey);
+diff --git a/main/java/net/minecraft/server/PlayerChunk.java b/main/java/net/minecraft/server/PlayerChunk.java
+index 460f0da..ab8da8f 100644
+--- a/main/java/net/minecraft/server/PlayerChunk.java
++++ b/main/java/net/minecraft/server/PlayerChunk.java
+@@ -210,6 +210,12 @@ public class PlayerChunk {
+         }
+     }
+ 
++    void sendLightUpdate(int sectionMask) {
++        if (this.done && this.chunk != null && !this.c.isEmpty() && sectionMask != 0) {
++            this.a((Packet) (new PacketPlayOutMapChunk(this.chunk, sectionMask)));
++        }
++    }
++
+     public void d() {
+         if (this.done && this.chunk != null) {
+             if (this.dirtyCount != 0) {
+diff --git a/main/java/net/minecraft/server/RelightService.java b/main/java/net/minecraft/server/RelightService.java
+index b15d7ed..2e45a99 100644
+--- a/main/java/net/minecraft/server/RelightService.java
++++ b/main/java/net/minecraft/server/RelightService.java
+@@ -59,6 +59,7 @@ public final class RelightService {
+     private final Long2LongOpenHashMap latestSnapshottedSeq = new Long2LongOpenHashMap();
+     private final Long2IntOpenHashMap pendingChunkCounts = new Long2IntOpenHashMap();
+     private final Long2IntOpenHashMap nonConvergedAttempts = new Long2IntOpenHashMap();
++    private final java.util.Set<RequestState> activeRequests = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<RequestState, Boolean>());
+ 
+     private long nextSeq = 1L;
+     private long nextApplySeq = 1L;
+@@ -128,7 +129,8 @@ public final class RelightService {
+             list.add(key);
+         }
+ 
+-        RequestState request = new RequestState(byTile.size());
++        RequestState request = new RequestState(byTile.size(), this.activeRequests);
++        this.activeRequests.add(request);
+         for (LongArrayList tileChunks : byTile.values()) {
+             long[] keys = tileChunks.toLongArray();
+             long seq = this.nextSeq++;
+@@ -427,12 +429,16 @@ public final class RelightService {
+                     heightChanged = true;
+                 }
+             }
++            if (minHeight != Integer.MAX_VALUE) {
++                live.setHeightMapMinimum(minHeight);
++            }
+             if (heightChanged) {
+                 live.f(true);
+             }
+         }
+ 
+         // Clarification 2: write nibbles and instantiate missing sections directly without Chunk.initLighting()
++        int changedSectionMask = 0;
+         ChunkSection[] sections = live.getSections();
+         for (int s = 0; s < LightRules.SECTIONS; ++s) {
+             byte[] skyNibbles = hasSky ? result.sky(cx, cz, s) : null;
+@@ -440,6 +446,7 @@ public final class RelightService {
+             if (skyNibbles == null && blockNibbles == null) {
+                 continue;
+             }
++            changedSectionMask |= (1 << s);
+             ChunkSection sec = sections[s];
+             if (sec == Chunk.a) {
+                 IBlockData[] predefined = this.world.chunkPacketBlockController != null
+@@ -466,13 +473,21 @@ public final class RelightService {
+             }
+         }
+ 
+-        // Clarification 3: mark dirty, lit=true, and clear carried pending marker once validated light is written
+-        live.antarcticLightPending = false;
++        // Clarification 3: mark dirty, lit=true, clear carried marker only if no newer tiles remain pending, and resend to watching clients
++        if (this.pendingChunkCounts.get(live.chunkKey) <= 1) {
++            live.antarcticLightPending = false;
++        }
+         live.f(true);
+         live.e(true);
+         if (Lighting.saveAfterRelight) {
+             live.setLastSaved(0L);
+         }
++        if (changedSectionMask != 0 && this.world.getPlayerChunkMap() != null) {
++            PlayerChunk playerChunk = this.world.getPlayerChunkMap().getChunk(cx, cz);
++            if (playerChunk != null) {
++                playerChunk.sendLightUpdate(changedSectionMask);
++            }
++        }
+     }
+ 
+     /** Main-thread on-demand consistency check for the entire chunk (all sections, sky and block). */
+@@ -549,11 +564,18 @@ public final class RelightService {
+                 addedAny = true;
+             }
+         }
+-        if (addedAny && live.areNeighborsLoaded(1)) {
+-            this.world.pendingLight.markReady(live.chunkKey);
++        if (addedAny) {
++            live.antarcticLightPending = true;
++            if (live.areNeighborsLoaded(1)) {
++                this.world.pendingLight.markReady(live.chunkKey);
++            }
+         }
+     }
+ 
++    public void onChunkUnload(long chunkKey) {
++        this.nonConvergedAttempts.remove(chunkKey);
++    }
++
+     private static boolean matchesSnapshot(Chunk live, TargetChunkSnapshot snap) {
+         ChunkSection[] sections = live.getSections();
+         for (int s = 0; s < LightRules.SECTIONS; ++s) {
+@@ -597,6 +619,12 @@ public final class RelightService {
+         } catch (InterruptedException e) {
+             Thread.currentThread().interrupt();
+         }
++        for (RequestState state : this.activeRequests) {
++            if (!state.future.isDone()) {
++                state.future.cancel(false);
++            }
++        }
++        this.activeRequests.clear();
+         this.queuedTiles.clear();
+         this.completedQueue.clear();
+         this.readyBySeq.clear();
+@@ -609,11 +637,13 @@ public final class RelightService {
+ 
+     private static final class RequestState {
+         final CompletableFuture<Integer> future = new CompletableFuture<>();
++        final java.util.Set<RequestState> registry;
+         int remainingTiles;
+         int appliedChunks;
+ 
+-        RequestState(int tiles) {
++        RequestState(int tiles, java.util.Set<RequestState> registry) {
+             this.remainingTiles = tiles;
++            this.registry = registry;
+         }
+ 
+         void addRetryTile() {
+@@ -623,6 +653,7 @@ public final class RelightService {
+         void onTileFinished(int applied) {
+             this.appliedChunks += applied;
+             if (--this.remainingTiles <= 0 && !this.future.isDone()) {
++                this.registry.remove(this);
+                 this.future.complete(this.appliedChunks);
+             }
+         }
+diff --git a/test/java/net/minecraft/server/RelightServiceLifecycleTest.java b/test/java/net/minecraft/server/RelightServiceLifecycleTest.java
+new file mode 100644
+index 0000000..60c63bd
+--- /dev/null
++++ b/test/java/net/minecraft/server/RelightServiceLifecycleTest.java
+@@ -0,0 +1,77 @@
++package net.minecraft.server;
++
++import java.lang.reflect.Field;
++import java.util.concurrent.CompletableFuture;
++import me.stella.antarctic.collection.PendingLightRegistry;
++import org.junit.Assert;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import org.spigotmc.AsyncCatcher;
++import sun.misc.Unsafe;
++
++public class RelightServiceLifecycleTest {
++
++    private static Unsafe unsafe;
++
++    @BeforeClass
++    public static void setup() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        unsafe = (Unsafe) f.get(null);
++    }
++
++    @Test
++    public void testShutdownCancelsPendingFuturesAndUnloadClearsTracking() throws Exception {
++        boolean prevAsync = AsyncCatcher.enabled;
++        AsyncCatcher.enabled = false;
++        try {
++            WorldServer world = (WorldServer) unsafe.allocateInstance(WorldServer.class);
++            ChunkProviderServer cps = (ChunkProviderServer) unsafe.allocateInstance(ChunkProviderServer.class);
++            cps.chunks = new it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<>();
++            Field cpField = World.class.getDeclaredField("chunkProvider");
++            cpField.setAccessible(true);
++            cpField.set(world, cps);
++
++            RelightService service = new RelightService(world);
++            long chunkKey = ChunkCoordIntPair.a(3, -4);
++            CompletableFuture<Integer> future = service.submit(new long[] { chunkKey });
++            Assert.assertFalse("Submitted future must be pending before tick/shutdown", future.isDone());
++
++            // Shutting down must cancel outstanding futures rather than stranding callers forever
++            service.shutdown();
++            Assert.assertTrue("shutdown() must complete/cancel pending futures", future.isDone());
++            Assert.assertTrue("shutdown() must cancel incomplete futures", future.isCancelled());
++        } finally {
++            AsyncCatcher.enabled = prevAsync;
++        }
++    }
++
++    @Test
++    public void testCaptureLightPendingSeesWorldPendingLightRegistry() throws Exception {
++        WorldServer world = (WorldServer) unsafe.allocateInstance(WorldServer.class);
++        PendingLightRegistry registry = new PendingLightRegistry(1024);
++        Field plField = World.class.getDeclaredField("pendingLight");
++        plField.setAccessible(true);
++        plField.set(world, registry);
++
++        Chunk chunk = (Chunk) unsafe.allocateInstance(Chunk.class);
++        Field keyField = Chunk.class.getDeclaredField("chunkKey");
++        keyField.setAccessible(true);
++        long key = ChunkCoordIntPair.a(5, 7);
++        keyField.setLong(chunk, key);
++        chunk.antarcticLightPending = false;
++
++        Assert.assertFalse(ChunkRegionLoader.captureLightPending(world, chunk));
++        registry.add(key, 123);
++        Assert.assertTrue("captureLightPending must detect queued entries in world.pendingLight",
++                ChunkRegionLoader.captureLightPending(world, chunk));
++    }
++
++    @Test
++    public void testChunkSetHeightMapMinimumUpdatesFieldV() throws Exception {
++        Chunk chunk = (Chunk) unsafe.allocateInstance(Chunk.class);
++        chunk.setHeightMapMinimum(42);
++        Assert.assertEquals(42, chunk.w());
++    }
++}

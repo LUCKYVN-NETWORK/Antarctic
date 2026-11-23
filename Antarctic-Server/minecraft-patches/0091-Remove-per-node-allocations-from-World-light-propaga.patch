@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Tue, 17 Nov 2026 16:33:41 +0700
-Subject: [PATCH 091/136] Remove per-node allocations from World light
+Subject: [PATCH 091/137] Remove per-node allocations from World light
  propagation
 
 World.c (the sky/block light BFS) allocated a BlockPosition per dequeued node plus six more for the neighbor probes, cloned EnumDirection.values() per node, and every probe did isLoaded + chunk lookup + BlockPosition clamp. Now:

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Sun, 18 Oct 2026 12:16:53 +0700
-Subject: [PATCH 067/136] Precompute VarInt encoded sizes without loops
+Subject: [PATCH 067/137] Precompute VarInt encoded sizes without loops
 
 - Backport Leaf MC 0079 (precomputed VarInt size) to PacketDataSerializer
 - Replace the up-to-four-iteration mask loop with a branch-free bit-length formula
