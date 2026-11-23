@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Sun, 18 Oct 2026 17:37:02 +0700
-Subject: [PATCH 075/116] Return unmodifiable safe view for
+Subject: [PATCH 075/117] Return unmodifiable safe view for
  CraftServer.getWorlds()
 
 - Backport Leaf Server-Paper 0045 (Safe view for CraftServer.getWorlds)

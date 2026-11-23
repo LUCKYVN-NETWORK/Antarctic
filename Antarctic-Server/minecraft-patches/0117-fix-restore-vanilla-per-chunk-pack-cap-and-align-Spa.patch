@@ -1,0 +1,402 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Mon, 23 Nov 2026 13:45:14 +0700
+Subject: [PATCH 117/117] fix: restore vanilla per-chunk pack cap and align
+ SpawnerCreature cap divisor
+
+
+diff --git a/main/java/net/minecraft/server/SpawnerCreature.java b/main/java/net/minecraft/server/SpawnerCreature.java
+index 441fda6..26704f3 100644
+--- a/main/java/net/minecraft/server/SpawnerCreature.java
++++ b/main/java/net/minecraft/server/SpawnerCreature.java
+@@ -18,6 +18,10 @@ public final class SpawnerCreature {
+     private static final int a = (int) Math.pow(17.0D, 2.0D);
+     private final LongHashSet b = new LongHashSet(); // CraftBukkit
+ 
++    static int computeMobLimit(int limit, int eligibleChunks, int currentMobCount) {
++        return (limit * eligibleChunks / SpawnerCreature.a) - currentMobCount + 1;
++    }
++
+     public SpawnerCreature() {}
+ 
+     // Spigot start - get entity count only from chunks being processed in b
+@@ -155,11 +159,11 @@ public final class SpawnerCreature {
+                     int l1 = limit * i / a; // CraftBukkit - use per-world limits
+                     */ // Paper end
+ 
+-                    if ((mobcnt = worldserver.getCreatureCount(enumcreaturetype)) <= limit * i / 289) { // Paper - use 17x17 like vanilla (a at top of file) // Antarctic - O(1) tracked world count
++                    if ((mobcnt = worldserver.getCreatureCount(enumcreaturetype)) <= limit * i / SpawnerCreature.a) { // Paper - use 17x17 like vanilla (a at top of file) // Antarctic - O(1) tracked world count
+                         BlockPosition.MutableBlockPosition blockposition_mutableblockposition = new BlockPosition.MutableBlockPosition();
+                         Iterator iterator1 = this.b.iterator();
+ 
+-                        int moblimit = (limit * i / 256) - mobcnt + 1; // Spigot - up to 1 more than limit
++                        int moblimit = computeMobLimit(limit, i, mobcnt); // Antarctic - align divisor with 17x17 (289) cap check above
+                         label120:
+                         while (iterator1.hasNext() && (moblimit > 0)) { // Spigot - while more allowed
+                             // CraftBukkit start = use LongHash and LongObjectHashMap
+@@ -247,12 +251,11 @@ public final class SpawnerCreature {
+                                                                 entityinsentient.die();
+                                                             }
+ 
+-                                                            // Spigot start
+-                                                            if ( moblimit <= 0 ) {
+-                                                                // If we're past limit, stop spawn
+-                                                                // Spigot end
++                                                            // Antarctic start - restore vanilla per-chunk pack cap (cU()) alongside Spigot moblimit
++                                                            if (l2 >= entityinsentient.cU() || moblimit <= 0) {
+                                                                 continue label120;
+                                                             }
++                                                            // Antarctic end
+                                                         }
+ 
+                                                         j1 += l2;
+diff --git a/test/java/net/minecraft/server/SpawnerCreatureCapParityTest.java b/test/java/net/minecraft/server/SpawnerCreatureCapParityTest.java
+new file mode 100644
+index 0000000..d17b76b
+--- /dev/null
++++ b/test/java/net/minecraft/server/SpawnerCreatureCapParityTest.java
+@@ -0,0 +1,344 @@
++package net.minecraft.server;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertTrue;
++
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Random;
++import java.util.UUID;
++import org.bukkit.Bukkit;
++import org.bukkit.craftbukkit.CraftServer;
++import org.bukkit.craftbukkit.CraftWorld;
++import org.bukkit.event.entity.CreatureSpawnEvent;
++import org.bukkit.plugin.SimplePluginManager;
++import org.junit.After;
++import org.junit.AfterClass;
++import org.junit.Before;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import org.spigotmc.AsyncCatcher;
++import org.spigotmc.SpigotWorldConfig;
++import sun.misc.Unsafe;
++
++/**
++ * Verifies vanilla parity fixes in SpawnerCreature:
++ * 1. moblimit divisor aligned from 256 to 289 (17x17) matching Paper's cap check.
++ * 2. Restored vanilla per-chunk pack cap (l2 >= entityinsentient.cU()):
++ *    Ghast=1, normal mob (Zombie)=4, Horse=6, Wolf=8.
++ */
++public class SpawnerCreatureCapParityTest {
++
++    private static Unsafe unsafe;
++    private static boolean installedBukkitServer;
++    private boolean prevAsyncCatcher;
++
++    /** Deterministic test mob with configurable cU() cap that always passes P() and canSpawn(). */
++    public static final class StubCapMob extends EntityInsentient implements IMonster {
++        static int configuredMaxPerChunk = 1;
++
++        public StubCapMob(World world) {
++            super(world);
++        }
++
++        @Override
++        public boolean P() {
++            return true;
++        }
++
++        @Override
++        public boolean canSpawn() {
++            return true;
++        }
++
++        @Override
++        public int cU() {
++            return configuredMaxPerChunk;
++        }
++
++        @Override
++        public GroupDataEntity prepare(DifficultyDamageScaler scaler, GroupDataEntity groupData) {
++            return groupData;
++        }
++    }
++
++    private static final class StubChunkProvider extends ChunkProviderServer {
++        StubChunkProvider(WorldServer world) {
++            super(world, null, null);
++        }
++
++        @Override
++        public List<BiomeBase.BiomeMeta> a(EnumCreatureType type, BlockPosition pos) {
++            return Collections.emptyList();
++        }
++    }
++
++    private static final class StubPlayerChunkMap extends PlayerChunkMap {
++        private final PlayerChunk readyChunk;
++
++        StubPlayerChunkMap(WorldServer world, PlayerChunk readyChunk) {
++            super(world);
++            this.readyChunk = readyChunk;
++        }
++
++        @Override
++        public PlayerChunk getChunk(int x, int z) {
++            return (x == 0 && z == 0) ? readyChunk : null;
++        }
++    }
++
++    private static final class StubWorldServer extends WorldServer {
++        BiomeBase.BiomeMeta forcedMeta;
++        int addedCount;
++        int monsterLimit = 70;
++        CraftWorld stubCraftWorld;
++
++        StubWorldServer() {
++            super(null, null, null, 0, null, null, null);
++        }
++
++        @Override
++        public CraftWorld getWorld() {
++            return stubCraftWorld;
++        }
++
++        @Override
++        public BlockPosition getSpawn() {
++            return new BlockPosition(10000, 64, 10000);
++        }
++
++        @Override
++        public BiomeBase.BiomeMeta a(EnumCreatureType type, BlockPosition pos) {
++            return type == EnumCreatureType.MONSTER ? forcedMeta : null;
++        }
++
++        @Override
++        public boolean a(EnumCreatureType type, BiomeBase.BiomeMeta meta, BlockPosition pos) {
++            return type == EnumCreatureType.MONSTER && meta == forcedMeta;
++        }
++
++        @Override
++        public boolean addEntity(Entity entity, CreatureSpawnEvent.SpawnReason reason) {
++            ++addedCount;
++            return true;
++        }
++
++        @Override
++        public DifficultyDamageScaler D(BlockPosition pos) {
++            return new DifficultyDamageScaler(EnumDifficulty.NORMAL, 0L, 0L, 0.0F);
++        }
++
++        @Override
++        public boolean isPlayerNearby(double x, double y, double z, double dist) {
++            return false;
++        }
++    }
++
++    private static final class StubCraftWorld extends CraftWorld {
++        int monsterLimit = 70;
++
++        StubCraftWorld() {
++            super(null, null, null);
++        }
++
++        @Override
++        public int getMonsterSpawnLimit() {
++            return monsterLimit;
++        }
++
++        @Override
++        public int getAnimalSpawnLimit() {
++            return 0;
++        }
++
++        @Override
++        public int getWaterAnimalSpawnLimit() {
++            return 0;
++        }
++
++        @Override
++        public int getAmbientSpawnLimit() {
++            return 0;
++        }
++    }
++
++    @BeforeClass
++    public static void bootstrap() throws Exception {
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        unsafe = (Unsafe) f.get(null);
++        DispenserRegistry.c();
++
++        if (Bukkit.getServer() == null) {
++            CraftServer server = (CraftServer) unsafe.allocateInstance(CraftServer.class);
++            SimplePluginManager pm = new SimplePluginManager(server, new org.bukkit.command.SimpleCommandMap(server));
++            setField(CraftServer.class, server, "pluginManager", pm);
++            Field serverField = Bukkit.class.getDeclaredField("server");
++            serverField.setAccessible(true);
++            serverField.set(null, server);
++            installedBukkitServer = true;
++        }
++    }
++
++    @AfterClass
++    public static void cleanupBukkitServer() throws Exception {
++        if (installedBukkitServer) {
++            Field serverField = Bukkit.class.getDeclaredField("server");
++            serverField.setAccessible(true);
++            serverField.set(null, null);
++            installedBukkitServer = false;
++        }
++    }
++
++    @Before
++    public void setUp() {
++        this.prevAsyncCatcher = AsyncCatcher.enabled;
++        AsyncCatcher.enabled = false;
++    }
++
++    @After
++    public void tearDown() {
++        AsyncCatcher.enabled = this.prevAsyncCatcher;
++    }
++
++    private static void setField(Class<?> owner, Object target, String name, Object value) throws Exception {
++        Field f = owner.getDeclaredField(name);
++        f.setAccessible(true);
++        f.set(target, value);
++    }
++
++    private static StubWorldServer createSpawningWorld(int monsterLimit, int existingMonsters) throws Exception {
++        StubWorldServer world = (StubWorldServer) unsafe.allocateInstance(StubWorldServer.class);
++        SpigotWorldConfig spigotConfig = (SpigotWorldConfig) unsafe.allocateInstance(SpigotWorldConfig.class);
++        spigotConfig.mobSpawnRange = 4;
++        spigotConfig.viewDistance = 8;
++        setField(World.class, world, "spigotConfig", spigotConfig);
++        setField(World.class, world, "paperConfig", unsafe.allocateInstance(com.destroystokyo.paper.PaperWorldConfig.class));
++        world.worldProvider = new WorldProviderNormal();
++        setField(World.class, world, "random", new Random(42L));
++        setField(World.class, world, "P", new WorldBorder());
++        setField(World.class, world, "players", new ArrayList<EntityHuman>());
++        setField(World.class, world, "u", new ArrayList<IWorldAccess>());
++        setField(World.class, world, "methodProfiler", new MethodProfiler());
++        int[] counts = new int[EnumCreatureType.values().length];
++        counts[EnumCreatureType.MONSTER.ordinal()] = existingMonsters;
++        setField(World.class, world, "antarcticCreatureCounts", counts);
++
++        StubCraftWorld craftWorld = (StubCraftWorld) unsafe.allocateInstance(StubCraftWorld.class);
++        craftWorld.monsterLimit = monsterLimit;
++        world.stubCraftWorld = craftWorld;
++        world.monsterLimit = monsterLimit;
++
++        StubChunkProvider provider = new StubChunkProvider(world);
++        setField(World.class, world, "chunkProvider", provider);
++
++        // Single loaded stone-floor chunk at (0, 0) where every (x, 64, z) is valid ON_GROUND
++        Chunk chunk = (Chunk) unsafe.allocateInstance(Chunk.class);
++        setField(Chunk.class, chunk, "world", world);
++        setField(Chunk.class, chunk, "locX", 0);
++        setField(Chunk.class, chunk, "locZ", 0);
++        setField(Chunk.class, chunk, "chunkKey", ChunkCoordIntPair.a(0, 0));
++        ChunkSection[] sections = new ChunkSection[16];
++        for (int s = 0; s < 16; ++s) {
++            sections[s] = new ChunkSection(s << 4, true);
++        }
++        int[] heightMap = new int[256];
++        for (int x = 0; x < 16; ++x) {
++            for (int z = 0; z < 16; ++z) {
++                // Place stone floor at every even Y so random Y in [0..15] almost always hits valid support
++                for (int y = 0; y < 32; y += 3) {
++                    sections[y >> 4].setType(x, y & 15, z, Blocks.STONE.getBlockData());
++                }
++                heightMap[z << 4 | x] = 15;
++            }
++        }
++        setField(Chunk.class, chunk, "sections", sections);
++        setField(Chunk.class, chunk, "heightMap", heightMap);
++        provider.chunks.put(ChunkCoordIntPair.a(0, 0), chunk);
++
++        PlayerChunk playerChunk = (PlayerChunk) unsafe.allocateInstance(PlayerChunk.class);
++        setField(PlayerChunk.class, playerChunk, "done", true);
++        StubPlayerChunkMap pcm = (StubPlayerChunkMap) unsafe.allocateInstance(StubPlayerChunkMap.class);
++        setField(StubPlayerChunkMap.class, pcm, "readyChunk", playerChunk);
++        setField(WorldServer.class, world, "manager", pcm);
++
++        // One non-spectator player at (0, 0) so chunk (0, 0) is inside the spawn ring
++        EntityPlayer player = (EntityPlayer) unsafe.allocateInstance(EntityPlayer.class);
++        player.world = world;
++        player.locX = 8.0;
++        player.locY = 100.0;
++        player.locZ = 8.0;
++        player.affectsSpawning = true;
++        player.uniqueID = UUID.randomUUID();
++        PlayerInteractManager pim = (PlayerInteractManager) unsafe.allocateInstance(PlayerInteractManager.class);
++        setField(PlayerInteractManager.class, pim, "gamemode", EnumGamemode.SURVIVAL);
++        setField(EntityPlayer.class, player, "playerInteractManager", pim);
++        player.bukkitEntity = (org.bukkit.craftbukkit.entity.CraftPlayer) unsafe.allocateInstance(org.bukkit.craftbukkit.entity.CraftPlayer.class);
++        world.players.add(player);
++
++        return world;
++    }
++
++    @Test
++    public void testMobLimitDivisorAlignedTo289() {
++        // 1 player with 17x17 ring => eligibleChunks = 289, monster limit = 70
++        // Old Spigot divisor 256 produced (70*289/256) - 70 + 1 = 10 (+14.3% overspawn!).
++        // Aligned 289 divisor produces (70*289/289) - 70 + 1 = 1.
++        assertEquals(1, SpawnerCreature.computeMobLimit(70, 289, 70));
++        assertEquals(6, SpawnerCreature.computeMobLimit(70, 289, 65));
++        assertEquals(71, SpawnerCreature.computeMobLimit(70, 289, 0));
++
++        // 2 disjoint players => 578 eligible chunks => cap = 140
++        assertEquals(1, SpawnerCreature.computeMobLimit(70, 578, 140));
++        assertEquals(11, SpawnerCreature.computeMobLimit(70, 578, 130));
++    }
++
++    @Test
++    public void testVanillaEntityMaxSpawnedInChunkValues() throws Exception {
++        EntityGhast ghast = (EntityGhast) unsafe.allocateInstance(EntityGhast.class);
++        EntityZombie zombie = (EntityZombie) unsafe.allocateInstance(EntityZombie.class);
++        EntityHorse horse = (EntityHorse) unsafe.allocateInstance(EntityHorse.class);
++        EntityWolf wolf = (EntityWolf) unsafe.allocateInstance(EntityWolf.class);
++        assertEquals(1, ghast.cU());
++        assertEquals(4, zombie.cU());
++        assertEquals(6, horse.cU());
++        assertEquals(8, wolf.cU());
++    }
++
++    @Test
++    public void testPerChunkPackCapEnforcedForGhastAndNormalMob() throws Exception {
++        SpawnerCreature spawner = new SpawnerCreature();
++
++        // Test Ghast-like cap cU() == 1: across 200 spawn ticks on a single chunk, NO tick may spawn > 1 mob
++        StubCapMob.configuredMaxPerChunk = 1;
++        int maxObservedSingleTickCap1 = 0;
++        int totalCap1 = 0;
++        for (int tick = 0; tick < 200; ++tick) {
++            StubWorldServer world = createSpawningWorld(700, 0);
++            world.forcedMeta = new BiomeBase.BiomeMeta(StubCapMob.class, 100, 4, 4);
++            spawner.a(world, true, false, false);
++            maxObservedSingleTickCap1 = Math.max(maxObservedSingleTickCap1, world.addedCount);
++            totalCap1 += world.addedCount;
++        }
++        assertTrue("Expected at least some spawns during cap=1 test", totalCap1 > 0);
++        assertEquals("cU()==1 (Ghast) must never spawn more than 1 entity per chunk per tick", 1, maxObservedSingleTickCap1);
++
++        // Test normal mob cap cU() == 4: across 400 ticks, NO tick may spawn > 4 mobs (pre-fix allowed up to 12)
++        StubCapMob.configuredMaxPerChunk = 4;
++        int maxObservedSingleTickCap4 = 0;
++        int totalCap4 = 0;
++        for (int tick = 0; tick < 400; ++tick) {
++            StubWorldServer world = createSpawningWorld(700, 0);
++            world.forcedMeta = new BiomeBase.BiomeMeta(StubCapMob.class, 100, 4, 4);
++            spawner.a(world, true, false, false);
++            maxObservedSingleTickCap4 = Math.max(maxObservedSingleTickCap4, world.addedCount);
++            totalCap4 += world.addedCount;
++        }
++        assertTrue("Expected multiple spawns during cap=4 test", totalCap4 > 0);
++        assertTrue("cU()==4 must never exceed 4 per chunk per tick, observed " + maxObservedSingleTickCap4,
++                maxObservedSingleTickCap4 <= 4);
++    }
++}
