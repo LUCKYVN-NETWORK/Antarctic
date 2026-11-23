@@ -1,0 +1,989 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Mon, 23 Nov 2026 14:08:19 +0700
+Subject: [PATCH 120/120] perf: optimize MobSpawnerAbstract cap check and
+ zero-alloc spawn collisions
+
+
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/MobSpawning.java b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/MobSpawning.java
+index d5986b3..e3436d9 100644
+--- a/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/MobSpawning.java
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/MobSpawning.java
+@@ -38,6 +38,12 @@ public class MobSpawning implements IConfigModule {
+     )
+     public static int eligibleChunkTrimFactor = 4;
+ 
++    @ConfigInfo(
++        baseName = "spawner-idle-player-check-interval",
++        comments = "Ticks between nearby-player activation checks for idle mob spawners (>= 1).\nDefault 1 preserves strict vanilla every-tick activation; high-spawner servers (1k-2k spawners) can raise this (e.g. 4) to linearly cut idle player-scan CPU."
++    )
++    public static int spawnerIdlePlayerCheckInterval = 1;
++
+     public static int getPrecheckLightMode() {
+         String mode = precheckLightMode;
+         if (mode == "single-roll") {
+@@ -100,5 +106,10 @@ public class MobSpawning implements IConfigModule {
+                 "optimizations.mob-spawning.eligible-chunk-trim-factor must be 0 or >= 2, got: " + eligibleChunkTrimFactor
+             );
+         }
++        if (spawnerIdlePlayerCheckInterval < 1) {
++            throw new IllegalArgumentException(
++                "optimizations.mob-spawning.spawner-idle-player-check-interval must be >= 1, got: " + spawnerIdlePlayerCheckInterval
++            );
++        }
+     }
+ }
+diff --git a/main/java/net/minecraft/server/Chunk.java b/main/java/net/minecraft/server/Chunk.java
+index dd2f2d2..5ddac41 100644
+--- a/main/java/net/minecraft/server/Chunk.java
++++ b/main/java/net/minecraft/server/Chunk.java
+@@ -1187,6 +1187,121 @@ public class Chunk {
+ 
+     }
+ 
++    // Antarctic start - zero-allocation early-exit entity queries for MobSpawnerAbstract and spawn collision checks
++    public <T extends Entity> int countEntities(Class<? extends T> oclass, AxisAlignedBB axisalignedbb, @Nullable Predicate<? super T> predicate, int limit) {
++        if (limit <= 0) {
++            return 0;
++        }
++        int i = MathHelper.floor((axisalignedbb.b - 2.0D) / 16.0D);
++        int j = MathHelper.floor((axisalignedbb.e + 2.0D) / 16.0D);
++
++        i = MathHelper.clamp(i, 0, this.entitySlices.length - 1);
++        j = MathHelper.clamp(j, 0, this.entitySlices.length - 1);
++
++        int[] counts;
++        if (EntityItem.class.isAssignableFrom(oclass)) {
++            counts = itemCounts;
++        } else if (IInventory.class.isAssignableFrom(oclass)) {
++            counts = inventoryEntityCounts;
++        } else {
++            counts = null;
++        }
++
++        int count = 0;
++        for (int k = i; k <= j; ++k) {
++            if (counts != null && counts[k] <= 0) {
++                continue;
++            }
++            List<Entity> slice = this.entitySlices[k];
++            for (int idx = 0, len = slice.size(); idx < len; ++idx) {
++                Entity entity = slice.get(idx);
++                if (oclass.isInstance(entity) && entity.getBoundingBox().c(axisalignedbb) && (predicate == null || predicate.apply((T) entity))) {
++                    if (++count >= limit) {
++                        return count;
++                    }
++                }
++            }
++        }
++        return count;
++    }
++
++    boolean hasEntityBlockingSpawn(AxisAlignedBB axisalignedbb, @Nullable Entity exclude) {
++        int i = MathHelper.floor((axisalignedbb.b - 2.0D) / 16.0D);
++        int j = MathHelper.floor((axisalignedbb.e + 2.0D) / 16.0D);
++
++        i = MathHelper.clamp(i, 0, this.entitySlices.length - 1);
++        j = MathHelper.clamp(j, 0, this.entitySlices.length - 1);
++
++        for (int k = i; k <= j; ++k) {
++            List<Entity> slice = this.entitySlices[k];
++            for (int idx = 0, len = slice.size(); idx < len; ++idx) {
++                Entity entity1 = slice.get(idx);
++                if (entity1.getBoundingBox().c(axisalignedbb)) {
++                    if (IEntitySelector.e.apply(entity1) && !entity1.dead && entity1.i && entity1 != exclude && (exclude == null || !entity1.x(exclude))) {
++                        return true;
++                    }
++                    Entity[] aentity = entity1.bb();
++                    if (aentity != null) {
++                        for (int m = 0, alen = aentity.length; m < alen; ++m) {
++                            Entity entity2 = aentity[m];
++                            if (entity2.getBoundingBox().c(axisalignedbb) && IEntitySelector.e.apply(entity2) && !entity2.dead && entity2.i && entity2 != exclude && (exclude == null || !entity2.x(exclude))) {
++                                return true;
++                            }
++                        }
++                    }
++                }
++            }
++        }
++        return false;
++    }
++
++    boolean hasHardEntityCollision(Entity entity, AxisAlignedBB box, double minX, double minY, double minZ, double maxX, double maxY, double maxZ) {
++        int i = MathHelper.floor((minY - 2.0D) / 16.0D);
++        int j = MathHelper.floor((maxY + 2.0D) / 16.0D);
++
++        i = MathHelper.clamp(i, 0, this.entitySlices.length - 1);
++        j = MathHelper.clamp(j, 0, this.entitySlices.length - 1);
++
++        for (int k = i; k <= j; ++k) {
++            List<Entity> slice = this.entitySlices[k];
++            for (int idx = 0, len = slice.size(); idx < len; ++idx) {
++                Entity entity1 = slice.get(idx);
++                AxisAlignedBB bb1 = entity1.getBoundingBox();
++                if (bb1.d > minX && bb1.a < maxX && bb1.e > minY && bb1.b < maxY && bb1.f > minZ && bb1.c < maxZ && entity1 != entity) {
++                    if (IEntitySelector.e.apply(entity1) && !entity.x(entity1)) {
++                        AxisAlignedBB hard = entity1.al();
++                        if (hard != null && hard.c(box)) {
++                            return true;
++                        }
++                        hard = entity.j(entity1);
++                        if (hard != null && hard.c(box)) {
++                            return true;
++                        }
++                    }
++                    Entity[] aentity = entity1.bb();
++                    if (aentity != null) {
++                        for (int m = 0, alen = aentity.length; m < alen; ++m) {
++                            Entity entity2 = aentity[m];
++                            AxisAlignedBB bb2 = entity2.getBoundingBox();
++                            if (entity2 != entity && bb2.d > minX && bb2.a < maxX && bb2.e > minY && bb2.b < maxY && bb2.f > minZ && bb2.c < maxZ && IEntitySelector.e.apply(entity2) && !entity.x(entity2)) {
++                                AxisAlignedBB hard = entity2.al();
++                                if (hard != null && hard.c(box)) {
++                                    return true;
++                                }
++                                hard = entity.j(entity2);
++                                if (hard != null && hard.c(box)) {
++                                    return true;
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++        }
++        return false;
++    }
++    // Antarctic end
++
+     public boolean a(boolean flag) {
+         if (flag) {
+             if (this.t && this.world.getTime() != this.lastSaved || this.s) {
+diff --git a/main/java/net/minecraft/server/EntityInsentient.java b/main/java/net/minecraft/server/EntityInsentient.java
+index d2cfd7c..03e14c8 100644
+--- a/main/java/net/minecraft/server/EntityInsentient.java
++++ b/main/java/net/minecraft/server/EntityInsentient.java
+@@ -760,7 +760,8 @@ public abstract class EntityInsentient extends EntityLiving {
+     }
+ 
+     public boolean canSpawn() {
+-        return !this.world.containsLiquid(this.getBoundingBox()) && this.world.getCubes(this, this.getBoundingBox()).isEmpty() && this.world.a(this.getBoundingBox(), (Entity) this);
++        AxisAlignedBB bb = this.getBoundingBox();
++        return !this.world.containsLiquid(bb) && !this.world.hasAnyBlockOrEntityCollision(this, bb) && !this.world.hasAnyEntityCollision(bb, (Entity) this); // Antarctic - zero-alloc spawn collision queries
+     }
+ 
+     public int cU() {
+diff --git a/main/java/net/minecraft/server/EntityOcelot.java b/main/java/net/minecraft/server/EntityOcelot.java
+index 858bbef..db26e6a 100644
+--- a/main/java/net/minecraft/server/EntityOcelot.java
++++ b/main/java/net/minecraft/server/EntityOcelot.java
+@@ -197,7 +197,8 @@ public class EntityOcelot extends EntityTameableAnimal {
+     }
+ 
+     public boolean canSpawn() {
+-        if (this.world.a(this.getBoundingBox(), (Entity) this) && this.world.getCubes(this, this.getBoundingBox()).isEmpty() && !this.world.containsLiquid(this.getBoundingBox())) {
++        AxisAlignedBB bb = this.getBoundingBox();
++        if (!this.world.hasAnyEntityCollision(bb, (Entity) this) && !this.world.hasAnyBlockOrEntityCollision(this, bb) && !this.world.containsLiquid(bb)) { // Antarctic - zero-alloc spawn collision queries
+             BlockPosition blockposition = new BlockPosition(this.locX, this.getBoundingBox().b, this.locZ);
+ 
+             if (blockposition.getY() < this.world.getSeaLevel()) {
+diff --git a/main/java/net/minecraft/server/MobSpawnerAbstract.java b/main/java/net/minecraft/server/MobSpawnerAbstract.java
+index 2a32351..5a1d461 100644
+--- a/main/java/net/minecraft/server/MobSpawnerAbstract.java
++++ b/main/java/net/minecraft/server/MobSpawnerAbstract.java
+@@ -21,20 +21,52 @@ public abstract class MobSpawnerAbstract {
+     public int requiredPlayerRange = 16; // CraftBukkit private -> public
+     public int spawnRange = 4; // CraftBukkit private -> public
+     private int tickDelay = 0; // Paper
++    // Antarctic start - cached resolved mob key/class per spawnData and configurable idle player-check interval
++    private MobSpawnerData cachedSpawnData;
++    private String cachedMobId;
++    private MinecraftKey cachedMobKey;
++    private Class<? extends Entity> cachedEntityClass;
++    private int idleCheckCounter;
++    // Antarctic end
+ 
+     public MobSpawnerAbstract() {}
+ 
++    // Antarctic start - resolve and cache mob key + entity class per spawnData/id
++    private void resolveMobCache() {
++        String id = this.spawnData.b().getString("id");
++        if (this.spawnData == this.cachedSpawnData && java.util.Objects.equals(id, this.cachedMobId)) {
++            return;
++        }
++        this.cachedSpawnData = this.spawnData;
++        this.cachedMobId = id;
++        if (UtilColor.b(id)) {
++            this.cachedMobKey = null;
++            this.cachedEntityClass = null;
++        } else {
++            this.cachedMobKey = new MinecraftKey(id);
++            this.cachedEntityClass = EntityTypes.b.get(this.cachedMobKey);
++        }
++    }
++
++    private void invalidateMobCache() {
++        this.cachedSpawnData = null;
++        this.cachedMobId = null;
++        this.cachedMobKey = null;
++        this.cachedEntityClass = null;
++    }
++    // Antarctic end
++
+     @Nullable
+     public MinecraftKey getMobName() {
+-        String s = this.spawnData.b().getString("id");
+-
+-        return UtilColor.b(s) ? null : new MinecraftKey(s);
++        this.resolveMobCache();
++        return this.cachedMobKey;
+     }
+ 
+     public void setMobName(@Nullable MinecraftKey minecraftkey) {
+         if (minecraftkey != null) {
+             this.spawnData.b().setString("id", minecraftkey.toString());
+             this.mobs.clear(); // CraftBukkit - SPIGOT-3496, MC-92282
++            this.invalidateMobCache(); // Antarctic
+         }
+ 
+     }
+@@ -50,9 +82,20 @@ public abstract class MobSpawnerAbstract {
+         if (spawnDelay > 0 && --tickDelay > 0) return;
+         tickDelay = this.a().paperConfig.mobSpawnerTickRate;
+         // Paper end
++        // Antarctic start - optional idle spawner player-check interval (default 1 = vanilla every tick)
++        int idleInterval = com.destroystokyo.paper.config.toml.modules.optimizations.MobSpawning.spawnerIdlePlayerCheckInterval;
++        if (idleInterval > 1 && this.idleCheckCounter > 0) {
++            --this.idleCheckCounter;
++            this.e = this.d;
++            return;
++        }
+         if (!this.h()) {
+             this.e = this.d;
++            if (idleInterval > 1) {
++                this.idleCheckCounter = idleInterval - 1;
++            }
+         } else {
++        // Antarctic end
+             BlockPosition blockposition = this.b();
+ 
+             if (this.a().isClientSide) {
+@@ -77,24 +120,39 @@ public abstract class MobSpawnerAbstract {
+                     this.spawnDelay -= tickDelay; // Paper
+                     return;
+                 }
++                if (this.spawnCount <= 0) {
++                    return;
++                }
++
++                // Antarctic start - resolve mob key/class and hoist spawner AABB outside spawnCount loop
++                World world = this.a();
++                NBTTagCompound nbttagcompound = this.spawnData.b();
++                this.resolveMobCache();
++                MinecraftKey mobName = this.cachedMobKey;
++                if (mobName == null) {
++                    return;
++                }
++                Class<? extends Entity> entityClass = this.cachedEntityClass;
++                boolean hasPreSpawnListeners = com.destroystokyo.paper.event.entity.PreCreatureSpawnEvent.getHandlerList().getRegisteredListeners().length != 0;
++                org.bukkit.entity.EntityType type = hasPreSpawnListeners ? org.bukkit.entity.EntityType.fromName(mobName.getKey()) : null;
++                AxisAlignedBB spawnerBox = (new AxisAlignedBB((double) blockposition.getX(), (double) blockposition.getY(), (double) blockposition.getZ(), (double) (blockposition.getX() + 1), (double) (blockposition.getY() + 1), (double) (blockposition.getZ() + 1))).g((double) this.spawnRange);
++                // Fast early cap exit before any loop work when no PreCreatureSpawnEvent listeners are registered
++                if (!hasPreSpawnListeners && entityClass != null && world.countEntities(entityClass, spawnerBox, IEntitySelector.e, this.maxNearbyEntities) >= this.maxNearbyEntities) {
++                    this.i();
++                    return;
++                }
++                // Antarctic end
+ 
+                 boolean flag = false;
+ 
+                 for (int i = 0; i < this.spawnCount; ++i) {
+-                    NBTTagCompound nbttagcompound = this.spawnData.b();
+                     NBTTagList nbttaglist = nbttagcompound.getList("Pos", 6);
+-                    World world = this.a();
+                     int j = nbttaglist.size();
+                     double d3 = j >= 1 ? nbttaglist.f(0) : (double) blockposition.getX() + (world.random.nextDouble() - world.random.nextDouble()) * (double) this.spawnRange + 0.5D;
+                     double d4 = j >= 2 ? nbttaglist.f(1) : (double) (blockposition.getY() + world.random.nextInt(3) - 1);
+                     double d5 = j >= 3 ? nbttaglist.f(2) : (double) blockposition.getZ() + (world.random.nextDouble() - world.random.nextDouble()) * (double) this.spawnRange + 0.5D;
+-                    // Paper start
+-                    if (this.getMobName() == null) {
+-                        return;
+-                    }
+-                    String key = this.getMobName().getKey();
+-                    org.bukkit.entity.EntityType type = org.bukkit.entity.EntityType.fromName(key);
+-                    if (type != null && com.destroystokyo.paper.event.entity.PreCreatureSpawnEvent.getHandlerList().getRegisteredListeners().length != 0) { // Leaf - skip event creation and dispatch when no listeners are registered (backport of Leaf MC 0264)
++                    // Paper start - preserve PreCreatureSpawnEvent firing order when listeners are registered
++                    if (type != null) {
+                         com.destroystokyo.paper.event.entity.PreCreatureSpawnEvent event;
+                         event = new com.destroystokyo.paper.event.entity.PreCreatureSpawnEvent(
+                                 MCUtil.toLocation(world, d3, d4, d5),
+@@ -110,17 +168,25 @@ public abstract class MobSpawnerAbstract {
+                         }
+                     }
+                     // Paper end
++                    // Antarctic start - check maxNearbyEntities BEFORE NBT deserialization & 14.9 KiB entity construction
++                    if (entityClass != null && world.countEntities(entityClass, spawnerBox, IEntitySelector.e, this.maxNearbyEntities) >= this.maxNearbyEntities) {
++                        this.i();
++                        return;
++                    }
++                    // Antarctic end
+                     Entity entity = ChunkRegionLoader.a(nbttagcompound, world, d3, d4, d5, false);
+ 
+                     if (entity == null) {
+                         return;
+                     }
+ 
+-                    int k = world.a(entity.getClass(), (new AxisAlignedBB((double) blockposition.getX(), (double) blockposition.getY(), (double) blockposition.getZ(), (double) (blockposition.getX() + 1), (double) (blockposition.getY() + 1), (double) (blockposition.getZ() + 1))).g((double) this.spawnRange)).size();
++                    if (entityClass == null) {
++                        int k = world.countEntities(entity.getClass(), spawnerBox, IEntitySelector.e, this.maxNearbyEntities);
+ 
+-                    if (k >= this.maxNearbyEntities) {
+-                        this.i();
+-                        return;
++                        if (k >= this.maxNearbyEntities) {
++                            this.i();
++                            return;
++                        }
+                     }
+ 
+                     EntityInsentient entityinsentient = entity instanceof EntityInsentient ? (EntityInsentient) entity : null;
+@@ -259,6 +325,7 @@ public abstract class MobSpawnerAbstract {
+ 
+     public void a(MobSpawnerData mobspawnerdata) {
+         this.spawnData = mobspawnerdata;
++        this.invalidateMobCache(); // Antarctic
+     }
+ 
+     public abstract void a(int i);
+diff --git a/main/java/net/minecraft/server/World.java b/main/java/net/minecraft/server/World.java
+index 91ca338..c10b387 100644
+--- a/main/java/net/minecraft/server/World.java
++++ b/main/java/net/minecraft/server/World.java
+@@ -1493,6 +1493,115 @@ public abstract class World implements IBlockAccess {
+         return arraylist;
+     }
+ 
++    // Antarctic start - zero-allocation early-exit equivalent of !getCubes(entity, axisalignedbb).isEmpty()
++    public boolean hasAnyBlockOrEntityCollision(@Nullable Entity entity, AxisAlignedBB axisalignedbb) {
++        int i = MathHelper.floor(axisalignedbb.a) - 1;
++        int j = MathHelper.f(axisalignedbb.d) + 1;
++        int k = MathHelper.floor(axisalignedbb.b) - 1;
++        int l = MathHelper.f(axisalignedbb.e) + 1;
++        int i1 = MathHelper.floor(axisalignedbb.c) - 1;
++        int j1 = MathHelper.f(axisalignedbb.f) + 1;
++        WorldBorder worldborder = this.getWorldBorder();
++        boolean flag1 = entity != null && entity.bz();
++        boolean flag2 = entity != null && this.g(entity);
++        IBlockData stone = Blocks.STONE.getBlockData();
++        boolean optimizeVoxel = com.destroystokyo.paper.config.toml.modules.optimizations.Physics.optimizeVoxelCollisions;
++
++        BlockPosition.MutableBlockPosition pos = null;
++        ArrayList<AxisAlignedBB> nonCubeScratch = null;
++        int cachedChunkX = Integer.MIN_VALUE;
++        int cachedChunkZ = Integer.MIN_VALUE;
++        Chunk cachedChunk = null;
++
++        for (int k1 = i; k1 < j; ++k1) {
++            for (int l1 = i1; l1 < j1; ++l1) {
++                boolean flag3 = k1 == i || k1 == j - 1;
++                boolean flag4 = l1 == i1 || l1 == j1 - 1;
++
++                if (flag3 && flag4) {
++                    continue;
++                }
++
++                int chunkX = k1 >> 4;
++                int chunkZ = l1 >> 4;
++                if (chunkX != cachedChunkX || chunkZ != cachedChunkZ) {
++                    cachedChunkX = chunkX;
++                    cachedChunkZ = chunkZ;
++                    cachedChunk = this.getChunkIfLoaded(chunkX, chunkZ);
++                }
++                if (cachedChunk == null) {
++                    continue;
++                }
++
++                boolean outsideBorder = flag2 && !worldborder.isBlockInBounds(k1, l1);
++                for (int i2 = k; i2 < l; ++i2) {
++                    if (!flag3 && !flag4 || i2 != l - 1) {
++                        if (entity != null && flag1 == flag2) {
++                            entity.k(!flag2);
++                        }
++
++                        IBlockData iblockdata1 = outsideBorder ? stone : cachedChunk.a(k1, i2, l1);
++
++                        if (optimizeVoxel) {
++                            me.stella.antarctic.spatial.FastVoxelCache.ShapeType shape = me.stella.antarctic.spatial.FastVoxelCache.classify(iblockdata1);
++                            if (shape == me.stella.antarctic.spatial.FastVoxelCache.ShapeType.EMPTY) {
++                                continue;
++                            }
++                            if (shape == me.stella.antarctic.spatial.FastVoxelCache.ShapeType.FULL_CUBE) {
++                                if (axisalignedbb.a < (double) (k1 + 1) && axisalignedbb.d > (double) k1
++                                    && axisalignedbb.b < (double) (i2 + 1) && axisalignedbb.e > (double) i2
++                                    && axisalignedbb.c < (double) (l1 + 1) && axisalignedbb.f > (double) l1) {
++                                    return true;
++                                }
++                                continue;
++                            }
++                        }
++
++                        if (pos == null) {
++                            pos = new BlockPosition.MutableBlockPosition();
++                        }
++                        if (nonCubeScratch == null) {
++                            nonCubeScratch = new ArrayList<AxisAlignedBB>(1);
++                        }
++                        pos.c(k1, i2, l1);
++                        iblockdata1.a(this, pos, axisalignedbb, nonCubeScratch, entity, false);
++                        if (!nonCubeScratch.isEmpty()) {
++                            return true;
++                        }
++                    }
++                }
++            }
++        }
++
++        if (entity != null) {
++            if (entity instanceof EntityArmorStand && !entity.world.paperConfig.armorStandEntityLookups) {
++                return false;
++            }
++            double minX = axisalignedbb.a - 0.25D;
++            double minY = axisalignedbb.b - 0.25D;
++            double minZ = axisalignedbb.c - 0.25D;
++            double maxX = axisalignedbb.d + 0.25D;
++            double maxY = axisalignedbb.e + 0.25D;
++            double maxZ = axisalignedbb.f + 0.25D;
++            int minCx = MathHelper.floor((minX - 2.0D) / 16.0D);
++            int maxCx = MathHelper.floor((maxX + 2.0D) / 16.0D);
++            int minCz = MathHelper.floor((minZ - 2.0D) / 16.0D);
++            int maxCz = MathHelper.floor((maxZ + 2.0D) / 16.0D);
++
++            for (int cx = minCx; cx <= maxCx; ++cx) {
++                for (int cz = minCz; cz <= maxCz; ++cz) {
++                    Chunk chunk = this.getChunkIfLoaded(cx, cz);
++                    if (chunk != null && chunk.hasHardEntityCollision(entity, axisalignedbb, minX, minY, minZ, maxX, maxY, maxZ)) {
++                        return true;
++                    }
++                }
++            }
++        }
++
++        return false;
++    }
++    // Antarctic end
++
+     public boolean g(Entity entity) {
+         double d0 = this.P.b();
+         double d1 = this.P.c();
+@@ -1983,18 +2092,27 @@ public abstract class World implements IBlockAccess {
+     // Paper end
+ 
+     public boolean a(AxisAlignedBB axisalignedbb, @Nullable Entity entity) {
+-        List list = this.getEntities((Entity) null, axisalignedbb);
++        return !this.hasAnyEntityCollision(axisalignedbb, entity); // Antarctic - zero-allocation early-exit entity collision check
++    }
+ 
+-        for (int i = 0; i < list.size(); ++i) {
+-            Entity entity1 = (Entity) list.get(i);
++    // Antarctic start - zero-allocation early-exit counterpart of !a(AxisAlignedBB, Entity)
++    public boolean hasAnyEntityCollision(AxisAlignedBB axisalignedbb, @Nullable Entity entity) {
++        int minCx = MathHelper.floor((axisalignedbb.a - 2.0D) / 16.0D);
++        int maxCx = MathHelper.floor((axisalignedbb.d + 2.0D) / 16.0D);
++        int minCz = MathHelper.floor((axisalignedbb.c - 2.0D) / 16.0D);
++        int maxCz = MathHelper.floor((axisalignedbb.f + 2.0D) / 16.0D);
+ 
+-            if (!entity1.dead && entity1.i && entity1 != entity && (entity == null || !entity1.x(entity))) { // Reaper - Fix MC-103516
+-                return false;
++        for (int cx = minCx; cx <= maxCx; ++cx) {
++            for (int cz = minCz; cz <= maxCz; ++cz) {
++                Chunk chunk = this.getChunkIfLoaded(cx, cz);
++                if (chunk != null && chunk.hasEntityBlockingSpawn(axisalignedbb, entity)) {
++                    return true;
++                }
+             }
+         }
+-
+-        return true;
++        return false;
+     }
++    // Antarctic end
+ 
+     public boolean c(AxisAlignedBB axisalignedbb) {
+         int i = MathHelper.floor(axisalignedbb.a);
+@@ -2023,29 +2141,53 @@ public abstract class World implements IBlockAccess {
+     }
+ 
+     public boolean containsLiquid(AxisAlignedBB axisalignedbb) {
++        // Antarctic start - chunk-cached, lock-free containsLiquid (eliminates synchronized PooledBlockPosition & per-block chunk lookups)
+         int i = MathHelper.floor(axisalignedbb.a);
+         int j = MathHelper.f(axisalignedbb.d);
+-        int k = MathHelper.floor(axisalignedbb.b);
+-        int l = MathHelper.f(axisalignedbb.e);
++        int k = Math.max(0, MathHelper.floor(axisalignedbb.b));
++        int l = Math.min(256, MathHelper.f(axisalignedbb.e));
+         int i1 = MathHelper.floor(axisalignedbb.c);
+         int j1 = MathHelper.f(axisalignedbb.f);
+-        BlockPosition.PooledBlockPosition blockposition_pooledblockposition = BlockPosition.PooledBlockPosition.s();
+ 
+-        for (int k1 = i; k1 < j; ++k1) {
+-            for (int l1 = k; l1 < l; ++l1) {
+-                for (int i2 = i1; i2 < j1; ++i2) {
+-                    IBlockData iblockdata = this.getType(blockposition_pooledblockposition.f(k1, l1, i2));
++        if (k >= l) {
++            return false;
++        }
+ 
+-                    if (iblockdata.getMaterial().isLiquid()) {
+-                        blockposition_pooledblockposition.t();
++        int cachedChunkX = Integer.MIN_VALUE;
++        int cachedChunkZ = Integer.MIN_VALUE;
++        Chunk cachedChunk = null;
++
++        for (int k1 = i; k1 < j; ++k1) {
++            if (k1 < -30000000 || k1 >= 30000000) {
++                continue;
++            }
++            int chunkX = k1 >> 4;
++            for (int i2 = i1; i2 < j1; ++i2) {
++                if (i2 < -30000000 || i2 >= 30000000) {
++                    continue;
++                }
++                int chunkZ = i2 >> 4;
++                if (chunkX != cachedChunkX || chunkZ != cachedChunkZ) {
++                    cachedChunkX = chunkX;
++                    cachedChunkZ = chunkZ;
++                    cachedChunk = this.getChunkAt(chunkX, chunkZ);
++                }
++                ChunkSection[] sections = cachedChunk.getSections();
++                for (int l1 = k; l1 < l; ++l1) {
++                    ChunkSection section = sections[l1 >> 4];
++                    if (section == Chunk.a) {
++                        l1 = ((l1 >> 4) + 1) * 16 - 1;
++                        continue;
++                    }
++                    if (section.getType(k1 & 15, l1 & 15, i2 & 15).getMaterial().isLiquid()) {
+                         return true;
+                     }
+                 }
+             }
+         }
+ 
+-        blockposition_pooledblockposition.t();
+         return false;
++        // Antarctic end
+     }
+ 
+     public boolean e(AxisAlignedBB axisalignedbb) {
+@@ -2847,6 +2989,33 @@ public abstract class World implements IBlockAccess {
+         return arraylist;
+     }
+ 
++    // Antarctic start - zero-allocation early-exit count matching a(Class, AxisAlignedBB, Predicate).size()
++    public <T extends Entity> int countEntities(Class<? extends T> oclass, AxisAlignedBB axisalignedbb, @Nullable Predicate<? super T> predicate, int limit) {
++        if (limit <= 0) {
++            return 0;
++        }
++        int i = MathHelper.floor((axisalignedbb.a - 2.0D) / 16.0D);
++        int j = MathHelper.f((axisalignedbb.d + 2.0D) / 16.0D);
++        int k = MathHelper.floor((axisalignedbb.c - 2.0D) / 16.0D);
++        int l = MathHelper.f((axisalignedbb.f + 2.0D) / 16.0D);
++        int count = 0;
++
++        for (int i1 = i; i1 < j; ++i1) {
++            for (int j1 = k; j1 < l; ++j1) {
++                Chunk chunk = this.getChunkIfLoaded(i1, j1);
++                if (chunk != null) {
++                    count += chunk.countEntities(oclass, axisalignedbb, predicate, limit - count);
++                    if (count >= limit) {
++                        return count;
++                    }
++                }
++            }
++        }
++
++        return count;
++    }
++    // Antarctic end
++
+     @Nullable
+     public <T extends Entity> T a(Class<? extends T> oclass, AxisAlignedBB axisalignedbb, T t0) {
+         List list = this.a(oclass, axisalignedbb);
+diff --git a/test/java/net/minecraft/server/MobSpawnerOptimizationTest.java b/test/java/net/minecraft/server/MobSpawnerOptimizationTest.java
+new file mode 100644
+index 0000000..4410476
+--- /dev/null
++++ b/test/java/net/minecraft/server/MobSpawnerOptimizationTest.java
+@@ -0,0 +1,373 @@
++package net.minecraft.server;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++
++import com.destroystokyo.paper.PaperWorldConfig;
++import com.destroystokyo.paper.config.toml.modules.optimizations.MobSpawning;
++import java.lang.management.ManagementFactory;
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Random;
++import java.util.UUID;
++import org.bukkit.craftbukkit.entity.CraftPlayer;
++import org.junit.After;
++import org.junit.AfterClass;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import org.spigotmc.SpigotWorldConfig;
++import sun.misc.Unsafe;
++
++/**
++ * Verifies Commit 5 (0120):
++ * - Zero-alloc World/Chunk.countEntities parity and early-exit at limit
++ * - Zero-alloc World.hasAnyBlockOrEntityCollision parity vs !getCubes().isEmpty() (air, stone, slabs/carpets/fences, boat hard collision, world border)
++ * - Zero-alloc World.hasAnyEntityCollision / World.a(AABB, Entity) parity (dead, blocksEntitySpawning, self, MC-103516)
++ * - Chunk-cached lock-free World.containsLiquid parity (water, lava, empty sections, multi-chunk, out-of-Y)
++ * - MobSpawnerAbstract cached mob key/class invalidation, spawner-idle-player-check-interval, and full-cap speedup/allocation elimination
++ */
++public class MobSpawnerOptimizationTest {
++
++    private static Unsafe unsafe;
++    private static boolean installedBukkitServer;
++    private static int nextEntityId = 10000;
++
++    private static final class StubChunkProvider extends ChunkProviderServer {
++        StubChunkProvider(WorldServer world) {
++            super(world, null, null);
++        }
++    }
++
++    private static final class CountingWorld extends WorldServer {
++        int playerNearbyChecks;
++
++        CountingWorld() {
++            super(null, null, null, 0, null, null, null);
++        }
++
++        @Override
++        public boolean isPlayerNearby(double x, double y, double z, double dist) {
++            ++playerNearbyChecks;
++            return super.isPlayerNearby(x, y, z, dist);
++        }
++    }
++
++    private static final class TestSpawner extends MobSpawnerAbstract {
++        final World world;
++        final BlockPosition pos;
++        int resetEvents;
++
++        TestSpawner(World world, BlockPosition pos) {
++            this.world = world;
++            this.pos = pos;
++        }
++
++        @Override
++        public void a(int i) {
++            if (i == 1) {
++                ++resetEvents;
++            }
++        }
++
++        @Override
++        public World a() {
++            return world;
++        }
++
++        @Override
++        public BlockPosition b() {
++            return pos;
++        }
++    }
++
++    @BeforeClass
++    public static void bootstrap() throws Exception {
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        unsafe = (Unsafe) f.get(null);
++        DispenserRegistry.c();
++        if (org.bukkit.Bukkit.getServer() == null) {
++            org.bukkit.craftbukkit.CraftServer server = (org.bukkit.craftbukkit.CraftServer) unsafe.allocateInstance(org.bukkit.craftbukkit.CraftServer.class);
++            org.bukkit.plugin.SimplePluginManager pm = new org.bukkit.plugin.SimplePluginManager(server, new org.bukkit.command.SimpleCommandMap(server));
++            setField(org.bukkit.craftbukkit.CraftServer.class, server, "pluginManager", pm);
++            setField(org.bukkit.Bukkit.class, null, "server", server);
++            installedBukkitServer = true;
++        }
++    }
++
++    @AfterClass
++    public static void cleanupBukkitServer() throws Exception {
++        if (installedBukkitServer) {
++            setField(org.bukkit.Bukkit.class, null, "server", null);
++            installedBukkitServer = false;
++        }
++    }
++
++    @After
++    public void tearDown() {
++        MobSpawning.spawnerIdlePlayerCheckInterval = 1;
++    }
++
++    private static void setField(Class<?> owner, Object target, String name, Object value) throws Exception {
++        Field f = owner.getDeclaredField(name);
++        f.setAccessible(true);
++        f.set(target, value);
++    }
++
++    @SuppressWarnings("unchecked")
++    private static Chunk newStubChunk(WorldServer world, int cx, int cz) throws Exception {
++        Chunk chunk = (Chunk) unsafe.allocateInstance(Chunk.class);
++        setField(Chunk.class, chunk, "world", world);
++        setField(Chunk.class, chunk, "locX", cx);
++        setField(Chunk.class, chunk, "locZ", cz);
++        long key = ChunkCoordIntPair.a(cx, cz);
++        setField(Chunk.class, chunk, "chunkKey", key);
++        ChunkSection[] sections = new ChunkSection[16];
++        for (int s = 0; s < 16; ++s) {
++            sections[s] = new ChunkSection(s << 4, true);
++        }
++        setField(Chunk.class, chunk, "sections", sections);
++        List<Entity>[] slices = new List[16];
++        for (int s = 0; s < 16; ++s) {
++            slices[s] = new ArrayList<Entity>();
++        }
++        setField(Chunk.class, chunk, "entitySlices", slices);
++        setField(Chunk.class, chunk, "entityCounts", new co.aikar.util.Counter<String>());
++        setField(Chunk.class, chunk, "itemCounts", new int[16]);
++        setField(Chunk.class, chunk, "inventoryEntityCounts", new int[16]);
++        setField(Chunk.class, chunk, "entityCount", new gnu.trove.map.hash.TObjectIntHashMap<Class>());
++        setField(Chunk.class, chunk, "antarcticCreatureCounts", new int[EnumCreatureType.values().length]);
++        world.getChunkProviderServer().chunks.put(key, chunk);
++        return chunk;
++    }
++
++    private static CountingWorld newTestWorld() throws Exception {
++        CountingWorld world = (CountingWorld) unsafe.allocateInstance(CountingWorld.class);
++        SpigotWorldConfig spigotConfig = (SpigotWorldConfig) unsafe.allocateInstance(SpigotWorldConfig.class);
++        setField(World.class, world, "spigotConfig", spigotConfig);
++        PaperWorldConfig paperConfig = (PaperWorldConfig) unsafe.allocateInstance(PaperWorldConfig.class);
++        paperConfig.mobSpawnerTickRate = 1;
++        paperConfig.armorStandEntityLookups = true;
++        setField(World.class, world, "paperConfig", paperConfig);
++        world.worldProvider = new WorldProviderNormal();
++        world.worldData = new WorldData(new WorldSettings(1L, EnumGamemode.SURVIVAL, false, false, WorldType.NORMAL), "test");
++        setField(World.class, world, "random", new Random(99L));
++        setField(World.class, world, "P", new WorldBorder());
++        setField(World.class, world, "players", new ArrayList<EntityHuman>());
++        setField(World.class, world, "methodProfiler", new MethodProfiler());
++        setField(World.class, world, "antarcticCreatureCounts", new int[EnumCreatureType.values().length]);
++        setField(World.class, world, "chunkProvider", new StubChunkProvider(world));
++        return world;
++    }
++
++    private static <T extends Entity> T placeEntity(Class<T> cls, WorldServer world, Chunk chunk, double x, double y, double z, double halfW, double h) throws Exception {
++        T e = cls.cast(unsafe.allocateInstance(cls));
++        setField(Entity.class, e, "id", nextEntityId++);
++        e.world = world;
++        e.locX = x;
++        e.locY = y;
++        e.locZ = z;
++        e.i = true;
++        e.dead = false;
++        e.uniqueID = UUID.randomUUID();
++        e.a(new AxisAlignedBB(x - halfW, y, z - halfW, x + halfW, y + h, z + halfW));
++        chunk.a(e);
++        return e;
++    }
++
++    @Test
++    public void testCountEntitiesParityAndEarlyExit() throws Exception {
++        CountingWorld world = newTestWorld();
++        Chunk c0 = newStubChunk(world, 0, 0);
++        Chunk c1 = newStubChunk(world, 1, 0);
++
++        for (int i = 0; i < 5; ++i) {
++            placeEntity(EntityZombie.class, world, c0, 14.0 + i * 0.1, 64.0, 8.0, 0.3, 1.95);
++        }
++        for (int i = 0; i < 4; ++i) {
++            placeEntity(EntityZombie.class, world, c1, 17.0 + i * 0.1, 64.0, 8.0, 0.3, 1.95);
++        }
++        // Unrelated type inside the same box
++        placeEntity(EntitySkeleton.class, world, c0, 15.0, 64.0, 8.0, 0.3, 1.99);
++
++        AxisAlignedBB box = new AxisAlignedBB(10.0, 60.0, 4.0, 22.0, 70.0, 12.0);
++        int vanillaCount = world.a(EntityZombie.class, box, IEntitySelector.e).size();
++        assertEquals(9, vanillaCount);
++        assertEquals(0, world.countEntities(EntityZombie.class, box, IEntitySelector.e, 0));
++        assertEquals(1, world.countEntities(EntityZombie.class, box, IEntitySelector.e, 1));
++        assertEquals(6, world.countEntities(EntityZombie.class, box, IEntitySelector.e, 6));
++        assertEquals(9, world.countEntities(EntityZombie.class, box, IEntitySelector.e, 20));
++    }
++
++    @Test
++    public void testHasAnyBlockOrEntityCollisionAndEntityCollisionParity() throws Exception {
++        CountingWorld world = newTestWorld();
++        Chunk chunk = newStubChunk(world, 0, 0);
++        ChunkSection sec = chunk.getSections()[4]; // y = 64..79
++
++        // Stone at (4, 64, 4), Carpet at (6, 64, 4), Fence at (8, 64, 4), Bottom Slab at (10, 64, 4)
++        sec.setType(4, 0, 4, Blocks.STONE.getBlockData());
++        sec.setType(6, 0, 4, Blocks.CARPET.getBlockData());
++        sec.setType(8, 0, 4, Blocks.FENCE.getBlockData());
++        sec.setType(10, 0, 4, Blocks.STONE_SLAB.getBlockData());
++
++        EntityZombie probe = (EntityZombie) unsafe.allocateInstance(EntityZombie.class);
++        probe.world = world;
++        probe.locX = 2.5;
++        probe.locY = 65.0;
++        probe.locZ = 4.5;
++
++        AxisAlignedBB[] boxes = new AxisAlignedBB[] {
++            new AxisAlignedBB(2.2, 65.0, 4.2, 2.8, 66.9, 4.8),       // pure air
++            new AxisAlignedBB(4.2, 64.1, 4.2, 4.8, 66.0, 4.8),       // inside stone
++            new AxisAlignedBB(6.2, 64.0, 4.2, 6.8, 65.9, 4.8),       // touching carpet (height 1/16)
++            new AxisAlignedBB(6.2, 64.2, 4.2, 6.8, 66.0, 4.8),       // above carpet (no collision!)
++            new AxisAlignedBB(8.3, 65.2, 4.3, 8.7, 66.5, 4.7),       // fence 1.5-tall top collision!
++            new AxisAlignedBB(10.2, 64.2, 4.2, 10.8, 66.0, 4.8),     // touching bottom slab (0.0..0.5)
++            new AxisAlignedBB(10.2, 64.6, 4.2, 10.8, 66.5, 4.8),     // above bottom slab (no collision!)
++        };
++        for (AxisAlignedBB bb : boxes) {
++            boolean vanilla = !world.getCubes(probe, bb).isEmpty();
++            boolean fast = world.hasAnyBlockOrEntityCollision(probe, bb);
++            assertEquals("Mismatch for box " + bb, vanilla, fast);
++        }
++
++        // Hard entity collision (EntityBoat returns its bounding box from al())
++        placeEntity(EntityBoat.class, world, chunk, 12.5, 65.0, 4.5, 0.68, 0.56);
++        AxisAlignedBB boatOverlap = new AxisAlignedBB(12.2, 65.0, 4.2, 12.8, 66.9, 4.8);
++        assertTrue(world.hasAnyBlockOrEntityCollision(probe, boatOverlap));
++        assertTrue(!world.getCubes(probe, boatOverlap).isEmpty());
++
++        // Entity spawn-blocking collision (World.a(AABB, Entity) / hasAnyEntityCollision)
++        EntityZombie blocker = placeEntity(EntityZombie.class, world, chunk, 14.5, 65.0, 4.5, 0.3, 1.95);
++        AxisAlignedBB blockerBox = new AxisAlignedBB(14.3, 65.0, 4.3, 14.7, 66.5, 4.7);
++        assertTrue(world.hasAnyEntityCollision(blockerBox, probe));
++        assertFalse(world.a(blockerBox, probe));
++        assertFalse("Self-exclusion must ignore blocker itself", world.hasAnyEntityCollision(blockerBox, blocker));
++        assertTrue(world.a(blockerBox, blocker));
++
++        blocker.dead = true;
++        assertFalse("Dead entity must not block spawning", world.hasAnyEntityCollision(blockerBox, probe));
++    }
++
++    @Test
++    public void testContainsLiquidParity() throws Exception {
++        CountingWorld world = newTestWorld();
++        Chunk c0 = newStubChunk(world, 0, 0);
++        Chunk c1 = newStubChunk(world, 1, 0);
++        // Leave section 2 empty (null) to verify O(1) empty-section skip
++        c0.getSections()[2] = Chunk.a;
++        c1.getSections()[4].setType(1, 2, 3, Blocks.WATER.getBlockData()); // (17, 66, 3)
++        c0.getSections()[4].setType(5, 1, 5, Blocks.LAVA.getBlockData());  // (5, 65, 5)
++
++        assertFalse(world.containsLiquid(new AxisAlignedBB(1.0, 32.0, 1.0, 3.0, 47.0, 3.0)));   // empty section
++        assertFalse(world.containsLiquid(new AxisAlignedBB(1.0, -5.0, 1.0, 3.0, -1.0, 3.0)));   // y < 0
++        assertFalse(world.containsLiquid(new AxisAlignedBB(1.0, 260.0, 1.0, 3.0, 265.0, 3.0))); // y >= 256
++        assertTrue(world.containsLiquid(new AxisAlignedBB(15.5, 65.5, 2.5, 17.5, 67.5, 3.5)));  // cross-chunk water
++        assertTrue(world.containsLiquid(new AxisAlignedBB(4.8, 64.8, 4.8, 5.2, 65.2, 5.2)));    // lava
++        assertFalse(world.containsLiquid(new AxisAlignedBB(8.0, 64.0, 8.0, 10.0, 68.0, 10.0))); // dry air
++    }
++
++    @Test
++    public void testMobSpawnerCacheInvalidationIdleIntervalAndFullCapPerformance() throws Exception {
++        CountingWorld world = newTestWorld();
++        Chunk chunk = newStubChunk(world, 0, 0);
++        TestSpawner spawner = new TestSpawner(world, new BlockPosition(8, 64, 8));
++
++        // 1. Mob name caching & invalidation (setMobName + a(MobSpawnerData) + direct NBT mutation)
++        spawner.setMobName(new MinecraftKey("zombie"));
++        assertEquals(new MinecraftKey("zombie"), spawner.getMobName());
++        assertEquals(new MinecraftKey("zombie"), spawner.getMobName()); // cache hit
++        spawner.setMobName(new MinecraftKey("skeleton"));
++        assertEquals(new MinecraftKey("skeleton"), spawner.getMobName());
++        NBTTagCompound customTag = new NBTTagCompound();
++        customTag.setString("id", "minecraft:creeper");
++        spawner.a(new MobSpawnerData(1, customTag));
++        assertEquals(new MinecraftKey("creeper"), spawner.getMobName());
++        customTag.setString("id", "minecraft:zombie"); // direct NBT mutation
++        assertEquals(new MinecraftKey("zombie"), spawner.getMobName());
++
++        // 1b. Vanilla parity when spawnCount == 0: loop runs 0 times, must NOT call reset i() even at cap
++        spawner.spawnCount = 0;
++        spawner.spawnDelay = 0;
++        spawner.resetEvents = 0;
++        spawner.c();
++        assertEquals("spawnCount==0 must not trigger spawner reset", 0, spawner.resetEvents);
++        spawner.spawnCount = 4;
++
++        // 2. Idle player check interval (no players in world)
++        MobSpawning.spawnerIdlePlayerCheckInterval = 4;
++        world.playerNearbyChecks = 0;
++        for (int t = 0; t < 40; ++t) {
++            spawner.c();
++        }
++        assertEquals("interval=4 must run 10 checks over 40 idle ticks", 10, world.playerNearbyChecks);
++
++        // Add player in range -> full-cap farm with 6 zombies
++        MobSpawning.spawnerIdlePlayerCheckInterval = 1;
++        EntityPlayer player = (EntityPlayer) unsafe.allocateInstance(EntityPlayer.class);
++        player.world = world;
++        player.locX = 8.0;
++        player.locY = 64.0;
++        player.locZ = 8.0;
++        player.affectsSpawning = true;
++        player.uniqueID = UUID.randomUUID();
++        PlayerInteractManager pim = (PlayerInteractManager) unsafe.allocateInstance(PlayerInteractManager.class);
++        setField(PlayerInteractManager.class, pim, "gamemode", EnumGamemode.SURVIVAL);
++        setField(EntityPlayer.class, player, "playerInteractManager", pim);
++        player.bukkitEntity = (CraftPlayer) unsafe.allocateInstance(CraftPlayer.class);
++        world.players.add(player);
++
++        for (int i = 0; i < 6; ++i) {
++            placeEntity(EntityZombie.class, world, chunk, 8.0 + i * 0.2, 64.0, 8.0, 0.3, 1.95);
++        }
++
++        // Warmup
++        for (int t = 0; t < 200; ++t) {
++            spawner.spawnDelay = 0;
++            spawner.c();
++        }
++        assertTrue("Full-cap spawner must still reset delay via i()", spawner.resetEvents >= 200);
++
++        com.sun.management.ThreadMXBean tmxb = (com.sun.management.ThreadMXBean) ManagementFactory.getThreadMXBean();
++        long tid = Thread.currentThread().getId();
++        int ticks = 1_000;
++
++        // Baseline: old path constructed NBT + EntityZombie then world.a(Class, AABB).size()
++        NBTTagCompound zombieTag = new NBTTagCompound();
++        zombieTag.setString("id", "minecraft:zombie");
++        AxisAlignedBB spawnerBox = new AxisAlignedBB(8, 64, 8, 9, 65, 9).g(4.0);
++        int oldSink = 0;
++        long oldAlloc0 = tmxb.getThreadAllocatedBytes(tid);
++        long oldT0 = System.nanoTime();
++        for (int t = 0; t < ticks; ++t) {
++            Entity e = ChunkRegionLoader.a(zombieTag, world, 8.5, 64.0, 8.5, false);
++            if (world.a(e.getClass(), spawnerBox).size() >= 6) {
++                ++oldSink;
++            }
++        }
++        long oldNs = System.nanoTime() - oldT0;
++        long oldBytes = tmxb.getThreadAllocatedBytes(tid) - oldAlloc0;
++
++        // Optimized MobSpawnerAbstract.c() at cap (6/6)
++        spawner.resetEvents = 0;
++        long newAlloc0 = tmxb.getThreadAllocatedBytes(tid);
++        long newT0 = System.nanoTime();
++        for (int t = 0; t < ticks; ++t) {
++            spawner.spawnDelay = 0;
++            spawner.c();
++        }
++        long newNs = System.nanoTime() - newT0;
++        long newBytes = tmxb.getThreadAllocatedBytes(tid) - newAlloc0;
++
++        assertEquals(ticks, oldSink);
++        assertEquals(ticks, spawner.resetEvents);
++        double speedup = (double) oldNs / Math.max(1L, newNs);
++        System.out.printf("MobSpawnerOptimizationTest (full-cap 6/6 x %d): old=%.2fms (%.1f KiB) new=%.3fms (%.1f KiB) speedup=%.1fx%n",
++                ticks, oldNs / 1e6, oldBytes / 1024.0, newNs / 1e6, newBytes / 1024.0, speedup);
++        assertTrue("Expected >= 10x speedup on full-cap spawner, got " + speedup + "x", speedup >= 10.0);
++        assertTrue("Expected >= 90% allocation reduction on full-cap spawner, old=" + oldBytes + " new=" + newBytes, newBytes * 10L < oldBytes);
++    }
++}
