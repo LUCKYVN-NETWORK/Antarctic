@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 01:22:24 +0700
+Subject: [PATCH 143/143] fix: publish CraftServer worldsView safely and evict
+ duplicate UUIDs
+
+
+diff --git a/main/java/org/bukkit/craftbukkit/CraftServer.java b/main/java/org/bukkit/craftbukkit/CraftServer.java
+index 99c1861..736d698 100644
+--- a/main/java/org/bukkit/craftbukkit/CraftServer.java
++++ b/main/java/org/bukkit/craftbukkit/CraftServer.java
+@@ -155,7 +155,7 @@ public final class CraftServer implements Server {
+     // Leaf start - Fastutil worlds map and UUID lookup (backport of Leaf Server-Paper 0016 & 0041)
+     private final Map<String, World> worlds = new it.unimi.dsi.fastutil.objects.Object2ObjectLinkedOpenHashMap<String, World>();
+     private final Map<UUID, World> worldsByUUID = new it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap<UUID, World>();
+-    private List<World> worldsView = Collections.emptyList(); // Leaf - Safe view for getWorlds (backport of Leaf Server-Paper 0045)
++    private volatile List<World> worldsView = Collections.emptyList(); // Leaf / Antarctic - volatile immutable snapshot for safe cross-thread publication
+     // Leaf end
+     private YamlConfiguration configuration;
+     private YamlConfiguration commandsConfiguration;
+@@ -1089,7 +1089,7 @@ public final class CraftServer implements Server {
+ 
+         worlds.remove(world.getName().toLowerCase(java.util.Locale.ENGLISH));
+         worldsByUUID.remove(world.getUID()); // Leaf - remove from UUID map
+-        this.worldsView = Collections.unmodifiableList(new ArrayList<World>(this.worlds.values())); // Leaf - update safe view
++        this.worldsView = List.copyOf(this.worlds.values()); // Antarctic - immutable volatile snapshot
+         console.worlds.remove(console.worlds.indexOf(handle));
+ 
+         File parentFolder = world.getWorldFolder().getAbsoluteFile();
+@@ -1143,9 +1143,12 @@ public final class CraftServer implements Server {
+             System.out.println("World " + world.getName() + " is a duplicate of another world and has been prevented from loading. Please delete the uid.dat file from " + world.getName() + "'s world directory if you want to be able to load the duplicate world.");
+             return;
+         }
+-        worlds.put(world.getName().toLowerCase(java.util.Locale.ENGLISH), world);
++        World previous = worlds.put(world.getName().toLowerCase(java.util.Locale.ENGLISH), world);
++        if (previous != null && !previous.getUID().equals(world.getUID())) {
++            worldsByUUID.remove(previous.getUID()); // Antarctic - prevent orphaned UUID entry on duplicate world name
++        }
+         worldsByUUID.put(world.getUID(), world); // Leaf - track by UUID
+-        this.worldsView = Collections.unmodifiableList(new ArrayList<World>(this.worlds.values())); // Leaf - update safe view
++        this.worldsView = List.copyOf(this.worlds.values()); // Antarctic - immutable volatile snapshot
+     }
+ 
+     @Override
+diff --git a/test/java/org/bukkit/craftbukkit/CraftServerWorldsSafetyTest.java b/test/java/org/bukkit/craftbukkit/CraftServerWorldsSafetyTest.java
+new file mode 100644
+index 0000000..cd08089
+--- /dev/null
++++ b/test/java/org/bukkit/craftbukkit/CraftServerWorldsSafetyTest.java
+@@ -0,0 +1,68 @@
++package org.bukkit.craftbukkit;
++
++import it.unimi.dsi.fastutil.objects.Object2ObjectLinkedOpenHashMap;
++import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap;
++import java.lang.reflect.Field;
++import java.lang.reflect.Modifier;
++import java.lang.reflect.Proxy;
++import java.util.List;
++import java.util.UUID;
++import org.bukkit.World;
++import org.junit.Assert;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++public class CraftServerWorldsSafetyTest {
++
++    private static World stubWorld(String name, UUID uid) {
++        return (World) Proxy.newProxyInstance(
++                World.class.getClassLoader(),
++                new Class<?>[] { World.class },
++                (proxy, method, args) -> {
++                    if ("getName".equals(method.getName())) return name;
++                    if ("getUID".equals(method.getName())) return uid;
++                    if ("equals".equals(method.getName())) return proxy == args[0];
++                    if ("hashCode".equals(method.getName())) return System.identityHashCode(proxy);
++                    return null;
++                });
++    }
++
++    @Test
++    public void testWorldsViewIsVolatileAndDuplicateNameEvictsPreviousUuid() throws Exception {
++        Field viewField = CraftServer.class.getDeclaredField("worldsView");
++        Assert.assertTrue("worldsView must be volatile for safe cross-thread publication",
++                Modifier.isVolatile(viewField.getModifiers()));
++
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        Unsafe unsafe = (Unsafe) f.get(null);
++
++        CraftServer server = (CraftServer) unsafe.allocateInstance(CraftServer.class);
++        Field worldsField = CraftServer.class.getDeclaredField("worlds");
++        worldsField.setAccessible(true);
++        worldsField.set(server, new Object2ObjectLinkedOpenHashMap<String, World>());
++        Field uuidField = CraftServer.class.getDeclaredField("worldsByUUID");
++        uuidField.setAccessible(true);
++        uuidField.set(server, new Object2ObjectOpenHashMap<UUID, World>());
++        viewField.setAccessible(true);
++        viewField.set(server, java.util.Collections.emptyList());
++
++        UUID id1 = UUID.randomUUID();
++        UUID id2 = UUID.randomUUID();
++        World w1 = stubWorld("world", id1);
++        World w2 = stubWorld("World", id2); // same lowercased name, different UUID
++
++        server.addWorld(w1);
++        Assert.assertSame(w1, server.getWorld(id1));
++        Assert.assertEquals(1, server.getWorlds().size());
++
++        server.addWorld(w2);
++        Assert.assertNull("Previous world UUID must be evicted when overwritten by duplicate name", server.getWorld(id1));
++        Assert.assertSame(w2, server.getWorld(id2));
++        Assert.assertSame(w2, server.getWorld("world"));
++
++        List<World> view = server.getWorlds();
++        Assert.assertEquals(1, view.size());
++        Assert.assertSame(w2, view.get(0));
++    }
++}

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Mon, 19 Oct 2026 00:17:20 +0700
-Subject: [PATCH 088/142] Optimize World getCubes block collision loop
+Subject: [PATCH 088/143] Optimize World getCubes block collision loop
 
 - Cache chunk references across coordinate sweeps to reduce getChunkIfLoaded lookups
 
