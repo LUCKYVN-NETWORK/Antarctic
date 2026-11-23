@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Sat, 17 Oct 2026 18:19:00 +0700
-Subject: [PATCH 044/153] Skip unloadable classes in the known-attribute scan
+Subject: [PATCH 044/154] Skip unloadable classes in the known-attribute scan
 
 - Catch Throwable from Class.forName so classes rejected by the Java 21 sealed-class verifier (2017-era remapped bytecode, e.g. BlockMonsterEggs$a$1) are skipped instead of failing the scan
 - Unloadable classes cannot declare attributes; GenericAttributes still loads and covers every known name

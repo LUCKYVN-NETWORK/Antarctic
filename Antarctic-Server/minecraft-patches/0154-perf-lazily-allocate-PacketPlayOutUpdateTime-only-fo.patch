@@ -1,0 +1,210 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 02:06:16 +0700
+Subject: [PATCH 154/154] perf: lazily allocate PacketPlayOutUpdateTime only
+ for due players
+
+
+diff --git a/main/java/net/minecraft/server/MinecraftServer.java b/main/java/net/minecraft/server/MinecraftServer.java
+index 8db83e3..a309310 100644
+--- a/main/java/net/minecraft/server/MinecraftServer.java
++++ b/main/java/net/minecraft/server/MinecraftServer.java
+@@ -877,22 +877,8 @@ public abstract class MinecraftServer implements ICommandListener, Runnable, IAs
+ 
+         MinecraftTimings.timeUpdateTimer.startTiming(); // Spigot
+         // Paper start - optimize time updates
+-        for (final WorldServer world : this.worlds) {
+-            final boolean doDaylight = world.getGameRules().getBoolean("doDaylightCycle");
+-            final long dayTime = world.getDayTime();
+-            long worldTime = world.getTime();
+-            final PacketPlayOutUpdateTime worldPacket = new PacketPlayOutUpdateTime(worldTime, dayTime, doDaylight);
+-            for (EntityHuman entityhuman : world.players) {
+-                if (!(entityhuman instanceof EntityPlayer) || (ticks + entityhuman.getId()) % 20 != 0) {
+-                    continue;
+-                }
+-                EntityPlayer entityplayer = (EntityPlayer) entityhuman;
+-                long playerTime = entityplayer.getPlayerTime();
+-                PacketPlayOutUpdateTime packet = (playerTime == dayTime) ? worldPacket :
+-                        new PacketPlayOutUpdateTime(worldTime, playerTime, doDaylight);
+-                entityplayer.playerConnection.sendPacket(packet); // Add support for per player time
+-            }
+-        }
++        // Antarctic - skip empty worlds, avoid Iterator alloc, and lazily construct PacketPlayOutUpdateTime
++        sendTimeUpdates(this.worlds, this.ticks);
+         // Paper end
+         MinecraftTimings.timeUpdateTimer.stopTiming(); // Spigot
+ 
+@@ -986,6 +972,48 @@ public abstract class MinecraftServer implements ICommandListener, Runnable, IAs
+         this.methodProfiler.b();
+     }
+ 
++    // Antarctic start - zero-alloc time update dispatch when no player is due in a world
++    static void sendTimeUpdates(List<WorldServer> worlds, int ticks) {
++        for (int w = 0, wLen = worlds.size(); w < wLen; ++w) {
++            final WorldServer world = worlds.get(w);
++            final List<EntityHuman> players = world.players;
++            final int pLen = players.size();
++            if (pLen == 0) {
++                continue;
++            }
++            boolean initialized = false;
++            boolean doDaylight = false;
++            long dayTime = 0L;
++            long worldTime = 0L;
++            PacketPlayOutUpdateTime worldPacket = null;
++            for (int p = 0; p < pLen; ++p) {
++                EntityHuman entityhuman = players.get(p);
++                if (!(entityhuman instanceof EntityPlayer) || (ticks + entityhuman.getId()) % 20 != 0) {
++                    continue;
++                }
++                if (!initialized) {
++                    doDaylight = world.getGameRules().getBoolean("doDaylightCycle");
++                    dayTime = world.getDayTime();
++                    worldTime = world.getTime();
++                    initialized = true;
++                }
++                EntityPlayer entityplayer = (EntityPlayer) entityhuman;
++                long playerTime = entityplayer.getPlayerTime();
++                PacketPlayOutUpdateTime packet;
++                if (playerTime == dayTime) {
++                    if (worldPacket == null) {
++                        worldPacket = new PacketPlayOutUpdateTime(worldTime, dayTime, doDaylight);
++                    }
++                    packet = worldPacket;
++                } else {
++                    packet = new PacketPlayOutUpdateTime(worldTime, playerTime, doDaylight);
++                }
++                entityplayer.playerConnection.sendPacket(packet); // Add support for per player time
++            }
++        }
++    }
++    // Antarctic end
++
+     public boolean getAllowNether() {
+         return true;
+     }
+diff --git a/test/java/net/minecraft/server/MinecraftServerTimeUpdatePerfTest.java b/test/java/net/minecraft/server/MinecraftServerTimeUpdatePerfTest.java
+new file mode 100644
+index 0000000..7ae4ee6
+--- /dev/null
++++ b/test/java/net/minecraft/server/MinecraftServerTimeUpdatePerfTest.java
+@@ -0,0 +1,119 @@
++package net.minecraft.server;
++
++import com.sun.management.ThreadMXBean;
++import java.lang.management.ManagementFactory;
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.List;
++import org.junit.Assert;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++public class MinecraftServerTimeUpdatePerfTest {
++
++    private static Unsafe UNSAFE;
++
++    @BeforeClass
++    public static void setup() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        UNSAFE = (Unsafe) f.get(null);
++    }
++
++    private static final class RecordingConn extends PlayerConnection {
++        final List<Packet<?>> sent = new ArrayList<Packet<?>>();
++
++        RecordingConn() {
++            super(null, null, null);
++        }
++
++        @Override
++        public void sendPacket(Packet<?> packet) {
++            this.sent.add(packet);
++        }
++    }
++
++    private static WorldServer newWorld(long time, long dayTime, List<EntityHuman> players) throws Exception {
++        WorldServer world = (WorldServer) UNSAFE.allocateInstance(WorldServer.class);
++        WorldData data = new WorldData();
++        data.setTime(time);
++        data.setDayTime(dayTime);
++        world.worldData = data;
++        Field playersField = World.class.getDeclaredField("players");
++        playersField.setAccessible(true);
++        playersField.set(world, players);
++        return world;
++    }
++
++    private static EntityPlayer newPlayer(int id, WorldServer world, long timeOffset, boolean relative) throws Exception {
++        EntityPlayer p = (EntityPlayer) UNSAFE.allocateInstance(EntityPlayer.class);
++        p.h(id);
++        p.world = world;
++        p.timeOffset = timeOffset;
++        p.relativeTime = relative;
++        RecordingConn conn = (RecordingConn) UNSAFE.allocateInstance(RecordingConn.class);
++        Field sentField = RecordingConn.class.getDeclaredField("sent");
++        sentField.setAccessible(true);
++        sentField.set(conn, new ArrayList<Packet<?>>());
++        p.playerConnection = conn;
++        return p;
++    }
++
++    @Test
++    public void testTimeUpdateDispatchParityAndZeroAllocIdleTicks() throws Exception {
++        List<EntityHuman> players = new ArrayList<EntityHuman>();
++        WorldServer activeWorld = newWorld(1000L, 6000L, players);
++        WorldServer emptyWorld = newWorld(1000L, 6000L, Collections.<EntityHuman>emptyList());
++
++        EntityPlayer pShared1 = newPlayer(5, activeWorld, 0L, true);     // matches ticks % 20 == 15
++        EntityPlayer pShared2 = newPlayer(25, activeWorld, 0L, true);    // also matches ticks % 20 == 15 -> shares worldPacket
++        EntityPlayer pCustom = newPlayer(45, activeWorld, 12000L, false); // custom fixed time -> distinct packet
++        players.add(pShared1);
++        players.add(pShared2);
++        players.add(pCustom);
++
++        List<WorldServer> worlds = new ArrayList<WorldServer>();
++        worlds.add(emptyWorld);
++        worlds.add(activeWorld);
++
++        // Non-matching tick (ticks = 14 -> (14+5)%20 = 19) -> zero packets sent
++        MinecraftServer.sendTimeUpdates(worlds, 14);
++        Assert.assertTrue(((RecordingConn) pShared1.playerConnection).sent.isEmpty());
++        Assert.assertTrue(((RecordingConn) pShared2.playerConnection).sent.isEmpty());
++        Assert.assertTrue(((RecordingConn) pCustom.playerConnection).sent.isEmpty());
++
++        // Matching tick (ticks = 15) -> shared players get same PacketPlayOutUpdateTime instance, custom gets own
++        MinecraftServer.sendTimeUpdates(worlds, 15);
++        List<Packet<?>> s1 = ((RecordingConn) pShared1.playerConnection).sent;
++        List<Packet<?>> s2 = ((RecordingConn) pShared2.playerConnection).sent;
++        List<Packet<?>> sc = ((RecordingConn) pCustom.playerConnection).sent;
++        Assert.assertEquals(1, s1.size());
++        Assert.assertEquals(1, s2.size());
++        Assert.assertEquals(1, sc.size());
++        Assert.assertSame("Players with world dayTime must share the single worldPacket instance", s1.get(0), s2.get(0));
++        Assert.assertNotSame("Player with custom playerTime must receive a separate packet", s1.get(0), sc.get(0));
++
++        // Allocation test on non-due ticks across empty + non-due worlds -> strictly 0 B allocated
++        final int warmup = 20_000;
++        final int measured = 200_000;
++        for (int i = 0; i < warmup; ++i) {
++            MinecraftServer.sendTimeUpdates(worlds, 14);
++        }
++        ThreadMXBean bean = (ThreadMXBean) ManagementFactory.getThreadMXBean();
++        long tid = Thread.currentThread().getId();
++        long a0 = bean.getThreadAllocatedBytes(tid);
++        long t0 = System.nanoTime();
++        for (int i = 0; i < measured; ++i) {
++            MinecraftServer.sendTimeUpdates(worlds, 14);
++        }
++        long ns = System.nanoTime() - t0;
++        long alloc = Math.max(0L, bean.getThreadAllocatedBytes(tid) - a0);
++
++        System.out.printf("[perf] MinecraftServer.sendTimeUpdates (%d idle ticks x 2 worlds): %.2f ms (alloc=%d B)%n",
++                measured, ns / 1e6, alloc);
++        Assert.assertEquals("Idle time-update ticks must allocate 0 bytes", 0L, alloc);
++    }
++}
