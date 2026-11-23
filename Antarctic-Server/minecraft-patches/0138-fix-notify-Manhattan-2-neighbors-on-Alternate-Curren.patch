@@ -1,0 +1,84 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 01:06:14 +0700
+Subject: [PATCH 138/138] fix: notify Manhattan-2 neighbors on Alternate
+ Current redirection
+
+
+diff --git a/main/java/com/destroystokyo/paper/util/AlternateCurrentWireHandler.java b/main/java/com/destroystokyo/paper/util/AlternateCurrentWireHandler.java
+index ee4db47..594c15a 100644
+--- a/main/java/com/destroystokyo/paper/util/AlternateCurrentWireHandler.java
++++ b/main/java/com/destroystokyo/paper/util/AlternateCurrentWireHandler.java
+@@ -37,6 +37,7 @@ import org.bukkit.event.block.BlockPhysicsEvent;
+ public final class AlternateCurrentWireHandler {
+ 
+     private static final int MAX_RECURSION_DEPTH = 64;
++    private static final EnumDirection[] ALL_DIRECTIONS = EnumDirection.values();
+ 
+     // Horizontal cardinal offsets: W, E, N, S (deterministic non-locational order)
+     private static final int[] H_DX = {-1, 1, 0, 0};
+@@ -206,8 +207,8 @@ public final class AlternateCurrentWireHandler {
+         int y = pos.getY();
+         int z = pos.getZ();
+         // Notify 6 immediate neighbors of the removed wire first (matches vanilla remove)
+-        for (EnumDirection dir : EnumDirection.values()) {
+-            this.world.applyPhysics(pos.shift(dir), this.wire, false);
++        for (int i = 0; i < ALL_DIRECTIONS.length; ++i) {
++            this.world.applyPhysics(pos.shift(ALL_DIRECTIONS[i]), this.wire, false);
+         }
+         if (this.inPhaseA) {
+             enqueueAdjacentWireTriggers(x, y, z);
+@@ -251,7 +252,9 @@ public final class AlternateCurrentWireHandler {
+             return;
+         }
+         BlockPosition wirePos = new BlockPosition(x, y, z);
+-        for (int d = 0; d < 6; ++d) {
++        // Antarctic - notify full 24-neighbor Manhattan <= 2 ring (matches vanilla BlockRedstoneWire.b)
++        // so components attached to solid blocks redirected by shape changes still receive physics updates.
++        for (int d = 0; d < NEIGHBOR_OFFSETS_24.length; ++d) {
+             int[] off = NEIGHBOR_OFFSETS_24[d];
+             int nx = x + off[0];
+             int ny = y + off[1];
+@@ -264,7 +267,8 @@ public final class AlternateCurrentWireHandler {
+             if (nb == Blocks.AIR && !hasPhysicsListeners) {
+                 continue;
+             }
+-            this.world.a(new BlockPosition(nx, ny, nz), this.wire, wirePos);
++            BlockPosition fromPos = (d < 6) ? wirePos : new BlockPosition(x + off[3], y + off[4], z + off[5]);
++            this.world.a(new BlockPosition(nx, ny, nz), this.wire, fromPos);
+         }
+     }
+ 
+diff --git a/test/java/net/minecraft/server/AlternateCurrentRedstoneTest.java b/test/java/net/minecraft/server/AlternateCurrentRedstoneTest.java
+index ae52f25..12cf651 100644
+--- a/test/java/net/minecraft/server/AlternateCurrentRedstoneTest.java
++++ b/test/java/net/minecraft/server/AlternateCurrentRedstoneTest.java
+@@ -432,4 +432,28 @@ public class AlternateCurrentRedstoneTest {
+         assertTrue("AC must be >= 5x faster than vanilla on 15x15 lag carpet depower (speedup=" + speedup + "x)",
+             acNs * 5L < vanillaNs);
+     }
++
++    @Test
++    public void testWireRedirectionNotifiesManhattan2NeighborsThroughSolidBlock() throws Exception {
++        Redstone.implementation = "alternate-current";
++        TrackingRedstoneWorld w = buildTrackingWorld(77L);
++        for (int x = 3; x <= 9; ++x) {
++            for (int z = 3; z <= 9; ++z) {
++                LightPropagationParityTest.setBlock(w, x, 39, z, Blocks.STONE.getBlockData());
++            }
++        }
++        // Powered wire at (5,40,5) pointing into solid stone at (6,40,5), with a lamp at (7,40,5) (Manhattan 2 from wire)
++        LightPropagationParityTest.setBlock(w, 5, 40, 5, Blocks.REDSTONE_WIRE.getBlockData().set(BlockRedstoneWire.POWER, 15));
++        LightPropagationParityTest.setBlock(w, 6, 40, 5, Blocks.STONE.getBlockData());
++        LightPropagationParityTest.setBlock(w, 7, 40, 5, Blocks.REDSTONE_LAMP.getBlockData());
++        // Place redirecting wire at (5,40,6) so (5,40,5) redirects north-south instead of pointing east into stone (6,40,5)
++        BlockPosition placed = new BlockPosition(5, 40, 6);
++        LightPropagationParityTest.setBlock(w, 5, 40, 6, Blocks.REDSTONE_WIRE.getBlockData());
++        w.notifiedPositions.clear();
++
++        Blocks.REDSTONE_WIRE.onPlace(w, placed, w.getType(placed));
++
++        assertTrue("Manhattan-2 receiver (7,40,5) behind solid block (6,40,5) must be notified on wire redirection",
++                w.notifiedPositions.contains(new BlockPosition(7, 40, 5)));
++    }
+ }

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Wed, 18 Nov 2026 13:10:06 +0700
-Subject: [PATCH 095/137] fix(lighting): keep deferred light replay in queue
+Subject: [PATCH 095/138] fix(lighting): keep deferred light replay in queue
  order after a chunk reloads
 
 A chunk that unloaded while queued kept its old slot in the ready queue. When it reloaded and was queued again, the stale slot made it replay before chunks queued in between, breaking the oldest-queued-first order. Each slot now carries a never-reused sequence number and is skipped once the chunk is cleared.

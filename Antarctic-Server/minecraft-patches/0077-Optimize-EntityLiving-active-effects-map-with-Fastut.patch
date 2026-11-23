@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Sun, 18 Oct 2026 17:38:35 +0700
-Subject: [PATCH 077/137] Optimize EntityLiving active effects map with
+Subject: [PATCH 077/138] Optimize EntityLiving active effects map with
  Fastutil
 
 - Backport Leaf MC 0148 (Replace Entity active effects map with optimized collection)
