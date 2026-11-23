@@ -1,0 +1,217 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 00:34:35 +0700
+Subject: [PATCH 127/127] fix: preserve vanilla suffocation timing and world
+ border precedence
+
+
+diff --git a/main/java/net/minecraft/server/EntityLiving.java b/main/java/net/minecraft/server/EntityLiving.java
+index 2f304bf..b83cc34 100644
+--- a/main/java/net/minecraft/server/EntityLiving.java
++++ b/main/java/net/minecraft/server/EntityLiving.java
+@@ -211,9 +211,14 @@ public abstract class EntityLiving extends Entity {
+         boolean flag = this instanceof EntityHuman;
+ 
+         if (this.isAlive()) {
+-            if ((!com.destroystokyo.paper.config.toml.modules.optimizations.Suffocation.enableSuffocationOptimization || (ticksLived % 10 == 0 && couldPossiblyBeHurt(1.0F))) && this.inBlock()) {
++            // Antarctic start - preserve exact vanilla suffocation timing & WorldBorder precedence (drop ticksLived % 10 throttle)
++            boolean skipSuffocationCheck = com.destroystokyo.paper.config.toml.modules.optimizations.Suffocation.enableSuffocationOptimization
++                    && !this.couldPossiblyBeHurt(1.0F)
++                    && (!flag || this.world.getWorldBorder().a(this.getBoundingBox()));
++            if (!skipSuffocationCheck && this.inBlock()) {
+                 this.damageEntity(DamageSource.STUCK, 1.0F);
+             } else if (flag && !this.world.getWorldBorder().a(this.getBoundingBox())) {
++            // Antarctic end
+                 double d0 = this.world.getWorldBorder().a((Entity) this) + this.world.getWorldBorder().getDamageBuffer();
+ 
+                 if (d0 < 0.0D) {
+diff --git a/test/java/net/minecraft/server/SuffocationParityTest.java b/test/java/net/minecraft/server/SuffocationParityTest.java
+new file mode 100644
+index 0000000..cfe2ae7
+--- /dev/null
++++ b/test/java/net/minecraft/server/SuffocationParityTest.java
+@@ -0,0 +1,184 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.config.toml.modules.optimizations.Suffocation;
++import java.lang.reflect.Field;
++import java.util.Collections;
++import java.util.Random;
++import org.junit.Assert;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++public class SuffocationParityTest {
++
++    private static Unsafe unsafe;
++
++    @BeforeClass
++    public static void setup() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        unsafe = (Unsafe) f.get(null);
++    }
++
++    private static final class StubLiving extends EntityLiving {
++        int inBlockCalls;
++        int stuckDamageCalls;
++        boolean insideBlock;
++        float lastStuckAmount;
++
++        StubLiving() {
++            super(null);
++        }
++
++        @Override
++        public boolean aq() {
++            return false;
++        }
++
++        @Override
++        public boolean a(Material material) {
++            return false;
++        }
++
++        @Override
++        public boolean au() {
++            return false;
++        }
++
++        @Override
++        public boolean an() {
++            return false;
++        }
++
++        @Override
++        public boolean isAlive() {
++            return true;
++        }
++
++        @Override
++        public boolean inBlock() {
++            inBlockCalls++;
++            return insideBlock;
++        }
++
++        @Override
++        public boolean damageEntity(DamageSource source, float amount) {
++            if (source == DamageSource.STUCK) {
++                if ((float) this.noDamageTicks > (float) this.maxNoDamageTicks / 2.0F && amount <= this.lastDamage) {
++                    return false;
++                }
++                stuckDamageCalls++;
++                lastStuckAmount = amount;
++                this.lastDamage = amount;
++                this.noDamageTicks = this.maxNoDamageTicks;
++                return true;
++            }
++            return false;
++        }
++
++        @Override
++        public Iterable<ItemStack> getArmorItems() {
++            return Collections.emptyList();
++        }
++
++        @Override
++        public ItemStack getEquipment(EnumItemSlot slot) {
++            return ItemStack.a;
++        }
++
++        @Override
++        public void setSlot(EnumItemSlot slot, ItemStack stack) {
++        }
++
++        @Override
++        public EnumMainHand getMainHand() {
++            return EnumMainHand.RIGHT;
++        }
++    }
++
++    @SuppressWarnings("unchecked")
++    private static <T> DataWatcherObject<T> getStaticWatcher(Class<?> cls, String name) throws Exception {
++        Field f = cls.getDeclaredField(name);
++        f.setAccessible(true);
++        return (DataWatcherObject<T>) f.get(null);
++    }
++
++    private static StubLiving newStubLiving() throws Exception {
++        World world = (World) unsafe.allocateInstance(WorldServer.class);
++        Field mp = World.class.getDeclaredField("methodProfiler");
++        mp.setAccessible(true);
++        mp.set(world, new MethodProfiler());
++        Field borderField = World.class.getDeclaredField("P");
++        borderField.setAccessible(true);
++        WorldBorder border = new WorldBorder();
++        border.setCenter(0.0D, 0.0D);
++        border.setSize(1000.0D);
++        borderField.set(world, border);
++        Field paperConfigField = World.class.getDeclaredField("paperConfig");
++        paperConfigField.setAccessible(true);
++        paperConfigField.set(world, unsafe.allocateInstance(com.destroystokyo.paper.PaperWorldConfig.class));
++        Field clientSideField = World.class.getDeclaredField("isClientSide");
++        clientSideField.setAccessible(true);
++        clientSideField.setBoolean(world, true); // bypass server-only BlockPosition/effects work in Y()
++
++        StubLiving entity = (StubLiving) unsafe.allocateInstance(StubLiving.class);
++        entity.world = world;
++        entity.random = new Random(1L);
++        entity.maxNoDamageTicks = 20;
++        entity.noDamageTicks = 0;
++        entity.lastDamage = 0.0F;
++        entity.a(new AxisAlignedBB(0.0D, 64.0D, 0.0D, 0.6D, 65.8D, 0.6D));
++        Field dwField = Entity.class.getDeclaredField("datawatcher");
++        dwField.setAccessible(true);
++        DataWatcher dw = new DataWatcher(entity);
++        dw.register(Entity.Z, (byte) 0);
++        dw.register(getStaticWatcher(Entity.class, "aA"), 300);
++        dw.register(getStaticWatcher(EntityLiving.class, "g"), 0);
++        dw.register(getStaticWatcher(EntityLiving.class, "h"), Boolean.FALSE);
++        dw.register(EntityLiving.HEALTH, 20.0F);
++        dwField.set(entity, dw);
++        Field effectsField = EntityLiving.class.getDeclaredField("effects");
++        effectsField.setAccessible(true);
++        effectsField.set(entity, new it.unimi.dsi.fastutil.objects.Reference2ObjectOpenHashMap<>());
++        Field procField = EntityLiving.class.getDeclaredField("effectsToProcess");
++        procField.setAccessible(true);
++        procField.set(entity, new java.util.ArrayList<>());
++        Field passengersField = Entity.class.getDeclaredField("passengers");
++        passengersField.setAccessible(true);
++        passengersField.set(entity, Collections.emptyList());
++        return entity;
++    }
++
++    @Test
++    public void testImmediateFirstTickSuffocationAndInvulnerabilitySkip() throws Exception {
++        boolean prev = Suffocation.enableSuffocationOptimization;
++        try {
++            Suffocation.enableSuffocationOptimization = true;
++            StubLiving entity = newStubLiving();
++            entity.insideBlock = true;
++            entity.ticksLived = 3; // not a multiple of 10!
++
++            // Tick 1: Must damage IMMEDIATELY on tick 3 (previously delayed until tick 10)
++            entity.Y();
++            Assert.assertEquals("Must take suffocation damage on first tick in block regardless of ticksLived % 10", 1, entity.stuckDamageCalls);
++            Assert.assertEquals(1, entity.inBlockCalls);
++
++            // While noDamageTicks (19..11) > maxNoDamageTicks/2 (10), inBlock() must be skipped
++            for (int t = 0; t < 9; ++t) {
++                entity.ticksLived++;
++                entity.Y();
++            }
++            Assert.assertEquals("Must skip redundant inBlock() during invulnerability window", 1, entity.inBlockCalls);
++            Assert.assertEquals(1, entity.stuckDamageCalls);
++
++            // Next tick: noDamageTicks is now 10 (not > 10), so must immediately check & damage again!
++            entity.ticksLived++;
++            entity.Y();
++            Assert.assertEquals("Must resume suffocation damage immediately when invulnerability expires", 2, entity.stuckDamageCalls);
++            Assert.assertEquals(2, entity.inBlockCalls);
++        } finally {
++            Suffocation.enableSuffocationOptimization = prev;
++        }
++    }
++}
