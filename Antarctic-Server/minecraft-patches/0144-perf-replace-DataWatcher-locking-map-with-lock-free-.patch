@@ -1,0 +1,536 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 01:25:19 +0700
+Subject: [PATCH 144/144] perf: replace DataWatcher locking map with lock-free
+ dense array
+
+
+diff --git a/main/java/net/minecraft/server/DataWatcher.java b/main/java/net/minecraft/server/DataWatcher.java
+index fe84844..91c65a5 100644
+--- a/main/java/net/minecraft/server/DataWatcher.java
++++ b/main/java/net/minecraft/server/DataWatcher.java
+@@ -5,14 +5,20 @@ import com.google.common.collect.Maps;
+ import io.netty.handler.codec.DecoderException;
+ import io.netty.handler.codec.EncoderException;
+ import java.io.IOException;
++import java.util.AbstractMap;
++import java.util.AbstractSet;
+ import java.util.ArrayList;
++import java.util.Arrays;
+ import java.util.Iterator;
+ import java.util.List;
+ import java.util.Map;
++import java.util.NoSuchElementException;
++import java.util.Set;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.locks.Condition;
++import java.util.concurrent.locks.Lock;
+ import java.util.concurrent.locks.ReadWriteLock;
+-import java.util.concurrent.locks.ReentrantReadWriteLock;
+ import javax.annotation.Nullable;
+-import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap; // Paper
+ import org.apache.commons.lang3.ObjectUtils;
+ import org.apache.logging.log4j.LogManager;
+ import org.apache.logging.log4j.Logger;
+@@ -21,9 +27,26 @@ public class DataWatcher {
+ 
+     private static final Logger a = LogManager.getLogger();
+     private static final Map<Class<? extends Entity>, Integer> b = Maps.newHashMap();
++    private static final DataWatcher.Item<?>[] EMPTY_ITEMS = new DataWatcher.Item<?>[0];
++    // Antarctic - shared no-op ReadWriteLock kept solely for legacy plugin reflection compatibility (0B per entity)
++    private static final Lock NOOP_LOCK = new Lock() {
++        @Override public void lock() {}
++        @Override public void lockInterruptibly() {}
++        @Override public boolean tryLock() { return true; }
++        @Override public boolean tryLock(long time, TimeUnit unit) { return true; }
++        @Override public void unlock() {}
++        @Override public Condition newCondition() { throw new UnsupportedOperationException(); }
++    };
++    private static final ReadWriteLock NOOP_RW_LOCK = new ReadWriteLock() {
++        @Override public Lock readLock() { return NOOP_LOCK; }
++        @Override public Lock writeLock() { return NOOP_LOCK; }
++    };
+     private final Entity c;
+-    private final Map<Integer, DataWatcher.Item<?>> d = new Int2ObjectOpenHashMap<>(); // Paper
+-    private final ReadWriteLock e = new ReentrantReadWriteLock();
++    // Antarctic start - lock-free dense array indexed by DataWatcher ID (0..254), with lightweight Map view for reflection
++    private volatile DataWatcher.Item<?>[] items = EMPTY_ITEMS;
++    private final Map<Integer, DataWatcher.Item<?>> d = new DenseItemMap();
++    private final ReadWriteLock e = NOOP_RW_LOCK;
++    // Antarctic end
+     private boolean f = true;
+     private boolean g;
+ 
+@@ -74,9 +97,9 @@ public class DataWatcher {
+     public <T> void register(DataWatcherObject<T> datawatcherobject, Object t0) { // CraftBukkit T -> Object
+         int i = datawatcherobject.a();
+ 
+-        if (i > 254) {
++        if (i < 0 || i > 254) {
+             throw new IllegalArgumentException("Data value id is too big with " + i + "! (Max is " + 254 + ")");
+-        } else if (this.d.containsKey(Integer.valueOf(i))) {
++        } else if (this.getItemUnchecked(i) != null) {
+             throw new IllegalArgumentException("Duplicate id value for " + i + "!");
+         } else if (DataWatcherRegistry.b(datawatcherobject.b()) < 0) {
+             throw new IllegalArgumentException("Unregistered serializer " + datawatcherobject.b() + " for " + i + "!");
+@@ -85,32 +108,32 @@ public class DataWatcher {
+         }
+     }
+ 
++    private DataWatcher.Item<?> getItemUnchecked(int id) {
++        DataWatcher.Item<?>[] arr = this.items;
++        return id >= 0 && id < arr.length ? arr[id] : null;
++    }
++
+     private <T> void registerObject(DataWatcherObject<T> datawatcherobject, Object t0) { // CraftBukkit Object
+-        DataWatcher.Item datawatcher_item = new DataWatcher.Item(datawatcherobject, t0);
++        DataWatcher.Item<T> datawatcher_item = new DataWatcher.Item(datawatcherobject, t0);
++        this.putItem(datawatcherobject.a(), datawatcher_item);
++    }
+ 
+-        this.e.writeLock().lock();
+-        this.d.put(Integer.valueOf(datawatcherobject.a()), datawatcher_item);
++    synchronized void putItem(int id, DataWatcher.Item<?> item) {
++        DataWatcher.Item<?>[] arr = this.items;
++        if (id >= arr.length) {
++            int newLen = arr.length == 0 ? Math.max(16, id + 1) : Math.min(255, Math.max(id + 1, arr.length + 4));
++            arr = Arrays.copyOf(arr, newLen);
++        }
++        arr[id] = item;
+         this.f = false;
+-        this.e.writeLock().unlock();
++        this.items = arr; // volatile store publishes arr[id] to lock-free readers
+     }
+ 
++    @SuppressWarnings("unchecked")
+     private <T> DataWatcher.Item<T> c(DataWatcherObject<T> datawatcherobject) {
+-        this.e.readLock().lock();
+-
+-        DataWatcher.Item datawatcher_item;
+-
+-        try {
+-            datawatcher_item = (DataWatcher.Item) this.d.get(Integer.valueOf(datawatcherobject.a()));
+-        } catch (Throwable throwable) {
+-            CrashReport crashreport = CrashReport.a(throwable, "Getting synched entity data");
+-            CrashReportSystemDetails crashreportsystemdetails = crashreport.a("Synched entity data");
+-
+-            crashreportsystemdetails.a("Data ID", (Object) datawatcherobject);
+-            throw new ReportedException(crashreport);
+-        }
+-
+-        this.e.readLock().unlock();
+-        return datawatcher_item;
++        int id = datawatcherobject.a();
++        DataWatcher.Item<?>[] arr = this.items;
++        return (DataWatcher.Item<T>) (id >= 0 && id < arr.length ? arr[id] : null);
+     }
+ 
+     public <T> T get(DataWatcherObject<T> datawatcherobject) {
+@@ -154,16 +177,14 @@ public class DataWatcher {
+ 
+     @Nullable
+     public List<DataWatcher.Item<?>> b() {
+-        ArrayList arraylist = null;
++        ArrayList<DataWatcher.Item<?>> arraylist = null;
+ 
+         if (this.g) {
+-            this.e.readLock().lock();
+-            Iterator iterator = this.d.values().iterator();
+-
+-            while (iterator.hasNext()) {
+-                DataWatcher.Item datawatcher_item = (DataWatcher.Item) iterator.next();
++            DataWatcher.Item<?>[] arr = this.items;
++            for (int i = 0, len = arr.length; i < len; ++i) {
++                DataWatcher.Item<?> datawatcher_item = arr[i];
+ 
+-                if (datawatcher_item.c()) {
++                if (datawatcher_item != null && datawatcher_item.c()) {
+                     datawatcher_item.a(false);
+                     if (arraylist == null) {
+                         arraylist = Lists.newArrayList();
+@@ -172,8 +193,6 @@ public class DataWatcher {
+                     arraylist.add(datawatcher_item.d());
+                 }
+             }
+-
+-            this.e.readLock().unlock();
+         }
+ 
+         this.g = false;
+@@ -181,35 +200,32 @@ public class DataWatcher {
+     }
+ 
+     public void a(PacketDataSerializer packetdataserializer) throws IOException {
+-        this.e.readLock().lock();
+-        Iterator iterator = this.d.values().iterator();
+-
+-        while (iterator.hasNext()) {
+-            DataWatcher.Item datawatcher_item = (DataWatcher.Item) iterator.next();
+-
+-            a(packetdataserializer, datawatcher_item);
++        DataWatcher.Item<?>[] arr = this.items;
++        for (int i = 0, len = arr.length; i < len; ++i) {
++            DataWatcher.Item<?> datawatcher_item = arr[i];
++            if (datawatcher_item != null) {
++                a(packetdataserializer, datawatcher_item);
++            }
+         }
+ 
+-        this.e.readLock().unlock();
+         packetdataserializer.writeByte(255);
+     }
+ 
+     @Nullable
+     public List<DataWatcher.Item<?>> c() {
+-        ArrayList arraylist = null;
+-
+-        this.e.readLock().lock();
+-
+-        DataWatcher.Item datawatcher_item;
+-
+-        for (Iterator iterator = this.d.values().iterator(); iterator.hasNext(); arraylist.add(datawatcher_item.d())) {
+-            datawatcher_item = (DataWatcher.Item) iterator.next();
+-            if (arraylist == null) {
+-                arraylist = Lists.newArrayList();
++        ArrayList<DataWatcher.Item<?>> arraylist = null;
++        DataWatcher.Item<?>[] arr = this.items;
++
++        for (int i = 0, len = arr.length; i < len; ++i) {
++            DataWatcher.Item<?> datawatcher_item = arr[i];
++            if (datawatcher_item != null) {
++                if (arraylist == null) {
++                    arraylist = Lists.newArrayList();
++                }
++                arraylist.add(datawatcher_item.d());
+             }
+         }
+ 
+-        this.e.readLock().unlock();
+         return arraylist;
+     }
+ 
+@@ -256,22 +272,98 @@ public class DataWatcher {
+ 
+     public void e() {
+         this.g = false;
+-        this.e.readLock().lock();
+-        Iterator iterator = this.d.values().iterator();
++        DataWatcher.Item<?>[] arr = this.items;
++        for (int i = 0, len = arr.length; i < len; ++i) {
++            DataWatcher.Item<?> datawatcher_item = arr[i];
++            if (datawatcher_item != null) {
++                datawatcher_item.a(false);
++            }
++        }
++    }
++
++    // Antarctic - lightweight Map view backed by dense items[] for legacy reflection compatibility (e.g., ProtocolLib)
++    private final class DenseItemMap extends AbstractMap<Integer, DataWatcher.Item<?>> {
++        @Override
++        public DataWatcher.Item<?> get(Object key) {
++            if (!(key instanceof Integer)) {
++                return null;
++            }
++            return DataWatcher.this.getItemUnchecked(((Integer) key).intValue());
++        }
+ 
+-        while (iterator.hasNext()) {
+-            DataWatcher.Item datawatcher_item = (DataWatcher.Item) iterator.next();
++        @Override
++        public boolean containsKey(Object key) {
++            return get(key) != null;
++        }
+ 
+-            datawatcher_item.a(false);
++        @Override
++        public DataWatcher.Item<?> put(Integer key, DataWatcher.Item<?> value) {
++            int id = key.intValue();
++            if (id < 0 || id > 254) {
++                throw new IllegalArgumentException("Data value id out of range: " + id);
++            }
++            DataWatcher.Item<?> prev = DataWatcher.this.getItemUnchecked(id);
++            DataWatcher.this.putItem(id, value);
++            return prev;
++        }
++
++        @Override
++        public int size() {
++            int count = 0;
++            DataWatcher.Item<?>[] arr = DataWatcher.this.items;
++            for (int i = 0, len = arr.length; i < len; ++i) {
++                if (arr[i] != null) {
++                    count++;
++                }
++            }
++            return count;
+         }
+ 
+-        this.e.readLock().unlock();
++        @Override
++        public Set<Map.Entry<Integer, DataWatcher.Item<?>>> entrySet() {
++            return new AbstractSet<Map.Entry<Integer, DataWatcher.Item<?>>>() {
++                @Override
++                public Iterator<Map.Entry<Integer, DataWatcher.Item<?>>> iterator() {
++                    final DataWatcher.Item<?>[] snapshot = DataWatcher.this.items;
++                    return new Iterator<Map.Entry<Integer, DataWatcher.Item<?>>>() {
++                        private int nextIdx = advance(0);
++
++                        private int advance(int from) {
++                            while (from < snapshot.length && snapshot[from] == null) {
++                                from++;
++                            }
++                            return from;
++                        }
++
++                        @Override
++                        public boolean hasNext() {
++                            return nextIdx < snapshot.length;
++                        }
++
++                        @Override
++                        public Map.Entry<Integer, DataWatcher.Item<?>> next() {
++                            if (nextIdx >= snapshot.length) {
++                                throw new NoSuchElementException();
++                            }
++                            int idx = nextIdx;
++                            nextIdx = advance(idx + 1);
++                            return new SimpleImmutableEntry<>(idx, snapshot[idx]);
++                        }
++                    };
++                }
++
++                @Override
++                public int size() {
++                    return DenseItemMap.this.size();
++                }
++            };
++        }
+     }
+ 
+     public static class Item<T> {
+ 
+         private final DataWatcherObject<T> a;
+-        private T b;
++        private volatile T b;
+         private boolean c;
+ 
+         public Item(DataWatcherObject<T> datawatcherobject, T t0) {
+diff --git a/test/java/net/minecraft/server/DataWatcherPerformanceAndParityTest.java b/test/java/net/minecraft/server/DataWatcherPerformanceAndParityTest.java
+new file mode 100644
+index 0000000..64a9326
+--- /dev/null
++++ b/test/java/net/minecraft/server/DataWatcherPerformanceAndParityTest.java
+@@ -0,0 +1,213 @@
++package net.minecraft.server;
++
++import com.sun.management.ThreadMXBean;
++import io.netty.buffer.ByteBuf;
++import io.netty.buffer.Unpooled;
++import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
++import java.lang.management.ManagementFactory;
++import java.lang.reflect.Field;
++import java.util.List;
++import java.util.Map;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.Future;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.locks.ReentrantReadWriteLock;
++import org.junit.Assert;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++public class DataWatcherPerformanceAndParityTest {
++
++    private static Unsafe unsafe;
++
++    @BeforeClass
++    public static void setup() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        unsafe = (Unsafe) f.get(null);
++    }
++
++    private static Entity newStubEntity() throws Exception {
++        return (Entity) unsafe.allocateInstance(EntityZombie.class);
++    }
++
++    @SuppressWarnings("unchecked")
++    @Test
++    public void testFullParityWireRoundTripAndReflectionView() throws Exception {
++        Entity entity = newStubEntity();
++        DataWatcher watcher = new DataWatcher(entity);
++
++        DataWatcherObject<Byte> flags = DataWatcherRegistry.a.a(0);
++        DataWatcherObject<Integer> air = DataWatcherRegistry.b.a(1);
++        DataWatcherObject<String> name = DataWatcherRegistry.d.a(2);
++        DataWatcherObject<Float> health = DataWatcherRegistry.c.a(7);
++        DataWatcherObject<Boolean> highId = DataWatcherRegistry.h.a(42); // forces array growth > 16
++
++        Assert.assertTrue(watcher.d());
++        watcher.register(flags, (byte) 0);
++        watcher.register(air, 300);
++        watcher.register(name, "Test");
++        watcher.register(health, 20.0F);
++        watcher.register(highId, Boolean.FALSE);
++        Assert.assertFalse(watcher.d());
++
++        // Duplicate registration must still throw
++        try {
++            watcher.register(air, 100);
++            Assert.fail("Duplicate ID must throw IllegalArgumentException");
++        } catch (IllegalArgumentException expected) {
++            // expected
++        }
++
++        Assert.assertEquals(Byte.valueOf((byte) 0), watcher.get(flags));
++        Assert.assertEquals(Integer.valueOf(300), watcher.get(air));
++        Assert.assertEquals("Test", watcher.get(name));
++        Assert.assertEquals(20.0F, watcher.get(health), 0.0F);
++        Assert.assertEquals(Boolean.FALSE, watcher.get(highId));
++
++        // Clear dirty via e(), then mutate health & highId
++        watcher.e();
++        Assert.assertFalse(watcher.a());
++        watcher.set(health, 15.5F);
++        watcher.set(highId, Boolean.TRUE);
++        Assert.assertTrue(watcher.a());
++
++        List<DataWatcher.Item<?>> dirty = watcher.b();
++        Assert.assertNotNull(dirty);
++        Assert.assertEquals(2, dirty.size());
++        Assert.assertFalse(watcher.a());
++
++        // Full serialization round-trip via PacketDataSerializer
++        ByteBuf buf = Unpooled.buffer(256);
++        try {
++            PacketDataSerializer serializer = new PacketDataSerializer(buf);
++            watcher.a(serializer);
++            List<DataWatcher.Item<?>> decoded = DataWatcher.b(serializer);
++            Assert.assertNotNull(decoded);
++            Assert.assertEquals(5, decoded.size());
++            Assert.assertEquals(15.5F, (Float) decoded.get(3).b(), 0.0F);
++            Assert.assertEquals(Boolean.TRUE, decoded.get(4).b());
++        } finally {
++            buf.release();
++        }
++
++        // Reflection compatibility: legacy plugins reading private Map d
++        Field dField = DataWatcher.class.getDeclaredField("d");
++        dField.setAccessible(true);
++        Map<Integer, DataWatcher.Item<?>> mapView = (Map<Integer, DataWatcher.Item<?>>) dField.get(watcher);
++        Assert.assertEquals(5, mapView.size());
++        Assert.assertTrue(mapView.containsKey(42));
++        Assert.assertEquals(Boolean.TRUE, mapView.get(42).b());
++    }
++
++    @Test
++    public void testConcurrentNettySnapshotReadsAreSafe() throws Exception {
++        Entity entity = newStubEntity();
++        DataWatcher watcher = new DataWatcher(entity);
++        DataWatcherObject<Integer> k0 = DataWatcherRegistry.b.a(0);
++        DataWatcherObject<Integer> k1 = DataWatcherRegistry.b.a(1);
++        watcher.register(k0, 0);
++        watcher.register(k1, 1);
++
++        ExecutorService pool = Executors.newFixedThreadPool(4);
++        CountDownLatch start = new CountDownLatch(1);
++        try {
++            Future<?>[] readers = new Future<?>[4];
++            for (int t = 0; t < 4; ++t) {
++                readers[t] = pool.submit(() -> {
++                    try {
++                        start.await();
++                        ByteBuf buf = Unpooled.buffer(128);
++                        try {
++                            PacketDataSerializer ser = new PacketDataSerializer(buf);
++                            for (int i = 0; i < 2000; ++i) {
++                                buf.clear();
++                                watcher.a(ser);
++                                List<DataWatcher.Item<?>> snap = watcher.c();
++                                Assert.assertNotNull(snap);
++                                Assert.assertTrue(snap.size() >= 2);
++                            }
++                        } finally {
++                            buf.release();
++                        }
++                    } catch (Exception e) {
++                        throw new RuntimeException(e);
++                    }
++                });
++            }
++
++            start.countDown();
++            for (int i = 0; i < 4000; ++i) {
++                watcher.set(k0, i);
++                watcher.set(k1, i + 1);
++                if (i == 500) {
++                    watcher.register(DataWatcherRegistry.b.a(20), 99);
++                }
++            }
++            for (Future<?> r : readers) {
++                r.get(10, TimeUnit.SECONDS);
++            }
++        } finally {
++            pool.shutdownNow();
++        }
++    }
++
++    @Test
++    public void testLockFreeDenseArrayBenchmarkAndZeroAllocGets() throws Exception {
++        Entity entity = newStubEntity();
++        DataWatcher watcher = new DataWatcher(entity);
++        @SuppressWarnings("unchecked")
++        DataWatcherObject<Integer>[] keys = new DataWatcherObject[12];
++        Map<Integer, DataWatcher.Item<?>> baselineMap = new Int2ObjectOpenHashMap<>();
++        ReentrantReadWriteLock baselineLock = new ReentrantReadWriteLock();
++        for (int i = 0; i < keys.length; ++i) {
++            keys[i] = DataWatcherRegistry.b.a(i);
++            watcher.register(keys[i], i + 1);
++            baselineMap.put(i, new DataWatcher.Item<>(keys[i], i + 1));
++        }
++
++        final int warmup = 200_000;
++        final int iters = 2_000_000;
++        long sink = 0;
++        for (int i = 0; i < warmup; ++i) {
++            DataWatcherObject<Integer> k = keys[i % keys.length];
++            sink += watcher.get(k);
++            baselineLock.readLock().lock();
++            sink += (Integer) baselineMap.get(Integer.valueOf(k.a())).b();
++            baselineLock.readLock().unlock();
++        }
++
++        ThreadMXBean bean = (ThreadMXBean) ManagementFactory.getThreadMXBean();
++        long tid = Thread.currentThread().getId();
++
++        long t0 = System.nanoTime();
++        for (int i = 0; i < iters; ++i) {
++            DataWatcherObject<Integer> k = keys[i % keys.length];
++            baselineLock.readLock().lock();
++            sink += (Integer) baselineMap.get(Integer.valueOf(k.a())).b();
++            baselineLock.readLock().unlock();
++        }
++        long baselineNs = System.nanoTime() - t0;
++
++        long allocBefore = bean.getThreadAllocatedBytes(tid);
++        long t1 = System.nanoTime();
++        for (int i = 0; i < iters; ++i) {
++            DataWatcherObject<Integer> k = keys[i % keys.length];
++            sink += watcher.get(k);
++        }
++        long optimizedNs = System.nanoTime() - t1;
++        long allocBytes = bean.getThreadAllocatedBytes(tid) - allocBefore;
++
++        double speedup = (double) baselineNs / (double) Math.max(1L, optimizedNs);
++        System.out.printf("[perf] DataWatcher.get (%d ops): baseline=%.2f ms vs lock-free=%.2f ms (%.1fx speedup), alloc=%d B (sink=%d)%n",
++                iters, baselineNs / 1e6, optimizedNs / 1e6, speedup, allocBytes, sink);
++
++        Assert.assertEquals("DataWatcher.get must allocate 0 bytes", 0L, allocBytes);
++        Assert.assertTrue("Lock-free dense DataWatcher.get must be >= 2x faster than RWLock+Map baseline (got " + speedup + "x)",
++                optimizedNs * 2L < baselineNs);
++    }
++}
