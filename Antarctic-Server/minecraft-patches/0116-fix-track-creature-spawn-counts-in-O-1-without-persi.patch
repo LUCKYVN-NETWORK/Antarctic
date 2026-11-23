@@ -1,0 +1,876 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Mon, 23 Nov 2026 13:40:29 +0700
+Subject: [PATCH 116/116] fix: track creature spawn counts in O(1) without
+ persistence drift
+
+
+diff --git a/main/java/net/minecraft/server/Chunk.java b/main/java/net/minecraft/server/Chunk.java
+index 4c59040..6d3f535 100644
+--- a/main/java/net/minecraft/server/Chunk.java
++++ b/main/java/net/minecraft/server/Chunk.java
+@@ -85,6 +85,83 @@ public class Chunk {
+     private final ConcurrentLinkedQueue<BlockPosition> y;
+     public boolean d; public void setShouldUnload(boolean unload) { this.d = unload; } public boolean isUnloading() { return d; } // Paper - OBFHELPER
+     protected gnu.trove.map.hash.TObjectIntHashMap<Class> entityCount = new gnu.trove.map.hash.TObjectIntHashMap<Class>(); // Spigot
++    // Antarctic start - O(1) per-chunk creature spawn count tracking (indexed by EnumCreatureType.ordinal())
++    private static final EnumCreatureType[] CREATURE_TYPES = EnumCreatureType.values();
++    public final int[] antarcticCreatureCounts = new int[CREATURE_TYPES.length];
++    private boolean antarcticCountsInWorld = false;
++
++    public int getCreatureCount(EnumCreatureType type) {
++        return this.antarcticCreatureCounts[type.ordinal()];
++    }
++
++    static byte computeSpawnCountMask(Entity entity) {
++        if (entity instanceof EntityInsentient) {
++            EntityInsentient entityinsentient = (EntityInsentient) entity;
++            if (entityinsentient.isTypeNotPersistent() && entityinsentient.isPersistent()) {
++                return 0;
++            }
++        }
++        int mask = 0;
++        if (entity instanceof IMonster) {
++            mask |= 1 << EnumCreatureType.MONSTER.ordinal();
++        }
++        if (entity instanceof EntityAnimal) {
++            mask |= 1 << EnumCreatureType.CREATURE.ordinal();
++        }
++        if (entity instanceof EntityAmbient) {
++            mask |= 1 << EnumCreatureType.AMBIENT.ordinal();
++        }
++        if (entity instanceof EntityWaterAnimal) {
++            mask |= 1 << EnumCreatureType.WATER_CREATURE.ordinal();
++        }
++        return (byte) mask;
++    }
++
++    private void applyCreatureCountDelta(byte oldMask, byte newMask) {
++        int diff = (oldMask ^ newMask) & 0xFF;
++        if (diff == 0) {
++            return;
++        }
++        int[] worldCounts = (this.antarcticCountsInWorld && this.world != null) ? this.world.antarcticCreatureCounts : null;
++        for (int ord = 0; ord < CREATURE_TYPES.length; ++ord) {
++            int bit = 1 << ord;
++            if ((diff & bit) != 0) {
++                int delta = (newMask & bit) != 0 ? 1 : -1;
++                this.antarcticCreatureCounts[ord] += delta;
++                if (worldCounts != null) {
++                    worldCounts[ord] += delta;
++                }
++                Class<? extends IAnimal> typeClass = CREATURE_TYPES[ord].a();
++                if (delta > 0) {
++                    this.entityCount.adjustOrPutValue(typeClass, 1, 1);
++                } else {
++                    this.entityCount.adjustValue(typeClass, -1);
++                }
++            }
++        }
++    }
++
++    public void reconcileCreatureCount(Entity entity) {
++        int sliceIdx = entity.ac;
++        if (entity.entitySlice == null || sliceIdx < 0 || sliceIdx >= this.entitySlices.length || entity.entitySlice != this.entitySlices[sliceIdx]) {
++            return;
++        }
++        byte expected = computeSpawnCountMask(entity);
++        byte current = entity.antarcticSpawnCountMask;
++        if (expected != current) {
++            this.applyCreatureCountDelta(current, expected);
++            entity.antarcticSpawnCountMask = expected;
++        }
++    }
++
++    private void untrackEntityCreatureCount(Entity entity) {
++        byte mask = entity.antarcticSpawnCountMask;
++        if (mask != 0) {
++            entity.antarcticSpawnCountMask = 0;
++            this.applyCreatureCountDelta(mask, (byte) 0);
++        }
++    }
++    // Antarctic end
+ 
+     // Paper start
+     // Track the number of minecarts and items
+@@ -695,6 +772,10 @@ public class Chunk {
+             k = this.entitySlices.length - 1;
+         }
+ 
++        // Antarctic start - capture previous chunk and slice before overwriting entity.ab/ac/ad
++        Chunk prevChunk = entity.getCurrentChunk();
++        int prevChunkY = entity.ac;
++        // Antarctic end
+         entity.aa = true;
+         entity.ab = this.locX;
+         entity.ac = k;
+@@ -708,13 +789,15 @@ public class Chunk {
+             if (currentSlice == entitySlice || inThis) {
+                 return;
+             } else {
+-                Chunk chunk = entity.getCurrentChunk();
+-                if (chunk != null) {
+-                    chunk.removeEntity(entity);
++                if (prevChunk != null) {
++                    prevChunk.a(entity, prevChunkY); // Antarctic - remove from previous slice index so counts decrement cleanly
+                 } else {
+-                    removeEntity(entity);
++                    this.a(entity, prevChunkY);
+                 }
+                 currentSlice.remove(entity); // Just incase the above did not remove from this target slice
++                if (entity.antarcticSpawnCountMask != 0 && prevChunk != null) {
++                    prevChunk.untrackEntityCreatureCount(entity);
++                }
+             }
+         }
+         entity.entitySlice = entitySlice;
+@@ -729,22 +812,13 @@ public class Chunk {
+             inventoryEntityCounts[k]++;
+         }
+         // Paper end
+-        // Spigot start - increment creature type count
+-        // Keep this synced up with World.a(Class)
+-        if (entity instanceof EntityInsentient) {
+-            EntityInsentient entityinsentient = (EntityInsentient) entity;
+-            if (entityinsentient.isTypeNotPersistent() && entityinsentient.isPersistent()) {
+-                return;
+-            }
+-        }
+-        for ( EnumCreatureType creatureType : EnumCreatureType.values() )
+-        {
+-            if ( creatureType.a().isAssignableFrom( entity.getClass() ) )
+-            {
+-                this.entityCount.adjustOrPutValue( creatureType.a(), 1, 1 );
+-            }
++        // Antarctic start - track creature counts via stored mask to prevent persistence drift
++        byte spawnMask = computeSpawnCountMask(entity);
++        entity.antarcticSpawnCountMask = spawnMask;
++        if (spawnMask != 0) {
++            this.applyCreatureCountDelta((byte) 0, spawnMask);
+         }
+-        // Spigot end
++        // Antarctic end
+     }
+ 
+     public void removeEntity(Entity entity) { b(entity); } // Paper - OBFHELPER
+@@ -775,22 +849,9 @@ public class Chunk {
+             inventoryEntityCounts[i]--;
+         }
+         // Paper end
+-        // Spigot start - decrement creature type count
+-        // Keep this synced up with World.a(Class)
+-        if (entity instanceof EntityInsentient) {
+-            EntityInsentient entityinsentient = (EntityInsentient) entity;
+-            if (entityinsentient.isTypeNotPersistent() && entityinsentient.isPersistent()) {
+-                return;
+-            }
+-        }
+-        for ( EnumCreatureType creatureType : EnumCreatureType.values() )
+-        {
+-            if ( creatureType.a().isAssignableFrom( entity.getClass() ) )
+-            {
+-                this.entityCount.adjustValue( creatureType.a(), -1 );
+-            }
+-        }
+-        // Spigot end
++        // Antarctic start - decrement creature counts via exact stored mask
++        this.untrackEntityCreatureCount(entity);
++        // Antarctic end
+     }
+ 
+     public boolean c(BlockPosition blockposition) {
+@@ -921,6 +982,11 @@ public class Chunk {
+                         if (World.DEBUG_ENTITIES) logger.warn("[DUPE-UUID] Duplicate UUID found used by " + other + ", deleted entity " + entity + " because it was near the duplicate and likely an actual duplicate. See https://github.com/PaperMC/Paper/issues/1223 for discussion on what this is about.");
+                         entity.die();
+                         iterator.remove();
++                        // Antarctic start - untrack deleted duplicate-UUID entity from creature counts
++                        this.untrackEntityCreatureCount(entity);
++                        entity.setCurrentChunk(null);
++                        entity.entitySlice = null;
++                        // Antarctic end
+                         continue;
+                     }
+                     if (other != null && !other.dead) {
+@@ -934,6 +1000,11 @@ public class Chunk {
+                                 if (World.DEBUG_ENTITIES) logger.warn("[DUPE-UUID] Duplicate UUID found used by " + other + ", deleted entity " + entity + ". See https://github.com/PaperMC/Paper/issues/1223 for discussion on what this is about.");
+                                 entity.die();
+                                 iterator.remove();
++                                // Antarctic start - untrack deleted duplicate-UUID entity from creature counts
++                                this.untrackEntityCreatureCount(entity);
++                                entity.setCurrentChunk(null);
++                                entity.entitySlice = null;
++                                // Antarctic end
+                                 break;
+                             }
+                             default:
+@@ -949,6 +1020,14 @@ public class Chunk {
+             toAdd.addAll(entityslice);
+             // Paper end
+         }
++        // Antarctic start - publish loaded chunk creature counts to world
++        if (!this.antarcticCountsInWorld) {
++            this.antarcticCountsInWorld = true;
++            if (this.world != null) {
++                this.world.addChunkCreatureCounts(this.antarcticCreatureCounts);
++            }
++        }
++        // Antarctic end
+         this.world.addChunkEntities(toAdd); // Paper - add all at same time to avoid entities adding to world modifying slice state
+ 
+     }
+@@ -998,6 +1077,7 @@ public class Chunk {
+                 // Spigot End
+                 entity.setCurrentChunk(null); // Paper
+                 entity.entitySlice = null; // Paper
++                entity.antarcticSpawnCountMask = 0; // Antarctic - prevent double-decrement after unload
+ 
+                 // Do not pass along players, as doing so can get them stuck outside of time.
+                 // (which for example disables inventory icon updates and prevents block breaking)
+@@ -1009,6 +1089,16 @@ public class Chunk {
+             this.world.c(newList);
+             // CraftBukkit end
+         }
++        // Antarctic start - subtract unloaded chunk creature counts from world and reset local counts
++        if (this.antarcticCountsInWorld) {
++            this.antarcticCountsInWorld = false;
++            if (this.world != null) {
++                this.world.removeChunkCreatureCounts(this.antarcticCreatureCounts);
++            }
++        }
++        Arrays.fill(this.antarcticCreatureCounts, 0);
++        this.entityCount.clear();
++        // Antarctic end
+ 
+     }
+ 
+diff --git a/main/java/net/minecraft/server/Entity.java b/main/java/net/minecraft/server/Entity.java
+index 8a9305e..de1c82a 100644
+--- a/main/java/net/minecraft/server/Entity.java
++++ b/main/java/net/minecraft/server/Entity.java
+@@ -61,6 +61,7 @@ public abstract class Entity implements ICommandListener, KeyedObject { // Paper
+     };
+     List<Entity> entitySlice = null;
+     // Paper end
++    byte antarcticSpawnCountMask; // Antarctic - 4-bit EnumCreatureType mask currently accounted in currentChunk/world
+     static boolean isLevelAtLeast(NBTTagCompound tag, int level) {
+         return tag.hasKey("Bukkit.updateLevel") && tag.getInt("Bukkit.updateLevel") >= level;
+     }
+@@ -1725,7 +1726,7 @@ public abstract class Entity implements ICommandListener, KeyedObject { // Paper
+                 // Reset the persistence for tamed animals
+                 if (entity instanceof EntityTameableAnimal && !isLevelAtLeast(nbttagcompound, 2) && !nbttagcompound.getBoolean("PersistenceRequired")) {
+                     EntityInsentient entityinsentient = (EntityInsentient) entity;
+-                    entityinsentient.persistent = !entityinsentient.isTypeNotPersistent();
++                    entityinsentient.setPersistent(!entityinsentient.isTypeNotPersistent()); // Antarctic - reconcile creature spawn count
+                 }
+             }
+             // CraftBukkit end
+diff --git a/main/java/net/minecraft/server/EntityChicken.java b/main/java/net/minecraft/server/EntityChicken.java
+index 55f0263..c01b936 100644
+--- a/main/java/net/minecraft/server/EntityChicken.java
++++ b/main/java/net/minecraft/server/EntityChicken.java
+@@ -46,7 +46,7 @@ public class EntityChicken extends EntityAnimal {
+     public void n() {
+         // CraftBukkit start
+         if (this.isChickenJockey()) {
+-            this.persistent = !this.isTypeNotPersistent();
++            this.setPersistent(!this.isTypeNotPersistent()); // Antarctic - reconcile creature spawn count
+         }
+         // CraftBukkit end
+         super.n();
+diff --git a/main/java/net/minecraft/server/EntityInsentient.java b/main/java/net/minecraft/server/EntityInsentient.java
+index d6a1933..d2cfd7c 100644
+--- a/main/java/net/minecraft/server/EntityInsentient.java
++++ b/main/java/net/minecraft/server/EntityInsentient.java
+@@ -397,7 +397,7 @@ public abstract class EntityInsentient extends EntityLiving {
+ 
+         boolean data = nbttagcompound.getBoolean("PersistenceRequired");
+         if (isLevelAtLeast(nbttagcompound, 1) || data) {
+-            this.persistent = data;
++            this.setPersistent(data); // Antarctic - reconcile creature spawn count
+         }
+         // CraftBukkit end
+         NBTTagList nbttaglist;
+@@ -609,7 +609,7 @@ public abstract class EntityInsentient extends EntityLiving {
+                 this.dropChanceArmor[enumitemslot.b()] = 2.0F;
+             }
+ 
+-            this.persistent = true;
++            this.setPersistent(true); // Antarctic - reconcile creature spawn count
+             this.receive(entityitem, itemstack.getCount());
+             entityitem.die();
+         }
+@@ -625,6 +625,12 @@ public abstract class EntityInsentient extends EntityLiving {
+     }
+ 
+     protected void L() {
++        // Antarctic start - 1-cycle self-heal for direct NMS persistent writes or dynamic isTypeNotPersistent() changes
++        Chunk trackedChunk = this.getCurrentChunk();
++        if (trackedChunk != null) {
++            trackedChunk.reconcileCreatureCount(this);
++        }
++        // Antarctic end
+         if (this.persistent) {
+             this.ticksFarFromPlayer = 0;
+         } else {
+@@ -994,8 +1000,21 @@ public abstract class EntityInsentient extends EntityLiving {
+     }
+ 
+     public void cW() {
+-        this.persistent = true;
++        this.setPersistent(true); // Antarctic - reconcile creature spawn count
++    }
++
++    // Antarctic start - reconcile O(1) creature spawn count when persistence changes
++    public void setPersistent(boolean persistent) {
++        if (this.persistent == persistent) {
++            return;
++        }
++        this.persistent = persistent;
++        Chunk chunk = this.getCurrentChunk();
++        if (chunk != null) {
++            chunk.reconcileCreatureCount(this);
++        }
+     }
++    // Antarctic end
+ 
+     public void a(EnumItemSlot enumitemslot, float f) {
+         switch (enumitemslot.a()) {
+diff --git a/main/java/net/minecraft/server/PathfinderGoalBreed.java b/main/java/net/minecraft/server/PathfinderGoalBreed.java
+index 444792e..8e60731 100644
+--- a/main/java/net/minecraft/server/PathfinderGoalBreed.java
++++ b/main/java/net/minecraft/server/PathfinderGoalBreed.java
+@@ -77,7 +77,7 @@ public class PathfinderGoalBreed extends PathfinderGoal {
+         if (entityageable != null) {
+             // CraftBukkit start - set persistence for tame animals
+             if (entityageable instanceof EntityTameableAnimal && ((EntityTameableAnimal) entityageable).isTamed()) {
+-                entityageable.persistent = true;
++                entityageable.setPersistent(true); // Antarctic - reconcile creature spawn count
+             }
+             // CraftBukkit end
+             EntityPlayer entityplayer = this.animal.getBreedCause();
+diff --git a/main/java/net/minecraft/server/SpawnerCreature.java b/main/java/net/minecraft/server/SpawnerCreature.java
+index 8741629..441fda6 100644
+--- a/main/java/net/minecraft/server/SpawnerCreature.java
++++ b/main/java/net/minecraft/server/SpawnerCreature.java
+@@ -23,6 +23,17 @@ public final class SpawnerCreature {
+     // Spigot start - get entity count only from chunks being processed in b
+     private int getEntityCount(WorldServer server, Class oClass)
+     {
++        // Antarctic start - O(1) tracked creature counts without persistence drift
++        if (oClass == IMonster.class) {
++            return server.getCreatureCount(EnumCreatureType.MONSTER);
++        } else if (oClass == EntityAnimal.class) {
++            return server.getCreatureCount(EnumCreatureType.CREATURE);
++        } else if (oClass == EntityAmbient.class) {
++            return server.getCreatureCount(EnumCreatureType.AMBIENT);
++        } else if (oClass == EntityWaterAnimal.class) {
++            return server.getCreatureCount(EnumCreatureType.WATER_CREATURE);
++        }
++        // Antarctic end
+         // Paper start - use entire world, not just active chunks. Spigot broke vanilla expectations.
+         if (true) {
+             int sum = 0;
+@@ -144,7 +155,7 @@ public final class SpawnerCreature {
+                     int l1 = limit * i / a; // CraftBukkit - use per-world limits
+                     */ // Paper end
+ 
+-                    if ((mobcnt = getEntityCount(worldserver, enumcreaturetype.a())) <= limit * i / 289) { // Paper - use 17x17 like vanilla (a at top of file)
++                    if ((mobcnt = worldserver.getCreatureCount(enumcreaturetype)) <= limit * i / 289) { // Paper - use 17x17 like vanilla (a at top of file) // Antarctic - O(1) tracked world count
+                         BlockPosition.MutableBlockPosition blockposition_mutableblockposition = new BlockPosition.MutableBlockPosition();
+                         Iterator iterator1 = this.b.iterator();
+ 
+diff --git a/main/java/net/minecraft/server/World.java b/main/java/net/minecraft/server/World.java
+index 055a0da..670d24c 100644
+--- a/main/java/net/minecraft/server/World.java
++++ b/main/java/net/minecraft/server/World.java
+@@ -114,6 +114,24 @@ public abstract class World implements IBlockAccess {
+     int[] J;
+     // Antarctic start - light checks vanilla discards at partially loaded borders, replayed once the neighbors load
+     public final me.stella.antarctic.collection.PendingLightRegistry pendingLight = new me.stella.antarctic.collection.PendingLightRegistry(com.destroystokyo.paper.config.toml.modules.optimizations.Lighting.deferredLightMaxEntries);
++    // O(1) world creature spawn count tracking (indexed by EnumCreatureType.ordinal())
++    final int[] antarcticCreatureCounts = new int[EnumCreatureType.values().length];
++
++    public int getCreatureCount(EnumCreatureType type) {
++        return this.antarcticCreatureCounts[type.ordinal()];
++    }
++
++    void addChunkCreatureCounts(int[] chunkCounts) {
++        for (int i = 0; i < this.antarcticCreatureCounts.length; ++i) {
++            this.antarcticCreatureCounts[i] += chunkCounts[i];
++        }
++    }
++
++    void removeChunkCreatureCounts(int[] chunkCounts) {
++        for (int i = 0; i < this.antarcticCreatureCounts.length; ++i) {
++            this.antarcticCreatureCounts[i] -= chunkCounts[i];
++        }
++    }
+     // Antarctic end
+ 
+     // CraftBukkit start Added the following
+diff --git a/main/java/org/bukkit/craftbukkit/entity/CraftLivingEntity.java b/main/java/org/bukkit/craftbukkit/entity/CraftLivingEntity.java
+index 5121e38..8812484 100644
+--- a/main/java/org/bukkit/craftbukkit/entity/CraftLivingEntity.java
++++ b/main/java/org/bukkit/craftbukkit/entity/CraftLivingEntity.java
+@@ -414,7 +414,7 @@ public class CraftLivingEntity extends CraftEntity implements LivingEntity {
+ 
+     public void setRemoveWhenFarAway(boolean remove) {
+         if (getHandle() instanceof EntityInsentient) {
+-            ((EntityInsentient) getHandle()).persistent = !remove;
++            ((EntityInsentient) getHandle()).setPersistent(!remove); // Antarctic - reconcile creature spawn count
+         }
+     }
+ 
+diff --git a/main/java/org/bukkit/craftbukkit/event/CraftEventFactory.java b/main/java/org/bukkit/craftbukkit/event/CraftEventFactory.java
+index cc00742..42fe61d 100644
+--- a/main/java/org/bukkit/craftbukkit/event/CraftEventFactory.java
++++ b/main/java/org/bukkit/craftbukkit/event/CraftEventFactory.java
+@@ -294,7 +294,7 @@ public class CraftEventFactory {
+         org.bukkit.entity.AnimalTamer bukkitTamer = (tamer != null ? tamer.getBukkitEntity() : null);
+         CraftServer craftServer = (CraftServer) bukkitEntity.getServer();
+ 
+-        entity.persistent = true;
++        entity.setPersistent(true); // Antarctic - reconcile creature spawn count
+ 
+         EntityTameEvent event = new EntityTameEvent((LivingEntity) bukkitEntity, bukkitTamer);
+         craftServer.getPluginManager().callEvent(event);
+diff --git a/test/java/net/minecraft/server/MobSpawnCountAccountingTest.java b/test/java/net/minecraft/server/MobSpawnCountAccountingTest.java
+new file mode 100644
+index 0000000..c4f1f4f
+--- /dev/null
++++ b/test/java/net/minecraft/server/MobSpawnCountAccountingTest.java
+@@ -0,0 +1,434 @@
++package net.minecraft.server;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertTrue;
++
++import com.destroystokyo.paper.PaperWorldConfig;
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Random;
++import java.util.UUID;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import org.spigotmc.AsyncCatcher;
++import sun.misc.Unsafe;
++
++/**
++ * Verifies O(1) creature spawn count tracking in Chunk/World/SpawnerCreature:
++ * - Fixes the Spigot ghost mob-switch / persistence drift bug (persistent false <-> true)
++ * - Self-heals direct NMS EntityInsentient.persistent field writes inside EntityInsentient.L()
++ * - Handles chunk load (addEntities + duplicate-UUID deletion), cross-chunk moves, and chunk unload (removeEntities)
++ * - Keeps legacy Trove Chunk.entityCount synced for reflection ABI compatibility
++ * - Demonstrates large speedup over O(all chunks) Trove scanning at 8,000 loaded chunks
++ */
++public class MobSpawnCountAccountingTest {
++
++    private static Unsafe unsafe;
++    private static int nextEntityId = 1;
++    private boolean prevAsyncCatcher;
++
++    private static final class StubChunkProvider extends ChunkProviderServer {
++        StubChunkProvider(WorldServer world) {
++            super(world, null, null);
++        }
++    }
++
++    private static final class StubWorldServer extends WorldServer {
++        StubWorldServer() {
++            super(null, null, null, 0, null, null, null);
++        }
++
++        @Override
++        protected void b(Entity entity) {
++            entity.valid = true;
++            entity.shouldBeRemoved = false;
++        }
++    }
++
++    @BeforeClass
++    public static void bootstrap() throws Exception {
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        unsafe = (Unsafe) f.get(null);
++        DispenserRegistry.c();
++    }
++
++    @Before
++    public void setUp() {
++        this.prevAsyncCatcher = AsyncCatcher.enabled;
++        AsyncCatcher.enabled = false;
++    }
++
++    @After
++    public void tearDown() {
++        AsyncCatcher.enabled = this.prevAsyncCatcher;
++    }
++
++    private static void setField(Class<?> owner, Object target, String name, Object value) throws Exception {
++        Field f = owner.getDeclaredField(name);
++        f.setAccessible(true);
++        f.set(target, value);
++    }
++
++    private static WorldServer newStubWorld() throws Exception {
++        WorldServer world = (WorldServer) unsafe.allocateInstance(StubWorldServer.class);
++        PaperWorldConfig paperConfig = (PaperWorldConfig) unsafe.allocateInstance(PaperWorldConfig.class);
++        paperConfig.duplicateUUIDMode = PaperWorldConfig.DuplicateUUIDMode.DELETE;
++        paperConfig.duplicateUUIDDeleteRange = 32;
++        paperConfig.hardDespawnDistance = 128 * 128;
++        paperConfig.softDespawnDistance = 32 * 32;
++        setField(World.class, world, "paperConfig", paperConfig);
++        setField(World.class, world, "antarcticCreatureCounts", new int[EnumCreatureType.values().length]);
++        setField(World.class, world, "entityList", new ArrayList<Entity>());
++        setField(World.class, world, "f", Collections.newSetFromMap(new HashMap<Entity, Boolean>()));
++        setField(World.class, world, "players", new ArrayList<EntityHuman>());
++        setField(World.class, world, "u", new ArrayList<IWorldAccess>());
++        setField(World.class, world, "tileEntityListTick", new ArrayList<TileEntity>());
++        setField(World.class, world, "b", new ArrayList<TileEntity>());
++        setField(World.class, world, "methodProfiler", new MethodProfiler());
++        setField(World.class, world, "chunkProvider", new StubChunkProvider(world));
++        setField(WorldServer.class, world, "entitiesByUUID", new HashMap<UUID, Entity>());
++        return world;
++    }
++
++    @SuppressWarnings("unchecked")
++    private static Chunk newStubChunk(WorldServer world, int cx, int cz) throws Exception {
++        Chunk chunk = (Chunk) unsafe.allocateInstance(Chunk.class);
++        setField(Chunk.class, chunk, "world", world);
++        setField(Chunk.class, chunk, "locX", cx);
++        setField(Chunk.class, chunk, "locZ", cz);
++        long key = ChunkCoordIntPair.a(cx, cz);
++        setField(Chunk.class, chunk, "chunkKey", key);
++        setField(Chunk.class, chunk, "sections", new ChunkSection[16]);
++        setField(Chunk.class, chunk, "tileEntities", new HashMap<BlockPosition, TileEntity>());
++        List<Entity>[] slices = new List[16];
++        for (int i = 0; i < 16; ++i) {
++            slices[i] = new ArrayList<Entity>();
++        }
++        setField(Chunk.class, chunk, "entitySlices", slices);
++        setField(Chunk.class, chunk, "entityCounts", new co.aikar.util.Counter<String>());
++        setField(Chunk.class, chunk, "itemCounts", new int[16]);
++        setField(Chunk.class, chunk, "inventoryEntityCounts", new int[16]);
++        setField(Chunk.class, chunk, "entityCount", new gnu.trove.map.hash.TObjectIntHashMap<Class>());
++        setField(Chunk.class, chunk, "antarcticCreatureCounts", new int[EnumCreatureType.values().length]);
++        setField(Chunk.class, chunk, "antarcticCountsInWorld", false);
++        world.getChunkProviderServer().chunks.put(key, chunk);
++        return chunk;
++    }
++
++    private static <T extends Entity> T newStubEntity(Class<T> cls, World world, double x, double y, double z, boolean persistent) throws Exception {
++        T entity = cls.cast(unsafe.allocateInstance(cls));
++        setField(Entity.class, entity, "id", nextEntityId++);
++        entity.world = world;
++        entity.locX = x;
++        entity.locY = y;
++        entity.locZ = z;
++        entity.uniqueID = UUID.randomUUID();
++        entity.random = new Random(1L);
++        if (entity instanceof EntityInsentient) {
++            ((EntityInsentient) entity).persistent = persistent;
++        }
++        return entity;
++    }
++
++    @Test
++    public void testPersistenceTransitionsEliminateGhostMobSwitchAndNegativeDrift() throws Exception {
++        WorldServer world = newStubWorld();
++        Chunk chunk = newStubChunk(world, 0, 0);
++        chunk.addEntities();
++
++        List<EntityZombie> zombies = new ArrayList<EntityZombie>();
++        for (int i = 0; i < 70; ++i) {
++            EntityZombie z = newStubEntity(EntityZombie.class, world, 8.0, 64.0, 8.0, false);
++            chunk.a(z);
++            zombies.add(z);
++        }
++        assertEquals(70, chunk.getCreatureCount(EnumCreatureType.MONSTER));
++        assertEquals(70, world.getCreatureCount(EnumCreatureType.MONSTER));
++        assertEquals(70, chunk.entityCount.get(IMonster.class));
++
++        // Transition all 70 natural zombies to persistent (simulating item pickup / nametag / setRemoveWhenFarAway(false))
++        for (int i = 0; i < 70; ++i) {
++            if ((i & 1) == 0) {
++                zombies.get(i).cW();
++            } else {
++                zombies.get(i).setPersistent(true);
++            }
++        }
++        assertEquals(0, chunk.getCreatureCount(EnumCreatureType.MONSTER));
++        assertEquals(0, world.getCreatureCount(EnumCreatureType.MONSTER));
++        assertEquals(0, chunk.entityCount.get(IMonster.class));
++
++        // Remove all 70 zombies - must stay exactly 0 (no ghost 70, no negative drift)
++        for (EntityZombie z : zombies) {
++            chunk.removeEntity(z);
++        }
++        assertEquals(0, chunk.getCreatureCount(EnumCreatureType.MONSTER));
++        assertEquals(0, world.getCreatureCount(EnumCreatureType.MONSTER));
++        assertEquals(0, chunk.entityCount.get(IMonster.class));
++
++        // Reverse transition: spawn persistent -> unpersist -> remove (must not go negative)
++        EntityZombie pz = newStubEntity(EntityZombie.class, world, 8.0, 64.0, 8.0, true);
++        chunk.a(pz);
++        assertEquals(0, world.getCreatureCount(EnumCreatureType.MONSTER));
++        pz.setPersistent(false);
++        assertEquals(1, world.getCreatureCount(EnumCreatureType.MONSTER));
++        assertEquals(1, chunk.entityCount.get(IMonster.class));
++        chunk.removeEntity(pz);
++        assertEquals(0, world.getCreatureCount(EnumCreatureType.MONSTER));
++        assertEquals(0, chunk.entityCount.get(IMonster.class));
++    }
++
++    @Test
++    public void testDirectPersistentFieldWriteSelfHealsInDespawnTick() throws Exception {
++        WorldServer world = newStubWorld();
++        Chunk chunk = newStubChunk(world, 0, 0);
++        chunk.addEntities();
++
++        EntityZombie z = newStubEntity(EntityZombie.class, world, 8.0, 64.0, 8.0, false);
++        chunk.a(z);
++        assertEquals(1, world.getCreatureCount(EnumCreatureType.MONSTER));
++
++        // Direct NMS field write bypassing setPersistent()
++        z.persistent = true;
++        z.L();
++        assertEquals(0, world.getCreatureCount(EnumCreatureType.MONSTER));
++        assertEquals(0, chunk.getCreatureCount(EnumCreatureType.MONSTER));
++        assertEquals(0, chunk.entityCount.get(IMonster.class));
++
++        // Direct NMS field write back to false
++        z.persistent = false;
++        z.L();
++        assertEquals(1, world.getCreatureCount(EnumCreatureType.MONSTER));
++        assertEquals(1, chunk.getCreatureCount(EnumCreatureType.MONSTER));
++        assertEquals(1, chunk.entityCount.get(IMonster.class));
++
++        chunk.removeEntity(z);
++        assertEquals(0, world.getCreatureCount(EnumCreatureType.MONSTER));
++    }
++
++    @Test
++    public void testChunkLoadDuplicateUuidUnloadAndCrossChunkMove() throws Exception {
++        WorldServer world = newStubWorld();
++        Chunk chunkA = newStubChunk(world, 0, 0);
++        Chunk chunkB = newStubChunk(world, 1, 0);
++        chunkB.addEntities();
++
++        // Simulate ChunkRegionLoader adding entities BEFORE chunkA.addEntities()
++        UUID dupUuid = UUID.randomUUID();
++        EntityZombie existing = newStubEntity(EntityZombie.class, world, 24.0, 64.0, 8.0, false);
++        existing.uniqueID = dupUuid;
++        chunkB.a(existing);
++        world.entitiesByUUID.put(dupUuid, existing);
++        assertEquals(1, world.getCreatureCount(EnumCreatureType.MONSTER));
++
++        EntityZombie dupe = newStubEntity(EntityZombie.class, world, 8.0, 64.0, 8.0, false);
++        dupe.uniqueID = dupUuid;
++        EntityZombie normal = newStubEntity(EntityZombie.class, world, 8.0, 64.0, 8.0, false);
++        EntityCow cow = newStubEntity(EntityCow.class, world, 8.0, 64.0, 8.0, true); // EntityAnimal: isTypeNotPersistent() == false, still counted!
++        EntityBat bat = newStubEntity(EntityBat.class, world, 8.0, 64.0, 8.0, false);
++        EntitySquid squid = newStubEntity(EntitySquid.class, world, 8.0, 48.0, 8.0, false);
++        EntityItem item = newStubEntity(EntityItem.class, world, 8.0, 64.0, 8.0, false);
++
++        chunkA.a(dupe);
++        chunkA.a(normal);
++        chunkA.a(cow);
++        chunkA.a(bat);
++        chunkA.a(squid);
++        chunkA.a(item);
++
++        // Before addEntities, world count must not include chunkA yet
++        assertEquals(1, world.getCreatureCount(EnumCreatureType.MONSTER));
++        assertEquals(0, world.getCreatureCount(EnumCreatureType.CREATURE));
++        assertEquals(2, chunkA.getCreatureCount(EnumCreatureType.MONSTER));
++
++        // addEntities deletes dupe and publishes remaining chunkA counts to world
++        chunkA.addEntities();
++        assertTrue(dupe.dead);
++        assertEquals(0, dupe.antarcticSpawnCountMask);
++        assertEquals(1, chunkA.getCreatureCount(EnumCreatureType.MONSTER));
++        assertEquals(2, world.getCreatureCount(EnumCreatureType.MONSTER)); // existing in B + normal in A
++        assertEquals(1, world.getCreatureCount(EnumCreatureType.CREATURE));
++        assertEquals(1, world.getCreatureCount(EnumCreatureType.AMBIENT));
++        assertEquals(1, world.getCreatureCount(EnumCreatureType.WATER_CREATURE));
++
++        // Move normal zombie from chunkA to chunkB AND across a vertical Y-slice boundary (y=64 slice 4 -> y=12 slice 0)
++        normal.locX = 24.0;
++        normal.locY = 12.0;
++        chunkB.a(normal);
++        assertEquals(0, chunkA.getCreatureCount(EnumCreatureType.MONSTER));
++        assertEquals(2, chunkB.getCreatureCount(EnumCreatureType.MONSTER));
++        assertEquals(2, world.getCreatureCount(EnumCreatureType.MONSTER));
++
++        // Vertical-only slice move within the same chunkB (y=12 slice 0 -> y=96 slice 6) directly via chunkB.a(normal)
++        normal.locY = 96.0;
++        chunkB.a(normal);
++        assertEquals(2, chunkB.getCreatureCount(EnumCreatureType.MONSTER));
++        assertEquals(2, world.getCreatureCount(EnumCreatureType.MONSTER));
++        assertEquals(2, chunkB.entityCount.get(IMonster.class));
++
++        // Unload chunkA - world counts drop by chunkA's cow/bat/squid, idempotent on second call
++        chunkA.removeEntities();
++        assertEquals(0, chunkA.getCreatureCount(EnumCreatureType.CREATURE));
++        assertEquals(0, world.getCreatureCount(EnumCreatureType.CREATURE));
++        assertEquals(0, world.getCreatureCount(EnumCreatureType.AMBIENT));
++        assertEquals(0, world.getCreatureCount(EnumCreatureType.WATER_CREATURE));
++        assertEquals(2, world.getCreatureCount(EnumCreatureType.MONSTER));
++        assertEquals(0, cow.antarcticSpawnCountMask);
++
++        chunkA.removeEntities();
++        world.getChunkProviderServer().chunks.remove(chunkA.chunkKey);
++        assertEquals(2, world.getCreatureCount(EnumCreatureType.MONSTER));
++
++        // Reload a new chunk at the same (0, 0) and mutate stale unloaded entity's persistence:
++        // must NOT corrupt the newly loaded chunk's or world's creature counts!
++        Chunk reloadedA = newStubChunk(world, 0, 0);
++        reloadedA.addEntities();
++        bat.setPersistent(true);
++        bat.setPersistent(false);
++        assertEquals(0, reloadedA.getCreatureCount(EnumCreatureType.AMBIENT));
++        assertEquals(0, world.getCreatureCount(EnumCreatureType.AMBIENT));
++    }
++
++    @Test
++    public void testRandomizedLifecycleZeroDrift() throws Exception {
++        WorldServer world = newStubWorld();
++        Chunk[] chunks = new Chunk[8];
++        for (int i = 0; i < chunks.length; ++i) {
++            chunks[i] = newStubChunk(world, i, 0);
++            chunks[i].addEntities();
++        }
++
++        Random rng = new Random(20261123L);
++        List<Entity> live = new ArrayList<Entity>();
++        for (int op = 0; op < 10_000; ++op) {
++            int action = rng.nextInt(100);
++            if (action < 40 || live.isEmpty()) {
++                int ci = rng.nextInt(chunks.length);
++                int kind = rng.nextInt(5);
++                boolean pers = rng.nextBoolean();
++                Entity e;
++                double x = ci * 16.0 + 8.0;
++                if (kind == 0) e = newStubEntity(EntityZombie.class, world, x, 64.0, 8.0, pers);
++                else if (kind == 1) e = newStubEntity(EntityCow.class, world, x, 64.0, 8.0, pers);
++                else if (kind == 2) e = newStubEntity(EntityBat.class, world, x, 64.0, 8.0, pers);
++                else if (kind == 3) e = newStubEntity(EntitySquid.class, world, x, 48.0, 8.0, pers);
++                else e = newStubEntity(EntityItem.class, world, x, 64.0, 8.0, false);
++                chunks[ci].a(e);
++                live.add(e);
++            } else if (action < 65) {
++                Entity e = live.get(rng.nextInt(live.size()));
++                if (e instanceof EntityInsentient) {
++                    EntityInsentient ins = (EntityInsentient) e;
++                    if (rng.nextBoolean()) {
++                        ins.setPersistent(!ins.persistent);
++                    } else {
++                        ins.persistent = !ins.persistent;
++                        ins.L();
++                    }
++                }
++            } else if (action < 85) {
++                int idx = rng.nextInt(live.size());
++                Entity e = live.remove(idx);
++                Chunk c = e.getCurrentChunk();
++                if (c != null) {
++                    c.removeEntity(e);
++                }
++            } else if (action < 95) {
++                Entity e = live.get(rng.nextInt(live.size()));
++                int target = rng.nextInt(chunks.length);
++                e.locX = target * 16.0 + 8.0;
++                chunks[target].a(e);
++            } else {
++                int ci = rng.nextInt(chunks.length);
++                Chunk old = chunks[ci];
++                old.removeEntities();
++                world.getChunkProviderServer().chunks.remove(old.chunkKey);
++                live.removeIf(ent -> ent.entitySlice == null);
++                chunks[ci] = newStubChunk(world, ci, 0);
++                chunks[ci].addEntities();
++            }
++        }
++
++        // Verify exact parity against ground truth across all 4 categories and legacy Trove maps
++        int[] expectedWorld = new int[EnumCreatureType.values().length];
++        for (Entity e : live) {
++            byte mask = Chunk.computeSpawnCountMask(e);
++            for (int ord = 0; ord < expectedWorld.length; ++ord) {
++                if ((mask & (1 << ord)) != 0) {
++                    expectedWorld[ord]++;
++                }
++            }
++        }
++        for (EnumCreatureType type : EnumCreatureType.values()) {
++            int ord = type.ordinal();
++            assertEquals("World count mismatch for " + type, expectedWorld[ord], world.getCreatureCount(type));
++            int sumChunk = 0;
++            int sumTrove = 0;
++            for (Chunk c : chunks) {
++                sumChunk += c.getCreatureCount(type);
++                sumTrove += c.entityCount.get(type.a());
++            }
++            assertEquals("Chunk array sum mismatch for " + type, expectedWorld[ord], sumChunk);
++            assertEquals("Legacy Trove sum mismatch for " + type, expectedWorld[ord], sumTrove);
++        }
++    }
++
++    @Test
++    public void testO1CountPerformanceVsTroveChunkScan() throws Exception {
++        WorldServer world = newStubWorld();
++        int numChunks = 8_000;
++        List<Chunk> chunks = new ArrayList<Chunk>(numChunks);
++        for (int i = 0; i < numChunks; ++i) {
++            Chunk c = newStubChunk(world, i & 127, i >> 7);
++            c.addEntities();
++            if ((i & 7) == 0) {
++                EntityZombie z = newStubEntity(EntityZombie.class, world, (i & 127) * 16.0 + 8.0, 64.0, (i >> 7) * 16.0 + 8.0, false);
++                c.a(z);
++            }
++            chunks.add(c);
++        }
++
++        int expected = world.getCreatureCount(EnumCreatureType.MONSTER);
++        assertEquals(1_000, expected);
++
++        // Warmup
++        long sink = 0;
++        for (int i = 0; i < 100; ++i) {
++            int sum = 0;
++            for (int j = 0; j < numChunks; ++j) {
++                sum += chunks.get(j).entityCount.get(IMonster.class);
++            }
++            sink += sum;
++            sink += world.getCreatureCount(EnumCreatureType.MONSTER);
++        }
++
++        int iters = 500;
++        long t0 = System.nanoTime();
++        for (int i = 0; i < iters; ++i) {
++            int sum = 0;
++            for (int j = 0; j < numChunks; ++j) {
++                sum += chunks.get(j).entityCount.get(IMonster.class);
++            }
++            sink += sum;
++        }
++        long oldNs = System.nanoTime() - t0;
++
++        long t1 = System.nanoTime();
++        for (int i = 0; i < iters; ++i) {
++            sink += world.getCreatureCount(EnumCreatureType.MONSTER);
++        }
++        long newNs = System.nanoTime() - t1;
++
++        assertTrue("Unexpected sink: " + sink, sink > 0);
++        double speedup = (double) oldNs / Math.max(1L, newNs);
++        System.out.printf("MobSpawnCountAccountingTest (8k chunks x %d): old=%.2fms new=%.4fms speedup=%.1fx%n",
++                iters, oldNs / 1e6, newNs / 1e6, speedup);
++        assertTrue("Expected >= 50x speedup over Trove scan, got " + speedup + "x", speedup >= 50.0);
++    }
++}
