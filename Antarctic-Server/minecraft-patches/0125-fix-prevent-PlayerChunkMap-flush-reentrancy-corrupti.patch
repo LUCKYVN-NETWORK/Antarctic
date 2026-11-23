@@ -1,0 +1,442 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 00:23:43 +0700
+Subject: [PATCH 125/125] fix: prevent PlayerChunkMap flush reentrancy
+ corruption
+
+
+diff --git a/main/java/net/minecraft/server/PlayerChunkMap.java b/main/java/net/minecraft/server/PlayerChunkMap.java
+index 7e17e91..ee8bf58 100644
+--- a/main/java/net/minecraft/server/PlayerChunkMap.java
++++ b/main/java/net/minecraft/server/PlayerChunkMap.java
+@@ -47,6 +47,10 @@ public class PlayerChunkMap {
+     private final List<PlayerChunk> g = new it.unimi.dsi.fastutil.objects.ObjectArrayList<PlayerChunk>(); // Antarctic - O(1) indexed list
+     private final List<PlayerChunk> h = new it.unimi.dsi.fastutil.objects.ObjectArrayList<PlayerChunk>(); // Antarctic - O(1) indexed list
+     private final List<PlayerChunk> i = new it.unimi.dsi.fastutil.objects.ObjectArrayList<PlayerChunk>(); // Antarctic - O(1) indexed list
++    private boolean antarcticFlushingLoadList; // Antarctic - reentrancy-safe tombstone compaction
++    private boolean antarcticLoadListDirty;
++    private boolean antarcticFlushingSendList; // Antarctic - reentrancy-safe tombstone compaction
++    private boolean antarcticSendListDirty;
+     private int j;public int getViewDistance() { return j; } // Paper OBFHELPER
+     private long k;
+     private boolean l = true;
+@@ -175,60 +179,61 @@ public class PlayerChunkMap {
+             int chunkGensAllowed = world.paperConfig.maxChunkGensPerTick; // Paper
+             // Spigot end
+ 
+-            // Antarctic start - order-preserving linear compaction instead of O(N) iterator.remove shifts
+-            int read = 0;
+-            int write = 0;
+-            int size = this.h.size();
+-            while (read < size) {
+-                PlayerChunk playerchunk1 = this.h.get(read++);
+-                boolean removeEntry = false;
+-
+-                if (playerchunk1.f() == null) {
+-                    boolean flag = playerchunk1.a(PlayerChunkMap.b);
+-                    // Paper start
+-                    if (flag && !playerchunk1.chunkExists && chunkGensAllowed-- <= 0) {
+-                        if (write != read - 1) {
+-                            this.h.set(write, playerchunk1);
++            // Antarctic start - reentrancy-safe tombstone compaction over h
++            if (!this.antarcticFlushingLoadList) {
++                this.antarcticFlushingLoadList = true;
++                this.antarcticLoadListDirty = false;
++                try {
++                    int limit = this.h.size();
++                    for (int read = 0; read < limit; ++read) {
++                        PlayerChunk playerchunk1 = this.h.get(read);
++                        if (playerchunk1 == null) {
++                            this.antarcticLoadListDirty = true;
++                            continue;
+                         }
+-                        playerchunk1.antarcticLoadIdx = write++;
+-                        continue;
+-                    }
+-                    // Paper end
++                        boolean removeEntry = false;
+ 
+-                    if (playerchunk1.a(flag)) {
+-                        removeEntry = true;
+-                        if (playerchunk1.b()) {
+-                            this.removeFromSendList(playerchunk1);
++                        if (playerchunk1.f() == null) {
++                            boolean flag = playerchunk1.a(PlayerChunkMap.b);
++                            // Paper start
++                            if (flag && !playerchunk1.chunkExists && chunkGensAllowed-- <= 0) {
++                                continue;
++                            }
++                            // Paper end
++
++                            if (playerchunk1.a(flag)) {
++                                removeEntry = true;
++                                if (playerchunk1.b()) {
++                                    this.removeFromSendList(playerchunk1);
++                                }
++
++                                if (activityAccountant.activityTimeIsExhausted()) { // Spigot
++                                    this.h.set(read, null);
++                                    playerchunk1.antarcticLoadIdx = -1;
++                                    this.antarcticLoadListDirty = true;
++                                    break;
++                                }
++                            }
++                        // CraftBukkit start - SPIGOT-2891: remove once chunk has been provided
++                        } else {
++                            removeEntry = true;
+                         }
++                        // CraftBukkit end
+ 
+-                        if (activityAccountant.activityTimeIsExhausted()) { // Spigot
++                        if (removeEntry) {
++                            this.h.set(read, null);
+                             playerchunk1.antarcticLoadIdx = -1;
+-                            break;
++                            this.antarcticLoadListDirty = true;
+                         }
+                     }
+-                // CraftBukkit start - SPIGOT-2891: remove once chunk has been provided
+-                } else {
+-                    removeEntry = true;
+-                }
+-                // CraftBukkit end
+-
+-                if (removeEntry) {
+-                    playerchunk1.antarcticLoadIdx = -1;
+-                } else {
+-                    if (write != read - 1) {
+-                        this.h.set(write, playerchunk1);
++                } finally {
++                    this.antarcticFlushingLoadList = false;
++                    if (this.antarcticLoadListDirty) {
++                        this.antarcticLoadListDirty = false;
++                        this.compactLoadList();
+                     }
+-                    playerchunk1.antarcticLoadIdx = write++;
+                 }
+             }
+-            if (write != read) {
+-                while (read < size) {
+-                    PlayerChunk rem = this.h.get(read++);
+-                    this.h.set(write, rem);
+-                    rem.antarcticLoadIdx = write++;
+-                }
+-                this.truncateList(this.h, write);
+-            }
+             // Antarctic end
+ 
+             activityAccountant.endActivity(); // Spigot
+@@ -238,33 +243,36 @@ public class PlayerChunkMap {
+         if (!this.g.isEmpty()) {
+             j = world.paperConfig.maxChunkSendsPerTick; // Paper
+             try (Timing ignored = world.timings.doChunkMapPendingSendToPlayers.startTiming()) { // Paper
+-            // Antarctic start - order-preserving linear compaction instead of O(N) iterator.remove shifts
+-            int read = 0;
+-            int write = 0;
+-            int size = this.g.size();
+-            while (read < size) {
+-                PlayerChunk playerchunk2 = this.g.get(read++);
+-
+-                if (playerchunk2.b()) {
+-                    playerchunk2.antarcticSendIdx = -1;
+-                    --j;
+-                    if (j < 0) {
+-                        break;
++            // Antarctic start - reentrancy-safe tombstone compaction over g
++            if (!this.antarcticFlushingSendList) {
++                this.antarcticFlushingSendList = true;
++                this.antarcticSendListDirty = false;
++                try {
++                    int limit = this.g.size();
++                    for (int read = 0; read < limit; ++read) {
++                        PlayerChunk playerchunk2 = this.g.get(read);
++                        if (playerchunk2 == null) {
++                            this.antarcticSendListDirty = true;
++                            continue;
++                        }
++
++                        if (playerchunk2.b()) {
++                            this.g.set(read, null);
++                            playerchunk2.antarcticSendIdx = -1;
++                            this.antarcticSendListDirty = true;
++                            --j;
++                            if (j < 0) {
++                                break;
++                            }
++                        }
+                     }
+-                } else {
+-                    if (write != read - 1) {
+-                        this.g.set(write, playerchunk2);
++                } finally {
++                    this.antarcticFlushingSendList = false;
++                    if (this.antarcticSendListDirty) {
++                        this.antarcticSendListDirty = false;
++                        this.compactSendList();
+                     }
+-                    playerchunk2.antarcticSendIdx = write++;
+-                }
+-            }
+-            if (write != read) {
+-                while (read < size) {
+-                    PlayerChunk rem = this.g.get(read++);
+-                    this.g.set(write, rem);
+-                    rem.antarcticSendIdx = write++;
+                 }
+-                this.truncateList(this.g, write);
+             }
+             // Antarctic end
+             } // Paper timing
+@@ -633,6 +641,11 @@ public class PlayerChunkMap {
+             }
+         }
+         pc.antarcticSendIdx = -1;
++        if (this.antarcticFlushingSendList) {
++            this.g.set(idx, null);
++            this.antarcticSendListDirty = true;
++            return;
++        }
+         int lastIdx = size - 1;
+         if (idx < lastIdx) {
+             PlayerChunk last = this.g.get(lastIdx);
+@@ -653,6 +666,11 @@ public class PlayerChunkMap {
+             }
+         }
+         pc.antarcticLoadIdx = -1;
++        if (this.antarcticFlushingLoadList) {
++            this.h.set(idx, null);
++            this.antarcticLoadListDirty = true;
++            return;
++        }
+         int lastIdx = size - 1;
+         if (idx < lastIdx) {
+             PlayerChunk last = this.h.get(lastIdx);
+@@ -662,6 +680,40 @@ public class PlayerChunkMap {
+         this.h.remove(lastIdx);
+     }
+ 
++    private void compactLoadList() {
++        int write = 0;
++        int size = this.h.size();
++        for (int read = 0; read < size; ++read) {
++            PlayerChunk pc = this.h.get(read);
++            if (pc != null) {
++                if (write != read) {
++                    this.h.set(write, pc);
++                }
++                pc.antarcticLoadIdx = write++;
++            }
++        }
++        if (write < size) {
++            this.truncateList(this.h, write);
++        }
++    }
++
++    private void compactSendList() {
++        int write = 0;
++        int size = this.g.size();
++        for (int read = 0; read < size; ++read) {
++            PlayerChunk pc = this.g.get(read);
++            if (pc != null) {
++                if (write != read) {
++                    this.g.set(write, pc);
++                }
++                pc.antarcticSendIdx = write++;
++            }
++        }
++        if (write < size) {
++            this.truncateList(this.g, write);
++        }
++    }
++
+     private void truncateList(List<PlayerChunk> list, int newSize) {
+         if (list instanceof it.unimi.dsi.fastutil.objects.ObjectArrayList) {
+             ((it.unimi.dsi.fastutil.objects.ObjectArrayList<PlayerChunk>) list).removeElements(newSize, list.size());
+diff --git a/test/java/net/minecraft/server/PlayerChunkMapFlushReentrancyTest.java b/test/java/net/minecraft/server/PlayerChunkMapFlushReentrancyTest.java
+new file mode 100644
+index 0000000..2046938
+--- /dev/null
++++ b/test/java/net/minecraft/server/PlayerChunkMapFlushReentrancyTest.java
+@@ -0,0 +1,182 @@
++package net.minecraft.server;
++
++import co.aikar.timings.WorldTimingsHandler;
++import com.destroystokyo.paper.PaperWorldConfig;
++import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
++import it.unimi.dsi.fastutil.objects.ObjectArrayList;
++import java.lang.reflect.Field;
++import java.lang.reflect.Method;
++import java.util.ArrayList;
++import java.util.HashSet;
++import java.util.List;
++import org.junit.Assert;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++public class PlayerChunkMapFlushReentrancyTest {
++
++    private static Unsafe unsafe;
++
++    @BeforeClass
++    public static void setup() throws Exception {
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        unsafe = (Unsafe) f.get(null);
++    }
++
++    private static final class ReentrantPlayerChunk extends PlayerChunk {
++        Runnable onSend;
++        boolean sendResult;
++
++        ReentrantPlayerChunk() {
++            super(null, 0, 0);
++        }
++
++        @Override
++        public boolean b() {
++            if (onSend != null) {
++                onSend.run();
++            }
++            return sendResult;
++        }
++    }
++
++    private static PlayerChunkMap newStubMap() throws Exception {
++        WorldServer world = (WorldServer) unsafe.allocateInstance(WorldServer.class);
++        PaperWorldConfig pwc = (PaperWorldConfig) unsafe.allocateInstance(PaperWorldConfig.class);
++        pwc.maxChunkGensPerTick = 100;
++        pwc.maxChunkSendsPerTick = 100;
++        Field paperConfigField = World.class.getDeclaredField("paperConfig");
++        paperConfigField.setAccessible(true);
++        paperConfigField.set(world, pwc);
++
++        WorldTimingsHandler timings = (WorldTimingsHandler) unsafe.allocateInstance(WorldTimingsHandler.class);
++        Field sendTiming = WorldTimingsHandler.class.getDeclaredField("doChunkMapPendingSendToPlayers");
++        sendTiming.setAccessible(true);
++        sendTiming.set(timings, co.aikar.timings.Timings.NULL_HANDLER);
++        Field loadTiming = WorldTimingsHandler.class.getDeclaredField("doChunkMapPlayersNeedingChunks");
++        loadTiming.setAccessible(true);
++        loadTiming.set(timings, co.aikar.timings.Timings.NULL_HANDLER);
++        Field updateTiming = WorldTimingsHandler.class.getDeclaredField("doChunkMapUpdate");
++        updateTiming.setAccessible(true);
++        updateTiming.set(timings, co.aikar.timings.Timings.NULL_HANDLER);
++        Field unloadTiming = WorldTimingsHandler.class.getDeclaredField("doChunkMapUnloadChunks");
++        unloadTiming.setAccessible(true);
++        unloadTiming.set(timings, co.aikar.timings.Timings.NULL_HANDLER);
++        Field timingsField = World.class.getDeclaredField("timings");
++        timingsField.setAccessible(true);
++        timingsField.set(world, timings);
++
++        Field worldDataField = World.class.getDeclaredField("worldData");
++        worldDataField.setAccessible(true);
++        WorldData wd = (WorldData) unsafe.allocateInstance(WorldData.class);
++        worldDataField.set(world, wd);
++
++        PlayerChunkMap map = (PlayerChunkMap) unsafe.allocateInstance(PlayerChunkMap.class);
++        setField(map, "world", world);
++        List<EntityPlayer> players = new ArrayList<>();
++        // Add a dummy player so managedPlayers.isEmpty() branch isn't entered
++        players.add((EntityPlayer) unsafe.allocateInstance(EntityPlayer.class));
++        setField(map, "managedPlayers", players);
++        setField(map, "e", new Long2ObjectOpenHashMap<PlayerChunk>());
++        setField(map, "f", new HashSet<PlayerChunk>());
++        setField(map, "g", new ObjectArrayList<PlayerChunk>());
++        setField(map, "h", new ObjectArrayList<PlayerChunk>());
++        setField(map, "i", new ObjectArrayList<PlayerChunk>());
++        setField(map, "l", false);
++        setField(map, "m", false);
++        return map;
++    }
++
++    private static void setField(Object target, String name, Object value) throws Exception {
++        Field f = PlayerChunkMap.class.getDeclaredField(name);
++        f.setAccessible(true);
++        f.set(target, value);
++    }
++
++    @SuppressWarnings("unchecked")
++    private static List<PlayerChunk> getList(PlayerChunkMap map, String name) throws Exception {
++        Field f = PlayerChunkMap.class.getDeclaredField(name);
++        f.setAccessible(true);
++        return (List<PlayerChunk>) f.get(map);
++    }
++
++    private static ReentrantPlayerChunk newChunk(boolean sendResult, Runnable onSend) throws Exception {
++        ReentrantPlayerChunk pc = (ReentrantPlayerChunk) unsafe.allocateInstance(ReentrantPlayerChunk.class);
++        pc.antarcticLoadIdx = -1;
++        pc.antarcticSendIdx = -1;
++        pc.antarcticAllIdx = -1;
++        pc.sendResult = sendResult;
++        pc.onSend = onSend;
++        return pc;
++    }
++
++    @Test
++    public void testReentrantAddAndRemoveDuringSendFlushPreservesNewEntriesAndIndices() throws Exception {
++        PlayerChunkMap map = newStubMap();
++        List<PlayerChunk> sendList = getList(map, "g");
++        Method removeFromSendList = PlayerChunkMap.class.getDeclaredMethod("removeFromSendList", PlayerChunk.class);
++        removeFromSendList.setAccessible(true);
++
++        ReentrantPlayerChunk reentrantAdded = newChunk(false, null);
++        ReentrantPlayerChunk pc1 = newChunk(true, null);
++        ReentrantPlayerChunk pc2 = newChunk(false, null);
++        ReentrantPlayerChunk pc3 = newChunk(true, null);
++
++        // During pc1.b(), re-entrantly remove pc2 AND append reentrantAdded to sendList
++        pc1.onSend = () -> {
++            try {
++                removeFromSendList.invoke(map, pc2);
++                reentrantAdded.antarcticSendIdx = sendList.size();
++                sendList.add(reentrantAdded);
++            } catch (Exception e) {
++                throw new RuntimeException(e);
++            }
++        };
++
++        pc1.antarcticSendIdx = 0; sendList.add(pc1);
++        pc2.antarcticSendIdx = 1; sendList.add(pc2);
++        pc3.antarcticSendIdx = 2; sendList.add(pc3);
++
++        // Previously threw IndexOutOfBoundsException OR truncated reentrantAdded silently
++        map.flush();
++
++        Assert.assertEquals("Only reentrantAdded must remain in sendList", 1, sendList.size());
++        Assert.assertSame("Re-entrantly appended PlayerChunk must NOT be silently dropped", reentrantAdded, sendList.get(0));
++        Assert.assertEquals("Compacted intrusive index must match slot 0", 0, reentrantAdded.antarcticSendIdx);
++        Assert.assertEquals(-1, pc1.antarcticSendIdx);
++        Assert.assertEquals(-1, pc2.antarcticSendIdx);
++        Assert.assertEquals(-1, pc3.antarcticSendIdx);
++    }
++
++    @Test
++    public void testExceptionDuringSendFlushStillCompactsTombstones() throws Exception {
++        PlayerChunkMap map = newStubMap();
++        List<PlayerChunk> sendList = getList(map, "g");
++
++        ReentrantPlayerChunk pc1 = newChunk(true, null);
++        ReentrantPlayerChunk pc2 = newChunk(false, () -> {
++            throw new IllegalStateException("simulated plugin failure");
++        });
++        ReentrantPlayerChunk pc3 = newChunk(false, null);
++
++        pc1.antarcticSendIdx = 0; sendList.add(pc1);
++        pc2.antarcticSendIdx = 1; sendList.add(pc2);
++        pc3.antarcticSendIdx = 2; sendList.add(pc3);
++
++        try {
++            map.flush();
++            Assert.fail("Expected simulated exception");
++        } catch (IllegalStateException expected) {
++            // expected
++        }
++
++        Assert.assertEquals("Remaining 2 chunks must be compacted without nulls", 2, sendList.size());
++        Assert.assertSame(pc2, sendList.get(0));
++        Assert.assertSame(pc3, sendList.get(1));
++        Assert.assertEquals(0, pc2.antarcticSendIdx);
++        Assert.assertEquals(1, pc3.antarcticSendIdx);
++        Assert.assertEquals(-1, pc1.antarcticSendIdx);
++    }
++}
