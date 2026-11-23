@@ -1,0 +1,108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 02:00:07 +0700
+Subject: [PATCH 151/151] fix: fix HandshakeListener stale throttle entry
+ expiry condition
+
+
+diff --git a/main/java/net/minecraft/server/HandshakeListener.java b/main/java/net/minecraft/server/HandshakeListener.java
+index 13cf0a5..8cf6572 100644
+--- a/main/java/net/minecraft/server/HandshakeListener.java
++++ b/main/java/net/minecraft/server/HandshakeListener.java
+@@ -13,7 +13,10 @@ public class HandshakeListener implements PacketHandshakingInListener {
+ 
+     private static final com.google.gson.Gson gson = new com.google.gson.Gson(); // Spigot
+     // CraftBukkit start - add fields
+-    private static final Object2LongOpenHashMap<InetAddress> throttleTracker = new Object2LongOpenHashMap<>();
++    static final Object2LongOpenHashMap<InetAddress> throttleTracker = new Object2LongOpenHashMap<>();
++    static {
++        throttleTracker.defaultReturnValue(-1L); // Antarctic - single-lookup miss sentinel
++    }
+     private static int throttleCounter = 0;
+     // CraftBukkit end
+ 
+@@ -39,7 +42,8 @@ public class HandshakeListener implements PacketHandshakingInListener {
+                 InetAddress address = ((java.net.InetSocketAddress) this.b.getSocketAddress()).getAddress();
+ 
+                 synchronized (throttleTracker) {
+-                    if (throttleTracker.containsKey(address) && !"127.0.0.1".equals(address.getHostAddress()) && currentTime - throttleTracker.getLong(address) < connectionThrottle) {
++                    long lastConnect = throttleTracker.getLong(address); // Antarctic - single hash probe
++                    if (lastConnect != -1L && !"127.0.0.1".equals(address.getHostAddress()) && currentTime - lastConnect < connectionThrottle) {
+                         throttleTracker.put(address, currentTime);
+                         chatmessage = new ChatMessage("Connection throttled! Please wait before reconnecting.");
+                         this.b.sendPacket(new PacketLoginOutDisconnect(chatmessage));
+@@ -53,7 +57,7 @@ public class HandshakeListener implements PacketHandshakingInListener {
+                         throttleCounter = 0;
+ 
+                         // Cleanup stale entries
+-                        throttleTracker.object2LongEntrySet().removeIf(entry -> entry.getLongValue() > connectionThrottle); // Dionysus
++                        pruneThrottleTracker(currentTime, connectionThrottle); // Antarctic - fix broken expiry check and avoid entry boxing
+                     }
+                 }
+             } catch (Throwable t) {
+@@ -135,5 +139,16 @@ public class HandshakeListener implements PacketHandshakingInListener {
+         // Paper end
+     }
+ 
++    // Antarctic start - preserve CraftBukkit stale-entry expiry condition without per-entry boxing
++    static void pruneThrottleTracker(long currentTime, long connectionThrottle) {
++        it.unimi.dsi.fastutil.objects.ObjectIterator<Object2LongMap.Entry<InetAddress>> iterator = throttleTracker.object2LongEntrySet().fastIterator();
++        while (iterator.hasNext()) {
++            if (currentTime - iterator.next().getLongValue() > connectionThrottle) {
++                iterator.remove();
++            }
++        }
++    }
++    // Antarctic end
++
+     public void a(IChatBaseComponent ichatbasecomponent) {}
+ }
+diff --git a/test/java/net/minecraft/server/HandshakeListenerThrottleExpiryTest.java b/test/java/net/minecraft/server/HandshakeListenerThrottleExpiryTest.java
+new file mode 100644
+index 0000000..7887809
+--- /dev/null
++++ b/test/java/net/minecraft/server/HandshakeListenerThrottleExpiryTest.java
+@@ -0,0 +1,43 @@
++package net.minecraft.server;
++
++import java.net.InetAddress;
++import org.junit.After;
++import org.junit.Assert;
++import org.junit.Test;
++
++public class HandshakeListenerThrottleExpiryTest {
++
++    @After
++    public void cleanup() {
++        synchronized (HandshakeListener.throttleTracker) {
++            HandshakeListener.throttleTracker.clear();
++        }
++    }
++
++    @Test
++    public void testPruneRemovesOnlyExpiredEntriesAndKeepsActiveOnes() throws Exception {
++        InetAddress freshIp = InetAddress.getByAddress(new byte[] { 10, 0, 0, 1 });
++        InetAddress boundaryIp = InetAddress.getByAddress(new byte[] { 10, 0, 0, 2 });
++        InetAddress staleIp = InetAddress.getByAddress(new byte[] { 10, 0, 0, 3 });
++
++        long now = 1_700_000_010_000L;
++        long throttleMs = 4_000L;
++
++        synchronized (HandshakeListener.throttleTracker) {
++            HandshakeListener.throttleTracker.clear();
++            HandshakeListener.throttleTracker.put(freshIp, now - 1_000L);     // active (1s < 4s)
++            HandshakeListener.throttleTracker.put(boundaryIp, now - 4_000L);  // exact boundary (4s == 4s, not >)
++            HandshakeListener.throttleTracker.put(staleIp, now - 4_001L);     // expired (4.001s > 4s)
++
++            HandshakeListener.pruneThrottleTracker(now, throttleMs);
++
++            Assert.assertTrue("Fresh throttle entry must NOT be wiped by cleanup",
++                    HandshakeListener.throttleTracker.containsKey(freshIp));
++            Assert.assertTrue("Exact-boundary entry must remain (strict > expiry)",
++                    HandshakeListener.throttleTracker.containsKey(boundaryIp));
++            Assert.assertFalse("Stale entry older than connectionThrottle must be pruned",
++                    HandshakeListener.throttleTracker.containsKey(staleIp));
++            Assert.assertEquals(-1L, HandshakeListener.throttleTracker.getLong(staleIp));
++        }
++    }
++}
