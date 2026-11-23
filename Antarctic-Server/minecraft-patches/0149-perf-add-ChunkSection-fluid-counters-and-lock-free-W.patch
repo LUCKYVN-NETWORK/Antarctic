@@ -1,0 +1,660 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 01:52:52 +0700
+Subject: [PATCH 149/149] perf: add ChunkSection fluid counters and lock-free
+ World fluid sweeps
+
+
+diff --git a/main/java/net/minecraft/server/ChunkSection.java b/main/java/net/minecraft/server/ChunkSection.java
+index aae227f..f5194fe 100644
+--- a/main/java/net/minecraft/server/ChunkSection.java
++++ b/main/java/net/minecraft/server/ChunkSection.java
+@@ -5,6 +5,8 @@ public class ChunkSection {
+     private final int yPos;
+     private int nonEmptyBlockCount;
+     private int tickingBlockCount;
++    private int fluidCount; // Antarctic - O(1) section fluid skip for World fluid sweeps
++    private int fireOrLavaCount; // Antarctic - O(1) section fire/lava skip for World.e(AABB)
+     final DataPaletteBlock blockIds; // Paper - package
+     private NibbleArray emittedLight;
+     private NibbleArray skyLight;
+@@ -63,6 +65,12 @@ public class ChunkSection {
+             if (block.isTicking()) {
+                 --this.tickingBlockCount;
+             }
++            if (iblockdata1.getMaterial().isLiquid()) {
++                --this.fluidCount;
++            }
++            if (block == Blocks.FIRE || block == Blocks.FLOWING_LAVA || block == Blocks.LAVA) {
++                --this.fireOrLavaCount;
++            }
+         }
+ 
+         if (block1 != Blocks.AIR) {
+@@ -70,6 +78,12 @@ public class ChunkSection {
+             if (block1.isTicking()) {
+                 ++this.tickingBlockCount;
+             }
++            if (iblockdata.getMaterial().isLiquid()) {
++                ++this.fluidCount;
++            }
++            if (block1 == Blocks.FIRE || block1 == Blocks.FLOWING_LAVA || block1 == Blocks.LAVA) {
++                ++this.fireOrLavaCount;
++            }
+         }
+ 
+         this.blockIds.setBlock(i, j, k, iblockdata);
+@@ -83,6 +97,16 @@ public class ChunkSection {
+         return this.tickingBlockCount > 0;
+     }
+ 
++    // Antarctic start
++    public boolean hasFluids() {
++        return this.fluidCount > 0;
++    }
++
++    public boolean hasFireOrLava() {
++        return this.fireOrLavaCount > 0;
++    }
++    // Antarctic end
++
+     public int getYPosition() {
+         return this.yPos;
+     }
+@@ -106,17 +130,26 @@ public class ChunkSection {
+     public void recalcBlockCounts() {
+         this.nonEmptyBlockCount = 0;
+         this.tickingBlockCount = 0;
++        this.fluidCount = 0;
++        this.fireOrLavaCount = 0;
+ 
+         for (int i = 0; i < 16; ++i) {
+             for (int j = 0; j < 16; ++j) {
+                 for (int k = 0; k < 16; ++k) {
+-                    Block block = this.getType(i, j, k).getBlock();
++                    IBlockData data = this.getType(i, j, k);
++                    Block block = data.getBlock();
+ 
+                     if (block != Blocks.AIR) {
+                         ++this.nonEmptyBlockCount;
+                         if (block.isTicking()) {
+                             ++this.tickingBlockCount;
+                         }
++                        if (data.getMaterial().isLiquid()) {
++                            ++this.fluidCount;
++                        }
++                        if (block == Blocks.FIRE || block == Blocks.FLOWING_LAVA || block == Blocks.LAVA) {
++                            ++this.fireOrLavaCount;
++                        }
+                     }
+                 }
+             }
+diff --git a/main/java/net/minecraft/server/World.java b/main/java/net/minecraft/server/World.java
+index 50b3256..3220da7 100644
+--- a/main/java/net/minecraft/server/World.java
++++ b/main/java/net/minecraft/server/World.java
+@@ -2219,7 +2219,7 @@ public abstract class World implements IBlockAccess {
+                 ChunkSection[] sections = cachedChunk.getSections();
+                 for (int l1 = k; l1 < l; ++l1) {
+                     ChunkSection section = sections[l1 >> 4];
+-                    if (section == Chunk.a) {
++                    if (section == Chunk.a || !section.hasFluids()) { // Antarctic - O(1) section fluid skip
+                         l1 = ((l1 >> 4) + 1) * 16 - 1;
+                         continue;
+                     }
+@@ -2235,6 +2235,7 @@ public abstract class World implements IBlockAccess {
+     }
+ 
+     public boolean e(AxisAlignedBB axisalignedbb) {
++        // Antarctic start - chunk/section-cached lock-free fire/lava sweep with O(1) section skip
+         int i = MathHelper.floor(axisalignedbb.a);
+         int j = MathHelper.f(axisalignedbb.d);
+         int k = MathHelper.floor(axisalignedbb.b);
+@@ -2243,34 +2244,54 @@ public abstract class World implements IBlockAccess {
+         int j1 = MathHelper.f(axisalignedbb.f);
+ 
+         if (this.isAreaLoaded(i, k, i1, j, l, j1, true)) {
+-            BlockPosition.PooledBlockPosition blockposition_pooledblockposition = BlockPosition.PooledBlockPosition.s();
+-            int k1 = i;
++            int minY = Math.max(0, k);
++            int maxY = Math.min(256, l);
++            if (minY >= maxY) {
++                return false;
++            }
+ 
+-            while (true) {
+-                if (k1 >= j) {
+-                    blockposition_pooledblockposition.t();
+-                    break;
+-                }
++            int cachedChunkX = Integer.MIN_VALUE;
++            int cachedChunkZ = Integer.MIN_VALUE;
++            Chunk cachedChunk = null;
+ 
+-                for (int l1 = k; l1 < l; ++l1) {
+-                    for (int i2 = i1; i2 < j1; ++i2) {
+-                        Block block = this.getType(blockposition_pooledblockposition.f(k1, l1, i2)).getBlock();
++            for (int k1 = i; k1 < j; ++k1) {
++                if (k1 < -30000000 || k1 >= 30000000) {
++                    continue;
++                }
++                int chunkX = k1 >> 4;
++                for (int i2 = i1; i2 < j1; ++i2) {
++                    if (i2 < -30000000 || i2 >= 30000000) {
++                        continue;
++                    }
++                    int chunkZ = i2 >> 4;
++                    if (chunkX != cachedChunkX || chunkZ != cachedChunkZ) {
++                        cachedChunkX = chunkX;
++                        cachedChunkZ = chunkZ;
++                        cachedChunk = this.getChunkAt(chunkX, chunkZ);
++                    }
++                    ChunkSection[] sections = cachedChunk.getSections();
++                    for (int l1 = minY; l1 < maxY; ++l1) {
++                        ChunkSection section = sections[l1 >> 4];
++                        if (section == Chunk.a || !section.hasFireOrLava()) {
++                            l1 = ((l1 >> 4) + 1) * 16 - 1;
++                            continue;
++                        }
++                        Block block = section.getType(k1 & 15, l1 & 15, i2 & 15).getBlock();
+ 
+                         if (block == Blocks.FIRE || block == Blocks.FLOWING_LAVA || block == Blocks.LAVA) {
+-                            blockposition_pooledblockposition.t();
+                             return true;
+                         }
+                     }
+                 }
+-
+-                ++k1;
+             }
+         }
+ 
+         return false;
++        // Antarctic end
+     }
+ 
+     public boolean a(AxisAlignedBB axisalignedbb, Material material, Entity entity) {
++        // Antarctic start - chunk/section-cached lock-free handleMaterialAcceleration with exact vanilla loop order
+         int i = MathHelper.floor(axisalignedbb.a);
+         int j = MathHelper.f(axisalignedbb.d);
+         int k = MathHelper.floor(axisalignedbb.b);
+@@ -2280,66 +2301,161 @@ public abstract class World implements IBlockAccess {
+ 
+         if (!this.isAreaLoaded(i, k, i1, j, l, j1, true)) {
+             return false;
+-        } else {
+-            boolean flag = false;
+-            Vec3D vec3d = Vec3D.a;
+-            BlockPosition.PooledBlockPosition blockposition_pooledblockposition = BlockPosition.PooledBlockPosition.s();
++        }
+ 
+-            for (int k1 = i; k1 < j; ++k1) {
+-                for (int l1 = k; l1 < l; ++l1) {
+-                    for (int i2 = i1; i2 < j1; ++i2) {
+-                        blockposition_pooledblockposition.f(k1, l1, i2);
+-                        IBlockData iblockdata = this.getType(blockposition_pooledblockposition);
+-                        Block block = iblockdata.getBlock();
++        boolean isLiquid = material.isLiquid();
++        int minY = isLiquid ? Math.max(0, k) : k;
++        int maxY = isLiquid ? Math.min(256, l) : l;
++        if (i >= j || minY >= maxY || i1 >= j1) {
++            return false;
++        }
++
++        // Fast-path the common single-chunk, single-section dry check before entering the 3D loop
++        if (isLiquid && i >= -30000000 && j <= 30000000 && i1 >= -30000000 && j1 <= 30000000) {
++            int cx = i >> 4;
++            int cz = i1 >> 4;
++            int secY = minY >> 4;
++            if (cx == ((j - 1) >> 4) && cz == ((j1 - 1) >> 4) && secY == ((maxY - 1) >> 4)) {
++                ChunkSection section = this.getChunkAt(cx, cz).getSections()[secY];
++                if (section == Chunk.a || !section.hasFluids()) {
++                    return false;
++                }
++            }
++        }
++
++        boolean flag = false;
++        Vec3D vec3d = Vec3D.a;
++        BlockPosition.MutableBlockPosition pos = null;
++        int cachedChunkX = Integer.MIN_VALUE;
++        int cachedChunkZ = Integer.MIN_VALUE;
++        Chunk cachedChunk = null;
++
++        for (int k1 = i; k1 < j; ++k1) {
++            boolean xInBounds = k1 >= -30000000 && k1 < 30000000;
++            int chunkX = k1 >> 4;
++            for (int l1 = minY; l1 < maxY; ++l1) {
++                boolean yInBounds = l1 >= 0 && l1 < 256;
++                int secY = l1 >> 4;
++                for (int i2 = i1; i2 < j1; ++i2) {
++                    IBlockData iblockdata;
++                    if (xInBounds && yInBounds && i2 >= -30000000 && i2 < 30000000) {
++                        int chunkZ = i2 >> 4;
++                        if (chunkX != cachedChunkX || chunkZ != cachedChunkZ) {
++                            cachedChunkX = chunkX;
++                            cachedChunkZ = chunkZ;
++                            cachedChunk = this.getChunkAt(chunkX, chunkZ);
++                        }
++                        ChunkSection section = cachedChunk.getSections()[secY];
++                        if (section == Chunk.a || (isLiquid && !section.hasFluids())) {
++                            if (isLiquid) {
++                                // Skip remaining Z cells within this same chunk
++                                int nextChunkZ = ((chunkZ + 1) << 4) - 1;
++                                if (nextChunkZ > i2) {
++                                    i2 = Math.min(nextChunkZ, j1 - 1);
++                                }
++                                continue;
++                            }
++                            iblockdata = Blocks.AIR.getBlockData();
++                        } else {
++                            iblockdata = section.getType(k1 & 15, l1 & 15, i2 & 15);
++                        }
++                    } else {
++                        iblockdata = Blocks.AIR.getBlockData();
++                    }
+ 
+-                        if (iblockdata.getMaterial() == material) {
+-                            double d0 = (double) ((float) (l1 + 1) - BlockFluids.b(((Integer) iblockdata.get(BlockFluids.LEVEL)).intValue()));
++                    if (iblockdata.getMaterial() == material) {
++                        double d0 = (double) ((float) (l1 + 1) - BlockFluids.b(((Integer) iblockdata.get(BlockFluids.LEVEL)).intValue()));
+ 
+-                            if ((double) l >= d0) {
+-                                flag = true;
+-                                vec3d = block.a(this, (BlockPosition) blockposition_pooledblockposition, entity, vec3d);
++                        if ((double) l >= d0) {
++                            flag = true;
++                            if (pos == null) {
++                                pos = new BlockPosition.MutableBlockPosition(k1, l1, i2);
++                            } else {
++                                pos.c(k1, l1, i2);
+                             }
++                            vec3d = iblockdata.getBlock().a(this, (BlockPosition) pos, entity, vec3d);
+                         }
+                     }
+                 }
+             }
++        }
+ 
+-            blockposition_pooledblockposition.t();
+-            if (vec3d.b() > 0.0D && entity.bo()) {
+-                vec3d = vec3d.a();
+-                double d1 = 0.014D;
+-
+-                entity.motX += vec3d.x * 0.014D;
+-                entity.motY += vec3d.y * 0.014D;
+-                entity.motZ += vec3d.z * 0.014D;
+-            }
++        if (vec3d.b() > 0.0D && entity.bo()) {
++            vec3d = vec3d.a();
++            double d1 = 0.014D;
+ 
+-            return flag;
++            entity.motX += vec3d.x * 0.014D;
++            entity.motY += vec3d.y * 0.014D;
++            entity.motZ += vec3d.z * 0.014D;
+         }
++
++        return flag;
++        // Antarctic end
+     }
+ 
+     public boolean a(AxisAlignedBB axisalignedbb, Material material) {
++        // Antarctic start - chunk/section-cached lock-free isMaterialInBB with O(1) fluid section skip
+         int i = MathHelper.floor(axisalignedbb.a);
+         int j = MathHelper.f(axisalignedbb.d);
+         int k = MathHelper.floor(axisalignedbb.b);
+         int l = MathHelper.f(axisalignedbb.e);
+         int i1 = MathHelper.floor(axisalignedbb.c);
+         int j1 = MathHelper.f(axisalignedbb.f);
+-        BlockPosition.PooledBlockPosition blockposition_pooledblockposition = BlockPosition.PooledBlockPosition.s();
+ 
++        if (material.isLiquid()) {
++            int minY = Math.max(0, k);
++            int maxY = Math.min(256, l);
++            if (minY >= maxY) {
++                return false;
++            }
++            int cachedChunkX = Integer.MIN_VALUE;
++            int cachedChunkZ = Integer.MIN_VALUE;
++            Chunk cachedChunk = null;
++
++            for (int k1 = i; k1 < j; ++k1) {
++                if (k1 < -30000000 || k1 >= 30000000) {
++                    continue;
++                }
++                int chunkX = k1 >> 4;
++                for (int i2 = i1; i2 < j1; ++i2) {
++                    if (i2 < -30000000 || i2 >= 30000000) {
++                        continue;
++                    }
++                    int chunkZ = i2 >> 4;
++                    if (chunkX != cachedChunkX || chunkZ != cachedChunkZ) {
++                        cachedChunkX = chunkX;
++                        cachedChunkZ = chunkZ;
++                        cachedChunk = this.getChunkAt(chunkX, chunkZ);
++                    }
++                    ChunkSection[] sections = cachedChunk.getSections();
++                    for (int l1 = minY; l1 < maxY; ++l1) {
++                        ChunkSection section = sections[l1 >> 4];
++                        if (section == Chunk.a || !section.hasFluids()) {
++                            l1 = ((l1 >> 4) + 1) * 16 - 1;
++                            continue;
++                        }
++                        if (section.getType(k1 & 15, l1 & 15, i2 & 15).getMaterial() == material) {
++                            return true;
++                        }
++                    }
++                }
++            }
++            return false;
++        }
++
++        BlockPosition.MutableBlockPosition pos = new BlockPosition.MutableBlockPosition();
+         for (int k1 = i; k1 < j; ++k1) {
+             for (int l1 = k; l1 < l; ++l1) {
+                 for (int i2 = i1; i2 < j1; ++i2) {
+-                    if (this.getType(blockposition_pooledblockposition.f(k1, l1, i2)).getMaterial() == material) {
+-                        blockposition_pooledblockposition.t();
++                    if (this.getType(pos.c(k1, l1, i2)).getMaterial() == material) {
+                         return true;
+                     }
+                 }
+             }
+         }
+ 
+-        blockposition_pooledblockposition.t();
+         return false;
++        // Antarctic end
+     }
+ 
+     public Explosion explode(@Nullable Entity entity, double d0, double d1, double d2, float f, boolean flag) {
+diff --git a/test/java/net/minecraft/server/WorldFluidSweepOptimizationTest.java b/test/java/net/minecraft/server/WorldFluidSweepOptimizationTest.java
+new file mode 100644
+index 0000000..b048998
+--- /dev/null
++++ b/test/java/net/minecraft/server/WorldFluidSweepOptimizationTest.java
+@@ -0,0 +1,283 @@
++package net.minecraft.server;
++
++import com.sun.management.ThreadMXBean;
++import java.lang.management.ManagementFactory;
++import java.lang.reflect.Field;
++import org.junit.Assert;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++public class WorldFluidSweepOptimizationTest {
++
++    private static Unsafe UNSAFE;
++
++    @BeforeClass
++    public static void setup() throws Exception {
++        LightPropagationParityTest.bootstrap();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        UNSAFE = (Unsafe) f.get(null);
++    }
++
++    @Test
++    public void testChunkSectionFluidAndFireOrLavaCounters() {
++        ChunkSection sec = new ChunkSection(64, true);
++        Assert.assertFalse(sec.hasFluids());
++        Assert.assertFalse(sec.hasFireOrLava());
++
++        sec.setType(1, 2, 3, Blocks.WATER.getBlockData());
++        Assert.assertTrue(sec.hasFluids());
++        Assert.assertFalse(sec.hasFireOrLava());
++
++        sec.setType(1, 2, 3, Blocks.FIRE.getBlockData());
++        Assert.assertFalse(sec.hasFluids());
++        Assert.assertTrue(sec.hasFireOrLava());
++
++        sec.setType(4, 5, 6, Blocks.FLOWING_LAVA.getBlockData());
++        Assert.assertTrue(sec.hasFluids());
++        Assert.assertTrue(sec.hasFireOrLava());
++
++        sec.setType(1, 2, 3, Blocks.STONE.getBlockData());
++        Assert.assertTrue(sec.hasFluids());
++        Assert.assertTrue(sec.hasFireOrLava());
++
++        sec.setType(4, 5, 6, Blocks.AIR.getBlockData());
++        Assert.assertFalse(sec.hasFluids());
++        Assert.assertFalse(sec.hasFireOrLava());
++
++        // Verify recalcBlockCounts() rebuilds both counters identically
++        sec.setType(0, 0, 0, Blocks.LAVA.getBlockData());
++        sec.recalcBlockCounts();
++        Assert.assertTrue(sec.hasFluids());
++        Assert.assertTrue(sec.hasFireOrLava());
++
++        sec.setType(0, 0, 0, Blocks.AIR.getBlockData());
++        sec.recalcBlockCounts();
++        Assert.assertFalse(sec.hasFluids());
++        Assert.assertFalse(sec.hasFireOrLava());
++    }
++
++    @Test
++    public void testFluidAndFireSweepParityAcrossSectionsAndEdgeCases() throws Exception {
++        WorldServer world = LightPropagationParityTest.buildWorld(2, new LightPropagationParityTest.StubProvider[1]);
++        // Fill solid ground at y=63 so section 3 (y=48..63) and section 4 (y=64..79) are populated dry sections
++        for (int x = -2; x <= 18; ++x) {
++            for (int z = -2; z <= 18; ++z) {
++                LightPropagationParityTest.setBlock(world, x, 63, z, Blocks.STONE.getBlockData());
++            }
++        }
++        LightPropagationParityTest.setBlock(world, 0, 64, 0, Blocks.TORCH.getBlockData()); // non-empty dry section 4
++
++        AxisAlignedBB dryBox = new AxisAlignedBB(2.0D, 64.0D, 2.0D, 2.6D, 65.8D, 2.6D);
++        Assert.assertFalse(world.containsLiquid(dryBox));
++        Assert.assertFalse(world.e(dryBox));
++        Assert.assertFalse(world.a(dryBox, Material.LAVA));
++        Assert.assertTrue(world.a(dryBox.b(0.0D, -1.0D, 0.0D), Material.STONE)); // non-liquid fallback
++
++        EntityZombie entity = (EntityZombie) UNSAFE.allocateInstance(EntityZombie.class);
++        entity.world = world;
++        Assert.assertFalse(world.a(dryBox, Material.WATER, entity));
++        Assert.assertEquals(0.0D, entity.motX, 0.0D);
++        Assert.assertEquals(0.0D, entity.motY, 0.0D);
++        Assert.assertEquals(0.0D, entity.motZ, 0.0D);
++
++        // Place fire at (2, 64, 2) -> e(AABB) must detect it, liquid checks must stay false
++        LightPropagationParityTest.setBlock(world, 2, 64, 2, Blocks.FIRE.getBlockData());
++        Assert.assertTrue(world.e(dryBox));
++        Assert.assertFalse(world.containsLiquid(dryBox));
++        Assert.assertFalse(world.a(dryBox, Material.LAVA));
++
++        // Replace with lava -> all of containsLiquid, e(AABB), a(AABB, LAVA) must detect it
++        LightPropagationParityTest.setBlock(world, 2, 64, 2, Blocks.LAVA.getBlockData());
++        Assert.assertTrue(world.e(dryBox));
++        Assert.assertTrue(world.containsLiquid(dryBox));
++        Assert.assertTrue(world.a(dryBox, Material.LAVA));
++        Assert.assertFalse(world.a(dryBox, Material.WATER, entity));
++
++        // Remove lava -> back to dry
++        LightPropagationParityTest.setBlock(world, 2, 64, 2, Blocks.AIR.getBlockData());
++        Assert.assertFalse(world.e(dryBox));
++        Assert.assertFalse(world.containsLiquid(dryBox));
++        Assert.assertFalse(world.a(dryBox, Material.LAVA));
++
++        // Place flowing water slope across chunk boundary (x=15 -> x=16) and verify exact push vector parity
++        LightPropagationParityTest.setBlock(world, 15, 64, 5, Blocks.FLOWING_WATER.getBlockData().set(BlockFluids.LEVEL, 1));
++        LightPropagationParityTest.setBlock(world, 16, 64, 5, Blocks.FLOWING_WATER.getBlockData().set(BlockFluids.LEVEL, 2));
++        AxisAlignedBB crossChunkBox = new AxisAlignedBB(15.2D, 64.0D, 5.2D, 16.5D, 65.5D, 5.8D);
++
++        EntityZombie eOpt = (EntityZombie) UNSAFE.allocateInstance(EntityZombie.class);
++        eOpt.world = world;
++        EntityZombie eRef = (EntityZombie) UNSAFE.allocateInstance(EntityZombie.class);
++        eRef.world = world;
++
++        boolean optInWater = world.a(crossChunkBox, Material.WATER, eOpt);
++        boolean refInWater = referenceHandleMaterialAcceleration(world, crossChunkBox, Material.WATER, eRef);
++        Assert.assertEquals(refInWater, optInWater);
++        Assert.assertTrue(optInWater);
++        Assert.assertEquals("motX must match vanilla bit-for-bit", Double.doubleToLongBits(eRef.motX), Double.doubleToLongBits(eOpt.motX));
++        Assert.assertEquals("motY must match vanilla bit-for-bit", Double.doubleToLongBits(eRef.motY), Double.doubleToLongBits(eOpt.motY));
++        Assert.assertEquals("motZ must match vanilla bit-for-bit", Double.doubleToLongBits(eRef.motZ), Double.doubleToLongBits(eOpt.motZ));
++
++        // Out-of-Y-bounds safety
++        Assert.assertFalse(world.containsLiquid(new AxisAlignedBB(0, -10, 0, 1, -5, 1)));
++        Assert.assertFalse(world.e(new AxisAlignedBB(0, 260, 0, 1, 265, 1)));
++        Assert.assertFalse(world.a(new AxisAlignedBB(0, -10, 0, 1, -5, 1), Material.LAVA));
++    }
++
++    @Test
++    public void testDrySectionSweepSpeedupAndZeroAllocation() throws Exception {
++        WorldServer world = LightPropagationParityTest.buildWorld(1, new LightPropagationParityTest.StubProvider[1]);
++        // Populated non-empty dry section (e.g. a house/base full of stone/wood/air, no water/fire)
++        for (int x = 0; x < 16; ++x) {
++            for (int z = 0; z < 16; ++z) {
++                LightPropagationParityTest.setBlock(world, x, 64, z, Blocks.STONE.getBlockData());
++            }
++        }
++
++        AxisAlignedBB box = new AxisAlignedBB(4.2D, 65.0D, 4.2D, 4.8D, 66.8D, 4.8D);
++        EntityZombie entity = (EntityZombie) UNSAFE.allocateInstance(EntityZombie.class);
++        entity.world = world;
++
++        final int warmup = 20_000;
++        final int measured = 200_000;
++        long sink = 0;
++
++        for (int i = 0; i < warmup; ++i) {
++            if (referenceAllSweeps(world, box, entity)) sink++;
++            if (optimizedAllSweeps(world, box, entity)) sink++;
++        }
++
++        ThreadMXBean bean = (ThreadMXBean) ManagementFactory.getThreadMXBean();
++        long tid = Thread.currentThread().getId();
++
++        long a0 = bean.getThreadAllocatedBytes(tid);
++        long t0 = System.nanoTime();
++        for (int i = 0; i < measured; ++i) {
++            if (referenceAllSweeps(world, box, entity)) sink++;
++        }
++        long baseNs = System.nanoTime() - t0;
++        long baseAlloc = Math.max(0L, bean.getThreadAllocatedBytes(tid) - a0);
++
++        long a1 = bean.getThreadAllocatedBytes(tid);
++        long t1 = System.nanoTime();
++        for (int i = 0; i < measured; ++i) {
++            if (optimizedAllSweeps(world, box, entity)) sink++;
++        }
++        long optNs = System.nanoTime() - t1;
++        long optAlloc = Math.max(0L, bean.getThreadAllocatedBytes(tid) - a1);
++
++        System.out.printf(
++                "[perf] World fluid/fire sweeps (%d x 4 checks on dry section): baseline=%.2f ms (alloc=%d B) vs sectionCounter=%.2f ms (alloc=%d B), speedup=%.2fx (sink=%d)%n",
++                measured, baseNs / 1e6, baseAlloc, optNs / 1e6, optAlloc,
++                (double) baseNs / Math.max(1L, optNs), sink);
++
++        Assert.assertEquals("Optimized dry fluid/fire sweeps must allocate 0 bytes", 0L, optAlloc);
++        Assert.assertTrue("Section-counter lock-free sweeps must be significantly faster than PooledBlockPosition + getType",
++                optNs * 2L < baseNs);
++    }
++
++    private static boolean optimizedAllSweeps(World world, AxisAlignedBB box, Entity entity) {
++        return world.containsLiquid(box)
++                | world.e(box)
++                | world.a(box, Material.WATER, entity)
++                | world.a(box, Material.LAVA);
++    }
++
++    private static boolean referenceAllSweeps(World world, AxisAlignedBB box, Entity entity) {
++        return referenceContainsLiquid(world, box)
++                | referenceFireOrLava(world, box)
++                | referenceHandleMaterialAcceleration(world, box, Material.WATER, entity)
++                | referenceIsMaterialInBB(world, box, Material.LAVA);
++    }
++
++    private static boolean referenceContainsLiquid(World world, AxisAlignedBB bb) {
++        int i = MathHelper.floor(bb.a), j = MathHelper.f(bb.d);
++        int k = MathHelper.floor(bb.b), l = MathHelper.f(bb.e);
++        int i1 = MathHelper.floor(bb.c), j1 = MathHelper.f(bb.f);
++        BlockPosition.PooledBlockPosition pos = BlockPosition.PooledBlockPosition.s();
++        for (int x = i; x < j; ++x) {
++            for (int y = k; y < l; ++y) {
++                for (int z = i1; z < j1; ++z) {
++                    if (world.getType(pos.f(x, y, z)).getMaterial().isLiquid()) {
++                        pos.t();
++                        return true;
++                    }
++                }
++            }
++        }
++        pos.t();
++        return false;
++    }
++
++    private static boolean referenceFireOrLava(World world, AxisAlignedBB bb) {
++        int i = MathHelper.floor(bb.a), j = MathHelper.f(bb.d);
++        int k = MathHelper.floor(bb.b), l = MathHelper.f(bb.e);
++        int i1 = MathHelper.floor(bb.c), j1 = MathHelper.f(bb.f);
++        BlockPosition.PooledBlockPosition pos = BlockPosition.PooledBlockPosition.s();
++        for (int x = i; x < j; ++x) {
++            for (int y = k; y < l; ++y) {
++                for (int z = i1; z < j1; ++z) {
++                    Block block = world.getType(pos.f(x, y, z)).getBlock();
++                    if (block == Blocks.FIRE || block == Blocks.FLOWING_LAVA || block == Blocks.LAVA) {
++                        pos.t();
++                        return true;
++                    }
++                }
++            }
++        }
++        pos.t();
++        return false;
++    }
++
++    private static boolean referenceIsMaterialInBB(World world, AxisAlignedBB bb, Material material) {
++        int i = MathHelper.floor(bb.a), j = MathHelper.f(bb.d);
++        int k = MathHelper.floor(bb.b), l = MathHelper.f(bb.e);
++        int i1 = MathHelper.floor(bb.c), j1 = MathHelper.f(bb.f);
++        BlockPosition.PooledBlockPosition pos = BlockPosition.PooledBlockPosition.s();
++        for (int x = i; x < j; ++x) {
++            for (int y = k; y < l; ++y) {
++                for (int z = i1; z < j1; ++z) {
++                    if (world.getType(pos.f(x, y, z)).getMaterial() == material) {
++                        pos.t();
++                        return true;
++                    }
++                }
++            }
++        }
++        pos.t();
++        return false;
++    }
++
++    private static boolean referenceHandleMaterialAcceleration(World world, AxisAlignedBB bb, Material material, Entity entity) {
++        int i = MathHelper.floor(bb.a), j = MathHelper.f(bb.d);
++        int k = MathHelper.floor(bb.b), l = MathHelper.f(bb.e);
++        int i1 = MathHelper.floor(bb.c), j1 = MathHelper.f(bb.f);
++        boolean flag = false;
++        Vec3D vec3d = Vec3D.a;
++        BlockPosition.PooledBlockPosition pos = BlockPosition.PooledBlockPosition.s();
++        for (int x = i; x < j; ++x) {
++            for (int y = k; y < l; ++y) {
++                for (int z = i1; z < j1; ++z) {
++                    pos.f(x, y, z);
++                    IBlockData data = world.getType(pos);
++                    if (data.getMaterial() == material) {
++                        double d0 = (double) ((float) (y + 1) - BlockFluids.b(((Integer) data.get(BlockFluids.LEVEL)).intValue()));
++                        if ((double) l >= d0) {
++                            flag = true;
++                            vec3d = data.getBlock().a(world, pos, entity, vec3d);
++                        }
++                    }
++                }
++            }
++        }
++        pos.t();
++        if (vec3d.b() > 0.0D && entity.bo()) {
++            vec3d = vec3d.a();
++            entity.motX += vec3d.x * 0.014D;
++            entity.motY += vec3d.y * 0.014D;
++            entity.motZ += vec3d.z * 0.014D;
++        }
++        return flag;
++    }
++}
