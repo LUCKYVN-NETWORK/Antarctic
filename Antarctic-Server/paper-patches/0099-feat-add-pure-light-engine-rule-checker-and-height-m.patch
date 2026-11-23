@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Thu, 19 Nov 2026 12:59:58 +0700
-Subject: [PATCH 099/131] feat: add pure light engine, rule checker and height
+Subject: [PATCH 099/132] feat: add pure light engine, rule checker and height
  map helper
 
 New package me.stella.antarctic.light, with no Minecraft references, so it can run on worker threads and be tested alone. This is commit 1 of the asynchronous relight work (design: Step 11); nothing in the server calls it yet.

@@ -1,0 +1,277 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 00:50:50 +0700
+Subject: [PATCH 132/132] fix: preserve EntityLiving effects CME safety and
+ skip empty ticks
+
+
+diff --git a/main/java/net/minecraft/server/EntityLiving.java b/main/java/net/minecraft/server/EntityLiving.java
+index b83cc34..702e02e 100644
+--- a/main/java/net/minecraft/server/EntityLiving.java
++++ b/main/java/net/minecraft/server/EntityLiving.java
+@@ -47,7 +47,8 @@ public abstract class EntityLiving extends Entity {
+     private AttributeMapBase attributeMap;
+     public CombatTracker combatTracker = new CombatTracker(this);
+     // Leaf start - Fastutil Reference2ObjectOpenHashMap for effects (backport of Leaf MC 0148)
+-    public final Map<MobEffectList, MobEffect> effects = new it.unimi.dsi.fastutil.objects.Reference2ObjectOpenHashMap<MobEffectList, MobEffect>();
++    // Antarctic - use small initial capacity (2 -> 4-slot table) to save ~256B/entity when empty
++    public final Map<MobEffectList, MobEffect> effects = new it.unimi.dsi.fastutil.objects.Reference2ObjectOpenHashMap<MobEffectList, MobEffect>(2);
+     // Leaf end
+     private final NonNullList<ItemStack> bv;
+     private final NonNullList<ItemStack> bw;
+@@ -565,43 +566,54 @@ public abstract class EntityLiving extends Entity {
+     }
+ 
+     // CraftBukkit start
++    private static final Object REMOVE_ALL_EFFECTS_SENTINEL = new Object(); // Antarctic - defer removeAllEffects while ticking non-fail-fast fastutil map
+     private boolean isTickingEffects = false;
+     private List<Object> effectsToProcess = Lists.newArrayList();
+     // CraftBukkit end
+ 
+     protected void tickPotionEffects() {
+-        // Leaf start - Optimize potion effect ticking (backport of Leaf MC 0148)
+-        Iterator<MobEffect> iterator = this.effects.values().iterator();
++        // Antarctic start - skip iterator allocation when empty and preserve CME/reentrancy safety
++        if (!this.effects.isEmpty()) {
++            Iterator<MobEffect> iterator = this.effects.values().iterator();
+ 
+-        isTickingEffects = true; // CraftBukkit
+-        try {
+-            while (iterator.hasNext()) {
+-                MobEffect mobeffect = iterator.next();
++            isTickingEffects = true; // CraftBukkit
++            try {
++                while (iterator.hasNext()) {
++                    MobEffect mobeffect = iterator.next();
++                    if (mobeffect == null) {
++                        break;
++                    }
+ 
+-                if (!mobeffect.tick(this)) {
+-                    if (!this.world.isClientSide) {
+-                        iterator.remove();
+-                        this.b(mobeffect);
++                    if (!mobeffect.tick(this)) {
++                        if (!this.world.isClientSide) {
++                            iterator.remove();
++                            this.b(mobeffect);
++                        }
++                    } else if (mobeffect.getDuration() % 600 == 0) {
++                        this.a(mobeffect, false);
+                     }
+-                } else if (mobeffect.getDuration() % 600 == 0) {
+-                    this.a(mobeffect, false);
+                 }
++            } catch (ConcurrentModificationException | java.util.NoSuchElementException | IllegalStateException ignored) {
++                ;
++            } finally {
++                isTickingEffects = false;
+             }
+-        } catch (ConcurrentModificationException concurrentmodificationexception) {
+-            ;
+-        }
+-        // Leaf end
+-        // CraftBukkit start
+-        isTickingEffects = false;
+-        for (Object e : effectsToProcess) {
+-            if (e instanceof MobEffect) {
+-                addEffect((MobEffect) e);
+-            } else {
+-                removeEffect((MobEffectList) e);
++
++            if (!effectsToProcess.isEmpty()) {
++                for (int idx = 0, len = effectsToProcess.size(); idx < len; ++idx) {
++                    Object e = effectsToProcess.get(idx);
++                    if (e == REMOVE_ALL_EFFECTS_SENTINEL) {
++                        removeAllEffects();
++                    } else if (e instanceof MobEffect) {
++                        addEffect((MobEffect) e);
++                    } else {
++                        removeEffect((MobEffectList) e);
++                    }
++                }
++                effectsToProcess.clear();
+             }
+         }
+-        effectsToProcess.clear();
+-        // CraftBukkit end
++        // Antarctic end
+ 
+         if (this.updateEffects) {
+             if (!this.world.isClientSide) {
+@@ -675,6 +687,15 @@ public abstract class EntityLiving extends Entity {
+ 
+     public void removeAllEffects() {
+         if (!this.world.isClientSide) {
++            // Antarctic start - defer clear if called re-entrantly during tickPotionEffects
++            if (isTickingEffects) {
++                effectsToProcess.add(REMOVE_ALL_EFFECTS_SENTINEL);
++                return;
++            }
++            if (this.effects.isEmpty()) {
++                return;
++            }
++            // Antarctic end
+             Iterator iterator = this.effects.values().iterator();
+ 
+             while (iterator.hasNext()) {
+diff --git a/test/java/net/minecraft/server/EntityLivingEffectsSafetyTest.java b/test/java/net/minecraft/server/EntityLivingEffectsSafetyTest.java
+new file mode 100644
+index 0000000..9b682c5
+--- /dev/null
++++ b/test/java/net/minecraft/server/EntityLivingEffectsSafetyTest.java
+@@ -0,0 +1,154 @@
++package net.minecraft.server;
++
++import com.sun.management.ThreadMXBean;
++import java.lang.management.ManagementFactory;
++import java.lang.reflect.Field;
++import java.util.Collections;
++import java.util.Random;
++import org.junit.Assert;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import org.spigotmc.AsyncCatcher;
++import sun.misc.Unsafe;
++
++public class EntityLivingEffectsSafetyTest {
++
++    private static Unsafe unsafe;
++
++    @BeforeClass
++    public static void setup() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        unsafe = (Unsafe) f.get(null);
++    }
++
++    private static final class StubLiving extends EntityLiving {
++        boolean triggerRemoveAllOnDamage;
++        int removedCallbackCount;
++
++        StubLiving() {
++            super(null);
++        }
++
++        @Override
++        public boolean damageEntity(DamageSource source, float f) {
++            if (triggerRemoveAllOnDamage) {
++                triggerRemoveAllOnDamage = false;
++                this.removeAllEffects();
++                // Also queue a new effect after removeAllEffects to verify ordering
++                this.addEffect(new MobEffect(MobEffects.FASTER_MOVEMENT, 100, 0));
++            }
++            return true;
++        }
++
++        @Override
++        protected void b(MobEffect effect) {
++            removedCallbackCount++;
++        }
++
++        @Override
++        protected void a(MobEffect effect) {
++        }
++
++        @Override
++        protected void a(MobEffect effect, boolean flag) {
++        }
++
++        @Override
++        public Iterable<ItemStack> getArmorItems() {
++            return Collections.emptyList();
++        }
++
++        @Override
++        public ItemStack getEquipment(EnumItemSlot slot) {
++            return ItemStack.a;
++        }
++
++        @Override
++        public void setSlot(EnumItemSlot slot, ItemStack stack) {
++        }
++
++        @Override
++        public EnumMainHand getMainHand() {
++            return EnumMainHand.RIGHT;
++        }
++    }
++
++    private static StubLiving newStubLiving() throws Exception {
++        World world = (World) unsafe.allocateInstance(WorldServer.class);
++        Field clientSide = World.class.getDeclaredField("isClientSide");
++        clientSide.setAccessible(true);
++        clientSide.setBoolean(world, false);
++
++        StubLiving entity = (StubLiving) unsafe.allocateInstance(StubLiving.class);
++        entity.world = world;
++        entity.random = new Random(1L);
++        Field effectsField = EntityLiving.class.getDeclaredField("effects");
++        effectsField.setAccessible(true);
++        effectsField.set(entity, new it.unimi.dsi.fastutil.objects.Reference2ObjectOpenHashMap<MobEffectList, MobEffect>(2));
++        Field procField = EntityLiving.class.getDeclaredField("effectsToProcess");
++        procField.setAccessible(true);
++        procField.set(entity, new java.util.ArrayList<>());
++
++        Field dwField = Entity.class.getDeclaredField("datawatcher");
++        dwField.setAccessible(true);
++        DataWatcher dw = new DataWatcher(entity);
++        dw.register(Entity.Z, (byte) 0);
++        dw.register(getStaticWatcher(EntityLiving.class, "g"), 0);
++        dw.register(getStaticWatcher(EntityLiving.class, "h"), Boolean.FALSE);
++        dw.register(EntityLiving.HEALTH, 20.0F);
++        dwField.set(entity, dw);
++        return entity;
++    }
++
++    @SuppressWarnings("unchecked")
++    private static <T> DataWatcherObject<T> getStaticWatcher(Class<?> cls, String name) throws Exception {
++        Field f = cls.getDeclaredField(name);
++        f.setAccessible(true);
++        return (DataWatcherObject<T>) f.get(null);
++    }
++
++    @Test
++    public void testReentrantRemoveAllEffectsDuringTickDoesNotCrashAndPreservesOrder() throws Exception {
++        boolean prevAsync = AsyncCatcher.enabled;
++        AsyncCatcher.enabled = false;
++        try {
++            StubLiving entity = newStubLiving();
++            // Poison ticks damage when duration % 25 == 0 -> duration 25 triggers damageEntity on this tick!
++            entity.addEffect(new MobEffect(MobEffects.POISON, 25, 0));
++            entity.addEffect(new MobEffect(MobEffects.WATER_BREATHING, 200, 0));
++            entity.addEffect(new MobEffect(MobEffects.INCREASE_DAMAGE, 200, 0));
++            entity.triggerRemoveAllOnDamage = true;
++
++            // Must NOT throw NPE / IllegalStateException when Poison damage invokes removeAllEffects()
++            entity.tickPotionEffects();
++
++            Assert.assertFalse("Old effects must be removed by deferred removeAllEffects", entity.hasEffect(MobEffects.POISON));
++            Assert.assertFalse(entity.hasEffect(MobEffects.WATER_BREATHING));
++            Assert.assertFalse(entity.hasEffect(MobEffects.INCREASE_DAMAGE));
++            Assert.assertTrue("Effect queued AFTER removeAllEffects must be present", entity.hasEffect(MobEffects.FASTER_MOVEMENT));
++            Assert.assertEquals(3, entity.removedCallbackCount);
++        } finally {
++            AsyncCatcher.enabled = prevAsync;
++        }
++    }
++
++    @Test
++    public void testEmptyEffectsTickPerformsZeroAllocations() throws Exception {
++        StubLiving entity = newStubLiving();
++        // Warmup
++        for (int i = 0; i < 10_000; ++i) {
++            entity.tickPotionEffects();
++        }
++        ThreadMXBean bean = (ThreadMXBean) ManagementFactory.getThreadMXBean();
++        long tid = Thread.currentThread().getId();
++        long before = bean.getThreadAllocatedBytes(tid);
++        for (int i = 0; i < 10_000; ++i) {
++            entity.tickPotionEffects();
++        }
++        long after = bean.getThreadAllocatedBytes(tid);
++        long allocBytes = after - before;
++        Assert.assertEquals("Empty effects map must allocate 0 bytes in tickPotionEffects()", 0L, allocBytes);
++    }
++}
