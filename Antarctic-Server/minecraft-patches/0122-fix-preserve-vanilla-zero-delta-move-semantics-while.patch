@@ -1,0 +1,332 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 00:14:36 +0700
+Subject: [PATCH 122/122] fix: preserve vanilla zero-delta move semantics while
+ skipping getCubes
+
+
+diff --git a/main/java/net/minecraft/server/Entity.java b/main/java/net/minecraft/server/Entity.java
+index de1c82a..a308b6e 100644
+--- a/main/java/net/minecraft/server/Entity.java
++++ b/main/java/net/minecraft/server/Entity.java
+@@ -117,7 +117,6 @@ public abstract class Entity implements ICommandListener, KeyedObject { // Paper
+     public float lastYaw;
+     public float lastPitch;
+     private AxisAlignedBB boundingBox;
+-    private boolean boundingBoxChanged = false; // Leaf - Skip entity move if movement is zero (backport of Leaf MC 0055 / Gale 0103 / VMP)
+     public boolean onGround;
+     public boolean positionChanged;
+     public boolean B;
+@@ -604,12 +603,9 @@ public abstract class Entity implements ICommandListener, KeyedObject { // Paper
+                 throw new ReportedException(crashreport);
+             }
+             // Check if we're moving
+-            // Leaf start - Skip entity move if movement is zero (backport of Leaf MC 0055 / Gale 0103 / VMP)
+-            if (!this.boundingBoxChanged && d0 == 0.0D && d1 == 0.0D && d2 == 0.0D) {
++            if (d0 == 0 && d1 == 0 && d2 == 0 && this.isVehicle() && this.isPassenger()) {
+                 return;
+             }
+-            this.boundingBoxChanged = false;
+-            // Leaf end
+             // CraftBukkit end
+             if (enummovetype == EnumMoveType.PISTON) {
+                 long i = this.world.getTime();
+@@ -713,44 +709,49 @@ public abstract class Entity implements ICommandListener, KeyedObject { // Paper
+                 }
+             }
+ 
+-            List list = this.world.getCubes(this, this.getBoundingBox().b(d0, d1, d2));
+             AxisAlignedBB axisalignedbb = this.getBoundingBox();
+             int k;
+             int l;
+ 
+-            if (d1 != 0.0D) {
+-                k = 0;
++            // Antarctic start - skip unused getCubes collision lookup on zero delta while preserving vanilla move semantics
++            if (d0 != 0.0D || d1 != 0.0D || d2 != 0.0D) {
++                List list = this.world.getCubes(this, this.getBoundingBox().b(d0, d1, d2));
+ 
+-                for (l = list.size(); k < l; ++k) {
+-                    d1 = ((AxisAlignedBB) list.get(k)).b(this.getBoundingBox(), d1);
+-                }
+-
+-                this.a(this.getBoundingBox().d(0.0D, d1, 0.0D));
+-            }
++                if (d1 != 0.0D) {
++                    k = 0;
+ 
+-            if (d0 != 0.0D) {
+-                k = 0;
++                    for (l = list.size(); k < l; ++k) {
++                        d1 = ((AxisAlignedBB) list.get(k)).b(this.getBoundingBox(), d1);
++                    }
+ 
+-                for (l = list.size(); k < l; ++k) {
+-                    d0 = ((AxisAlignedBB) list.get(k)).a(this.getBoundingBox(), d0);
++                    this.a(this.getBoundingBox().d(0.0D, d1, 0.0D));
+                 }
+ 
+                 if (d0 != 0.0D) {
+-                    this.a(this.getBoundingBox().d(d0, 0.0D, 0.0D));
+-                }
+-            }
++                    k = 0;
+ 
+-            if (d2 != 0.0D) {
+-                k = 0;
++                    for (l = list.size(); k < l; ++k) {
++                        d0 = ((AxisAlignedBB) list.get(k)).a(this.getBoundingBox(), d0);
++                    }
+ 
+-                for (l = list.size(); k < l; ++k) {
+-                    d2 = ((AxisAlignedBB) list.get(k)).c(this.getBoundingBox(), d2);
++                    if (d0 != 0.0D) {
++                        this.a(this.getBoundingBox().d(d0, 0.0D, 0.0D));
++                    }
+                 }
+ 
+                 if (d2 != 0.0D) {
+-                    this.a(this.getBoundingBox().d(0.0D, 0.0D, d2));
++                    k = 0;
++
++                    for (l = list.size(); k < l; ++k) {
++                        d2 = ((AxisAlignedBB) list.get(k)).c(this.getBoundingBox(), d2);
++                    }
++
++                    if (d2 != 0.0D) {
++                        this.a(this.getBoundingBox().d(0.0D, 0.0D, d2));
++                    }
+                 }
+             }
++            // Antarctic end
+ 
+             boolean flag = this.onGround || d1 != d8 && d1 < 0.0D; // CraftBukkit - decompile error
+             double d11;
+@@ -2731,11 +2732,6 @@ public abstract class Entity implements ICommandListener, KeyedObject { // Paper
+     }
+ 
+     public void a(AxisAlignedBB axisalignedbb) {
+-        // Leaf start - Skip entity move if movement is zero (backport of Leaf MC 0055 / Gale 0103 / VMP)
+-        if (this.boundingBox == null || !this.boundingBox.equals(axisalignedbb)) {
+-            this.boundingBoxChanged = true;
+-        }
+-        // Leaf end
+         // CraftBukkit start - block invalid bounding boxes
+         double a = axisalignedbb.a,
+                 b = axisalignedbb.b,
+diff --git a/test/java/net/minecraft/server/ZeroMovementTest.java b/test/java/net/minecraft/server/ZeroMovementTest.java
+index 80a8541..3c479ee 100644
+--- a/test/java/net/minecraft/server/ZeroMovementTest.java
++++ b/test/java/net/minecraft/server/ZeroMovementTest.java
+@@ -1,31 +1,196 @@
+ package net.minecraft.server;
+ 
++import java.lang.reflect.Field;
++import java.util.Collections;
++import java.util.List;
++import java.util.Random;
+ import org.junit.Assert;
++import org.junit.BeforeClass;
+ import org.junit.Test;
++import sun.misc.Unsafe;
+ 
+ public class ZeroMovementTest {
+ 
++    private static Unsafe unsafe;
++
++    @BeforeClass
++    public static void setup() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        unsafe = (Unsafe) f.get(null);
++    }
++
++    private static final class StubWorld extends World {
++        int getCubesCalls;
++        int flammableCheckCalls;
++        boolean flammable;
++
++        StubWorld() {
++            super(null, null, null, null, false, null, null);
++        }
++
++        @Override
++        protected IChunkProvider n() {
++            return null;
++        }
++
++        @Override
++        protected boolean isChunkLoaded(int i, int j, boolean flag) {
++            return true;
++        }
++
++        @Override
++        public List<AxisAlignedBB> getCubes(Entity entity, AxisAlignedBB bb) {
++            getCubesCalls++;
++            return Collections.emptyList();
++        }
++
++        @Override
++        public IBlockData getType(BlockPosition pos) {
++            return Blocks.AIR.getBlockData();
++        }
++
++        @Override
++        public boolean e(AxisAlignedBB bb) {
++            flammableCheckCalls++;
++            return flammable;
++        }
++    }
++
++    private static final class StubEntity extends Entity {
++        int burnCalls;
++        int updateFallStateCalls;
++        boolean wet;
++        int extinguishSoundCalls;
++
++        StubEntity() {
++            super(null);
++        }
++
++        @Override
++        protected void i() {
++        }
++
++        @Override
++        protected void a(NBTTagCompound tag) {
++        }
++
++        @Override
++        protected void b(NBTTagCompound tag) {
++        }
++
++        @Override
++        protected void checkBlockCollisions() {
++        }
++
++        @Override
++        protected void burn(float i) {
++            burnCalls++;
++        }
++
++        @Override
++        protected void a(double d0, boolean flag, IBlockData iblockdata, BlockPosition blockposition) {
++            updateFallStateCalls++;
++        }
++
++        @Override
++        public boolean isSneaking() {
++            return false;
++        }
++
++        @Override
++        public boolean an() {
++            return wet;
++        }
++
++        @Override
++        public void a(SoundEffect soundeffect, float f, float f1) {
++            if (soundeffect == SoundEffects.bW) {
++                extinguishSoundCalls++;
++            }
++        }
++    }
++
++    private static StubWorld newStubWorld() throws Exception {
++        StubWorld world = (StubWorld) unsafe.allocateInstance(StubWorld.class);
++        Field mp = World.class.getDeclaredField("methodProfiler");
++        mp.setAccessible(true);
++        mp.set(world, new MethodProfiler());
++        return world;
++    }
++
++    private static StubEntity newStubEntity(StubWorld world) throws Exception {
++        StubEntity entity = (StubEntity) unsafe.allocateInstance(StubEntity.class);
++        entity.world = world;
++        entity.random = new Random(42L);
++        Field passengersField = Entity.class.getDeclaredField("passengers");
++        passengersField.setAccessible(true);
++        passengersField.set(entity, Collections.emptyList());
++        entity.a(new AxisAlignedBB(0.0D, 64.0D, 0.0D, 0.6D, 65.8D, 0.6D));
++        entity.fireTicks = -10;
++        entity.width = 0.6F;
++        entity.length = 1.8F;
++        entity.valid = false;
++        return entity;
++    }
++
++    @Test
++    public void testZeroDeltaSkipsGetCubesButPreservesVanillaMoveSemantics() throws Exception {
++        StubWorld world = newStubWorld();
++        StubEntity entity = newStubEntity(world);
++
++        // Pre-seed stale state that vanilla move(0, 0, 0) must still process/reset
++        entity.onGround = true;
++        entity.positionChanged = true;
++        entity.B = true;
++        entity.C = true;
++        entity.E = true; // in cobweb
++        entity.motX = 0.5D;
++        entity.motY = -0.2D;
++        entity.motZ = 0.3D;
++        world.flammable = true;
++
++        // First stationary tick
++        entity.move(EnumMoveType.SELF, 0.0D, 0.0D, 0.0D);
++        // Second consecutive stationary tick (previously completely skipped by 0083)
++        entity.move(EnumMoveType.SELF, 0.0D, 0.0D, 0.0D);
++
++        Assert.assertEquals("Zero-delta move must skip unused World.getCubes", 0, world.getCubesCalls);
++        Assert.assertEquals("Stationary entity must still check fire/lava contact each tick", 2, world.flammableCheckCalls);
++        Assert.assertEquals("Stationary entity in fire/lava must still take burn(1) each tick", 2, entity.burnCalls);
++        Assert.assertEquals("Stationary entity must still run updateFallState each tick", 2, entity.updateFallStateCalls);
++        Assert.assertFalse("Zero-delta move must reset onGround", entity.onGround);
++        Assert.assertFalse("Zero-delta move must reset positionChanged", entity.positionChanged);
++        Assert.assertFalse("Zero-delta move must reset B", entity.B);
++        Assert.assertFalse("Zero-delta move must reset C", entity.C);
++        Assert.assertFalse("Zero-delta move must clear cobweb flag E", entity.E);
++        Assert.assertEquals(0.0D, entity.motX, 0.0D);
++        Assert.assertEquals(0.0D, entity.motY, 0.0D);
++        Assert.assertEquals(0.0D, entity.motZ, 0.0D);
++    }
++
+     @Test
+-    public void testBoundingBoxEquality() {
+-        AxisAlignedBB bb1 = new AxisAlignedBB(0.0, 0.0, 0.0, 1.0, 2.0, 1.0);
+-        AxisAlignedBB bb2 = new AxisAlignedBB(0.0, 0.0, 0.0, 1.0, 2.0, 1.0);
+-        AxisAlignedBB bb3 = new AxisAlignedBB(0.0, 0.0, 0.0, 1.0, 2.5, 1.0);
++    public void testZeroDeltaStillExtinguishesInRain() throws Exception {
++        StubWorld world = newStubWorld();
++        StubEntity entity = newStubEntity(world);
++        entity.fireTicks = 100;
++        entity.wet = true;
++
++        entity.move(EnumMoveType.SELF, 0.0D, 0.0D, 0.0D);
+ 
+-        Assert.assertEquals(bb1, bb2);
+-        Assert.assertNotEquals(bb1, bb3);
++        Assert.assertEquals("Zero-delta move must skip getCubes", 0, world.getCubesCalls);
++        Assert.assertEquals("Burning stationary entity in rain must extinguish", -entity.getMaxFireTicks(), entity.fireTicks);
++        Assert.assertEquals("Extinguish sound must play", 1, entity.extinguishSoundCalls);
+     }
+ 
+     @Test
+-    public void testZeroMovementCondition() {
+-        double d0 = 0.0D;
+-        double d1 = 0.0D;
+-        double d2 = 0.0D;
++    public void testNonZeroDeltaStillCallsGetCubes() throws Exception {
++        StubWorld world = newStubWorld();
++        StubEntity entity = newStubEntity(world);
+ 
+-        boolean isZero = d0 == 0.0D && d1 == 0.0D && d2 == 0.0D;
+-        Assert.assertTrue("Zero vector check must succeed for 0, 0, 0", isZero);
++        entity.move(EnumMoveType.SELF, 0.1D, 0.0D, 0.0D);
+ 
+-        double dNonZero = 0.0001D;
+-        boolean isNonZero = dNonZero == 0.0D && d1 == 0.0D && d2 == 0.0D;
+-        Assert.assertFalse("Non-zero coordinate must fail zero check", isNonZero);
++        Assert.assertEquals("Non-zero delta must call World.getCubes", 1, world.getCubesCalls);
+     }
+ }
