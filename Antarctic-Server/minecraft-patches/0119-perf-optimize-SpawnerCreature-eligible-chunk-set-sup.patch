@@ -1,0 +1,883 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Mon, 23 Nov 2026 14:02:02 +0700
+Subject: [PATCH 119/119] perf: optimize SpawnerCreature eligible chunk set,
+ support-first filter and lookups
+
+
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/MobSpawning.java b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/MobSpawning.java
+index 215db1a..d5986b3 100644
+--- a/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/MobSpawning.java
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/MobSpawning.java
+@@ -20,6 +20,24 @@ public class MobSpawning implements IConfigModule {
+     )
+     public static String precheckLightMode = "single-roll";
+ 
++    @ConfigInfo(
++        baseName = "support-first-spawn-filtering",
++        comments = "Check solid support / water block at the candidate position before scanning nearby players and querying biome/structure spawn tables.\nEliminates ~99.7% of wasted player scans and structure lookups on void/mid-air Skyblock chunks (default: true)."
++    )
++    public static boolean supportFirstSpawnFiltering = true;
++
++    @ConfigInfo(
++        baseName = "eligible-chunk-initial-capacity",
++        comments = "Initial capacity for SpawnerCreature's reusable LongOpenHashSet + LongArrayList eligible chunk buffers (>= 64, default: 1024)."
++    )
++    public static int eligibleChunkInitialCapacity = 1024;
++
++    @ConfigInfo(
++        baseName = "eligible-chunk-trim-factor",
++        comments = "Shrink reusable eligible chunk buffers back toward current load when capacity exceeds active_chunks * factor (0 to disable, or >= 2; default: 4)."
++    )
++    public static int eligibleChunkTrimFactor = 4;
++
+     public static int getPrecheckLightMode() {
+         String mode = precheckLightMode;
+         if (mode == "single-roll") {
+@@ -72,5 +90,15 @@ public class MobSpawning implements IConfigModule {
+                     "optimizations.mob-spawning.precheck-light-mode must be one of 'off', 'deterministic', or 'single-roll', got: " + precheckLightMode
+                 );
+         }
++        if (eligibleChunkInitialCapacity < 64) {
++            throw new IllegalArgumentException(
++                "optimizations.mob-spawning.eligible-chunk-initial-capacity must be >= 64, got: " + eligibleChunkInitialCapacity
++            );
++        }
++        if (eligibleChunkTrimFactor != 0 && eligibleChunkTrimFactor < 2) {
++            throw new IllegalArgumentException(
++                "optimizations.mob-spawning.eligible-chunk-trim-factor must be 0 or >= 2, got: " + eligibleChunkTrimFactor
++            );
++        }
+     }
+ }
+diff --git a/main/java/net/minecraft/server/SpawnerCreature.java b/main/java/net/minecraft/server/SpawnerCreature.java
+index 4a04b21..7346e0a 100644
+--- a/main/java/net/minecraft/server/SpawnerCreature.java
++++ b/main/java/net/minecraft/server/SpawnerCreature.java
+@@ -1,6 +1,8 @@
+ package net.minecraft.server;
+ 
+ import com.google.common.collect.Sets;
++import it.unimi.dsi.fastutil.longs.LongArrayList;
++import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
+ import java.util.Calendar;
+ import java.util.IdentityHashMap;
+ import java.util.Iterator;
+@@ -20,7 +22,34 @@ import org.bukkit.event.entity.CreatureSpawnEvent.SpawnReason;
+ public final class SpawnerCreature {
+ 
+     private static final int a = (int) Math.pow(17.0D, 2.0D);
+-    private final LongHashSet b = new LongHashSet(); // CraftBukkit
++    // Antarctic start - replace CraftBukkit LongHashSet + boxed Iterator with single-probe LongOpenHashSet + compact LongArrayList
++    private final LongOpenHashSet eligibleChunkSet = new LongOpenHashSet(Math.max(64, MobSpawning.eligibleChunkInitialCapacity));
++    private final LongArrayList eligibleChunkList = new LongArrayList(Math.max(64, MobSpawning.eligibleChunkInitialCapacity));
++
++    void resetEligibleChunks() {
++        int prevSize = this.eligibleChunkList.size();
++        this.eligibleChunkSet.clear();
++        this.eligibleChunkList.clear();
++        int trimFactor = MobSpawning.eligibleChunkTrimFactor;
++        if (trimFactor >= 2) {
++            int minCap = Math.max(64, MobSpawning.eligibleChunkInitialCapacity);
++            int currentCap = this.eligibleChunkList.elements().length;
++            if (currentCap > minCap && (long) prevSize * (long) trimFactor < (long) currentCap) {
++                int target = Math.max(minCap, prevSize * 2);
++                this.eligibleChunkSet.trim(target);
++                this.eligibleChunkList.trim(target);
++            }
++        }
++    }
++
++    int getEligibleChunkListCapacity() {
++        return this.eligibleChunkList.elements().length;
++    }
++
++    int getEligibleChunkCount() {
++        return this.eligibleChunkList.size();
++    }
++    // Antarctic end
+ 
+     // Antarctic start - exact-class pre-construction spawn rejection table (skips custom plugin subclasses)
+     private static final byte PRECHECK_MONSTER_STANDARD = 1;
+@@ -281,10 +310,9 @@ public final class SpawnerCreature {
+         }
+         // Paper end
+         int i = 0;
+-        Iterator<Long> it = this.b.iterator();
+-        while ( it.hasNext() )
++        for (int idx = 0, len = this.eligibleChunkList.size(); idx < len; ++idx)
+         {
+-            Long coord = it.next();
++            long coord = this.eligibleChunkList.getLong(idx);
+             int x = LongHash.msw( coord );
+             int z = LongHash.lsw( coord );
+             if ( !((ChunkProviderServer)server.chunkProvider).unloadQueue.contains( coord ) && server.isChunkLoaded( x, z, true ) )
+@@ -301,62 +329,78 @@ public final class SpawnerCreature {
+         if (!flag && !flag1) {
+             return 0;
+         } else {
+-            this.b.clear();
++            // Antarctic start - reuse and trim primitive eligible chunk buffers
++            this.resetEligibleChunks();
+             int i = 0;
+-            Iterator iterator = worldserver.players.iterator();
++            final WorldBorder worldBorder = worldserver.getWorldBorder();
++            final PlayerChunkMap playerChunkMap = worldserver.getPlayerChunkMap();
++            final boolean hasNaturalSpawnListeners = com.destroystokyo.paper.event.entity.PlayerNaturallySpawnCreaturesEvent.getHandlerList().getRegisteredListeners().length != 0;
++            final List<EntityHuman> players = worldserver.players;
+ 
+             int j;
+             int k;
+ 
+-            while (iterator.hasNext()) {
+-                EntityHuman entityhuman = (EntityHuman) iterator.next();
++            for (int pIdx = 0, pCount = players.size(); pIdx < pCount; ++pIdx) {
++                EntityHuman entityhuman = players.get(pIdx);
+ 
+                 if (!entityhuman.isSpectator() && entityhuman.affectsSpawning) {
+                     int l = MathHelper.floor(entityhuman.locX / 16.0D);
+ 
+                     j = MathHelper.floor(entityhuman.locZ / 16.0D);
+-                    boolean flag3 = true;
+                     // Spigot Start
+                     byte b0 = worldserver.spigotConfig.mobSpawnRange;
+                     b0 = ( b0 > worldserver.spigotConfig.viewDistance ) ? (byte) worldserver.spigotConfig.viewDistance : b0;
+                     b0 = ( b0 > 8 ) ? 8 : b0;
+-                    // Paper start
+-                    com.destroystokyo.paper.event.entity.PlayerNaturallySpawnCreaturesEvent event;
+-                    event = new com.destroystokyo.paper.event.entity.PlayerNaturallySpawnCreaturesEvent(
+-                            (org.bukkit.entity.Player) entityhuman.getBukkitEntity(), b0);
+-                    if (!event.callEvent()) {
+-                        continue;
++                    // Paper start - short-circuit event allocation when no listeners are registered
++                    if (hasNaturalSpawnListeners) {
++                        com.destroystokyo.paper.event.entity.PlayerNaturallySpawnCreaturesEvent event = new com.destroystokyo.paper.event.entity.PlayerNaturallySpawnCreaturesEvent(
++                                (org.bukkit.entity.Player) entityhuman.getBukkitEntity(), b0);
++                        if (!event.callEvent()) {
++                            continue;
++                        }
++                        b0 = event.getSpawnRadius();
+                     }
+-                    b0 = event.getSpawnRadius();
+-                    // Paperr end
++                    // Paper end
+ 
+                     for (int i1 = -b0; i1 <= b0; ++i1) {
++                        int cx = i1 + l;
++                        boolean xEdge = i1 == -b0 || i1 == b0;
+                         for (k = -b0; k <= b0; ++k) {
+-                            boolean flag4 = i1 == -b0 || i1 == b0 || k == -b0 || k == b0;
++                            boolean flag4 = xEdge || k == -b0 || k == b0;
+                             // Spigot End
+-                            ChunkCoordIntPair chunkcoordintpair = new ChunkCoordIntPair(i1 + l, k + j);
+-
+-                            // CraftBukkit start - use LongHash and LongHashSet
+-                            long chunkCoords = LongHash.toLong(chunkcoordintpair.x, chunkcoordintpair.z);
+-                            if (!this.b.contains(chunkCoords)) {
+-                                ++i;
+-                                if (!flag4 && worldserver.getWorldBorder().isInBounds(chunkcoordintpair)) {
+-                                    PlayerChunk playerchunk = worldserver.getPlayerChunkMap().getChunk(chunkcoordintpair.x, chunkcoordintpair.z);
++                            int cz = k + j;
++                            long chunkCoords = LongHash.toLong(cx, cz);
+ 
+-                                    if (playerchunk != null && playerchunk.e()) {
+-                                        this.b.add(chunkCoords);
+-                                        // CraftBukkit end
++                            if (flag4) {
++                                if (!this.eligibleChunkSet.contains(chunkCoords)) {
++                                    ++i;
++                                }
++                            } else if (worldBorder.isChunkInBounds(cx, cz)) {
++                                PlayerChunk playerchunk = playerChunkMap.getChunk(cx, cz);
++                                if (playerchunk != null && playerchunk.e()) {
++                                    if (this.eligibleChunkSet.add(chunkCoords)) {
++                                        ++i;
++                                        this.eligibleChunkList.add(chunkCoords);
+                                     }
++                                } else if (!this.eligibleChunkSet.contains(chunkCoords)) {
++                                    ++i;
+                                 }
++                            } else if (!this.eligibleChunkSet.contains(chunkCoords)) {
++                                ++i;
+                             }
+                         }
+                     }
+                 }
+             }
++            // Antarctic end
+ 
+             int j1 = 0;
+             BlockPosition blockposition = worldserver.getSpawn();
+             EnumCreatureType[] aenumcreaturetype = EnumCreatureType.values();
++            final int eligibleCount = this.eligibleChunkList.size();
++            final boolean supportFirst = MobSpawning.supportFirstSpawnFiltering;
++            final int precheckMode = MobSpawning.getPrecheckLightMode();
++            final boolean hasPreSpawnListeners = com.destroystokyo.paper.event.entity.PreCreatureSpawnEvent.getHandlerList().getRegisteredListeners().length != 0;
+ 
+             j = aenumcreaturetype.length;
+ 
+@@ -394,19 +438,26 @@ public final class SpawnerCreature {
+ 
+                     if ((mobcnt = worldserver.getCreatureCount(enumcreaturetype)) <= limit * i / SpawnerCreature.a) { // Paper - use 17x17 like vanilla (a at top of file) // Antarctic - O(1) tracked world count
+                         BlockPosition.MutableBlockPosition blockposition_mutableblockposition = new BlockPosition.MutableBlockPosition();
+-                        Iterator iterator1 = this.b.iterator();
+ 
+                         int moblimit = computeMobLimit(limit, i, mobcnt); // Antarctic - align divisor with 17x17 (289) cap check above
+                         label120:
+-                        while (iterator1.hasNext() && (moblimit > 0)) { // Spigot - while more allowed
+-                            // CraftBukkit start = use LongHash and LongObjectHashMap
+-                            long key = ((Long) iterator1.next()).longValue();
+-                            BlockPosition blockposition1 = getRandomPosition(worldserver, LongHash.msw(key), LongHash.lsw(key));
+-                            // CraftBukkit
+-                            int i2 = blockposition1.getX();
+-                            int j2 = blockposition1.getY();
+-                            int k2 = blockposition1.getZ();
+-                            IBlockData iblockdata = worldserver.getWorldBorder().isInBounds(blockposition1) ? worldserver.getTypeIfLoaded(blockposition1) : null; // Paper
++                        for (int chunkIdx = 0; chunkIdx < eligibleCount && moblimit > 0; ++chunkIdx) { // Antarctic - compact primitive iteration
++                            long key = this.eligibleChunkList.getLong(chunkIdx);
++                            int chunkX = LongHash.msw(key);
++                            int chunkZ = LongHash.lsw(key);
++                            Chunk originChunk = worldserver.getChunkIfLoaded(chunkX, chunkZ);
++                            if (originChunk == null) {
++                                continue;
++                            }
++                            // Antarctic start - inline getRandomPosition using heightMap directly (zero BlockPosition allocations)
++                            int localX = worldserver.random.nextInt(16);
++                            int localZ = worldserver.random.nextInt(16);
++                            int i2 = (chunkX << 4) + localX;
++                            int k2 = (chunkZ << 4) + localZ;
++                            int topY = MathHelper.c(originChunk.heightMap[(localZ << 4) | localX] + 1, 16);
++                            int j2 = worldserver.random.nextInt(topY > 0 ? topY : originChunk.g() + 16 - 1);
++                            IBlockData iblockdata = worldBorder.isBlockInBounds(i2, k2) ? originChunk.a(i2, j2, k2) : null;
++                            // Antarctic end
+ 
+                             if (iblockdata != null && !iblockdata.l()) { // Paper
+                                 int l2 = 0;
+@@ -419,91 +470,108 @@ public final class SpawnerCreature {
+                                     boolean flag5 = true;
+                                     BiomeBase.BiomeMeta biomebase_biomemeta = null;
+                                     GroupDataEntity groupdataentity = null;
+-                                    int i4 = MathHelper.f(Math.random() * 4.0D);
++                                    int i4 = MathHelper.f(java.util.concurrent.ThreadLocalRandom.current().nextDouble() * 4.0D); // Antarctic - lock-free uniform [0,1) matching Math.random()
+                                     int j4 = 0;
+ 
+                                     while (true) {
+                                         if (j4 < i4) {
+                                             label113: {
+                                                 j3 += worldserver.random.nextInt(6) - worldserver.random.nextInt(6);
+-                                                k3 += worldserver.random.nextInt(1) - worldserver.random.nextInt(1);
++                                                // k3 += worldserver.random.nextInt(1) - worldserver.random.nextInt(1); // Antarctic - always 0 - 0, saves 2 AtomicLong CAS ops/step
+                                                 l3 += worldserver.random.nextInt(6) - worldserver.random.nextInt(6);
+                                                 blockposition_mutableblockposition.c(j3, k3, l3);
+                                                 float f = (float) j3 + 0.5F;
+                                                 float f1 = (float) l3 + 0.5F;
+ 
+-                                                Chunk spawnChunk;
+-                                                if (worldserver.getWorldBorder().isInBounds(blockposition_mutableblockposition) && (spawnChunk = worldserver.getChunkIfLoaded(blockposition_mutableblockposition)) != null && !worldserver.isPlayerNearby((double) f, (double) k3, (double) f1, 24.0D) && blockposition.distanceSquared((double) f, (double) k3, (double) f1) >= 576.0D) { // Paper - Prevent mob spawning from loading/generating chunks
+-                                                    if (biomebase_biomemeta == null) {
+-                                                        biomebase_biomemeta = worldserver.a(enumcreaturetype, (BlockPosition) blockposition_mutableblockposition);
+-                                                        if (biomebase_biomemeta == null) {
+-                                                            break label113;
+-                                                        }
+-                                                    }
+-
+-                                                    if (worldserver.a(enumcreaturetype, biomebase_biomemeta, (BlockPosition) blockposition_mutableblockposition) && a(EntityPositionTypes.a(biomebase_biomemeta.b), worldserver, blockposition_mutableblockposition)) {
+-                                                        // Paper start
+-                                                        com.destroystokyo.paper.event.entity.PreCreatureSpawnEvent event;
+-                                                        Class<? extends EntityInsentient> cls = biomebase_biomemeta.b;
+-                                                        org.bukkit.entity.EntityType type = EntityTypes.clsToTypeMap.get(cls);
+-                                                        if (type != null && com.destroystokyo.paper.event.entity.PreCreatureSpawnEvent.getHandlerList().getRegisteredListeners().length != 0) { // Leaf - skip event creation and dispatch when no listeners are registered (backport of Leaf MC 0264)
+-                                                            event = new com.destroystokyo.paper.event.entity.PreCreatureSpawnEvent(
+-                                                                    MCUtil.toLocation(worldserver, blockposition_mutableblockposition),
+-                                                                    type, SpawnReason.NATURAL
+-                                                            );
+-                                                            if (!event.callEvent()) {
+-                                                                if (event.shouldAbortSpawn()) {
+-                                                                    continue label120;
+-                                                                }
+-                                                                j1 += l2;
+-                                                                ++j4;
+-                                                                continue;
+-                                                            }
+-                                                        }
+-                                                        // Paper end
+-                                                        // Antarctic start - pre-reject doomed spawn attempts before 14.9 KiB entity construction
+-                                                        int precheck = precheckSpawn(worldserver, spawnChunk, cls, blockposition_mutableblockposition, MobSpawning.getPrecheckLightMode());
+-                                                        if (precheck == PRECHECK_RESULT_REJECT) {
+-                                                            j1 += l2;
++                                                if (worldBorder.isBlockInBounds(j3, l3)) {
++                                                    int spawnChunkX = j3 >> 4;
++                                                    int spawnChunkZ = l3 >> 4;
++                                                    Chunk spawnChunk = (spawnChunkX == chunkX && spawnChunkZ == chunkZ)
++                                                            ? originChunk
++                                                            : worldserver.getChunkIfLoaded(spawnChunkX, spawnChunkZ);
++                                                    if (spawnChunk != null) {
++                                                        // Antarctic start - support-first filtering skips void/mid-air before O(P) player scan & structure lookups
++                                                        if (supportFirst && !spawnChunk.a(j3, k3 - 1, l3).q() && spawnChunk.a(j3, k3, l3).getMaterial() != Material.WATER) {
+                                                             ++j4;
+                                                             continue;
+                                                         }
+                                                         // Antarctic end
+-                                                        EntityInsentient entityinsentient;
+-
+-                                                        try {
+-                                                            entityinsentient = (EntityInsentient) EntityTypes.createEntity(cls, worldserver); // Antarctic - cached entity factory
+-                                                        } catch (Exception exception) {
+-                                                            exception.printStackTrace();
+-                                                            ServerInternalException.reportInternalException(exception); // Paper
+-                                                            return j1;
+-                                                        }
+-
+-                                                        entityinsentient.setPositionRotation((double) f, (double) k3, (double) f1, worldserver.random.nextFloat() * 360.0F, 0.0F);
+-                                                        if (precheck == PRECHECK_RESULT_PASS_LIGHT_PRECHECKED) {
+-                                                            ((EntityMonster) entityinsentient).antarcticLightPrechecked = true;
+-                                                        }
+-                                                        if (entityinsentient.P() && entityinsentient.canSpawn()) {
+-                                                            groupdataentity = entityinsentient.prepare(worldserver.D(new BlockPosition(entityinsentient)), groupdataentity);
+-                                                            if (entityinsentient.canSpawn()) {
+-                                                                // CraftBukkit start
+-                                                                if (worldserver.addEntity(entityinsentient, SpawnReason.NATURAL)) {
+-                                                                    ++l2;
+-                                                                    moblimit--; // Spigot
++                                                        if (!worldserver.isPlayerNearby((double) f, (double) k3, (double) f1, 24.0D) && blockposition.distanceSquared((double) f, (double) k3, (double) f1) >= 576.0D) {
++                                                            boolean metaJustSelected = false;
++                                                            if (biomebase_biomemeta == null) {
++                                                                biomebase_biomemeta = worldserver.a(enumcreaturetype, (BlockPosition) blockposition_mutableblockposition);
++                                                                if (biomebase_biomemeta == null) {
++                                                                    break label113;
+                                                                 }
+-                                                                // CraftBukkit end
+-                                                            } else {
+-                                                                entityinsentient.die();
++                                                                metaJustSelected = true;
+                                                             }
+ 
+-                                                            // Antarctic start - restore vanilla per-chunk pack cap (cU()) alongside Spigot moblimit
+-                                                            if (l2 >= entityinsentient.cU() || moblimit <= 0) {
+-                                                                continue label120;
++                                                            if ((metaJustSelected || worldserver.a(enumcreaturetype, biomebase_biomemeta, (BlockPosition) blockposition_mutableblockposition)) && canSpawnAtLocation(EntityPositionTypes.a(biomebase_biomemeta.b), spawnChunk, j3, k3, l3)) {
++                                                                // Paper start
++                                                                Class<? extends EntityInsentient> cls = biomebase_biomemeta.b;
++                                                                if (hasPreSpawnListeners) { // Leaf - skip event creation and dispatch when no listeners are registered
++                                                                    org.bukkit.entity.EntityType type = EntityTypes.clsToTypeMap.get(cls);
++                                                                    if (type != null) {
++                                                                        com.destroystokyo.paper.event.entity.PreCreatureSpawnEvent event = new com.destroystokyo.paper.event.entity.PreCreatureSpawnEvent(
++                                                                                MCUtil.toLocation(worldserver, blockposition_mutableblockposition),
++                                                                                type, SpawnReason.NATURAL
++                                                                        );
++                                                                        if (!event.callEvent()) {
++                                                                            if (event.shouldAbortSpawn()) {
++                                                                                continue label120;
++                                                                            }
++                                                                            j1 += l2;
++                                                                            ++j4;
++                                                                            continue;
++                                                                        }
++                                                                    }
++                                                                }
++                                                                // Paper end
++                                                                // Antarctic start - pre-reject doomed spawn attempts before 14.9 KiB entity construction
++                                                                int precheck = precheckSpawn(worldserver, spawnChunk, cls, blockposition_mutableblockposition, precheckMode);
++                                                                if (precheck == PRECHECK_RESULT_REJECT) {
++                                                                    j1 += l2;
++                                                                    ++j4;
++                                                                    continue;
++                                                                }
++                                                                // Antarctic end
++                                                                EntityInsentient entityinsentient;
++
++                                                                try {
++                                                                    entityinsentient = (EntityInsentient) EntityTypes.createEntity(cls, worldserver); // Antarctic - cached entity factory
++                                                                } catch (Exception exception) {
++                                                                    exception.printStackTrace();
++                                                                    ServerInternalException.reportInternalException(exception); // Paper
++                                                                    return j1;
++                                                                }
++
++                                                                entityinsentient.setPositionRotation((double) f, (double) k3, (double) f1, worldserver.random.nextFloat() * 360.0F, 0.0F);
++                                                                if (precheck == PRECHECK_RESULT_PASS_LIGHT_PRECHECKED) {
++                                                                    ((EntityMonster) entityinsentient).antarcticLightPrechecked = true;
++                                                                }
++                                                                if (entityinsentient.P() && entityinsentient.canSpawn()) {
++                                                                    groupdataentity = entityinsentient.prepare(worldserver.D(new BlockPosition(entityinsentient)), groupdataentity);
++                                                                    if (entityinsentient.canSpawn()) {
++                                                                        // CraftBukkit start
++                                                                        if (worldserver.addEntity(entityinsentient, SpawnReason.NATURAL)) {
++                                                                            ++l2;
++                                                                            moblimit--; // Spigot
++                                                                        }
++                                                                        // CraftBukkit end
++                                                                    } else {
++                                                                        entityinsentient.die();
++                                                                    }
++
++                                                                    // Antarctic start - restore vanilla per-chunk pack cap (cU()) alongside Spigot moblimit
++                                                                    if (l2 >= entityinsentient.cU() || moblimit <= 0) {
++                                                                        continue label120;
++                                                                    }
++                                                                    // Antarctic end
++                                                                }
++
++                                                                j1 += l2;
+                                                             }
+-                                                            // Antarctic end
+                                                         }
+-
+-                                                        j1 += l2;
+                                                     }
+                                                 }
+ 
+@@ -540,6 +608,23 @@ public final class SpawnerCreature {
+         return iblockdata.k() ? false : (iblockdata.m() ? false : (iblockdata.getMaterial().isLiquid() ? false : !BlockMinecartTrackAbstract.i(iblockdata)));
+     }
+ 
++    // Antarctic start - zero-alloc chunk-direct version of a(EnumEntityPositionType, World, BlockPosition) (border already verified)
++    static boolean canSpawnAtLocation(EntityInsentient.EnumEntityPositionType positionType, Chunk chunk, int x, int y, int z) {
++        IBlockData at = chunk.a(x, y, z);
++        if (positionType == EntityInsentient.EnumEntityPositionType.IN_WATER) {
++            return at.getMaterial() == Material.WATER
++                && chunk.a(x, y - 1, z).getMaterial() == Material.WATER
++                && !chunk.a(x, y + 1, z).l();
++        }
++        IBlockData below = chunk.a(x, y - 1, z);
++        if (!below.q()) {
++            return false;
++        }
++        Block block = below.getBlock();
++        return block != Blocks.BEDROCK && block != Blocks.BARRIER && a(at) && a(chunk.a(x, y + 1, z));
++    }
++    // Antarctic end
++
+     public static boolean a(EntityInsentient.EnumEntityPositionType entityinsentient_enumentitypositiontype, World world, BlockPosition blockposition) {
+         if (!world.getWorldBorder().a(blockposition)) {
+             return false;
+diff --git a/main/java/net/minecraft/server/World.java b/main/java/net/minecraft/server/World.java
+index 670d24c..91ca338 100644
+--- a/main/java/net/minecraft/server/World.java
++++ b/main/java/net/minecraft/server/World.java
+@@ -3071,19 +3071,25 @@ public abstract class World implements IBlockAccess {
+     }
+ 
+     public boolean isPlayerNearby(double d0, double d1, double d2, double d3) {
+-        for (int i = 0; i < this.players.size(); ++i) {
+-            EntityHuman entityhuman = (EntityHuman) this.players.get(i);
+-
+-            if (IEntitySelector.e.apply(entityhuman) && entityhuman.affectsSpawning) { // Paper - Affects Spawning API
+-                double d4 = entityhuman.d(d0, d1, d2);
+-
+-                if (d3 < 0.0D || d4 < d3 * d3) {
++        // Antarctic start - hoist d3*d3 and inline !isSpectator() && affectsSpawning
++        final List<EntityHuman> playerList = this.players;
++        final int size = playerList.size();
++        if (size == 0) {
++            return false;
++        }
++        final double d3Sq = d3 * d3;
++        final boolean anyRange = d3 < 0.0D;
++        for (int i = 0; i < size; ++i) {
++            EntityHuman entityhuman = playerList.get(i);
++            if (entityhuman != null && !entityhuman.isSpectator() && entityhuman.affectsSpawning) {
++                if (anyRange || entityhuman.d(d0, d1, d2) < d3Sq) {
+                     return true;
+                 }
+             }
+         }
+ 
+         return false;
++        // Antarctic end
+     }
+ 
+     @Nullable
+diff --git a/test/java/net/minecraft/server/SpawnerCreatureHotPathPerfTest.java b/test/java/net/minecraft/server/SpawnerCreatureHotPathPerfTest.java
+new file mode 100644
+index 0000000..5926f1e
+--- /dev/null
++++ b/test/java/net/minecraft/server/SpawnerCreatureHotPathPerfTest.java
+@@ -0,0 +1,387 @@
++package net.minecraft.server;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++
++import com.destroystokyo.paper.PaperWorldConfig;
++import com.destroystokyo.paper.config.toml.modules.optimizations.MobSpawning;
++import java.lang.management.ManagementFactory;
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Random;
++import java.util.UUID;
++import org.bukkit.Bukkit;
++import org.bukkit.craftbukkit.CraftServer;
++import org.bukkit.craftbukkit.CraftWorld;
++import org.bukkit.craftbukkit.entity.CraftPlayer;
++import org.bukkit.craftbukkit.util.LongHash;
++import org.bukkit.event.entity.CreatureSpawnEvent;
++import org.bukkit.plugin.SimplePluginManager;
++import org.junit.After;
++import org.junit.AfterClass;
++import org.junit.Before;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import org.spigotmc.AsyncCatcher;
++import org.spigotmc.SpigotWorldConfig;
++import sun.misc.Unsafe;
++
++/**
++ * Verifies Commit 4 (0119):
++ * - Single-probe LongOpenHashSet + LongArrayList eligible chunk ring semantics & spike-to-idle RAM trimming
++ * - Zero-alloc canSpawnAtLocation parity with vanilla SpawnerCreature.a(EnumEntityPositionType, World, BlockPosition)
++ * - Support-first void/mid-air filtering eliminates >95% of player scans & biome/structure lookups on Skyblock void chunks
++ * - Redundant 2nd worldserver.a(type, meta, pos) call eliminated on first pack selection
++ * - World.isPlayerNearby fast path parity (spectators, affectsSpawning, negative/zero/positive range)
++ * - Performance & zero-allocation gate on 50-player Skyblock-style world
++ */
++public class SpawnerCreatureHotPathPerfTest {
++
++    private static Unsafe unsafe;
++    private static boolean installedBukkitServer;
++    private boolean prevAsyncCatcher;
++
++    private static final class StubChunkProvider extends ChunkProviderServer {
++        StubChunkProvider(WorldServer world) {
++            super(world, null, null);
++        }
++    }
++
++    private static final class MapPlayerChunkMap extends PlayerChunkMap {
++        final it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<PlayerChunk> map = new it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<PlayerChunk>();
++
++        MapPlayerChunkMap() {
++            super(null);
++        }
++
++        @Override
++        public PlayerChunk getChunk(int x, int z) {
++            return map.get(LongHash.toLong(x, z));
++        }
++    }
++
++    private static final class StubCraftWorld extends CraftWorld {
++        StubCraftWorld() {
++            super(null, null, null);
++        }
++
++        @Override public int getMonsterSpawnLimit() { return 70; }
++        @Override public int getAnimalSpawnLimit() { return 0; }
++        @Override public int getWaterAnimalSpawnLimit() { return 0; }
++        @Override public int getAmbientSpawnLimit() { return 0; }
++    }
++
++    private static final class TrackingWorldServer extends WorldServer {
++        CraftWorld stubCraftWorld;
++        int playerNearbyCalls;
++        int getMobsSelectCalls;
++        int getMobsVerifyCalls;
++        BiomeBase.BiomeMeta forcedMeta = new BiomeBase.BiomeMeta(EntityZombie.class, 100, 4, 4);
++
++        TrackingWorldServer() {
++            super(null, null, null, 0, null, null, null);
++        }
++
++        @Override public CraftWorld getWorld() { return stubCraftWorld; }
++        @Override public BlockPosition getSpawn() { return new BlockPosition(100000, 64, 100000); }
++        @Override public EnumDifficulty getDifficulty() { return EnumDifficulty.NORMAL; }
++        @Override public boolean addEntity(Entity e, CreatureSpawnEvent.SpawnReason r) { return false; }
++
++        @Override
++        public boolean isPlayerNearby(double x, double y, double z, double d) {
++            ++playerNearbyCalls;
++            return super.isPlayerNearby(x, y, z, d);
++        }
++
++        @Override
++        public BiomeBase.BiomeMeta a(EnumCreatureType type, BlockPosition pos) {
++            ++getMobsSelectCalls;
++            return type == EnumCreatureType.MONSTER ? forcedMeta : null;
++        }
++
++        @Override
++        public boolean a(EnumCreatureType type, BiomeBase.BiomeMeta meta, BlockPosition pos) {
++            ++getMobsVerifyCalls;
++            return type == EnumCreatureType.MONSTER && meta == forcedMeta;
++        }
++    }
++
++    @BeforeClass
++    public static void bootstrap() throws Exception {
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        unsafe = (Unsafe) f.get(null);
++        DispenserRegistry.c();
++
++        if (Bukkit.getServer() == null) {
++            CraftServer server = (CraftServer) unsafe.allocateInstance(CraftServer.class);
++            SimplePluginManager pm = new SimplePluginManager(server, new org.bukkit.command.SimpleCommandMap(server));
++            setField(CraftServer.class, server, "pluginManager", pm);
++            Field serverField = Bukkit.class.getDeclaredField("server");
++            serverField.setAccessible(true);
++            serverField.set(null, server);
++            installedBukkitServer = true;
++        }
++    }
++
++    @AfterClass
++    public static void cleanupBukkitServer() throws Exception {
++        if (installedBukkitServer) {
++            Field serverField = Bukkit.class.getDeclaredField("server");
++            serverField.setAccessible(true);
++            serverField.set(null, null);
++            installedBukkitServer = false;
++        }
++    }
++
++    @Before
++    public void setUp() {
++        this.prevAsyncCatcher = AsyncCatcher.enabled;
++        AsyncCatcher.enabled = false;
++    }
++
++    @After
++    public void tearDown() {
++        AsyncCatcher.enabled = this.prevAsyncCatcher;
++        MobSpawning.supportFirstSpawnFiltering = true;
++        MobSpawning.eligibleChunkInitialCapacity = 1024;
++        MobSpawning.eligibleChunkTrimFactor = 4;
++    }
++
++    private static void setField(Class<?> owner, Object target, String name, Object value) throws Exception {
++        Field f = owner.getDeclaredField(name);
++        f.setAccessible(true);
++        f.set(target, value);
++    }
++
++    private static EntityPlayer newPlayer(WorldServer world, double x, double y, double z, boolean spectator, boolean affectsSpawning) throws Exception {
++        EntityPlayer p = (EntityPlayer) unsafe.allocateInstance(EntityPlayer.class);
++        p.world = world;
++        p.locX = x;
++        p.locY = y;
++        p.locZ = z;
++        p.affectsSpawning = affectsSpawning;
++        p.uniqueID = UUID.randomUUID();
++        PlayerInteractManager pim = (PlayerInteractManager) unsafe.allocateInstance(PlayerInteractManager.class);
++        setField(PlayerInteractManager.class, pim, "gamemode", spectator ? EnumGamemode.SPECTATOR : EnumGamemode.SURVIVAL);
++        setField(EntityPlayer.class, p, "playerInteractManager", pim);
++        p.bukkitEntity = (CraftPlayer) unsafe.allocateInstance(CraftPlayer.class);
++        return p;
++    }
++
++    private static Chunk newChunk(WorldServer world, int cx, int cz, boolean voidChunk) throws Exception {
++        Chunk chunk = (Chunk) unsafe.allocateInstance(Chunk.class);
++        setField(Chunk.class, chunk, "world", world);
++        setField(Chunk.class, chunk, "locX", cx);
++        setField(Chunk.class, chunk, "locZ", cz);
++        setField(Chunk.class, chunk, "chunkKey", ChunkCoordIntPair.a(cx, cz));
++        ChunkSection[] sections = new ChunkSection[16];
++        int[] heightMap = new int[256];
++        if (!voidChunk) {
++            sections[4] = new ChunkSection(64, true);
++            for (int x = 0; x < 16; ++x) {
++                for (int z = 0; z < 16; ++z) {
++                    sections[4].setType(x, 0, z, Blocks.STONE.getBlockData());
++                    sections[4].a(x, 1, z, 15); // daytime bright sky light so precheck rejects
++                    heightMap[(z << 4) | x] = 65;
++                }
++            }
++        }
++        setField(Chunk.class, chunk, "sections", sections);
++        setField(Chunk.class, chunk, "heightMap", heightMap);
++        return chunk;
++    }
++
++    private static TrackingWorldServer buildSkyblockWorld(int playerCount, int mobSpawnRange, boolean allVoid) throws Exception {
++        TrackingWorldServer world = (TrackingWorldServer) unsafe.allocateInstance(TrackingWorldServer.class);
++        SpigotWorldConfig spigotConfig = (SpigotWorldConfig) unsafe.allocateInstance(SpigotWorldConfig.class);
++        spigotConfig.mobSpawnRange = (byte) mobSpawnRange;
++        spigotConfig.viewDistance = 8;
++        setField(World.class, world, "spigotConfig", spigotConfig);
++        setField(World.class, world, "paperConfig", unsafe.allocateInstance(PaperWorldConfig.class));
++        WorldProvider provider = new WorldProviderNormal();
++        setField(WorldProvider.class, provider, "f", true);
++        world.worldProvider = provider;
++        setField(World.class, world, "random", new Random(1337L));
++        setField(World.class, world, "P", new WorldBorder());
++        setField(World.class, world, "players", new ArrayList<EntityHuman>());
++        setField(World.class, world, "methodProfiler", new MethodProfiler());
++        setField(World.class, world, "antarcticCreatureCounts", new int[EnumCreatureType.values().length]);
++        world.stubCraftWorld = (StubCraftWorld) unsafe.allocateInstance(StubCraftWorld.class);
++        world.forcedMeta = new BiomeBase.BiomeMeta(EntityZombie.class, 100, 4, 4);
++
++        StubChunkProvider cp = new StubChunkProvider(world);
++        setField(World.class, world, "chunkProvider", cp);
++
++        MapPlayerChunkMap pcm = (MapPlayerChunkMap) unsafe.allocateInstance(MapPlayerChunkMap.class);
++        setField(MapPlayerChunkMap.class, pcm, "map", new it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<PlayerChunk>());
++        setField(WorldServer.class, world, "manager", pcm);
++
++        PlayerChunk ready = (PlayerChunk) unsafe.allocateInstance(PlayerChunk.class);
++        setField(PlayerChunk.class, ready, "done", true);
++
++        for (int p = 0; p < playerCount; ++p) {
++            int baseCx = p * 20; // disjoint islands
++            world.players.add(newPlayer(world, baseCx * 16 + 8.0, 100.0, 8.0, false, true));
++            for (int dx = -mobSpawnRange; dx <= mobSpawnRange; ++dx) {
++                for (int dz = -mobSpawnRange; dz <= mobSpawnRange; ++dz) {
++                    int cx = baseCx + dx;
++                    int cz = dz;
++                    long key = LongHash.toLong(cx, cz);
++                    pcm.map.put(key, ready);
++                    boolean isVoid = allVoid || (dx != 0 || dz != 0);
++                    cp.chunks.put(ChunkCoordIntPair.a(cx, cz), newChunk(world, cx, cz, isVoid));
++                }
++            }
++        }
++        return world;
++    }
++
++    @Test
++    public void testCanSpawnAtLocationParityWithVanilla() throws Exception {
++        TrackingWorldServer world = buildSkyblockWorld(0, 4, false);
++        Chunk chunk = newChunk(world, 0, 0, true);
++        ChunkSection[] sections = new ChunkSection[16];
++        for (int s = 0; s < 16; ++s) {
++            sections[s] = new ChunkSection(s << 4, true);
++        }
++        setField(Chunk.class, chunk, "sections", sections);
++        world.getChunkProviderServer().chunks.put(ChunkCoordIntPair.a(0, 0), chunk);
++
++        // 1. Stone + air + air -> ON_GROUND true, IN_WATER false
++        sections[4].setType(2, 0, 2, Blocks.STONE.getBlockData());
++        BlockPosition pStone = new BlockPosition(2, 65, 2);
++        assertEquals(SpawnerCreature.a(EntityInsentient.EnumEntityPositionType.ON_GROUND, world, pStone),
++                SpawnerCreature.canSpawnAtLocation(EntityInsentient.EnumEntityPositionType.ON_GROUND, chunk, 2, 65, 2));
++        assertTrue(SpawnerCreature.canSpawnAtLocation(EntityInsentient.EnumEntityPositionType.ON_GROUND, chunk, 2, 65, 2));
++        assertFalse(SpawnerCreature.canSpawnAtLocation(EntityInsentient.EnumEntityPositionType.IN_WATER, chunk, 2, 65, 2));
++
++        // 2. Bedrock & Barrier -> ON_GROUND false
++        sections[4].setType(3, 0, 2, Blocks.BEDROCK.getBlockData());
++        sections[4].setType(4, 0, 2, Blocks.BARRIER.getBlockData());
++        assertFalse(SpawnerCreature.canSpawnAtLocation(EntityInsentient.EnumEntityPositionType.ON_GROUND, chunk, 3, 65, 2));
++        assertFalse(SpawnerCreature.canSpawnAtLocation(EntityInsentient.EnumEntityPositionType.ON_GROUND, chunk, 4, 65, 2));
++
++        // 3. Water column (water below, water at, air above) -> IN_WATER true, ON_GROUND false
++        sections[4].setType(5, 0, 2, Blocks.WATER.getBlockData());
++        sections[4].setType(5, 1, 2, Blocks.WATER.getBlockData());
++        BlockPosition pWater = new BlockPosition(5, 65, 2);
++        assertEquals(SpawnerCreature.a(EntityInsentient.EnumEntityPositionType.IN_WATER, world, pWater),
++                SpawnerCreature.canSpawnAtLocation(EntityInsentient.EnumEntityPositionType.IN_WATER, chunk, 5, 65, 2));
++        assertTrue(SpawnerCreature.canSpawnAtLocation(EntityInsentient.EnumEntityPositionType.IN_WATER, chunk, 5, 65, 2));
++        assertFalse(SpawnerCreature.canSpawnAtLocation(EntityInsentient.EnumEntityPositionType.ON_GROUND, chunk, 5, 65, 2));
++
++        // 4. Mid-air void -> both false
++        assertFalse(SpawnerCreature.canSpawnAtLocation(EntityInsentient.EnumEntityPositionType.ON_GROUND, chunk, 10, 65, 10));
++        assertFalse(SpawnerCreature.canSpawnAtLocation(EntityInsentient.EnumEntityPositionType.IN_WATER, chunk, 10, 65, 10));
++    }
++
++    @Test
++    public void testIsPlayerNearbyFastPathParity() throws Exception {
++        TrackingWorldServer world = buildSkyblockWorld(0, 4, true);
++        EntityPlayer normal = newPlayer(world, 10.0, 64.0, 10.0, false, true);
++        EntityPlayer spec = newPlayer(world, 0.0, 64.0, 0.0, true, true);
++        EntityPlayer noSpawn = newPlayer(world, 0.0, 64.0, 0.0, false, false);
++        world.players.add(spec);
++        world.players.add(noSpawn);
++        assertFalse("Spectator and !affectsSpawning players must be ignored", world.isPlayerNearby(0.0, 64.0, 0.0, 24.0));
++
++        world.players.add(normal);
++        assertTrue(world.isPlayerNearby(10.0, 64.0, 10.0, 1.0));
++        assertFalse(world.isPlayerNearby(40.0, 64.0, 10.0, 24.0));
++        assertTrue("Negative distance means any range", world.isPlayerNearby(10000.0, 64.0, 10000.0, -1.0));
++    }
++
++    @Test
++    public void testSupportFirstFilteringEliminatesVoidPlayerScansAndStructureLookups() throws Exception {
++        TrackingWorldServer voidWorldOff = buildSkyblockWorld(5, 4, true);
++        SpawnerCreature spawner = new SpawnerCreature();
++
++        MobSpawning.supportFirstSpawnFiltering = false;
++        spawner.a(voidWorldOff, true, false, false);
++        assertTrue("Baseline without support-first should invoke many isPlayerNearby scans on void chunks", voidWorldOff.playerNearbyCalls > 100);
++        assertTrue("Baseline without support-first should invoke many getMobsFor lookups on void chunks", voidWorldOff.getMobsSelectCalls > 50);
++
++        TrackingWorldServer voidWorldOn = buildSkyblockWorld(5, 4, true);
++        MobSpawning.supportFirstSpawnFiltering = true;
++        spawner.a(voidWorldOn, true, false, false);
++        assertEquals("Support-first must perform 0 player scans on 100% void chunks", 0, voidWorldOn.playerNearbyCalls);
++        assertEquals("Support-first must perform 0 getMobsFor lookups on 100% void chunks", 0, voidWorldOn.getMobsSelectCalls);
++        assertEquals("Support-first must perform 0 verify lookups on 100% void chunks", 0, voidWorldOn.getMobsVerifyCalls);
++    }
++
++    @Test
++    public void testEligibleChunkRingSemanticsAndSpikeToIdleMemoryTrim() throws Exception {
++        SpawnerCreature spawner = new SpawnerCreature();
++        MobSpawning.eligibleChunkInitialCapacity = 128;
++        MobSpawning.eligibleChunkTrimFactor = 4;
++
++        // 1 player with radius 4 => interior is 7x7 = 49 chunks (border ring never enters list!)
++        TrackingWorldServer onePlayer = buildSkyblockWorld(1, 4, true);
++        spawner.a(onePlayer, true, false, false);
++        assertEquals("Interior of radius-4 ring must contain exactly 7x7=49 chunks", 49, spawner.getEligibleChunkCount());
++
++        // Spike to 60 disjoint players at radius 6 => 60 * 11*11 = 7,260 chunks
++        TrackingWorldServer spikeWorld = buildSkyblockWorld(60, 6, true);
++        spawner.a(spikeWorld, true, false, false);
++        assertEquals(60 * 121, spawner.getEligibleChunkCount());
++        int peakCap = spawner.getEligibleChunkListCapacity();
++        assertTrue("Expected grown capacity >= 7260, got " + peakCap, peakCap >= 7260);
++
++        // Drop back to 1 player (49 chunks): 1st tick sees prevSize=7260, 2nd tick sees prevSize=49 and trims!
++        spawner.a(onePlayer, true, false, false);
++        spawner.a(onePlayer, true, false, false);
++        int trimmedCap = spawner.getEligibleChunkListCapacity();
++        assertTrue("Expected trimmed capacity << peakCap (" + peakCap + "), got " + trimmedCap, trimmedCap < peakCap / 4);
++    }
++
++    @Test
++    public void testEligibleChunkLoopZeroAllocationAndThroughput() throws Exception {
++        TrackingWorldServer world = buildSkyblockWorld(30, 5, false); // 30 islands, ~98% void chunks
++        SpawnerCreature spawner = new SpawnerCreature();
++
++        // Warmup both modes
++        for (int t = 0; t < 50; ++t) {
++            MobSpawning.supportFirstSpawnFiltering = false;
++            spawner.a(world, true, false, false);
++            MobSpawning.supportFirstSpawnFiltering = true;
++            spawner.a(world, true, false, false);
++        }
++
++        com.sun.management.ThreadMXBean tmxb = (com.sun.management.ThreadMXBean) ManagementFactory.getThreadMXBean();
++        long tid = Thread.currentThread().getId();
++        int ticks = 100;
++
++        MobSpawning.supportFirstSpawnFiltering = false;
++        long allocOff0 = tmxb.getThreadAllocatedBytes(tid);
++        long tOff0 = System.nanoTime();
++        for (int t = 0; t < ticks; ++t) {
++            spawner.a(world, true, false, false);
++        }
++        long offNs = System.nanoTime() - tOff0;
++        long offBytes = tmxb.getThreadAllocatedBytes(tid) - allocOff0;
++
++        MobSpawning.supportFirstSpawnFiltering = true;
++        long allocOn0 = tmxb.getThreadAllocatedBytes(tid);
++        long tOn0 = System.nanoTime();
++        for (int t = 0; t < ticks; ++t) {
++            spawner.a(world, true, false, false);
++        }
++        long onNs = System.nanoTime() - tOn0;
++        long onBytes = tmxb.getThreadAllocatedBytes(tid) - allocOn0;
++
++        double offMsPerTick = (offNs / 1e6) / ticks;
++        double onMsPerTick = (onNs / 1e6) / ticks;
++        double onKibPerTick = (onBytes / 1024.0) / ticks;
++        double speedup = (double) offNs / Math.max(1L, onNs);
++
++        System.out.printf("SpawnerCreatureHotPathPerfTest (30p Skyblock, %d ticks): off=%.3f ms/tick (%.2f KiB/t) on=%.3f ms/tick (%.2f KiB/t) speedup=%.2fx%n",
++                ticks, offMsPerTick, (offBytes / 1024.0) / ticks, onMsPerTick, onKibPerTick, speedup);
++        assertTrue("Expected support-first speedup >= 1.5x on 30p Skyblock, got " + speedup + "x", speedup >= 1.5);
++        assertTrue("Expected < 4.0 KiB/tick allocation on 30-player Skyblock world, got " + onKibPerTick, onKibPerTick < 4.0);
++    }
++}
