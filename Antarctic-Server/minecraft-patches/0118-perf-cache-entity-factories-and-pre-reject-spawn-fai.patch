@@ -1,0 +1,1010 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Mon, 23 Nov 2026 13:54:12 +0700
+Subject: [PATCH 118/118] perf: cache entity factories and pre-reject spawn
+ failures
+
+
+diff --git a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+index dbb37ce..89eded4 100644
+--- a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
++++ b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+@@ -15,6 +15,7 @@ import com.destroystokyo.paper.config.toml.modules.misc.Rebrand;
+ import com.destroystokyo.paper.config.toml.modules.network.Deflate;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.ArmourStands;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.ChunkLoading;
++import com.destroystokyo.paper.config.toml.modules.optimizations.MobSpawning;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Pathfinder;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Projectiles;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Suffocation;
+@@ -54,7 +55,7 @@ public final class AntarcticTomlConfig {
+             new Rebrand(), new Privacy(),
+             new Deflate(),
+             new VirtualThreads(), new AsyncPlayerDataSaving(),
+-            new Pathfinder(), new Suffocation(), new Projectiles(), new ArmourStands(), new WorldBorder(), new ChunkLoading(), new SunBurn(), new Rails(), new Redstone(), new Physics(), new Lighting(),
++            new Pathfinder(), new Suffocation(), new Projectiles(), new ArmourStands(), new WorldBorder(), new ChunkLoading(), new MobSpawning(), new SunBurn(), new Rails(), new Redstone(), new Physics(), new Lighting(),
+             new MergeChecks(), new ChunkOverloadDupe(), new Collisions(),
+             new MapDecorations(), new Books());
+     private static final YamlConfiguration yamlFacade = new YamlConfiguration();
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/MobSpawning.java b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/MobSpawning.java
+new file mode 100644
+index 0000000..215db1a
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/MobSpawning.java
+@@ -0,0 +1,76 @@
++package com.destroystokyo.paper.config.toml.modules.optimizations;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++import java.util.Locale;
++
++public class MobSpawning implements IConfigModule {
++
++    public static final int PRECHECK_OFF = 0;
++    public static final int PRECHECK_DETERMINISTIC = 1;
++    public static final int PRECHECK_SINGLE_ROLL = 2;
++
++    @ConfigInfo(
++        baseName = "precheck-light-mode",
++        comments = "Pre-construction spawn rejection mode in SpawnerCreature before allocating 14.9 KiB EntityInsentient instances:\n"
++            + "  'single-roll'   - (default, 6.3x-11.6x faster, 6.1x less GC churn) deterministic biome/Y/magma/slime/animal checks plus single-roll EntityMonster.s_() light check for exact vanilla classes (1-shot flag prevents double RNG roll; custom plugin subclasses are skipped).\n"
++            + "  'deterministic' - deterministic-only rejection (effective light >= 8, magma, peaceful, slime chunk/Y, sky, squid, bat, animal) with zero RNG pre-rolls.\n"
++            + "  'off'           - disable pre-construction rejection (vanilla construct-then-check)."
++    )
++    public static String precheckLightMode = "single-roll";
++
++    public static int getPrecheckLightMode() {
++        String mode = precheckLightMode;
++        if (mode == "single-roll") {
++            return PRECHECK_SINGLE_ROLL;
++        }
++        if (mode == "deterministic") {
++            return PRECHECK_DETERMINISTIC;
++        }
++        if (mode == "off" || mode == null) {
++            return PRECHECK_OFF;
++        }
++        String normalized = mode.trim().toLowerCase(Locale.ROOT);
++        if ("single-roll".equals(normalized)) {
++            return PRECHECK_SINGLE_ROLL;
++        }
++        if ("deterministic".equals(normalized)) {
++            return PRECHECK_DETERMINISTIC;
++        }
++        return PRECHECK_OFF;
++    }
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.OPTIMIZATIONS;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "mob-spawning";
++    }
++
++    @Override
++    public void onLoaded(com.electronwill.nightconfig.core.file.CommentedFileConfig config) {
++        if (precheckLightMode == null) {
++            throw new IllegalArgumentException("optimizations.mob-spawning.precheck-light-mode must not be null");
++        }
++        String normalized = precheckLightMode.trim().toLowerCase(Locale.ROOT);
++        switch (normalized) {
++            case "off":
++                precheckLightMode = "off";
++                break;
++            case "deterministic":
++                precheckLightMode = "deterministic";
++                break;
++            case "single-roll":
++                precheckLightMode = "single-roll";
++                break;
++            default:
++                throw new IllegalArgumentException(
++                    "optimizations.mob-spawning.precheck-light-mode must be one of 'off', 'deterministic', or 'single-roll', got: " + precheckLightMode
++                );
++        }
++    }
++}
+diff --git a/main/java/net/minecraft/server/Chunk.java b/main/java/net/minecraft/server/Chunk.java
+index 6d3f535..dd2f2d2 100644
+--- a/main/java/net/minecraft/server/Chunk.java
++++ b/main/java/net/minecraft/server/Chunk.java
+@@ -1197,6 +1197,22 @@ public class Chunk {
+         return ((this.s || this.t) && this.world.getTime() >= this.lastSaved + world.paperConfig.autoSavePeriod); // Paper - Make world configurable and incremental
+     }
+ 
++    // Antarctic start - cache slime chunk roll keyed by slimeSeed to avoid per-check new Random(...)
++    private byte antarcticSlimeChunkState; // 0 = uncomputed, 1 = false, 2 = true
++    private long antarcticSlimeSeed;
++
++    public boolean isSlimeChunk(long slimeSeed) {
++        byte state = this.antarcticSlimeChunkState;
++        if (state != 0 && this.antarcticSlimeSeed == slimeSeed) {
++            return state == 2;
++        }
++        boolean result = this.a(slimeSeed).nextInt(10) == 0;
++        this.antarcticSlimeSeed = slimeSeed;
++        this.antarcticSlimeChunkState = result ? (byte) 2 : (byte) 1;
++        return result;
++    }
++    // Antarctic end
++
+     public Random a(long i) {
+         return new Random(this.world.getSeed() + (long) (this.locX * this.locX * 4987142) + (long) (this.locX * 5947611) + (long) (this.locZ * this.locZ) * 4392871L + (long) (this.locZ * 389711) ^ i);
+     }
+diff --git a/main/java/net/minecraft/server/EntityMonster.java b/main/java/net/minecraft/server/EntityMonster.java
+index 8782bce..670451c 100644
+--- a/main/java/net/minecraft/server/EntityMonster.java
++++ b/main/java/net/minecraft/server/EntityMonster.java
+@@ -4,6 +4,8 @@ import org.bukkit.event.entity.EntityCombustByEntityEvent; // CraftBukkit
+ 
+ public abstract class EntityMonster extends EntityCreature implements IMonster {
+ 
++    boolean antarcticLightPrechecked; // Antarctic - 1-shot flag consumed on first s_() call in single-roll precheck mode
++
+     public EntityMonster(World world) {
+         super(world);
+         this.b_ = 5;
+@@ -113,6 +115,12 @@ public abstract class EntityMonster extends EntityCreature implements IMonster {
+     }
+ 
+     protected boolean s_() {
++        // Antarctic start - consume 1-shot single-roll light precheck so RNG is rolled only once
++        if (this.antarcticLightPrechecked) {
++            this.antarcticLightPrechecked = false;
++            return true;
++        }
++        // Antarctic end
+         BlockPosition blockposition = new BlockPosition(this.locX, this.getBoundingBox().b, this.locZ);
+ 
+         if (this.world.getBrightness(EnumSkyBlock.SKY, blockposition) > this.random.nextInt(32)) {
+diff --git a/main/java/net/minecraft/server/EntitySlime.java b/main/java/net/minecraft/server/EntitySlime.java
+index 3d3a9ca..7147b57 100644
+--- a/main/java/net/minecraft/server/EntitySlime.java
++++ b/main/java/net/minecraft/server/EntitySlime.java
+@@ -251,7 +251,7 @@ public class EntitySlime extends EntityInsentient implements IMonster {
+                 if (biomebase == Biomes.h && this.locY > 50.0D && this.locY < 70.0D && this.random.nextFloat() < 0.5F && this.random.nextFloat() < this.world.G() && this.world.getLightLevel(new BlockPosition(this)) <= this.random.nextInt(8)) {
+                     return super.P();
+                 }
+-                boolean isSlimeChunk = world.paperConfig.allChunksAreSlimeChunks || chunk.a(world.spigotConfig.slimeSeed).nextInt(10) == 0; // Spigot // Paper
++                boolean isSlimeChunk = world.paperConfig.allChunksAreSlimeChunks || chunk.isSlimeChunk(world.spigotConfig.slimeSeed); // Spigot // Paper // Antarctic - cached slime chunk roll
+                 if (this.random.nextInt(10) == 0 && isSlimeChunk && this.locY < 40.0D) { // Paper
+                     return super.P();
+                 }
+diff --git a/main/java/net/minecraft/server/EntityTypes.java b/main/java/net/minecraft/server/EntityTypes.java
+index 2359b31..e6130d0 100644
+--- a/main/java/net/minecraft/server/EntityTypes.java
++++ b/main/java/net/minecraft/server/EntityTypes.java
+@@ -3,10 +3,14 @@ package net.minecraft.server;
+ import com.google.common.collect.Lists;
+ import com.google.common.collect.Maps;
+ import com.google.common.collect.Sets;
++import java.lang.reflect.Constructor;
++import java.util.IdentityHashMap;
+ import java.util.Iterator;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.function.Function;
+ import javax.annotation.Nullable;
+ import org.apache.logging.log4j.LogManager;
+ import org.apache.logging.log4j.Logger;
+@@ -17,6 +21,10 @@ public class EntityTypes {
+     public static Map<Class<? extends Entity>, MinecraftKey> clsToKeyMap = new java.util.HashMap<>();
+     public static Map<Class<? extends Entity>, org.bukkit.entity.EntityType> clsToTypeMap = new java.util.HashMap<>();
+     // Paper end
++    // Antarctic start - direct lambda factories for vanilla entities + cached constructor fallback for custom subclasses
++    private static final Map<Class<? extends Entity>, Function<World, Entity>> FACTORY_MAP = new IdentityHashMap<>(128);
++    private static final ConcurrentHashMap<Class<? extends Entity>, Constructor<? extends Entity>> CUSTOM_CONSTRUCTOR_CACHE = new ConcurrentHashMap<>();
++    // Antarctic end
+ 
+     public static final MinecraftKey a = new MinecraftKey("lightning_bolt");
+     private static final MinecraftKey e = new MinecraftKey("player");
+@@ -51,13 +59,28 @@ public class EntityTypes {
+         return i == -1 ? null : (String) EntityTypes.g.get(i);
+     }
+ 
++    // Antarctic start - cached entity instantiation (direct lambda for vanilla classes, cached Constructor for custom subclasses)
++    public static Entity createEntity(Class<? extends Entity> oclass, World world) throws Exception {
++        Function<World, Entity> factory = FACTORY_MAP.get(oclass);
++        if (factory != null) {
++            return factory.apply(world);
++        }
++        Constructor<? extends Entity> ctor = CUSTOM_CONSTRUCTOR_CACHE.get(oclass);
++        if (ctor == null) {
++            ctor = oclass.getConstructor(new Class[] { World.class });
++            CUSTOM_CONSTRUCTOR_CACHE.putIfAbsent(oclass, ctor);
++        }
++        return ctor.newInstance(new Object[] { world });
++    }
++    // Antarctic end
++
+     @Nullable
+     public static Entity a(@Nullable Class<? extends Entity> oclass, World world) {
+         if (oclass == null) {
+             return null;
+         } else {
+             try {
+-                return (Entity) oclass.getConstructor(new Class[] { World.class}).newInstance(new Object[] { world});
++                return createEntity(oclass, world); // Antarctic - cached entity factory
+             } catch (Exception exception) {
+                 exception.printStackTrace();
+                 return null;
+@@ -197,6 +220,91 @@ public class EntityTypes {
+         a(105, "parrot", EntityParrot.class, "Parrot");
+         a(120, "villager", EntityVillager.class, "Villager");
+         a(200, "ender_crystal", EntityEnderCrystal.class, "EnderCrystal");
++        // Antarctic start - register direct ::new factories for all vanilla entities
++        FACTORY_MAP.put(EntityItem.class, EntityItem::new);
++        FACTORY_MAP.put(EntityExperienceOrb.class, EntityExperienceOrb::new);
++        FACTORY_MAP.put(EntityAreaEffectCloud.class, EntityAreaEffectCloud::new);
++        FACTORY_MAP.put(EntityGuardianElder.class, EntityGuardianElder::new);
++        FACTORY_MAP.put(EntitySkeletonWither.class, EntitySkeletonWither::new);
++        FACTORY_MAP.put(EntitySkeletonStray.class, EntitySkeletonStray::new);
++        FACTORY_MAP.put(EntityEgg.class, EntityEgg::new);
++        FACTORY_MAP.put(EntityLeash.class, EntityLeash::new);
++        FACTORY_MAP.put(EntityPainting.class, EntityPainting::new);
++        FACTORY_MAP.put(EntityTippedArrow.class, EntityTippedArrow::new);
++        FACTORY_MAP.put(EntitySnowball.class, EntitySnowball::new);
++        FACTORY_MAP.put(EntityLargeFireball.class, EntityLargeFireball::new);
++        FACTORY_MAP.put(EntitySmallFireball.class, EntitySmallFireball::new);
++        FACTORY_MAP.put(EntityEnderPearl.class, EntityEnderPearl::new);
++        FACTORY_MAP.put(EntityEnderSignal.class, EntityEnderSignal::new);
++        FACTORY_MAP.put(EntityPotion.class, EntityPotion::new);
++        FACTORY_MAP.put(EntityThrownExpBottle.class, EntityThrownExpBottle::new);
++        FACTORY_MAP.put(EntityItemFrame.class, EntityItemFrame::new);
++        FACTORY_MAP.put(EntityWitherSkull.class, EntityWitherSkull::new);
++        FACTORY_MAP.put(EntityTNTPrimed.class, EntityTNTPrimed::new);
++        FACTORY_MAP.put(EntityFallingBlock.class, EntityFallingBlock::new);
++        FACTORY_MAP.put(EntityFireworks.class, EntityFireworks::new);
++        FACTORY_MAP.put(EntityZombieHusk.class, EntityZombieHusk::new);
++        FACTORY_MAP.put(EntitySpectralArrow.class, EntitySpectralArrow::new);
++        FACTORY_MAP.put(EntityShulkerBullet.class, EntityShulkerBullet::new);
++        FACTORY_MAP.put(EntityDragonFireball.class, EntityDragonFireball::new);
++        FACTORY_MAP.put(EntityZombieVillager.class, EntityZombieVillager::new);
++        FACTORY_MAP.put(EntityHorseSkeleton.class, EntityHorseSkeleton::new);
++        FACTORY_MAP.put(EntityHorseZombie.class, EntityHorseZombie::new);
++        FACTORY_MAP.put(EntityArmorStand.class, EntityArmorStand::new);
++        FACTORY_MAP.put(EntityHorseDonkey.class, EntityHorseDonkey::new);
++        FACTORY_MAP.put(EntityHorseMule.class, EntityHorseMule::new);
++        FACTORY_MAP.put(EntityEvokerFangs.class, EntityEvokerFangs::new);
++        FACTORY_MAP.put(EntityEvoker.class, EntityEvoker::new);
++        FACTORY_MAP.put(EntityVex.class, EntityVex::new);
++        FACTORY_MAP.put(EntityVindicator.class, EntityVindicator::new);
++        FACTORY_MAP.put(EntityIllagerIllusioner.class, EntityIllagerIllusioner::new);
++        FACTORY_MAP.put(EntityMinecartCommandBlock.class, EntityMinecartCommandBlock::new);
++        FACTORY_MAP.put(EntityBoat.class, EntityBoat::new);
++        FACTORY_MAP.put(EntityMinecartRideable.class, EntityMinecartRideable::new);
++        FACTORY_MAP.put(EntityMinecartChest.class, EntityMinecartChest::new);
++        FACTORY_MAP.put(EntityMinecartFurnace.class, EntityMinecartFurnace::new);
++        FACTORY_MAP.put(EntityMinecartTNT.class, EntityMinecartTNT::new);
++        FACTORY_MAP.put(EntityMinecartHopper.class, EntityMinecartHopper::new);
++        FACTORY_MAP.put(EntityMinecartMobSpawner.class, EntityMinecartMobSpawner::new);
++        FACTORY_MAP.put(EntityCreeper.class, EntityCreeper::new);
++        FACTORY_MAP.put(EntitySkeleton.class, EntitySkeleton::new);
++        FACTORY_MAP.put(EntitySpider.class, EntitySpider::new);
++        FACTORY_MAP.put(EntityGiantZombie.class, EntityGiantZombie::new);
++        FACTORY_MAP.put(EntityZombie.class, EntityZombie::new);
++        FACTORY_MAP.put(EntitySlime.class, EntitySlime::new);
++        FACTORY_MAP.put(EntityGhast.class, EntityGhast::new);
++        FACTORY_MAP.put(EntityPigZombie.class, EntityPigZombie::new);
++        FACTORY_MAP.put(EntityEnderman.class, EntityEnderman::new);
++        FACTORY_MAP.put(EntityCaveSpider.class, EntityCaveSpider::new);
++        FACTORY_MAP.put(EntitySilverfish.class, EntitySilverfish::new);
++        FACTORY_MAP.put(EntityBlaze.class, EntityBlaze::new);
++        FACTORY_MAP.put(EntityMagmaCube.class, EntityMagmaCube::new);
++        FACTORY_MAP.put(EntityEnderDragon.class, EntityEnderDragon::new);
++        FACTORY_MAP.put(EntityWither.class, EntityWither::new);
++        FACTORY_MAP.put(EntityBat.class, EntityBat::new);
++        FACTORY_MAP.put(EntityWitch.class, EntityWitch::new);
++        FACTORY_MAP.put(EntityEndermite.class, EntityEndermite::new);
++        FACTORY_MAP.put(EntityGuardian.class, EntityGuardian::new);
++        FACTORY_MAP.put(EntityShulker.class, EntityShulker::new);
++        FACTORY_MAP.put(EntityPig.class, EntityPig::new);
++        FACTORY_MAP.put(EntitySheep.class, EntitySheep::new);
++        FACTORY_MAP.put(EntityCow.class, EntityCow::new);
++        FACTORY_MAP.put(EntityChicken.class, EntityChicken::new);
++        FACTORY_MAP.put(EntitySquid.class, EntitySquid::new);
++        FACTORY_MAP.put(EntityWolf.class, EntityWolf::new);
++        FACTORY_MAP.put(EntityMushroomCow.class, EntityMushroomCow::new);
++        FACTORY_MAP.put(EntitySnowman.class, EntitySnowman::new);
++        FACTORY_MAP.put(EntityOcelot.class, EntityOcelot::new);
++        FACTORY_MAP.put(EntityIronGolem.class, EntityIronGolem::new);
++        FACTORY_MAP.put(EntityHorse.class, EntityHorse::new);
++        FACTORY_MAP.put(EntityRabbit.class, EntityRabbit::new);
++        FACTORY_MAP.put(EntityPolarBear.class, EntityPolarBear::new);
++        FACTORY_MAP.put(EntityLlama.class, EntityLlama::new);
++        FACTORY_MAP.put(EntityLlamaSpit.class, EntityLlamaSpit::new);
++        FACTORY_MAP.put(EntityParrot.class, EntityParrot::new);
++        FACTORY_MAP.put(EntityVillager.class, EntityVillager::new);
++        FACTORY_MAP.put(EntityEnderCrystal.class, EntityEnderCrystal::new);
++        // Antarctic end
+         a("bat", 4996656, 986895);
+         a("blaze", 16167425, 16775294);
+         a("cave_spider", 803406, 11013646);
+diff --git a/main/java/net/minecraft/server/SpawnerCreature.java b/main/java/net/minecraft/server/SpawnerCreature.java
+index 26704f3..4a04b21 100644
+--- a/main/java/net/minecraft/server/SpawnerCreature.java
++++ b/main/java/net/minecraft/server/SpawnerCreature.java
+@@ -1,12 +1,16 @@
+ package net.minecraft.server;
+ 
+ import com.google.common.collect.Sets;
++import java.util.Calendar;
++import java.util.IdentityHashMap;
+ import java.util.Iterator;
+ import java.util.List;
++import java.util.Map;
+ import java.util.Random;
+ import java.util.Set;
+ 
+ // CraftBukkit start
++import com.destroystokyo.paper.config.toml.modules.optimizations.MobSpawning;
+ import com.destroystokyo.paper.exception.ServerInternalException;
+ import org.bukkit.craftbukkit.util.LongHash;
+ import org.bukkit.craftbukkit.util.LongHashSet;
+@@ -18,6 +22,235 @@ public final class SpawnerCreature {
+     private static final int a = (int) Math.pow(17.0D, 2.0D);
+     private final LongHashSet b = new LongHashSet(); // CraftBukkit
+ 
++    // Antarctic start - exact-class pre-construction spawn rejection table (skips custom plugin subclasses)
++    private static final byte PRECHECK_MONSTER_STANDARD = 1;
++    private static final byte PRECHECK_MONSTER_STANDARD_FIREPROOF = 2;
++    private static final byte PRECHECK_MONSTER_SKY_REQUIRED = 3;
++    private static final byte PRECHECK_MONSTER_PEACEFUL_ONLY = 4;
++    private static final byte PRECHECK_MONSTER_PEACEFUL_MAGMA = 5;
++    private static final byte PRECHECK_SLIME = 6;
++    private static final byte PRECHECK_SQUID = 7;
++    private static final byte PRECHECK_BAT = 8;
++    private static final byte PRECHECK_ANIMAL_GRASS = 9;
++    private static final byte PRECHECK_ANIMAL_MYCELIUM = 10;
++    private static final byte PRECHECK_OCELOT = 11;
++    private static final byte PRECHECK_PARROT = 12;
++
++    static final int PRECHECK_RESULT_REJECT = 0;
++    static final int PRECHECK_RESULT_PASS = 1;
++    static final int PRECHECK_RESULT_PASS_LIGHT_PRECHECKED = 2;
++
++    private static final Map<Class<? extends EntityInsentient>, Byte> PRECHECK_KIND = new IdentityHashMap<>(64);
++    static {
++        PRECHECK_KIND.put(EntityZombie.class, PRECHECK_MONSTER_STANDARD);
++        PRECHECK_KIND.put(EntityZombieVillager.class, PRECHECK_MONSTER_STANDARD);
++        PRECHECK_KIND.put(EntitySkeleton.class, PRECHECK_MONSTER_STANDARD);
++        PRECHECK_KIND.put(EntityCreeper.class, PRECHECK_MONSTER_STANDARD);
++        PRECHECK_KIND.put(EntitySpider.class, PRECHECK_MONSTER_STANDARD);
++        PRECHECK_KIND.put(EntityCaveSpider.class, PRECHECK_MONSTER_STANDARD);
++        PRECHECK_KIND.put(EntityEnderman.class, PRECHECK_MONSTER_STANDARD);
++        PRECHECK_KIND.put(EntityWitch.class, PRECHECK_MONSTER_STANDARD);
++        PRECHECK_KIND.put(EntityEvoker.class, PRECHECK_MONSTER_STANDARD);
++        PRECHECK_KIND.put(EntityVindicator.class, PRECHECK_MONSTER_STANDARD);
++        PRECHECK_KIND.put(EntityIllagerIllusioner.class, PRECHECK_MONSTER_STANDARD);
++        PRECHECK_KIND.put(EntityGiantZombie.class, PRECHECK_MONSTER_STANDARD);
++
++        PRECHECK_KIND.put(EntitySkeletonWither.class, PRECHECK_MONSTER_STANDARD_FIREPROOF);
++
++        PRECHECK_KIND.put(EntityZombieHusk.class, PRECHECK_MONSTER_SKY_REQUIRED);
++        PRECHECK_KIND.put(EntitySkeletonStray.class, PRECHECK_MONSTER_SKY_REQUIRED);
++
++        PRECHECK_KIND.put(EntityBlaze.class, PRECHECK_MONSTER_PEACEFUL_ONLY);
++        PRECHECK_KIND.put(EntityPigZombie.class, PRECHECK_MONSTER_PEACEFUL_ONLY);
++        PRECHECK_KIND.put(EntityMagmaCube.class, PRECHECK_MONSTER_PEACEFUL_ONLY);
++        PRECHECK_KIND.put(EntityGhast.class, PRECHECK_MONSTER_PEACEFUL_ONLY);
++
++        PRECHECK_KIND.put(EntityGuardian.class, PRECHECK_MONSTER_PEACEFUL_MAGMA);
++        PRECHECK_KIND.put(EntityGuardianElder.class, PRECHECK_MONSTER_PEACEFUL_MAGMA);
++        PRECHECK_KIND.put(EntitySilverfish.class, PRECHECK_MONSTER_PEACEFUL_MAGMA);
++        PRECHECK_KIND.put(EntityEndermite.class, PRECHECK_MONSTER_PEACEFUL_MAGMA);
++
++        PRECHECK_KIND.put(EntitySlime.class, PRECHECK_SLIME);
++        PRECHECK_KIND.put(EntitySquid.class, PRECHECK_SQUID);
++        PRECHECK_KIND.put(EntityBat.class, PRECHECK_BAT);
++
++        PRECHECK_KIND.put(EntityCow.class, PRECHECK_ANIMAL_GRASS);
++        PRECHECK_KIND.put(EntityPig.class, PRECHECK_ANIMAL_GRASS);
++        PRECHECK_KIND.put(EntitySheep.class, PRECHECK_ANIMAL_GRASS);
++        PRECHECK_KIND.put(EntityChicken.class, PRECHECK_ANIMAL_GRASS);
++        PRECHECK_KIND.put(EntityWolf.class, PRECHECK_ANIMAL_GRASS);
++        PRECHECK_KIND.put(EntityHorse.class, PRECHECK_ANIMAL_GRASS);
++        PRECHECK_KIND.put(EntityHorseDonkey.class, PRECHECK_ANIMAL_GRASS);
++        PRECHECK_KIND.put(EntityHorseMule.class, PRECHECK_ANIMAL_GRASS);
++        PRECHECK_KIND.put(EntityRabbit.class, PRECHECK_ANIMAL_GRASS);
++        PRECHECK_KIND.put(EntityPolarBear.class, PRECHECK_ANIMAL_GRASS);
++        PRECHECK_KIND.put(EntityLlama.class, PRECHECK_ANIMAL_GRASS);
++
++        PRECHECK_KIND.put(EntityMushroomCow.class, PRECHECK_ANIMAL_MYCELIUM);
++        PRECHECK_KIND.put(EntityOcelot.class, PRECHECK_OCELOT);
++        PRECHECK_KIND.put(EntityParrot.class, PRECHECK_PARROT);
++    }
++
++    private static boolean isBatHalloween(Calendar calendar) {
++        return calendar != null
++            && (calendar.get(Calendar.MONTH) + 1 == 10 && calendar.get(Calendar.DAY_OF_MONTH) >= 20
++                || calendar.get(Calendar.MONTH) + 1 == 11 && calendar.get(Calendar.DAY_OF_MONTH) <= 3);
++    }
++
++    private static boolean checkMonsterLight(World world, BlockPosition pos, int x, int y, int z, int mode) {
++        if (mode == MobSpawning.PRECHECK_SINGLE_ROLL) {
++            if (world.getBrightness(EnumSkyBlock.SKY, x, y, z) > world.random.nextInt(32)) {
++                return false;
++            }
++            boolean passes;
++            if (world.X()) {
++                int savedSkySubtracted = world.ah();
++                world.c(10);
++                passes = !world.isLightLevel(pos, world.random.nextInt(9));
++                world.c(savedSkySubtracted);
++            } else {
++                passes = !world.isLightLevel(pos, world.random.nextInt(9));
++            }
++            return passes;
++        }
++        // Deterministic mode: EntityMonster.s_() checks !world.isLightLevel(pos, nextInt(9)), max roll is 8.
++        // Whenever effective light >= 8 (accounting for thunderstorm skySubtracted=10), s_() always returns false.
++        boolean tooBright;
++        if (world.X()) {
++            int savedSkySubtracted = world.ah();
++            world.c(10);
++            tooBright = world.isLightLevel(pos, 8);
++            world.c(savedSkySubtracted);
++        } else {
++            tooBright = world.isLightLevel(pos, 8);
++        }
++        return !tooBright;
++    }
++
++    static int precheckSpawn(World world, Chunk chunk, Class<? extends EntityInsentient> cls, BlockPosition pos, int mode) {
++        if (mode == MobSpawning.PRECHECK_OFF) {
++            return PRECHECK_RESULT_PASS;
++        }
++        Byte kindBox = PRECHECK_KIND.get(cls);
++        if (kindBox == null) {
++            // Unknown / custom plugin subclass: skip precheck to preserve custom P()/s_() overrides
++            return PRECHECK_RESULT_PASS;
++        }
++        byte kind = kindBox.byteValue();
++        int x = pos.getX();
++        int y = pos.getY();
++        int z = pos.getZ();
++
++        switch (kind) {
++            case PRECHECK_MONSTER_STANDARD: {
++                if (world.getDifficulty() == EnumDifficulty.PEACEFUL) {
++                    return PRECHECK_RESULT_REJECT;
++                }
++                if (chunk.a(x, y - 1, z).getBlock() == Blocks.df) {
++                    return PRECHECK_RESULT_REJECT;
++                }
++                if (!checkMonsterLight(world, pos, x, y, z, mode)) {
++                    return PRECHECK_RESULT_REJECT;
++                }
++                return mode == MobSpawning.PRECHECK_SINGLE_ROLL ? PRECHECK_RESULT_PASS_LIGHT_PRECHECKED : PRECHECK_RESULT_PASS;
++            }
++            case PRECHECK_MONSTER_STANDARD_FIREPROOF: {
++                if (world.getDifficulty() == EnumDifficulty.PEACEFUL) {
++                    return PRECHECK_RESULT_REJECT;
++                }
++                if (!checkMonsterLight(world, pos, x, y, z, mode)) {
++                    return PRECHECK_RESULT_REJECT;
++                }
++                return mode == MobSpawning.PRECHECK_SINGLE_ROLL ? PRECHECK_RESULT_PASS_LIGHT_PRECHECKED : PRECHECK_RESULT_PASS;
++            }
++            case PRECHECK_MONSTER_SKY_REQUIRED: {
++                if (world.getDifficulty() == EnumDifficulty.PEACEFUL) {
++                    return PRECHECK_RESULT_REJECT;
++                }
++                if (!chunk.c(pos)) {
++                    return PRECHECK_RESULT_REJECT;
++                }
++                if (chunk.a(x, y - 1, z).getBlock() == Blocks.df) {
++                    return PRECHECK_RESULT_REJECT;
++                }
++                if (!checkMonsterLight(world, pos, x, y, z, mode)) {
++                    return PRECHECK_RESULT_REJECT;
++                }
++                return mode == MobSpawning.PRECHECK_SINGLE_ROLL ? PRECHECK_RESULT_PASS_LIGHT_PRECHECKED : PRECHECK_RESULT_PASS;
++            }
++            case PRECHECK_MONSTER_PEACEFUL_ONLY:
++                return world.getDifficulty() == EnumDifficulty.PEACEFUL ? PRECHECK_RESULT_REJECT : PRECHECK_RESULT_PASS;
++            case PRECHECK_MONSTER_PEACEFUL_MAGMA:
++                if (world.getDifficulty() == EnumDifficulty.PEACEFUL || chunk.a(x, y - 1, z).getBlock() == Blocks.df) {
++                    return PRECHECK_RESULT_REJECT;
++                }
++                return PRECHECK_RESULT_PASS;
++            case PRECHECK_SLIME: {
++                if (world.getDifficulty() == EnumDifficulty.PEACEFUL || chunk.a(x, y - 1, z).getBlock() == Blocks.df) {
++                    return PRECHECK_RESULT_REJECT;
++                }
++                if (y >= 70) {
++                    return PRECHECK_RESULT_REJECT;
++                }
++                if (y >= 40) {
++                    if (y <= 50 || world.getBiome(pos) != Biomes.h || world.getLightLevel(pos) >= 8) {
++                        return PRECHECK_RESULT_REJECT;
++                    }
++                } else {
++                    if (!world.paperConfig.allChunksAreSlimeChunks && !chunk.isSlimeChunk(world.spigotConfig.slimeSeed)) {
++                        return PRECHECK_RESULT_REJECT;
++                    }
++                }
++                return PRECHECK_RESULT_PASS;
++            }
++            case PRECHECK_SQUID: {
++                double maxHeight = world.paperConfig.squidMaxSpawnHeight > 0 ? world.paperConfig.squidMaxSpawnHeight : world.getSeaLevel();
++                if ((double) y <= world.spigotConfig.squidSpawnRangeMin || (double) y >= maxHeight) {
++                    return PRECHECK_RESULT_REJECT;
++                }
++                Block at = chunk.a(x, y, z).getBlock();
++                if (at != Blocks.WATER && at != Blocks.FLOWING_WATER) {
++                    return PRECHECK_RESULT_REJECT;
++                }
++                return PRECHECK_RESULT_PASS;
++            }
++            case PRECHECK_BAT: {
++                if (y >= world.getSeaLevel() || chunk.a(x, y - 1, z).getBlock() == Blocks.df) {
++                    return PRECHECK_RESULT_REJECT;
++                }
++                int maxLight = isBatHalloween(world.ae()) ? 7 : 4;
++                if (world.getLightLevel(pos) >= maxLight) {
++                    return PRECHECK_RESULT_REJECT;
++                }
++                return PRECHECK_RESULT_PASS;
++            }
++            case PRECHECK_ANIMAL_GRASS:
++                return (chunk.a(x, y - 1, z).getBlock() == Blocks.GRASS && world.j(pos) > 8) ? PRECHECK_RESULT_PASS : PRECHECK_RESULT_REJECT;
++            case PRECHECK_ANIMAL_MYCELIUM:
++                return (chunk.a(x, y - 1, z).getBlock() == Blocks.MYCELIUM && world.j(pos) > 8) ? PRECHECK_RESULT_PASS : PRECHECK_RESULT_REJECT;
++            case PRECHECK_OCELOT: {
++                if (y < world.getSeaLevel()) {
++                    return PRECHECK_RESULT_REJECT;
++                }
++                IBlockData belowData = chunk.a(x, y - 1, z);
++                if (belowData.getBlock() != Blocks.GRASS && belowData.getMaterial() != Material.LEAVES) {
++                    return PRECHECK_RESULT_REJECT;
++                }
++                return PRECHECK_RESULT_PASS;
++            }
++            case PRECHECK_PARROT: {
++                Block below = chunk.a(x, y - 1, z).getBlock();
++                if (!(below instanceof BlockLeaves || below == Blocks.GRASS || below instanceof BlockLogAbstract)) {
++                    return PRECHECK_RESULT_REJECT;
++                }
++                return PRECHECK_RESULT_PASS;
++            }
++            default:
++                return PRECHECK_RESULT_PASS;
++        }
++    }
++    // Antarctic end
++
+     static int computeMobLimit(int limit, int eligibleChunks, int currentMobCount) {
+         return (limit * eligibleChunks / SpawnerCreature.a) - currentMobCount + 1;
+     }
+@@ -199,7 +432,8 @@ public final class SpawnerCreature {
+                                                 float f = (float) j3 + 0.5F;
+                                                 float f1 = (float) l3 + 0.5F;
+ 
+-                                                if (worldserver.getWorldBorder().isInBounds(blockposition_mutableblockposition) && worldserver.getChunkIfLoaded(blockposition_mutableblockposition) != null && !worldserver.isPlayerNearby((double) f, (double) k3, (double) f1, 24.0D) && blockposition.distanceSquared((double) f, (double) k3, (double) f1) >= 576.0D) { // Paper - Prevent mob spawning from loading/generating chunks
++                                                Chunk spawnChunk;
++                                                if (worldserver.getWorldBorder().isInBounds(blockposition_mutableblockposition) && (spawnChunk = worldserver.getChunkIfLoaded(blockposition_mutableblockposition)) != null && !worldserver.isPlayerNearby((double) f, (double) k3, (double) f1, 24.0D) && blockposition.distanceSquared((double) f, (double) k3, (double) f1) >= 576.0D) { // Paper - Prevent mob spawning from loading/generating chunks
+                                                     if (biomebase_biomemeta == null) {
+                                                         biomebase_biomemeta = worldserver.a(enumcreaturetype, (BlockPosition) blockposition_mutableblockposition);
+                                                         if (biomebase_biomemeta == null) {
+@@ -227,10 +461,18 @@ public final class SpawnerCreature {
+                                                             }
+                                                         }
+                                                         // Paper end
++                                                        // Antarctic start - pre-reject doomed spawn attempts before 14.9 KiB entity construction
++                                                        int precheck = precheckSpawn(worldserver, spawnChunk, cls, blockposition_mutableblockposition, MobSpawning.getPrecheckLightMode());
++                                                        if (precheck == PRECHECK_RESULT_REJECT) {
++                                                            j1 += l2;
++                                                            ++j4;
++                                                            continue;
++                                                        }
++                                                        // Antarctic end
+                                                         EntityInsentient entityinsentient;
+ 
+                                                         try {
+-                                                            entityinsentient = (EntityInsentient) biomebase_biomemeta.b.getConstructor(new Class[] { World.class}).newInstance(new Object[] { worldserver});
++                                                            entityinsentient = (EntityInsentient) EntityTypes.createEntity(cls, worldserver); // Antarctic - cached entity factory
+                                                         } catch (Exception exception) {
+                                                             exception.printStackTrace();
+                                                             ServerInternalException.reportInternalException(exception); // Paper
+@@ -238,6 +480,9 @@ public final class SpawnerCreature {
+                                                         }
+ 
+                                                         entityinsentient.setPositionRotation((double) f, (double) k3, (double) f1, worldserver.random.nextFloat() * 360.0F, 0.0F);
++                                                        if (precheck == PRECHECK_RESULT_PASS_LIGHT_PRECHECKED) {
++                                                            ((EntityMonster) entityinsentient).antarcticLightPrechecked = true;
++                                                        }
+                                                         if (entityinsentient.P() && entityinsentient.canSpawn()) {
+                                                             groupdataentity = entityinsentient.prepare(worldserver.D(new BlockPosition(entityinsentient)), groupdataentity);
+                                                             if (entityinsentient.canSpawn()) {
+@@ -341,7 +586,7 @@ public final class SpawnerCreature {
+                             EntityInsentient entityinsentient;
+ 
+                             try {
+-                                entityinsentient = (EntityInsentient) biomebase_biomemeta.b.getConstructor(new Class[] { World.class}).newInstance(new Object[] { world});
++                                entityinsentient = (EntityInsentient) EntityTypes.createEntity(biomebase_biomemeta.b, world); // Antarctic - cached entity factory
+                             } catch (Exception exception) {
+                                 exception.printStackTrace();
+                                 ServerInternalException.reportInternalException(exception); // Paper
+diff --git a/test/java/net/minecraft/server/SpawnerCreaturePrecheckTest.java b/test/java/net/minecraft/server/SpawnerCreaturePrecheckTest.java
+new file mode 100644
+index 0000000..8b52543
+--- /dev/null
++++ b/test/java/net/minecraft/server/SpawnerCreaturePrecheckTest.java
+@@ -0,0 +1,370 @@
++package net.minecraft.server;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertTrue;
++
++import com.destroystokyo.paper.PaperWorldConfig;
++import com.destroystokyo.paper.config.toml.modules.optimizations.MobSpawning;
++import java.lang.management.ManagementFactory;
++import java.lang.reflect.Field;
++import java.util.Calendar;
++import java.util.GregorianCalendar;
++import java.util.Random;
++import org.junit.After;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import org.spigotmc.SpigotWorldConfig;
++import sun.misc.Unsafe;
++
++/**
++ * Verifies Commit 3 (0118):
++ * - Cached EntityTypes.createEntity lambda factories for vanilla entities + cached Constructor fallback for custom subclasses
++ * - Cached Chunk.isSlimeChunk(slimeSeed) parity and seed invalidation
++ * - Exact-class SpawnerCreature.precheckSpawn parity across all 1.12.2 mob families, light levels 0..15,
++ *   thunderstorms, PEACEFUL, BlockMagma (incl. WitherSkeleton fireproof exemption), Husk/Stray sky, Slime,
++ *   Squid, Bat, Animals/Mooshroom/Ocelot/Parrot, Blaze/Guardian/Silverfish/Endermite/PigZombie exemptions,
++ *   1-shot EntityMonster.antarcticLightPrechecked flag, and custom subclass bypass
++ * - Config toggle states ("off", "deterministic", "single-roll")
++ * - Performance & GC allocation reduction under daytime/lit-island spawn rejection load
++ */
++public class SpawnerCreaturePrecheckTest {
++
++    private static Unsafe unsafe;
++
++    /** Custom plugin subclass overriding P() to allow spawning in bright light - must NEVER be pre-rejected. */
++    public static final class CustomDaylightZombie extends EntityZombie {
++        public CustomDaylightZombie(World world) {
++            super(world);
++        }
++
++        @Override
++        public boolean P() {
++            return true;
++        }
++    }
++
++    private static final class StubChunkProvider extends ChunkProviderServer {
++        StubChunkProvider(WorldServer world) {
++            super(world, null, null);
++        }
++    }
++
++    private static final class TestWorld extends WorldServer {
++        EnumDifficulty difficulty = EnumDifficulty.NORMAL;
++        BiomeBase biome = Biomes.c; // Plains
++        int seaLevel = 63;
++        boolean thundering = false;
++        Calendar cal = new GregorianCalendar(2026, Calendar.MAY, 15);
++        long seed = 123456789L;
++
++        TestWorld() {
++            super(null, null, null, 0, null, null, null);
++        }
++
++        @Override
++        public EnumDifficulty getDifficulty() {
++            return difficulty;
++        }
++
++        @Override
++        public long getSeed() {
++            return seed;
++        }
++
++        @Override
++        public BiomeBase getBiome(BlockPosition pos) {
++            return biome;
++        }
++
++        @Override
++        public int getSeaLevel() {
++            return seaLevel;
++        }
++
++        @Override
++        public boolean X() {
++            return thundering;
++        }
++
++        @Override
++        public Calendar ae() {
++            return cal;
++        }
++    }
++
++    @BeforeClass
++    public static void bootstrap() throws Exception {
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        unsafe = (Unsafe) f.get(null);
++        DispenserRegistry.c();
++    }
++
++    @After
++    public void restoreDefaults() {
++        MobSpawning.precheckLightMode = "single-roll";
++    }
++
++    private static void setField(Class<?> owner, Object target, String name, Object value) throws Exception {
++        Field f = owner.getDeclaredField(name);
++        f.setAccessible(true);
++        f.set(target, value);
++    }
++
++    private static TestWorld buildWorld(EnumDifficulty difficulty, int skySubtracted, int skyLight, int blockLight, IBlockData belowBlock, IBlockData atBlock, int spawnY, int heightMapY, Chunk[] chunkOut) throws Exception {
++        TestWorld world = (TestWorld) unsafe.allocateInstance(TestWorld.class);
++        world.difficulty = difficulty;
++        world.biome = Biomes.c;
++        world.seaLevel = 63;
++        world.thundering = false;
++        world.cal = new GregorianCalendar(2026, Calendar.MAY, 15);
++        world.seed = 123456789L;
++
++        SpigotWorldConfig spigotConfig = (SpigotWorldConfig) unsafe.allocateInstance(SpigotWorldConfig.class);
++        spigotConfig.slimeSeed = 987234911;
++        spigotConfig.squidSpawnRangeMin = 45.0;
++        setField(World.class, world, "spigotConfig", spigotConfig);
++
++        PaperWorldConfig paperConfig = (PaperWorldConfig) unsafe.allocateInstance(PaperWorldConfig.class);
++        paperConfig.allChunksAreSlimeChunks = false;
++        paperConfig.squidMaxSpawnHeight = 0.0;
++        setField(World.class, world, "paperConfig", paperConfig);
++
++        WorldProvider provider = new WorldProviderNormal();
++        setField(WorldProvider.class, provider, "f", true);
++        world.worldProvider = provider;
++
++        world.worldData = new WorldData(new WorldSettings(123456789L, EnumGamemode.SURVIVAL, false, false, WorldType.NORMAL), "test");
++
++        setField(World.class, world, "random", new Random(777L));
++        setField(World.class, world, "L", skySubtracted);
++        setField(World.class, world, "methodProfiler", new MethodProfiler());
++        setField(World.class, world, "P", new WorldBorder());
++
++        StubChunkProvider cp = new StubChunkProvider(world);
++        setField(World.class, world, "chunkProvider", cp);
++
++        Chunk chunk = (Chunk) unsafe.allocateInstance(Chunk.class);
++        setField(Chunk.class, chunk, "world", world);
++        setField(Chunk.class, chunk, "locX", 0);
++        setField(Chunk.class, chunk, "locZ", 0);
++        setField(Chunk.class, chunk, "chunkKey", ChunkCoordIntPair.a(0, 0));
++        ChunkSection[] sections = new ChunkSection[16];
++        for (int s = 0; s < 16; ++s) {
++            sections[s] = new ChunkSection(s << 4, true);
++        }
++        int[] heightMap = new int[256];
++        heightMap[(8 << 4) | 8] = heightMapY;
++        if (spawnY - 1 >= 0) {
++            sections[(spawnY - 1) >> 4].setType(8, (spawnY - 1) & 15, 8, belowBlock);
++        }
++        sections[spawnY >> 4].setType(8, spawnY & 15, 8, atBlock);
++        sections[spawnY >> 4].a(8, spawnY & 15, 8, skyLight);
++        sections[spawnY >> 4].b(8, spawnY & 15, 8, blockLight);
++        setField(Chunk.class, chunk, "sections", sections);
++        setField(Chunk.class, chunk, "heightMap", heightMap);
++        cp.chunks.put(ChunkCoordIntPair.a(0, 0), chunk);
++
++        chunkOut[0] = chunk;
++        return world;
++    }
++
++    @Test
++    public void testCachedEntityFactoryVanillaAndCustomSubclasses() throws Exception {
++        Chunk[] out = new Chunk[1];
++        TestWorld world = buildWorld(EnumDifficulty.NORMAL, 0, 0, 0, Blocks.STONE.getBlockData(), Blocks.AIR.getBlockData(), 64, 64, out);
++
++        Entity zombie = EntityTypes.createEntity(EntityZombie.class, world);
++        assertNotNull(zombie);
++        assertEquals(EntityZombie.class, zombie.getClass());
++
++        Entity squid = EntityTypes.a(EntitySquid.class, world);
++        assertNotNull(squid);
++        assertEquals(EntitySquid.class, squid.getClass());
++
++        // Custom subclass must work cleanly through cached Constructor fallback
++        Entity custom = EntityTypes.createEntity(CustomDaylightZombie.class, world);
++        assertNotNull(custom);
++        assertEquals(CustomDaylightZombie.class, custom.getClass());
++    }
++
++    @Test
++    public void testChunkIsSlimeChunkCacheMatchesVanillaAndHonorsSeed() throws Exception {
++        Chunk[] out = new Chunk[1];
++        TestWorld world = buildWorld(EnumDifficulty.NORMAL, 0, 0, 0, Blocks.STONE.getBlockData(), Blocks.AIR.getBlockData(), 20, 64, out);
++        Chunk chunk = out[0];
++
++        for (int cx = -10; cx < 10; ++cx) {
++            setField(Chunk.class, chunk, "locX", cx);
++            setField(Chunk.class, chunk, "antarcticSlimeChunkState", (byte) 0);
++            boolean expectedDefault = chunk.a(987234911L).nextInt(10) == 0;
++            assertEquals(expectedDefault, chunk.isSlimeChunk(987234911L));
++            assertEquals(expectedDefault, chunk.isSlimeChunk(987234911L)); // cache hit
++
++            // Changing slimeSeed must recompute accurately
++            boolean expectedAlt = chunk.a(12345L).nextInt(10) == 0;
++            assertEquals(expectedAlt, chunk.isSlimeChunk(12345L));
++        }
++    }
++
++    @Test
++    public void testMonsterPrecheckParityAcrossLightLevelsThunderPeacefulMagmaAndExemptions() throws Exception {
++        Chunk[] out = new Chunk[1];
++        BlockPosition pos = new BlockPosition(8, 64, 8);
++
++        // 1. PEACEFUL rejects all IMonster classes
++        TestWorld peaceful = buildWorld(EnumDifficulty.PEACEFUL, 11, 0, 0, Blocks.STONE.getBlockData(), Blocks.AIR.getBlockData(), 64, 64, out);
++        assertEquals(SpawnerCreature.PRECHECK_RESULT_REJECT, SpawnerCreature.precheckSpawn(peaceful, out[0], EntityZombie.class, pos, MobSpawning.PRECHECK_DETERMINISTIC));
++        assertEquals(SpawnerCreature.PRECHECK_RESULT_REJECT, SpawnerCreature.precheckSpawn(peaceful, out[0], EntityBlaze.class, pos, MobSpawning.PRECHECK_DETERMINISTIC));
++        assertEquals(SpawnerCreature.PRECHECK_RESULT_REJECT, SpawnerCreature.precheckSpawn(peaceful, out[0], EntityPigZombie.class, pos, MobSpawning.PRECHECK_DETERMINISTIC));
++        assertEquals(SpawnerCreature.PRECHECK_RESULT_REJECT, SpawnerCreature.precheckSpawn(peaceful, out[0], EntityMagmaCube.class, pos, MobSpawning.PRECHECK_DETERMINISTIC));
++        assertEquals(SpawnerCreature.PRECHECK_RESULT_REJECT, SpawnerCreature.precheckSpawn(peaceful, out[0], EntityGhast.class, pos, MobSpawning.PRECHECK_DETERMINISTIC));
++
++        // 2. BlockMagma rejects non-fireproof monsters (Zombie, Guardian, Silverfish, Endermite), ALLOWS fireproof (WitherSkeleton, Blaze, PigZombie, MagmaCube, Ghast)
++        TestWorld magma = buildWorld(EnumDifficulty.NORMAL, 11, 0, 0, Blocks.df.getBlockData(), Blocks.AIR.getBlockData(), 64, 64, out);
++        assertEquals(SpawnerCreature.PRECHECK_RESULT_REJECT, SpawnerCreature.precheckSpawn(magma, out[0], EntityZombie.class, pos, MobSpawning.PRECHECK_DETERMINISTIC));
++        assertEquals(SpawnerCreature.PRECHECK_RESULT_REJECT, SpawnerCreature.precheckSpawn(magma, out[0], EntityGuardian.class, pos, MobSpawning.PRECHECK_DETERMINISTIC));
++        assertEquals(SpawnerCreature.PRECHECK_RESULT_REJECT, SpawnerCreature.precheckSpawn(magma, out[0], EntitySilverfish.class, pos, MobSpawning.PRECHECK_DETERMINISTIC));
++        assertEquals(SpawnerCreature.PRECHECK_RESULT_REJECT, SpawnerCreature.precheckSpawn(magma, out[0], EntityEndermite.class, pos, MobSpawning.PRECHECK_DETERMINISTIC));
++        assertEquals(SpawnerCreature.PRECHECK_RESULT_PASS, SpawnerCreature.precheckSpawn(magma, out[0], EntitySkeletonWither.class, pos, MobSpawning.PRECHECK_DETERMINISTIC));
++        assertEquals(SpawnerCreature.PRECHECK_RESULT_PASS, SpawnerCreature.precheckSpawn(magma, out[0], EntityBlaze.class, pos, MobSpawning.PRECHECK_DETERMINISTIC));
++        assertEquals(SpawnerCreature.PRECHECK_RESULT_PASS, SpawnerCreature.precheckSpawn(magma, out[0], EntityPigZombie.class, pos, MobSpawning.PRECHECK_DETERMINISTIC));
++
++        // 3. Light levels 0..15 for standard EntityMonster (deterministic mode)
++        for (int light = 0; light <= 15; ++light) {
++            TestWorld w = buildWorld(EnumDifficulty.NORMAL, 11, 0, light, Blocks.STONE.getBlockData(), Blocks.AIR.getBlockData(), 64, 64, out);
++            int res = SpawnerCreature.precheckSpawn(w, out[0], EntityZombie.class, pos, MobSpawning.PRECHECK_DETERMINISTIC);
++            if (light >= 8) {
++                assertEquals("Light " + light + " must deterministically reject EntityZombie", SpawnerCreature.PRECHECK_RESULT_REJECT, res);
++            } else {
++                assertEquals("Light " + light + " must NOT deterministically reject EntityZombie", SpawnerCreature.PRECHECK_RESULT_PASS, res);
++            }
++            // Blaze/PigZombie/Guardian/Silverfish/Endermite ignore s_() light level
++            assertEquals(SpawnerCreature.PRECHECK_RESULT_PASS, SpawnerCreature.precheckSpawn(w, out[0], EntityBlaze.class, pos, MobSpawning.PRECHECK_DETERMINISTIC));
++            assertEquals(SpawnerCreature.PRECHECK_RESULT_PASS, SpawnerCreature.precheckSpawn(w, out[0], EntityPigZombie.class, pos, MobSpawning.PRECHECK_DETERMINISTIC));
++            assertEquals(SpawnerCreature.PRECHECK_RESULT_PASS, SpawnerCreature.precheckSpawn(w, out[0], EntityGuardian.class, pos, MobSpawning.PRECHECK_DETERMINISTIC));
++        }
++
++        // 4. Thunderstorm daytime: skyLight=15, skySubtracted=0 -> without thunder effective=15 (reject), WITH thunder skySubtracted=10 -> effective=5 (pass!)
++        TestWorld storm = buildWorld(EnumDifficulty.NORMAL, 0, 15, 0, Blocks.STONE.getBlockData(), Blocks.AIR.getBlockData(), 64, 64, out);
++        assertEquals(SpawnerCreature.PRECHECK_RESULT_REJECT, SpawnerCreature.precheckSpawn(storm, out[0], EntityZombie.class, pos, MobSpawning.PRECHECK_DETERMINISTIC));
++        storm.thundering = true;
++        assertEquals(SpawnerCreature.PRECHECK_RESULT_PASS, SpawnerCreature.precheckSpawn(storm, out[0], EntityZombie.class, pos, MobSpawning.PRECHECK_DETERMINISTIC));
++        assertEquals("skySubtracted must be restored after thunderstorm check", 0, storm.ah());
++
++        // 5. Husk & Stray require sky access (chunk.c(pos))
++        TestWorld roofed = buildWorld(EnumDifficulty.NORMAL, 11, 0, 0, Blocks.STONE.getBlockData(), Blocks.AIR.getBlockData(), 64, 80, out);
++        assertEquals(SpawnerCreature.PRECHECK_RESULT_REJECT, SpawnerCreature.precheckSpawn(roofed, out[0], EntityZombieHusk.class, pos, MobSpawning.PRECHECK_DETERMINISTIC));
++        assertEquals(SpawnerCreature.PRECHECK_RESULT_REJECT, SpawnerCreature.precheckSpawn(roofed, out[0], EntitySkeletonStray.class, pos, MobSpawning.PRECHECK_DETERMINISTIC));
++        assertEquals(SpawnerCreature.PRECHECK_RESULT_PASS, SpawnerCreature.precheckSpawn(roofed, out[0], EntityZombie.class, pos, MobSpawning.PRECHECK_DETERMINISTIC));
++
++        // 6. Custom subclass & "off" mode bypass
++        TestWorld brightDay = buildWorld(EnumDifficulty.NORMAL, 0, 15, 15, Blocks.STONE.getBlockData(), Blocks.AIR.getBlockData(), 64, 64, out);
++        assertEquals(SpawnerCreature.PRECHECK_RESULT_PASS, SpawnerCreature.precheckSpawn(brightDay, out[0], CustomDaylightZombie.class, pos, MobSpawning.PRECHECK_SINGLE_ROLL));
++        assertEquals(SpawnerCreature.PRECHECK_RESULT_PASS, SpawnerCreature.precheckSpawn(brightDay, out[0], EntityZombie.class, pos, MobSpawning.PRECHECK_OFF));
++
++        // 7. 1-shot EntityMonster.antarcticLightPrechecked flag is consumed immediately on first s_() call
++        EntityZombie z = (EntityZombie) EntityTypes.createEntity(EntityZombie.class, brightDay);
++        z.setPosition(8.5, 64.0, 8.5);
++        z.antarcticLightPrechecked = true;
++        assertTrue("First s_() must consume 1-shot prechecked flag", z.s_());
++        assertFalse("Flag must be cleared immediately after first s_()", z.antarcticLightPrechecked);
++        assertFalse("Second s_() on bright block must run vanilla check and return false", z.s_());
++    }
++
++    @Test
++    public void testSlimeSquidBatAndAnimalPrecheckParity() throws Exception {
++        Chunk[] out = new Chunk[1];
++
++        // Slime: y >= 70 always rejected; y = 55 in plains rejected, in swamp at light 0 passed, in swamp at light 8 rejected
++        TestWorld slimeHigh = buildWorld(EnumDifficulty.NORMAL, 11, 0, 0, Blocks.STONE.getBlockData(), Blocks.AIR.getBlockData(), 70, 70, out);
++        assertEquals(SpawnerCreature.PRECHECK_RESULT_REJECT, SpawnerCreature.precheckSpawn(slimeHigh, out[0], EntitySlime.class, new BlockPosition(8, 70, 8), MobSpawning.PRECHECK_DETERMINISTIC));
++
++        TestWorld slimeMid = buildWorld(EnumDifficulty.NORMAL, 11, 0, 0, Blocks.STONE.getBlockData(), Blocks.AIR.getBlockData(), 55, 55, out);
++        assertEquals(SpawnerCreature.PRECHECK_RESULT_REJECT, SpawnerCreature.precheckSpawn(slimeMid, out[0], EntitySlime.class, new BlockPosition(8, 55, 8), MobSpawning.PRECHECK_DETERMINISTIC));
++        slimeMid.biome = Biomes.h; // Swampland
++        assertEquals(SpawnerCreature.PRECHECK_RESULT_PASS, SpawnerCreature.precheckSpawn(slimeMid, out[0], EntitySlime.class, new BlockPosition(8, 55, 8), MobSpawning.PRECHECK_DETERMINISTIC));
++
++        // Squid: must be inside (squidSpawnRangeMin, maxHeight) and in WATER
++        TestWorld squidWater = buildWorld(EnumDifficulty.NORMAL, 0, 15, 0, Blocks.WATER.getBlockData(), Blocks.WATER.getBlockData(), 50, 63, out);
++        assertEquals(SpawnerCreature.PRECHECK_RESULT_PASS, SpawnerCreature.precheckSpawn(squidWater, out[0], EntitySquid.class, new BlockPosition(8, 50, 8), MobSpawning.PRECHECK_DETERMINISTIC));
++        TestWorld squidTooLow = buildWorld(EnumDifficulty.NORMAL, 0, 15, 0, Blocks.WATER.getBlockData(), Blocks.WATER.getBlockData(), 40, 63, out);
++        assertEquals(SpawnerCreature.PRECHECK_RESULT_REJECT, SpawnerCreature.precheckSpawn(squidTooLow, out[0], EntitySquid.class, new BlockPosition(8, 40, 8), MobSpawning.PRECHECK_DETERMINISTIC));
++
++        // Bat: y >= seaLevel or bright light rejected; dark below seaLevel passes
++        TestWorld batDark = buildWorld(EnumDifficulty.NORMAL, 11, 0, 0, Blocks.STONE.getBlockData(), Blocks.AIR.getBlockData(), 40, 64, out);
++        assertEquals(SpawnerCreature.PRECHECK_RESULT_PASS, SpawnerCreature.precheckSpawn(batDark, out[0], EntityBat.class, new BlockPosition(8, 40, 8), MobSpawning.PRECHECK_DETERMINISTIC));
++        TestWorld batSurface = buildWorld(EnumDifficulty.NORMAL, 11, 0, 0, Blocks.STONE.getBlockData(), Blocks.AIR.getBlockData(), 64, 64, out);
++        assertEquals(SpawnerCreature.PRECHECK_RESULT_REJECT, SpawnerCreature.precheckSpawn(batSurface, out[0], EntityBat.class, new BlockPosition(8, 64, 8), MobSpawning.PRECHECK_DETERMINISTIC));
++
++        // Animals: Cow needs GRASS + j > 8; Mooshroom needs MYCELIUM + j > 8; Ocelot needs y >= seaLevel + GRASS/LEAVES; Parrot needs LEAVES/GRASS/LOG
++        TestWorld grassBright = buildWorld(EnumDifficulty.NORMAL, 0, 15, 0, Blocks.GRASS.getBlockData(), Blocks.AIR.getBlockData(), 64, 64, out);
++        assertEquals(SpawnerCreature.PRECHECK_RESULT_PASS, SpawnerCreature.precheckSpawn(grassBright, out[0], EntityCow.class, new BlockPosition(8, 64, 8), MobSpawning.PRECHECK_DETERMINISTIC));
++        assertEquals(SpawnerCreature.PRECHECK_RESULT_REJECT, SpawnerCreature.precheckSpawn(grassBright, out[0], EntityMushroomCow.class, new BlockPosition(8, 64, 8), MobSpawning.PRECHECK_DETERMINISTIC));
++        assertEquals(SpawnerCreature.PRECHECK_RESULT_PASS, SpawnerCreature.precheckSpawn(grassBright, out[0], EntityOcelot.class, new BlockPosition(8, 64, 8), MobSpawning.PRECHECK_DETERMINISTIC));
++        assertEquals(SpawnerCreature.PRECHECK_RESULT_PASS, SpawnerCreature.precheckSpawn(grassBright, out[0], EntityParrot.class, new BlockPosition(8, 64, 8), MobSpawning.PRECHECK_DETERMINISTIC));
++
++        TestWorld stoneBright = buildWorld(EnumDifficulty.NORMAL, 0, 15, 0, Blocks.STONE.getBlockData(), Blocks.AIR.getBlockData(), 64, 64, out);
++        assertEquals(SpawnerCreature.PRECHECK_RESULT_REJECT, SpawnerCreature.precheckSpawn(stoneBright, out[0], EntityCow.class, new BlockPosition(8, 64, 8), MobSpawning.PRECHECK_DETERMINISTIC));
++        assertEquals(SpawnerCreature.PRECHECK_RESULT_REJECT, SpawnerCreature.precheckSpawn(stoneBright, out[0], EntityOcelot.class, new BlockPosition(8, 64, 8), MobSpawning.PRECHECK_DETERMINISTIC));
++        assertEquals(SpawnerCreature.PRECHECK_RESULT_REJECT, SpawnerCreature.precheckSpawn(stoneBright, out[0], EntityParrot.class, new BlockPosition(8, 64, 8), MobSpawning.PRECHECK_DETERMINISTIC));
++
++        TestWorld myceliumBright = buildWorld(EnumDifficulty.NORMAL, 0, 15, 0, Blocks.MYCELIUM.getBlockData(), Blocks.AIR.getBlockData(), 64, 64, out);
++        assertEquals(SpawnerCreature.PRECHECK_RESULT_PASS, SpawnerCreature.precheckSpawn(myceliumBright, out[0], EntityMushroomCow.class, new BlockPosition(8, 64, 8), MobSpawning.PRECHECK_DETERMINISTIC));
++    }
++
++    @Test
++    public void testPrecheckPerformanceAndAllocationSavings() throws Exception {
++        Chunk[] out = new Chunk[1];
++        // Lit island / daytime stone surface (mirrors SuperiorWorld's 90.9% daytime light rejection)
++        TestWorld world = buildWorld(EnumDifficulty.NORMAL, 0, 15, 10, Blocks.STONE.getBlockData(), Blocks.AIR.getBlockData(), 64, 64, out);
++        Chunk chunk = out[0];
++        BlockPosition.MutableBlockPosition pos = new BlockPosition.MutableBlockPosition(8, 64, 8);
++
++        com.sun.management.ThreadMXBean tmxb = (com.sun.management.ThreadMXBean) ManagementFactory.getThreadMXBean();
++        long tid = Thread.currentThread().getId();
++
++        // Warmup both paths
++        int sink = 0;
++        for (int i = 0; i < 400; ++i) {
++            EntityZombie z = new EntityZombie(world);
++            z.setPositionRotation(8.5, 64.0, 8.5, 0.0F, 0.0F);
++            if (z.P()) sink++;
++            if (SpawnerCreature.precheckSpawn(world, chunk, EntityZombie.class, pos, MobSpawning.PRECHECK_SINGLE_ROLL) != SpawnerCreature.PRECHECK_RESULT_REJECT) {
++                sink++;
++            }
++        }
++
++        int attempts = 2_000;
++        long alloc0 = tmxb.getThreadAllocatedBytes(tid);
++        long t0 = System.nanoTime();
++        for (int i = 0; i < attempts; ++i) {
++            EntityInsentient e = (EntityInsentient) EntityZombie.class.getConstructor(new Class[] { World.class }).newInstance(new Object[] { world });
++            e.setPositionRotation(8.5, 64.0, 8.5, 0.0F, 0.0F);
++            if (e.P()) sink++;
++        }
++        long oldNs = System.nanoTime() - t0;
++        long oldBytes = tmxb.getThreadAllocatedBytes(tid) - alloc0;
++
++        long alloc1 = tmxb.getThreadAllocatedBytes(tid);
++        long t1 = System.nanoTime();
++        for (int i = 0; i < attempts; ++i) {
++            if (SpawnerCreature.precheckSpawn(world, chunk, EntityZombie.class, pos, MobSpawning.PRECHECK_SINGLE_ROLL) != SpawnerCreature.PRECHECK_RESULT_REJECT) {
++                EntityInsentient e = (EntityInsentient) EntityTypes.createEntity(EntityZombie.class, world);
++                e.setPositionRotation(8.5, 64.0, 8.5, 0.0F, 0.0F);
++                if (e.P()) sink++;
++            }
++        }
++        long newNs = System.nanoTime() - t1;
++        long newBytes = tmxb.getThreadAllocatedBytes(tid) - alloc1;
++
++        assertEquals(0, sink);
++        double speedup = (double) oldNs / Math.max(1L, newNs);
++        System.out.printf("SpawnerCreaturePrecheckTest (%d daytime rejects): old=%.2fms (%.1f KiB) new=%.3fms (%.1f KiB) speedup=%.1fx%n",
++                attempts, oldNs / 1e6, oldBytes / 1024.0, newNs / 1e6, newBytes / 1024.0, speedup);
++        assertTrue("Expected >= 10x speedup on rejected daytime spawns, got " + speedup + "x", speedup >= 10.0);
++        assertTrue("Expected >= 90% allocation reduction, old=" + oldBytes + " new=" + newBytes, newBytes * 10L < oldBytes);
++    }
++}

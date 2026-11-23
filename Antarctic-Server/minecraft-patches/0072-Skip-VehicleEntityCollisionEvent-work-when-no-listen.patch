@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Sun, 18 Oct 2026 14:53:24 +0700
-Subject: [PATCH 072/117] Skip VehicleEntityCollisionEvent work when no
+Subject: [PATCH 072/118] Skip VehicleEntityCollisionEvent work when no
  listeners are registered
 
 - Hoist a VehicleEntityCollisionEvent.getHandlerList().getRegisteredListeners().length != 0 check around both collision event firing sites in EntityBoat collide so the event, its entity snapshots and the dispatch are skipped entirely when no plugin listens (backport of Leaf MC 0311)
