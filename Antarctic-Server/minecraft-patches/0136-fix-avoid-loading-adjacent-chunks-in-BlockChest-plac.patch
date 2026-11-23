@@ -1,0 +1,176 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 00:56:26 +0700
+Subject: [PATCH 136/136] fix: avoid loading adjacent chunks in BlockChest
+ placement checks
+
+
+diff --git a/main/java/net/minecraft/server/BlockChest.java b/main/java/net/minecraft/server/BlockChest.java
+index 98e651f..ab2a332 100644
+--- a/main/java/net/minecraft/server/BlockChest.java
++++ b/main/java/net/minecraft/server/BlockChest.java
+@@ -36,19 +36,23 @@ public class BlockChest extends BlockTileEntity {
+         return iblockaccess.getType(blockposition.north()).getBlock() == this ? BlockChest.b : (iblockaccess.getType(blockposition.south()).getBlock() == this ? BlockChest.c : (iblockaccess.getType(blockposition.west()).getBlock() == this ? BlockChest.d : (iblockaccess.getType(blockposition.east()).getBlock() == this ? BlockChest.e : BlockChest.f)));
+     }
+ 
++    private static final EnumDirection[] HORIZONTAL_DIRECTIONS = new EnumDirection[] { EnumDirection.NORTH, EnumDirection.EAST, EnumDirection.SOUTH, EnumDirection.WEST };
++
++    private static IBlockData getTypeOrAirIfUnloaded(World world, BlockPosition pos) {
++        IBlockData data = world.getTypeIfLoaded(pos);
++        return data != null ? data : Blocks.AIR.getBlockData();
++    }
++
+     public void onPlace(World world, BlockPosition blockposition, IBlockData iblockdata) {
+         this.e(world, blockposition, iblockdata);
+-        Iterator iterator = EnumDirection.EnumDirectionLimit.HORIZONTAL.iterator();
+-
+-        while (iterator.hasNext()) {
+-            EnumDirection enumdirection = (EnumDirection) iterator.next();
+-            BlockPosition blockposition1 = blockposition.shift(enumdirection);
++        for (int i = 0; i < HORIZONTAL_DIRECTIONS.length; ++i) {
++            BlockPosition blockposition1 = blockposition.shift(HORIZONTAL_DIRECTIONS[i]);
+             // NeonPaper start - Dont load chunks for chests
+             final IBlockData iblockdata1 = world.getTypeIfLoaded(blockposition1);
+-            if (iblockdata1 ==  null) {
++            if (iblockdata1 == null) {
+                 continue;
+-             }
+-             // NeonPaper end
++            }
++            // NeonPaper end
+ 
+             if (iblockdata1.getBlock() == this) {
+                 this.e(world, blockposition1, iblockdata1);
+@@ -69,10 +73,10 @@ public class BlockChest extends BlockTileEntity {
+         BlockPosition blockposition2 = blockposition.south();
+         BlockPosition blockposition3 = blockposition.west();
+         BlockPosition blockposition4 = blockposition.east();
+-        boolean flag = this == world.getType(blockposition1).getBlock();
+-        boolean flag1 = this == world.getType(blockposition2).getBlock();
+-        boolean flag2 = this == world.getType(blockposition3).getBlock();
+-        boolean flag3 = this == world.getType(blockposition4).getBlock();
++        boolean flag = this == getTypeOrAirIfUnloaded(world, blockposition1).getBlock();
++        boolean flag1 = this == getTypeOrAirIfUnloaded(world, blockposition2).getBlock();
++        boolean flag2 = this == getTypeOrAirIfUnloaded(world, blockposition3).getBlock();
++        boolean flag3 = this == getTypeOrAirIfUnloaded(world, blockposition4).getBlock();
+ 
+         if (!flag && !flag1 && !flag2 && !flag3) {
+             world.setTypeAndData(blockposition, iblockdata, 3);
+@@ -108,10 +112,10 @@ public class BlockChest extends BlockTileEntity {
+         if (world.isClientSide) {
+             return iblockdata;
+         } else {
+-            IBlockData iblockdata1 = world.getType(blockposition.north());
+-            IBlockData iblockdata2 = world.getType(blockposition.south());
+-            IBlockData iblockdata3 = world.getType(blockposition.west());
+-            IBlockData iblockdata4 = world.getType(blockposition.east());
++            IBlockData iblockdata1 = getTypeOrAirIfUnloaded(world, blockposition.north());
++            IBlockData iblockdata2 = getTypeOrAirIfUnloaded(world, blockposition.south());
++            IBlockData iblockdata3 = getTypeOrAirIfUnloaded(world, blockposition.west());
++            IBlockData iblockdata4 = getTypeOrAirIfUnloaded(world, blockposition.east());
+             EnumDirection enumdirection = (EnumDirection) iblockdata.get(BlockChest.FACING);
+ 
+             if (iblockdata1.getBlock() != this && iblockdata2.getBlock() != this) {
+@@ -120,8 +124,8 @@ public class BlockChest extends BlockTileEntity {
+ 
+                 if (iblockdata3.getBlock() == this || iblockdata4.getBlock() == this) {
+                     BlockPosition blockposition1 = iblockdata3.getBlock() == this ? blockposition.west() : blockposition.east();
+-                    IBlockData iblockdata5 = world.getType(blockposition1.north());
+-                    IBlockData iblockdata6 = world.getType(blockposition1.south());
++                    IBlockData iblockdata5 = getTypeOrAirIfUnloaded(world, blockposition1.north());
++                    IBlockData iblockdata6 = getTypeOrAirIfUnloaded(world, blockposition1.south());
+ 
+                     enumdirection = EnumDirection.SOUTH;
+                     EnumDirection enumdirection1;
+@@ -146,8 +150,8 @@ public class BlockChest extends BlockTileEntity {
+                 }
+             } else {
+                 BlockPosition blockposition2 = iblockdata1.getBlock() == this ? blockposition.north() : blockposition.south();
+-                IBlockData iblockdata7 = world.getType(blockposition2.west());
+-                IBlockData iblockdata8 = world.getType(blockposition2.east());
++                IBlockData iblockdata7 = getTypeOrAirIfUnloaded(world, blockposition2.west());
++                IBlockData iblockdata8 = getTypeOrAirIfUnloaded(world, blockposition2.east());
+ 
+                 enumdirection = EnumDirection.EAST;
+                 EnumDirection enumdirection2;
+diff --git a/test/java/net/minecraft/server/BlockChestNoChunkLoadTest.java b/test/java/net/minecraft/server/BlockChestNoChunkLoadTest.java
+new file mode 100644
+index 0000000..0351189
+--- /dev/null
++++ b/test/java/net/minecraft/server/BlockChestNoChunkLoadTest.java
+@@ -0,0 +1,75 @@
++package net.minecraft.server;
++
++import java.lang.reflect.Field;
++import org.junit.Assert;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++public class BlockChestNoChunkLoadTest {
++
++    private static Unsafe unsafe;
++
++    @BeforeClass
++    public static void setup() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        unsafe = (Unsafe) f.get(null);
++    }
++
++    private static final class GuardedWorld extends World {
++        int syncGetTypeCalls;
++        int getTypeIfLoadedCalls;
++
++        GuardedWorld() {
++            super(null, null, null, null, false, null, null);
++        }
++
++        @Override
++        protected IChunkProvider n() {
++            return null;
++        }
++
++        @Override
++        protected boolean isChunkLoaded(int i, int j, boolean flag) {
++            return i == 0 && j == 0;
++        }
++
++        @Override
++        public IBlockData getType(BlockPosition pos) {
++            syncGetTypeCalls++;
++            throw new AssertionError("BlockChest must not call sync World.getType on neighbor " + pos);
++        }
++
++        @Override
++        public IBlockData getTypeIfLoaded(BlockPosition pos) {
++            getTypeIfLoadedCalls++;
++            // Only chunk (0, 0) is loaded; neighbors across chunk border return null
++            if ((pos.getX() >> 4) == 0 && (pos.getZ() >> 4) == 0) {
++                return Blocks.AIR.getBlockData();
++            }
++            return null;
++        }
++
++        @Override
++        public boolean setTypeAndData(BlockPosition pos, IBlockData state, int flags) {
++            return true;
++        }
++    }
++
++    @Test
++    public void testOnPlaceAtChunkBorderNeverCallsSyncGetType() throws Exception {
++        GuardedWorld world = (GuardedWorld) unsafe.allocateInstance(GuardedWorld.class);
++        Field clientSide = World.class.getDeclaredField("isClientSide");
++        clientSide.setAccessible(true);
++        clientSide.setBoolean(world, false);
++
++        BlockChest chest = (BlockChest) Blocks.CHEST;
++        // Place at chunk border (0, 64, 0) where north (0, 64, -1) and west (-1, 64, 0) are in unloaded chunks
++        chest.onPlace(world, new BlockPosition(0, 64, 0), chest.getBlockData());
++
++        Assert.assertEquals("BlockChest.onPlace/e must never trigger synchronous World.getType", 0, world.syncGetTypeCalls);
++        Assert.assertTrue("BlockChest must inspect neighbors via getTypeIfLoaded", world.getTypeIfLoadedCalls >= 4);
++    }
++}
