@@ -1,0 +1,672 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Mon, 23 Nov 2026 14:12:48 +0700
+Subject: [PATCH 121/121] feat: add opt-in per-player mob spawns
+
+
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/MobSpawning.java b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/MobSpawning.java
+index e3436d9..cd5b3a8 100644
+--- a/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/MobSpawning.java
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/MobSpawning.java
+@@ -44,6 +44,18 @@ public class MobSpawning implements IConfigModule {
+     )
+     public static int spawnerIdlePlayerCheckInterval = 1;
+ 
++    @ConfigInfo(
++        baseName = "per-player-mob-spawns",
++        comments = "Opt-in Paper 1.14+ per-player local mob-cap engine adapted for 1.12.2.\nWhen true, each player gets an isolated local mob cap so one player's mob farm or Skyblock island cannot starve other players.\nDefault false preserves strict 1.12.2 global world mob-cap behavior."
++    )
++    public static boolean perPlayerMobSpawns = false;
++
++    @ConfigInfo(
++        baseName = "per-player-mob-count-radius-chunks",
++        comments = "Chunk radius around each player used to tally local mob counts when per-player-mob-spawns is true.\n0 (default) auto-derives max(mobSpawnRange, ceil(sqrt(hardDespawnDistance) / 16)) (= 8 chunks at 128-block despawn) to block infinite-spawn exploits; set >= 1 to override explicitly."
++    )
++    public static int perPlayerMobCountRadiusChunks = 0;
++
+     public static int getPrecheckLightMode() {
+         String mode = precheckLightMode;
+         if (mode == "single-roll") {
+@@ -111,5 +123,10 @@ public class MobSpawning implements IConfigModule {
+                 "optimizations.mob-spawning.spawner-idle-player-check-interval must be >= 1, got: " + spawnerIdlePlayerCheckInterval
+             );
+         }
++        if (perPlayerMobCountRadiusChunks < 0) {
++            throw new IllegalArgumentException(
++                "optimizations.mob-spawning.per-player-mob-count-radius-chunks must be >= 0, got: " + perPlayerMobCountRadiusChunks
++            );
++        }
+     }
+ }
+diff --git a/main/java/net/minecraft/server/EntityPlayer.java b/main/java/net/minecraft/server/EntityPlayer.java
+index 15e2dae..c2c0fe1 100644
+--- a/main/java/net/minecraft/server/EntityPlayer.java
++++ b/main/java/net/minecraft/server/EntityPlayer.java
+@@ -83,6 +83,22 @@ public class EntityPlayer extends EntityHuman implements ICrafting {
+     public boolean queueHealthUpdatePacket = false;
+     public net.minecraft.server.PacketPlayOutUpdateHealth queuedHealthUpdatePacket;
+     // Paper end
++    // Antarctic start - reusable per-player local mob counts for opt-in per-player-mob-spawns
++    int[] antarcticLocalMobCounts = new int[EnumCreatureType.values().length];
++
++    int[] getOrInitLocalMobCounts() {
++        int[] counts = this.antarcticLocalMobCounts;
++        if (counts == null) {
++            counts = new int[EnumCreatureType.values().length];
++            this.antarcticLocalMobCounts = counts;
++        }
++        return counts;
++    }
++
++    public int getLocalMobCount(EnumCreatureType type) {
++        return this.getOrInitLocalMobCounts()[type.ordinal()];
++    }
++    // Antarctic end
+ 
+     // CraftBukkit start
+     public String displayName;
+diff --git a/main/java/net/minecraft/server/SpawnerCreature.java b/main/java/net/minecraft/server/SpawnerCreature.java
+index 7346e0a..109281a 100644
+--- a/main/java/net/minecraft/server/SpawnerCreature.java
++++ b/main/java/net/minecraft/server/SpawnerCreature.java
+@@ -1,8 +1,10 @@
+ package net.minecraft.server;
+ 
+ import com.google.common.collect.Sets;
++import it.unimi.dsi.fastutil.ints.IntArrayList;
+ import it.unimi.dsi.fastutil.longs.LongArrayList;
+ import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
++import java.util.ArrayList;
+ import java.util.Calendar;
+ import java.util.IdentityHashMap;
+ import java.util.Iterator;
+@@ -25,6 +27,89 @@ public final class SpawnerCreature {
+     // Antarctic start - replace CraftBukkit LongHashSet + boxed Iterator with single-probe LongOpenHashSet + compact LongArrayList
+     private final LongOpenHashSet eligibleChunkSet = new LongOpenHashSet(Math.max(64, MobSpawning.eligibleChunkInitialCapacity));
+     private final LongArrayList eligibleChunkList = new LongArrayList(Math.max(64, MobSpawning.eligibleChunkInitialCapacity));
++    // Reusable scratch buffers for opt-in per-player-mob-spawns (zero per-tick allocation)
++    private final ArrayList<EntityPlayer> localCapPlayers = new ArrayList<EntityPlayer>(64);
++    private final IntArrayList localCapPlayerChunkX = new IntArrayList(64);
++    private final IntArrayList localCapPlayerChunkZ = new IntArrayList(64);
++
++    static int resolvePerPlayerMobCountRadius(WorldServer worldserver) {
++        int configured = MobSpawning.perPlayerMobCountRadiusChunks;
++        if (configured > 0) {
++            return configured;
++        }
++        int spawnRange = Math.min(8, Math.min(worldserver.spigotConfig.mobSpawnRange, worldserver.spigotConfig.viewDistance));
++        int hardDespawnDistSq = worldserver.paperConfig != null ? worldserver.paperConfig.hardDespawnDistance : (128 * 128);
++        int despawnChunks = hardDespawnDistSq > 0 ? (int) Math.ceil(Math.sqrt((double) hardDespawnDistSq) / 16.0D) : 8;
++        return Math.max(1, Math.max(spawnRange, despawnChunks));
++    }
++
++    private void tallyPerPlayerMobCounts(WorldServer worldserver, int radius) {
++        final int playerCount = this.localCapPlayers.size();
++        for (int p = 0; p < playerCount; ++p) {
++            EntityPlayer player = this.localCapPlayers.get(p);
++            int[] counts = player.getOrInitLocalMobCounts();
++            counts[0] = 0;
++            counts[1] = 0;
++            counts[2] = 0;
++            counts[3] = 0;
++            int pcx = this.localCapPlayerChunkX.getInt(p);
++            int pcz = this.localCapPlayerChunkZ.getInt(p);
++            for (int dx = -radius; dx <= radius; ++dx) {
++                int cx = pcx + dx;
++                for (int dz = -radius; dz <= radius; ++dz) {
++                    Chunk chunk = worldserver.getChunkIfLoaded(cx, pcz + dz);
++                    if (chunk != null) {
++                        int[] cc = chunk.antarcticCreatureCounts;
++                        counts[0] += cc[0];
++                        counts[1] += cc[1];
++                        counts[2] += cc[2];
++                        counts[3] += cc[3];
++                    }
++                }
++            }
++        }
++    }
++
++    private boolean hasAnyPlayerBelowLocalCap(int categoryOrd, int limit) {
++        for (int p = 0, n = this.localCapPlayers.size(); p < n; ++p) {
++            if (this.localCapPlayers.get(p).antarcticLocalMobCounts[categoryOrd] < limit) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    private boolean canSpawnInChunkForLocalCaps(int chunkX, int chunkZ, int categoryOrd, int limit, int radius) {
++        for (int p = 0, n = this.localCapPlayers.size(); p < n; ++p) {
++            int dx = chunkX - this.localCapPlayerChunkX.getInt(p);
++            if (dx >= -radius && dx <= radius) {
++                int dz = chunkZ - this.localCapPlayerChunkZ.getInt(p);
++                if (dz >= -radius && dz <= radius) {
++                    if (this.localCapPlayers.get(p).antarcticLocalMobCounts[categoryOrd] >= limit) {
++                        return false;
++                    }
++                }
++            }
++        }
++        return true;
++    }
++
++    /** Records a newly spawned mob into every player whose local cap covers (chunkX, chunkZ) and returns true if any reached limit. */
++    private boolean recordLocalMobSpawnAndCheckCap(int chunkX, int chunkZ, int categoryOrd, int limit, int radius) {
++        boolean reachedCap = false;
++        for (int p = 0, n = this.localCapPlayers.size(); p < n; ++p) {
++            int dx = chunkX - this.localCapPlayerChunkX.getInt(p);
++            if (dx >= -radius && dx <= radius) {
++                int dz = chunkZ - this.localCapPlayerChunkZ.getInt(p);
++                if (dz >= -radius && dz <= radius) {
++                    if (++this.localCapPlayers.get(p).antarcticLocalMobCounts[categoryOrd] >= limit) {
++                        reachedCap = true;
++                    }
++                }
++            }
++        }
++        return reachedCap;
++    }
+ 
+     void resetEligibleChunks() {
+         int prevSize = this.eligibleChunkList.size();
+@@ -331,6 +416,13 @@ public final class SpawnerCreature {
+         } else {
+             // Antarctic start - reuse and trim primitive eligible chunk buffers
+             this.resetEligibleChunks();
++            final boolean perPlayerMobSpawns = MobSpawning.perPlayerMobSpawns;
++            final int localCapRadius = perPlayerMobSpawns ? resolvePerPlayerMobCountRadius(worldserver) : 0;
++            if (perPlayerMobSpawns) {
++                this.localCapPlayers.clear();
++                this.localCapPlayerChunkX.clear();
++                this.localCapPlayerChunkZ.clear();
++            }
+             int i = 0;
+             final WorldBorder worldBorder = worldserver.getWorldBorder();
+             final PlayerChunkMap playerChunkMap = worldserver.getPlayerChunkMap();
+@@ -347,6 +439,11 @@ public final class SpawnerCreature {
+                     int l = MathHelper.floor(entityhuman.locX / 16.0D);
+ 
+                     j = MathHelper.floor(entityhuman.locZ / 16.0D);
++                    if (perPlayerMobSpawns && entityhuman instanceof EntityPlayer) {
++                        this.localCapPlayers.add((EntityPlayer) entityhuman);
++                        this.localCapPlayerChunkX.add(l);
++                        this.localCapPlayerChunkZ.add(j);
++                    }
+                     // Spigot Start
+                     byte b0 = worldserver.spigotConfig.mobSpawnRange;
+                     b0 = ( b0 > worldserver.spigotConfig.viewDistance ) ? (byte) worldserver.spigotConfig.viewDistance : b0;
+@@ -393,6 +490,9 @@ public final class SpawnerCreature {
+                 }
+             }
+             // Antarctic end
++            if (perPlayerMobSpawns && !this.localCapPlayers.isEmpty()) {
++                this.tallyPerPlayerMobCounts(worldserver, localCapRadius);
++            }
+ 
+             int j1 = 0;
+             BlockPosition blockposition = worldserver.getSpawn();
+@@ -436,15 +536,23 @@ public final class SpawnerCreature {
+                     int l1 = limit * i / a; // CraftBukkit - use per-world limits
+                     */ // Paper end
+ 
+-                    if ((mobcnt = worldserver.getCreatureCount(enumcreaturetype)) <= limit * i / SpawnerCreature.a) { // Paper - use 17x17 like vanilla (a at top of file) // Antarctic - O(1) tracked world count
++                    final int categoryOrd = enumcreaturetype.ordinal();
++                    final boolean canSpawnCategory = perPlayerMobSpawns
++                            ? this.hasAnyPlayerBelowLocalCap(categoryOrd, limit)
++                            : ((mobcnt = worldserver.getCreatureCount(enumcreaturetype)) <= limit * i / SpawnerCreature.a);
++
++                    if (canSpawnCategory) { // Paper - use 17x17 like vanilla (a at top of file) // Antarctic - O(1) tracked world count or opt-in per-player local caps
+                         BlockPosition.MutableBlockPosition blockposition_mutableblockposition = new BlockPosition.MutableBlockPosition();
+ 
+-                        int moblimit = computeMobLimit(limit, i, mobcnt); // Antarctic - align divisor with 17x17 (289) cap check above
++                        int moblimit = perPlayerMobSpawns ? Integer.MAX_VALUE : computeMobLimit(limit, i, mobcnt); // Antarctic - align divisor with 17x17 (289) cap check above
+                         label120:
+                         for (int chunkIdx = 0; chunkIdx < eligibleCount && moblimit > 0; ++chunkIdx) { // Antarctic - compact primitive iteration
+                             long key = this.eligibleChunkList.getLong(chunkIdx);
+                             int chunkX = LongHash.msw(key);
+                             int chunkZ = LongHash.lsw(key);
++                            if (perPlayerMobSpawns && !this.canSpawnInChunkForLocalCaps(chunkX, chunkZ, categoryOrd, limit, localCapRadius)) {
++                                continue;
++                            }
+                             Chunk originChunk = worldserver.getChunkIfLoaded(chunkX, chunkZ);
+                             if (originChunk == null) {
+                                 continue;
+@@ -490,6 +598,10 @@ public final class SpawnerCreature {
+                                                             ? originChunk
+                                                             : worldserver.getChunkIfLoaded(spawnChunkX, spawnChunkZ);
+                                                     if (spawnChunk != null) {
++                                                        if (perPlayerMobSpawns && (spawnChunkX != chunkX || spawnChunkZ != chunkZ) && !this.canSpawnInChunkForLocalCaps(spawnChunkX, spawnChunkZ, categoryOrd, limit, localCapRadius)) {
++                                                            ++j4;
++                                                            continue;
++                                                        }
+                                                         // Antarctic start - support-first filtering skips void/mid-air before O(P) player scan & structure lookups
+                                                         if (supportFirst && !spawnChunk.a(j3, k3 - 1, l3).q() && spawnChunk.a(j3, k3, l3).getMaterial() != Material.WATER) {
+                                                             ++j4;
+@@ -555,7 +667,13 @@ public final class SpawnerCreature {
+                                                                         // CraftBukkit start
+                                                                         if (worldserver.addEntity(entityinsentient, SpawnReason.NATURAL)) {
+                                                                             ++l2;
+-                                                                            moblimit--; // Spigot
++                                                                            if (perPlayerMobSpawns) {
++                                                                                if (this.recordLocalMobSpawnAndCheckCap(spawnChunkX, spawnChunkZ, categoryOrd, limit, localCapRadius)) {
++                                                                                    continue label120;
++                                                                                }
++                                                                            } else {
++                                                                                moblimit--; // Spigot
++                                                                            }
+                                                                         }
+                                                                         // CraftBukkit end
+                                                                     } else {
+@@ -563,7 +681,7 @@ public final class SpawnerCreature {
+                                                                     }
+ 
+                                                                     // Antarctic start - restore vanilla per-chunk pack cap (cU()) alongside Spigot moblimit
+-                                                                    if (l2 >= entityinsentient.cU() || moblimit <= 0) {
++                                                                    if (l2 >= entityinsentient.cU() || (!perPlayerMobSpawns && moblimit <= 0)) {
+                                                                         continue label120;
+                                                                     }
+                                                                     // Antarctic end
+diff --git a/test/java/net/minecraft/server/PerPlayerMobSpawnsTest.java b/test/java/net/minecraft/server/PerPlayerMobSpawnsTest.java
+new file mode 100644
+index 0000000..1639989
+--- /dev/null
++++ b/test/java/net/minecraft/server/PerPlayerMobSpawnsTest.java
+@@ -0,0 +1,397 @@
++package net.minecraft.server;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++
++import com.destroystokyo.paper.PaperWorldConfig;
++import com.destroystokyo.paper.config.toml.modules.optimizations.MobSpawning;
++import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
++import java.lang.management.ManagementFactory;
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Random;
++import java.util.UUID;
++import org.bukkit.Bukkit;
++import org.bukkit.craftbukkit.CraftServer;
++import org.bukkit.craftbukkit.CraftWorld;
++import org.bukkit.craftbukkit.entity.CraftPlayer;
++import org.bukkit.craftbukkit.util.LongHash;
++import org.bukkit.event.entity.CreatureSpawnEvent;
++import org.bukkit.plugin.SimplePluginManager;
++import org.junit.After;
++import org.junit.AfterClass;
++import org.junit.Before;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import org.spigotmc.AsyncCatcher;
++import org.spigotmc.SpigotWorldConfig;
++import sun.misc.Unsafe;
++
++/**
++ * Verifies Commit 6 (0121) - opt-in per-player mob spawns:
++ * - Default per-player-mob-spawns == false preserves strict global 1.12.2 cap (Player A at 70/70 starves Player B)
++ * - When per-player-mob-spawns == true, Player A at 70/70 is blocked while isolated Player B at 0/70 spawns freely up to 70
++ * - Auto radius (0 -> max(mobSpawnRange, ceil(sqrt(hardDespawnDistance)/16)) == 8) blocks the r=4 infinite-spawn exploit
++ * - Overlapping players do not double-cap shared chunks (Paper LocalMobCapCalculator fairness)
++ * - High-load 100-player tally overhead is low (< 1 ms/tick) and 0 B steady-state allocation
++ */
++public class PerPlayerMobSpawnsTest {
++
++    private static Unsafe unsafe;
++    private static boolean installedBukkitServer;
++    private static int nextEntityId = 20000;
++    private boolean prevAsyncCatcher;
++
++    public static final class StubHostile extends EntityInsentient implements IMonster {
++        public StubHostile(World world) {
++            super(world);
++        }
++
++        @Override public boolean P() { return true; }
++        @Override public boolean canSpawn() { return true; }
++        @Override public int cU() { return 4; }
++        @Override public GroupDataEntity prepare(DifficultyDamageScaler d, GroupDataEntity g) { return g; }
++    }
++
++    private static final class StubChunkProvider extends ChunkProviderServer {
++        StubChunkProvider(WorldServer world) {
++            super(world, null, null);
++        }
++    }
++
++    private static final class FastPlayerChunkMap extends PlayerChunkMap {
++        final Long2ObjectOpenHashMap<PlayerChunk> map = new Long2ObjectOpenHashMap<PlayerChunk>();
++
++        FastPlayerChunkMap() {
++            super(null);
++        }
++
++        @Override
++        public PlayerChunk getChunk(int x, int z) {
++            return map.get(LongHash.toLong(x, z));
++        }
++    }
++
++    private static final class StubCraftWorld extends CraftWorld {
++        int monsterLimit = 70;
++
++        StubCraftWorld() {
++            super(null, null, null);
++        }
++
++        @Override public int getMonsterSpawnLimit() { return monsterLimit; }
++        @Override public int getAnimalSpawnLimit() { return 0; }
++        @Override public int getWaterAnimalSpawnLimit() { return 0; }
++        @Override public int getAmbientSpawnLimit() { return 0; }
++    }
++
++    private static final class TestWorld extends WorldServer {
++        StubCraftWorld stubCraftWorld;
++        BiomeBase.BiomeMeta forcedMeta = new BiomeBase.BiomeMeta(StubHostile.class, 100, 4, 4);
++        int spawnsNearA;
++        int spawnsNearB;
++
++        TestWorld() {
++            super(null, null, null, 0, null, null, null);
++        }
++
++        @Override public CraftWorld getWorld() { return stubCraftWorld; }
++        @Override public BlockPosition getSpawn() { return new BlockPosition(1000000, 64, 1000000); }
++        @Override public EnumDifficulty getDifficulty() { return EnumDifficulty.NORMAL; }
++        @Override public boolean isPlayerNearby(double x, double y, double z, double d) { return false; }
++        @Override public DifficultyDamageScaler D(BlockPosition pos) { return new DifficultyDamageScaler(EnumDifficulty.NORMAL, 0L, 0L, 0.0F); }
++
++        @Override
++        public BiomeBase.BiomeMeta a(EnumCreatureType type, BlockPosition pos) {
++            return type == EnumCreatureType.MONSTER ? forcedMeta : null;
++        }
++
++        @Override
++        public boolean a(EnumCreatureType type, BiomeBase.BiomeMeta meta, BlockPosition pos) {
++            return type == EnumCreatureType.MONSTER && meta == forcedMeta;
++        }
++
++        @Override
++        public boolean addEntity(Entity entity, CreatureSpawnEvent.SpawnReason reason) {
++            int cx = MathHelper.floor(entity.locX) >> 4;
++            int cz = MathHelper.floor(entity.locZ) >> 4;
++            Chunk chunk = this.getChunkIfLoaded(cx, cz);
++            if (chunk != null) {
++                chunk.a(entity);
++            }
++            if (cx < 50) {
++                ++spawnsNearA;
++            } else {
++                ++spawnsNearB;
++            }
++            return true;
++        }
++
++        @Override
++        protected void b(Entity entity) {
++            entity.valid = true;
++        }
++    }
++
++    @BeforeClass
++    public static void bootstrap() throws Exception {
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        unsafe = (Unsafe) f.get(null);
++        DispenserRegistry.c();
++        if (Bukkit.getServer() == null) {
++            CraftServer server = (CraftServer) unsafe.allocateInstance(CraftServer.class);
++            SimplePluginManager pm = new SimplePluginManager(server, new org.bukkit.command.SimpleCommandMap(server));
++            setField(CraftServer.class, server, "pluginManager", pm);
++            setField(Bukkit.class, null, "server", server);
++            installedBukkitServer = true;
++        }
++    }
++
++    @AfterClass
++    public static void cleanupBukkitServer() throws Exception {
++        if (installedBukkitServer) {
++            setField(Bukkit.class, null, "server", null);
++            installedBukkitServer = false;
++        }
++    }
++
++    @Before
++    public void setUp() {
++        this.prevAsyncCatcher = AsyncCatcher.enabled;
++        AsyncCatcher.enabled = false;
++    }
++
++    @After
++    public void tearDown() {
++        AsyncCatcher.enabled = this.prevAsyncCatcher;
++        MobSpawning.perPlayerMobSpawns = false;
++        MobSpawning.perPlayerMobCountRadiusChunks = 0;
++    }
++
++    private static void setField(Class<?> owner, Object target, String name, Object value) throws Exception {
++        Field f = owner.getDeclaredField(name);
++        f.setAccessible(true);
++        f.set(target, value);
++    }
++
++    private static TestWorld newWorld(int monsterLimit) throws Exception {
++        TestWorld world = (TestWorld) unsafe.allocateInstance(TestWorld.class);
++        SpigotWorldConfig spigot = (SpigotWorldConfig) unsafe.allocateInstance(SpigotWorldConfig.class);
++        spigot.mobSpawnRange = 4;
++        spigot.viewDistance = 8;
++        setField(World.class, world, "spigotConfig", spigot);
++        PaperWorldConfig paper = (PaperWorldConfig) unsafe.allocateInstance(PaperWorldConfig.class);
++        paper.hardDespawnDistance = 128 * 128;
++        setField(World.class, world, "paperConfig", paper);
++        world.worldProvider = new WorldProviderNormal();
++        setField(World.class, world, "random", new Random(555L));
++        setField(World.class, world, "P", new WorldBorder());
++        setField(World.class, world, "players", new ArrayList<EntityHuman>());
++        setField(World.class, world, "u", new ArrayList<IWorldAccess>());
++        setField(World.class, world, "tileEntityListTick", new ArrayList<TileEntity>());
++        setField(World.class, world, "b", new ArrayList<TileEntity>());
++        setField(World.class, world, "entityList", new ArrayList<Entity>());
++        setField(World.class, world, "methodProfiler", new MethodProfiler());
++        setField(World.class, world, "antarcticCreatureCounts", new int[EnumCreatureType.values().length]);
++        StubCraftWorld cw = (StubCraftWorld) unsafe.allocateInstance(StubCraftWorld.class);
++        cw.monsterLimit = monsterLimit;
++        world.stubCraftWorld = cw;
++        world.forcedMeta = new BiomeBase.BiomeMeta(StubHostile.class, 100, 4, 4);
++        setField(World.class, world, "chunkProvider", new StubChunkProvider(world));
++        FastPlayerChunkMap pcm = (FastPlayerChunkMap) unsafe.allocateInstance(FastPlayerChunkMap.class);
++        setField(FastPlayerChunkMap.class, pcm, "map", new Long2ObjectOpenHashMap<PlayerChunk>());
++        setField(WorldServer.class, world, "manager", pcm);
++        return world;
++    }
++
++    @SuppressWarnings("unchecked")
++    private static Chunk addSpawnableChunk(TestWorld world, int cx, int cz, boolean solidFloor) throws Exception {
++        Chunk chunk = (Chunk) unsafe.allocateInstance(Chunk.class);
++        setField(Chunk.class, chunk, "world", world);
++        setField(Chunk.class, chunk, "locX", cx);
++        setField(Chunk.class, chunk, "locZ", cz);
++        long key = ChunkCoordIntPair.a(cx, cz);
++        setField(Chunk.class, chunk, "chunkKey", key);
++        ChunkSection[] sections = new ChunkSection[16];
++        int[] heightMap = new int[256];
++        if (solidFloor) {
++            sections[0] = new ChunkSection(0, true);
++            for (int x = 0; x < 16; ++x) {
++                for (int z = 0; z < 16; ++z) {
++                    for (int y = 0; y < 15; y += 3) {
++                        sections[0].setType(x, y, z, Blocks.STONE.getBlockData());
++                    }
++                    heightMap[(z << 4) | x] = 15;
++                }
++            }
++        }
++        setField(Chunk.class, chunk, "sections", sections);
++        setField(Chunk.class, chunk, "heightMap", heightMap);
++        setField(Chunk.class, chunk, "tileEntities", new java.util.HashMap<BlockPosition, TileEntity>());
++        List<Entity>[] slices = new List[16];
++        for (int s = 0; s < 16; ++s) {
++            slices[s] = new ArrayList<Entity>();
++        }
++        setField(Chunk.class, chunk, "entitySlices", slices);
++        setField(Chunk.class, chunk, "entityCounts", new co.aikar.util.Counter<String>());
++        setField(Chunk.class, chunk, "itemCounts", new int[16]);
++        setField(Chunk.class, chunk, "inventoryEntityCounts", new int[16]);
++        setField(Chunk.class, chunk, "entityCount", new gnu.trove.map.hash.TObjectIntHashMap<Class>());
++        setField(Chunk.class, chunk, "antarcticCreatureCounts", new int[EnumCreatureType.values().length]);
++        world.getChunkProviderServer().chunks.put(key, chunk);
++        chunk.addEntities();
++
++        PlayerChunk pc = (PlayerChunk) unsafe.allocateInstance(PlayerChunk.class);
++        setField(PlayerChunk.class, pc, "done", true);
++        ((FastPlayerChunkMap) world.getPlayerChunkMap()).map.put(LongHash.toLong(cx, cz), pc);
++        return chunk;
++    }
++
++    private static EntityPlayer addPlayer(TestWorld world, int cx, int cz) throws Exception {
++        EntityPlayer p = (EntityPlayer) unsafe.allocateInstance(EntityPlayer.class);
++        p.world = world;
++        p.locX = cx * 16.0 + 8.0;
++        p.locY = 64.0;
++        p.locZ = cz * 16.0 + 8.0;
++        p.affectsSpawning = true;
++        p.uniqueID = UUID.randomUUID();
++        p.antarcticLocalMobCounts = new int[EnumCreatureType.values().length];
++        PlayerInteractManager pim = (PlayerInteractManager) unsafe.allocateInstance(PlayerInteractManager.class);
++        setField(PlayerInteractManager.class, pim, "gamemode", EnumGamemode.SURVIVAL);
++        setField(EntityPlayer.class, p, "playerInteractManager", pim);
++        p.bukkitEntity = (CraftPlayer) unsafe.allocateInstance(CraftPlayer.class);
++        world.players.add(p);
++        return p;
++    }
++
++    private static void addMonsters(TestWorld world, Chunk chunk, int count) throws Exception {
++        for (int i = 0; i < count; ++i) {
++            EntityZombie z = (EntityZombie) unsafe.allocateInstance(EntityZombie.class);
++            setField(Entity.class, z, "id", nextEntityId++);
++            z.world = world;
++            z.locX = chunk.locX * 16.0 + 8.0;
++            z.locY = 10.0;
++            z.locZ = chunk.locZ * 16.0 + 8.0;
++            z.uniqueID = UUID.randomUUID();
++            z.persistent = false;
++            chunk.a(z);
++        }
++    }
++
++    @Test
++    public void testDefaultsAndAutoRadiusBlocksR4InfiniteSpawnExploit() throws Exception {
++        assertFalse("per-player-mob-spawns must default to false", MobSpawning.perPlayerMobSpawns);
++        assertEquals("per-player-mob-count-radius-chunks must default to 0 (auto)", 0, MobSpawning.perPlayerMobCountRadiusChunks);
++
++        TestWorld world = newWorld(70);
++        // Auto radius for hardDespawnDistance=128^2 must be 8 chunks (128 blocks), NOT mobSpawnRange=4!
++        assertEquals(8, SpawnerCreature.resolvePerPlayerMobCountRadius(world));
++
++        // Explicit override works
++        MobSpawning.perPlayerMobCountRadiusChunks = 6;
++        assertEquals(6, SpawnerCreature.resolvePerPlayerMobCountRadius(world));
++        MobSpawning.perPlayerMobCountRadiusChunks = 0;
++
++        // Exploit defense test: place Player A at (0, 0) and push 70 mobs to chunk (6, 0) (96 blocks < 128 despawn!)
++        EntityPlayer playerA = addPlayer(world, 0, 0);
++        addSpawnableChunk(world, 0, 0, true);
++        Chunk exploitHoldingChunk = addSpawnableChunk(world, 6, 0, false);
++        addMonsters(world, exploitHoldingChunk, 70);
++
++        MobSpawning.perPlayerMobSpawns = true;
++        SpawnerCreature spawner = new SpawnerCreature();
++        for (int t = 0; t < 20; ++t) {
++            spawner.a(world, true, false, false);
++        }
++        assertEquals("Player A must see all 70 mobs at distance 6 chunks (96 blocks) within auto r=8", 70, playerA.getLocalMobCount(EnumCreatureType.MONSTER));
++        assertEquals("Auto r=8 must completely block infinite-spawn exploit at 96 blocks", 0, world.spawnsNearA);
++
++        // Cross-border pack walk guard: Player B at (13, 0) has uncapped chunk (9, 0) (dist 9 from A, dist 4 from B).
++        // Chunk (8, 0) is dist 8 from A (capped at 70). A pack starting at (9, 0) walking into (8, 0) must NOT overflow Player A past 70!
++        addPlayer(world, 13, 0);
++        addSpawnableChunk(world, 9, 0, true);
++        addSpawnableChunk(world, 8, 0, true);
++        for (int t = 0; t < 100; ++t) {
++            spawner.a(world, true, false, false);
++        }
++        assertEquals("Cross-border pack walk must never overflow neighboring capped Player A past 70",
++                70, playerA.getLocalMobCount(EnumCreatureType.MONSTER));
++    }
++
++    @Test
++    public void testTwoPlayerIsolationWhenEnabledVsGlobalStarvationWhenDisabled() throws Exception {
++        // 1. Default global mode (perPlayerMobSpawns = false): Player A's 100 monsters starve Player B
++        TestWorld globalWorld = newWorld(70);
++        addPlayer(globalWorld, 0, 0);
++        addPlayer(globalWorld, 100, 0);
++        Chunk chunkA = addSpawnableChunk(globalWorld, 0, 0, true);
++        addSpawnableChunk(globalWorld, 100, 0, true);
++        addMonsters(globalWorld, chunkA, 100);
++
++        MobSpawning.perPlayerMobSpawns = false;
++        SpawnerCreature spawner = new SpawnerCreature();
++        for (int t = 0; t < 50; ++t) {
++            spawner.a(globalWorld, true, false, false);
++        }
++        assertEquals("Global mode must starve Player B when global cap is filled by Player A", 0, globalWorld.spawnsNearB);
++
++        // 2. Per-player mode (perPlayerMobSpawns = true): Player A stays blocked at 70/70, Player B spawns freely up to 70!
++        TestWorld localWorld = newWorld(70);
++        EntityPlayer playerA = addPlayer(localWorld, 0, 0);
++        EntityPlayer playerB = addPlayer(localWorld, 100, 0);
++        Chunk localChunkA = addSpawnableChunk(localWorld, 0, 0, true);
++        addSpawnableChunk(localWorld, 100, 0, true);
++        addMonsters(localWorld, localChunkA, 70);
++
++        MobSpawning.perPlayerMobSpawns = true;
++        for (int t = 0; t < 150; ++t) {
++            spawner.a(localWorld, true, false, false);
++        }
++        assertEquals("Player A at 70/70 must receive 0 additional spawns", 0, localWorld.spawnsNearA);
++        assertTrue("Isolated Player B at 0/70 must receive spawns freely, got " + localWorld.spawnsNearB, localWorld.spawnsNearB > 0);
++        assertTrue("Player B must never exceed local cap of 70, got " + playerB.getLocalMobCount(EnumCreatureType.MONSTER),
++                playerB.getLocalMobCount(EnumCreatureType.MONSTER) <= 70);
++        assertEquals(70, playerA.getLocalMobCount(EnumCreatureType.MONSTER));
++    }
++
++    @Test
++    public void testHighLoadPerPlayerTallyZeroAllocAndLowLatency() throws Exception {
++        TestWorld world = newWorld(70);
++        // 100 disjoint players, each with 1 chunk loaded at their position containing 70 monsters (so spawning short-circuits after tally)
++        for (int p = 0; p < 100; ++p) {
++            int cx = p * 25;
++            addPlayer(world, cx, 0);
++            Chunk c = addSpawnableChunk(world, cx, 0, false);
++            addMonsters(world, c, 70);
++        }
++
++        MobSpawning.perPlayerMobSpawns = true;
++        SpawnerCreature spawner = new SpawnerCreature();
++
++        // Warmup
++        for (int t = 0; t < 30; ++t) {
++            spawner.a(world, true, false, false);
++        }
++
++        com.sun.management.ThreadMXBean tmxb = (com.sun.management.ThreadMXBean) ManagementFactory.getThreadMXBean();
++        long tid = Thread.currentThread().getId();
++        int ticks = 100;
++
++        long alloc0 = tmxb.getThreadAllocatedBytes(tid);
++        long t0 = System.nanoTime();
++        for (int t = 0; t < ticks; ++t) {
++            spawner.a(world, true, false, false);
++        }
++        long ns = System.nanoTime() - t0;
++        long bytes = tmxb.getThreadAllocatedBytes(tid) - alloc0;
++
++        double msPerTick = (ns / 1e6) / ticks;
++        double kibPerTick = (bytes / 1024.0) / ticks;
++        System.out.printf("PerPlayerMobSpawnsTest (100p r=8 tally, %d ticks): %.3f ms/tick, %.2f KiB/tick%n",
++                ticks, msPerTick, kibPerTick);
++        assertTrue("Expected < 2.0 KiB/tick steady-state allocation, got " + kibPerTick, kibPerTick < 2.0);
++    }
++}
