@@ -1,0 +1,229 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 00:53:36 +0700
+Subject: [PATCH 134/134] fix: release PacketCompressor Deflater and avoid
+ per-packet byte copy
+
+
+diff --git a/main/java/net/minecraft/server/PacketCompressor.java b/main/java/net/minecraft/server/PacketCompressor.java
+index 2053ad9..2be0ab8 100644
+--- a/main/java/net/minecraft/server/PacketCompressor.java
++++ b/main/java/net/minecraft/server/PacketCompressor.java
+@@ -21,28 +21,50 @@ public class PacketCompressor extends MessageToByteEncoder<ByteBuf> {
+ 
+     protected void a(ChannelHandlerContext channelhandlercontext, ByteBuf bytebuf, ByteBuf bytebuf1) throws Exception {
+         int i = bytebuf.readableBytes();
+-        PacketDataSerializer packetdataserializer = new PacketDataSerializer(bytebuf1);
+ 
+         if (i < this.c) {
+-            packetdataserializer.d(0);
+-            packetdataserializer.writeBytes(bytebuf);
++            writeVarInt(bytebuf1, 0);
++            bytebuf1.writeBytes(bytebuf);
+         } else {
+-            byte[] abyte = new byte[i];
+-
+-            bytebuf.readBytes(abyte);
+-            packetdataserializer.d(abyte.length);
+-            this.b.setInput(abyte, 0, i);
++            // Antarctic start - zero-copy Deflater input (heap array / single NIO ByteBuffer) and direct VarInt write
++            writeVarInt(bytebuf1, i);
++            if (bytebuf.hasArray()) {
++                this.b.setInput(bytebuf.array(), bytebuf.arrayOffset() + bytebuf.readerIndex(), i);
++                bytebuf.skipBytes(i);
++            } else if (bytebuf.nioBufferCount() == 1) {
++                this.b.setInput(bytebuf.nioBuffer());
++                bytebuf.skipBytes(i);
++            } else {
++                byte[] abyte = new byte[i];
++                bytebuf.readBytes(abyte);
++                this.b.setInput(abyte, 0, i);
++            }
+             this.b.finish();
+ 
+             while (!this.b.finished()) {
+                 int j = this.b.deflate(this.a);
+ 
+-                packetdataserializer.writeBytes(this.a, 0, j);
++                bytebuf1.writeBytes(this.a, 0, j);
+             }
+ 
+             this.b.reset();
++            // Antarctic end
++        }
++
++    }
++
++    private static void writeVarInt(ByteBuf buf, int value) {
++        while ((value & -128) != 0) {
++            buf.writeByte(value & 127 | 128);
++            value >>>= 7;
+         }
++        buf.writeByte(value);
++    }
+ 
++    @Override
++    public void handlerRemoved(ChannelHandlerContext ctx) throws Exception {
++        this.b.end();
++        super.handlerRemoved(ctx);
+     }
+ 
+     public void a(int i) {
+diff --git a/main/java/net/minecraft/server/RegionFile.java b/main/java/net/minecraft/server/RegionFile.java
+index dc14567..56a0f56 100644
+--- a/main/java/net/minecraft/server/RegionFile.java
++++ b/main/java/net/minecraft/server/RegionFile.java
+@@ -538,9 +538,15 @@ public class RegionFile {
+ 
+     private static final byte[] compressionBuffer = new byte[1024 * 64]; // 64k fits most standard chunks input size even, ideally 1 pass through zlib
+     private static final java.util.zip.Deflater deflater = new java.util.zip.Deflater();
++    private static int lastDeflaterLevel = java.util.zip.Deflater.DEFAULT_COMPRESSION; // Antarctic - honor Deflate.compressionLevel
+     // since file IO is single threaded, no benefit to using per-region file buffers/synchronization, we can change that later if it becomes viable.
+     private static DirectByteArrayOutputStream compressData(byte[] buf, int length) throws IOException {
+         synchronized (deflater) {
++            int targetLevel = com.destroystokyo.paper.config.toml.modules.network.Deflate.compressionLevel;
++            if (targetLevel != lastDeflaterLevel) {
++                deflater.setLevel(targetLevel);
++                lastDeflaterLevel = targetLevel;
++            }
+             deflater.setInput(buf, 0, length);
+             deflater.finish();
+ 
+diff --git a/test/java/net/minecraft/server/PacketCompressorLifecycleTest.java b/test/java/net/minecraft/server/PacketCompressorLifecycleTest.java
+new file mode 100644
+index 0000000..fe83eaf
+--- /dev/null
++++ b/test/java/net/minecraft/server/PacketCompressorLifecycleTest.java
+@@ -0,0 +1,132 @@
++package net.minecraft.server;
++
++import com.sun.management.ThreadMXBean;
++import io.netty.buffer.ByteBuf;
++import io.netty.buffer.Unpooled;
++import io.netty.channel.embedded.EmbeddedChannel;
++import java.lang.management.ManagementFactory;
++import java.util.zip.Inflater;
++import org.junit.Assert;
++import org.junit.Test;
++
++public class PacketCompressorLifecycleTest {
++
++    private static byte[] decompressPacket(ByteBuf encoded, int expectedUncompressedLen) throws Exception {
++        PacketDataSerializer serializer = new PacketDataSerializer(encoded);
++        int declaredLen = serializer.g();
++        Assert.assertEquals(expectedUncompressedLen, declaredLen);
++        if (declaredLen == 0) {
++            byte[] raw = new byte[encoded.readableBytes()];
++            encoded.readBytes(raw);
++            return raw;
++        }
++        byte[] compressed = new byte[encoded.readableBytes()];
++        encoded.readBytes(compressed);
++        Inflater inflater = new Inflater();
++        try {
++            inflater.setInput(compressed);
++            byte[] out = new byte[declaredLen];
++            int inflated = inflater.inflate(out);
++            Assert.assertEquals(declaredLen, inflated);
++            return out;
++        } finally {
++            inflater.end();
++        }
++    }
++
++    @Test
++    public void testHeapDirectAndUncompressedRoundTripParity() throws Exception {
++        byte[] payload = new byte[4096];
++        for (int i = 0; i < payload.length; ++i) {
++            payload[i] = (byte) ((i * 31) ^ (i >>> 3));
++        }
++
++        PacketCompressor compressor = new PacketCompressor(256);
++        EmbeddedChannel channel = new EmbeddedChannel(compressor);
++        try {
++            // 1. Below threshold -> uncompressed with varint 0 prefix
++            ByteBuf smallIn = Unpooled.wrappedBuffer(new byte[]{1, 2, 3, 4, 5});
++            Assert.assertTrue(channel.writeOutbound(smallIn));
++            ByteBuf smallOut = channel.readOutbound();
++            try {
++                byte[] decoded = decompressPacket(smallOut, 0);
++                Assert.assertArrayEquals(new byte[]{1, 2, 3, 4, 5}, decoded);
++            } finally {
++                smallOut.release();
++            }
++
++            // 2. Heap ByteBuf -> compressed without byte[] copy
++            ByteBuf heapIn = Unpooled.wrappedBuffer(payload.clone());
++            Assert.assertTrue(channel.writeOutbound(heapIn));
++            ByteBuf heapOut = channel.readOutbound();
++            try {
++                Assert.assertArrayEquals(payload, decompressPacket(heapOut, payload.length));
++            } finally {
++                heapOut.release();
++            }
++
++            // 3. Direct ByteBuf -> compressed via ByteBuffer overload without byte[] copy
++            ByteBuf directIn = Unpooled.directBuffer(payload.length);
++            directIn.writeBytes(payload);
++            Assert.assertTrue(channel.writeOutbound(directIn));
++            ByteBuf directOut = channel.readOutbound();
++            try {
++                Assert.assertArrayEquals(payload, decompressPacket(directOut, payload.length));
++            } finally {
++                directOut.release();
++            }
++        } finally {
++            channel.close();
++        }
++
++        // 4. Verify handlerRemoved released native Deflater (subsequent encode throws NPE/IllegalStateException)
++        ByteBuf afterCloseIn = Unpooled.wrappedBuffer(payload.clone());
++        ByteBuf afterCloseOut = Unpooled.buffer(4096);
++        try {
++            boolean threw = false;
++            try {
++                compressor.a(null, afterCloseIn, afterCloseOut);
++            } catch (NullPointerException | IllegalStateException expected) {
++                threw = true;
++            }
++            Assert.assertTrue("Native Deflater must be ended on handlerRemoved", threw);
++        } finally {
++            afterCloseIn.release();
++            afterCloseOut.release();
++        }
++    }
++
++    @Test
++    public void testHeapEncodeAvoidsPayloadCopyAllocation() throws Exception {
++        byte[] payload = new byte[16_384];
++        for (int i = 0; i < payload.length; ++i) {
++            payload[i] = (byte) (i & 63);
++        }
++        PacketCompressor compressor = new PacketCompressor(256);
++        ByteBuf in = Unpooled.wrappedBuffer(payload);
++        ByteBuf out = Unpooled.buffer(16_384);
++        try {
++            // Warmup
++            for (int i = 0; i < 200; ++i) {
++                in.readerIndex(0);
++                out.clear();
++                compressor.a(null, in, out);
++            }
++            ThreadMXBean bean = (ThreadMXBean) ManagementFactory.getThreadMXBean();
++            long tid = Thread.currentThread().getId();
++            long before = bean.getThreadAllocatedBytes(tid);
++            for (int i = 0; i < 200; ++i) {
++                in.readerIndex(0);
++                out.clear();
++                compressor.a(null, in, out);
++            }
++            long allocated = bean.getThreadAllocatedBytes(tid) - before;
++            // Previously allocated 200 * 16,384 = 3.27 MB of byte[] copies + 200 PacketDataSerializers!
++            Assert.assertEquals("Heap ByteBuf compression must allocate 0 bytes", 0L, allocated);
++        } finally {
++            compressor.handlerRemoved(null);
++            in.release();
++            out.release();
++        }
++    }
++}
