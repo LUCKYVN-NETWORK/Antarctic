@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Leijurv <leijurv@gmail.com>
 Date: Sat, 17 Oct 2026 16:03:02 +0700
-Subject: [PATCH 027/144] Isolate world-generation RNG to prevent Randar
+Subject: [PATCH 027/145] Isolate world-generation RNG to prevent Randar
  leakage
 
 - Preserve the seeded world-generation sequence without reseeding the shared gameplay RNG
