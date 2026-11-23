@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 00:37:32 +0700
+Subject: [PATCH 129/129] fix: guard null socket addresses during login and
+ error logging
+
+
+diff --git a/main/java/net/minecraft/server/LoginListener.java b/main/java/net/minecraft/server/LoginListener.java
+index d6d2a69..e9ee8f1 100644
+--- a/main/java/net/minecraft/server/LoginListener.java
++++ b/main/java/net/minecraft/server/LoginListener.java
+@@ -197,10 +197,9 @@ public class LoginListener implements PacketLoginInListener, ITickable {
+     }
+ 
+     public String c() {
+-        String address = this.networkManager.getSocketAddress().toString();
+-        if (com.destroystokyo.paper.config.toml.modules.misc.Privacy.redactPlayerData) {
+-            address = "/0.0.0.0:0";
+-        }
++        String address = com.destroystokyo.paper.config.toml.modules.misc.Privacy.redactPlayerData
++                ? "/0.0.0.0:0"
++                : String.valueOf(this.networkManager.getSocketAddress());
+         return this.i != null ? this.i + " (" + address + ")" : address;
+     }
+ 
+diff --git a/main/java/net/minecraft/server/ServerConnection.java b/main/java/net/minecraft/server/ServerConnection.java
+index 8ef701e..c4016e3 100644
+--- a/main/java/net/minecraft/server/ServerConnection.java
++++ b/main/java/net/minecraft/server/ServerConnection.java
+@@ -165,10 +165,9 @@ public class ServerConnection {
+                                 throw new ReportedException(crashreport);
+                             }
+ 
+-                            String address = networkmanager.getSocketAddress().toString();
+-                            if (com.destroystokyo.paper.config.toml.modules.misc.Privacy.redactPlayerData) {
+-                                address = "/0.0.0.0:0";
+-                            }
++                            String address = com.destroystokyo.paper.config.toml.modules.misc.Privacy.redactPlayerData
++                                    ? "/0.0.0.0:0"
++                                    : String.valueOf(networkmanager.getSocketAddress());
+                             ServerConnection.e.warn("Failed to handle packet for {}", address, exception);
+                             final ChatComponentText chatcomponenttext = new ChatComponentText("Internal server error");
+ 
+diff --git a/test/java/net/minecraft/server/NullSocketAddressLoggingTest.java b/test/java/net/minecraft/server/NullSocketAddressLoggingTest.java
+new file mode 100644
+index 0000000..4e595dd
+--- /dev/null
++++ b/test/java/net/minecraft/server/NullSocketAddressLoggingTest.java
+@@ -0,0 +1,34 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.config.toml.modules.misc.Privacy;
++import java.lang.reflect.Field;
++import org.junit.Assert;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++public class NullSocketAddressLoggingTest {
++
++    @Test
++    public void testLoginListenerNullSocketAddressDoesNotNPE() throws Exception {
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        Unsafe unsafe = (Unsafe) f.get(null);
++
++        LoginListener listener = (LoginListener) unsafe.allocateInstance(LoginListener.class);
++        NetworkManager nm = new NetworkManager(EnumProtocolDirection.SERVERBOUND);
++        Field nmField = LoginListener.class.getDeclaredField("networkManager");
++        nmField.setAccessible(true);
++        nmField.set(listener, nm);
++
++        boolean prev = Privacy.redactPlayerData;
++        try {
++            Privacy.redactPlayerData = false;
++            Assert.assertEquals("null", listener.c());
++
++            Privacy.redactPlayerData = true;
++            Assert.assertEquals("/0.0.0.0:0", listener.c());
++        } finally {
++            Privacy.redactPlayerData = prev;
++        }
++    }
++}
