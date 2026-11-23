@@ -1,0 +1,551 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 01:38:28 +0700
+Subject: [PATCH 146/146] perf: optimize EntityTrackerEntry viewer map and head
+ rotation send
+
+
+diff --git a/main/java/net/minecraft/server/EntityTrackerEntry.java b/main/java/net/minecraft/server/EntityTrackerEntry.java
+index e6223b9..951b3a1 100644
+--- a/main/java/net/minecraft/server/EntityTrackerEntry.java
++++ b/main/java/net/minecraft/server/EntityTrackerEntry.java
+@@ -42,10 +42,11 @@ public class EntityTrackerEntry {
+     private boolean x;
+     private boolean y;
+     public boolean b;
++    private static final EnumItemSlot[] ITEM_SLOTS = EnumItemSlot.values(); // Antarctic - avoid cloning values() per tracked living entity
+     // Paper start
+     // Replace trackedPlayers Set with a Map. The value is true until the player receives
+     // their first update (which is forced to have absolute coordinates), false afterward.
+-    public java.util.Map<EntityPlayer, Boolean> trackedPlayerMap = new it.unimi.dsi.fastutil.objects.Object2BooleanOpenHashMap<>();
++    public java.util.Map<EntityPlayer, Boolean> trackedPlayerMap = new it.unimi.dsi.fastutil.objects.Object2BooleanOpenHashMap<>(2); // Antarctic - compact initial capacity
+     public Set<EntityPlayer> trackedPlayers = trackedPlayerMap.keySet();
+     // Paper end
+ 
+@@ -164,17 +165,15 @@ public class EntityTrackerEntry {
+                 // CraftBukkit end
+ 
+                     if (l1 >= -32768L && l1 < 32768L && i2 >= -32768L && i2 < 32768L && j2 >= -32768L && j2 < 32768L && this.v <= 400 && !this.x && this.y == this.tracker.onGround) {
+-                        if (flag1 || flag2 || this.tracker instanceof EntityArrow) { // Dionysus
+-                        if ((!flag1 || !flag2) && !(this.tracker instanceof EntityArrow)) {
+-                            if (flag1) {
+-                                object = new PacketPlayOutEntity.PacketPlayOutRelEntityMove(this.tracker.getId(), l1, i2, j2, this.tracker.onGround);
+-                            } else if (flag2) {
+-                                object = new PacketPlayOutEntity.PacketPlayOutEntityLook(this.tracker.getId(), (byte) j1, (byte) k1, this.tracker.onGround);
+-                            }
+-                        } else {
++                        // Antarctic start - flatten redundant instanceof EntityArrow branch
++                        if ((flag1 && flag2) || this.tracker instanceof EntityArrow) {
+                             object = new PacketPlayOutEntity.PacketPlayOutRelEntityMoveLook(this.tracker.getId(), l1, i2, j2, (byte) j1, (byte) k1, this.tracker.onGround);
++                        } else if (flag1) {
++                            object = new PacketPlayOutEntity.PacketPlayOutRelEntityMove(this.tracker.getId(), l1, i2, j2, this.tracker.onGround);
++                        } else if (flag2) {
++                            object = new PacketPlayOutEntity.PacketPlayOutEntityLook(this.tracker.getId(), (byte) j1, (byte) k1, this.tracker.onGround);
+                         }
+-                        } // Dionysus
++                        // Antarctic end
+                     } else {
+                         this.y = this.tracker.onGround;
+                         this.v = 0;
+@@ -214,18 +213,35 @@ public class EntityTrackerEntry {
+                     // since we can't be certain what position they received in the spawn packet.
+                     if (object instanceof PacketPlayOutEntityTeleport) {
+                         this.broadcast((Packet) object);
+-                    } else {
++                    } else if (!this.trackedPlayerMap.isEmpty()) { // Antarctic - fast-path empty and zero-box fastIterator
+                         PacketPlayOutEntityTeleport teleportPacket = null;
+ 
+-                        for (java.util.Map.Entry<EntityPlayer, Boolean> viewer : trackedPlayerMap.entrySet()) {
+-                            if (viewer.getValue()) {
+-                                viewer.setValue(false);
+-                                if (teleportPacket == null) {
+-                                    teleportPacket = new PacketPlayOutEntityTeleport(this.tracker);
++                        if (this.trackedPlayerMap instanceof it.unimi.dsi.fastutil.objects.Object2BooleanOpenHashMap) {
++                            it.unimi.dsi.fastutil.objects.ObjectIterator<it.unimi.dsi.fastutil.objects.Object2BooleanMap.Entry<EntityPlayer>> viewerIterator =
++                                    ((it.unimi.dsi.fastutil.objects.Object2BooleanOpenHashMap<EntityPlayer>) this.trackedPlayerMap).object2BooleanEntrySet().fastIterator();
++                            while (viewerIterator.hasNext()) {
++                                it.unimi.dsi.fastutil.objects.Object2BooleanMap.Entry<EntityPlayer> viewer = viewerIterator.next();
++                                if (viewer.getBooleanValue()) {
++                                    viewer.setValue(false);
++                                    if (teleportPacket == null) {
++                                        teleportPacket = new PacketPlayOutEntityTeleport(this.tracker);
++                                    }
++                                    viewer.getKey().playerConnection.sendPacket(teleportPacket);
++                                } else {
++                                    viewer.getKey().playerConnection.sendPacket((Packet) object);
++                                }
++                            }
++                        } else {
++                            for (java.util.Map.Entry<EntityPlayer, Boolean> viewer : this.trackedPlayerMap.entrySet()) {
++                                if (viewer.getValue()) {
++                                    viewer.setValue(false);
++                                    if (teleportPacket == null) {
++                                        teleportPacket = new PacketPlayOutEntityTeleport(this.tracker);
++                                    }
++                                    viewer.getKey().playerConnection.sendPacket(teleportPacket);
++                                } else {
++                                    viewer.getKey().playerConnection.sendPacket((Packet) object);
+                                 }
+-                                viewer.getKey().playerConnection.sendPacket(teleportPacket);
+-                            } else {
+-                                viewer.getKey().playerConnection.sendPacket((Packet) object);
+                             }
+                         }
+                     }
+@@ -249,11 +265,15 @@ public class EntityTrackerEntry {
+                 this.x = false;
+             }
+ 
+-            i = MathHelper.d(this.tracker.getHeadRotation() * 256.0F / 360.0F);
+-            if (Math.abs(i - this.headYaw) >= 1) {
+-                this.broadcast(new PacketPlayOutEntityHeadRotation(this.tracker, (byte) i));
+-                this.headYaw = i;
++            // Antarctic start - only EntityLiving overrides getHeadRotation()
++            if (this.tracker instanceof EntityLiving) {
++                i = MathHelper.d(this.tracker.getHeadRotation() * 256.0F / 360.0F);
++                if (Math.abs(i - this.headYaw) >= 1) {
++                    this.broadcast(new PacketPlayOutEntityHeadRotation(this.tracker, (byte) i));
++                    this.headYaw = i;
++                }
+             }
++            // Antarctic end
+ 
+             this.tracker.impulse = false;
+         }
+@@ -312,6 +332,9 @@ public class EntityTrackerEntry {
+     }
+ 
+     public void broadcast(Packet<?> packet) {
++        if (this.trackedPlayers.isEmpty()) { // Antarctic - avoid iterator allocation when untracked
++            return;
++        }
+         Iterator iterator = this.trackedPlayers.iterator();
+ 
+         while (iterator.hasNext()) {
+@@ -366,7 +389,14 @@ public class EntityTrackerEntry {
+ 
+                     entityplayer.removeQueue.remove(Integer.valueOf(this.tracker.getId()));
+                     // CraftBukkit end
+-                    this.trackedPlayerMap.put(entityplayer, true); // Paper
++                    final boolean wasUntracked = this.trackedPlayerMap.isEmpty(); // Antarctic
++                    // Paper start - primitive put when backed by Object2BooleanMap
++                    if (this.trackedPlayerMap instanceof it.unimi.dsi.fastutil.objects.Object2BooleanMap) {
++                        ((it.unimi.dsi.fastutil.objects.Object2BooleanMap<EntityPlayer>) this.trackedPlayerMap).put(entityplayer, true);
++                    } else {
++                        this.trackedPlayerMap.put(entityplayer, true);
++                    }
++                    // Paper end
+                     Packet packet = this.e();
+ 
+                     entityplayer.playerConnection.sendPacket(packet);
+@@ -375,9 +405,10 @@ public class EntityTrackerEntry {
+                     }
+ 
+                     boolean flag = this.u;
++                    final EntityLiving livingTracker = (this.tracker instanceof EntityLiving) ? (EntityLiving) this.tracker : null; // Antarctic - hoist instanceof
+ 
+-                    if (this.tracker instanceof EntityLiving) {
+-                        AttributeMapServer attributemapserver = (AttributeMapServer) ((EntityLiving) this.tracker).getAttributeMap();
++                    if (livingTracker != null) {
++                        AttributeMapServer attributemapserver = (AttributeMapServer) livingTracker.getAttributeMap();
+                         Collection collection = attributemapserver.c();
+ 
+                         // CraftBukkit start - If sending own attributes send scaled health instead of current maximum health
+@@ -390,7 +421,7 @@ public class EntityTrackerEntry {
+                             entityplayer.playerConnection.sendPacket(new PacketPlayOutUpdateAttributes(this.tracker.getId(), collection));
+                         }
+ 
+-                        if (((EntityLiving) this.tracker).cP()) {
++                        if (livingTracker.cP()) {
+                             flag = true;
+                         }
+                     }
+@@ -402,13 +433,10 @@ public class EntityTrackerEntry {
+                         entityplayer.playerConnection.sendPacket(new PacketPlayOutEntityVelocity(this.tracker.getId(), this.tracker.motX, this.tracker.motY, this.tracker.motZ));
+                     }
+ 
+-                    if (this.tracker instanceof EntityLiving) {
+-                        EnumItemSlot[] aenumitemslot = EnumItemSlot.values();
+-                        int i = aenumitemslot.length;
+-
+-                        for (int j = 0; j < i; ++j) {
+-                            EnumItemSlot enumitemslot = aenumitemslot[j];
+-                            ItemStack itemstack = ((EntityLiving) this.tracker).getEquipment(enumitemslot);
++                    if (livingTracker != null) {
++                        for (int j = 0; j < ITEM_SLOTS.length; ++j) {
++                            EnumItemSlot enumitemslot = ITEM_SLOTS[j];
++                            ItemStack itemstack = livingTracker.getEquipment(enumitemslot);
+ 
+                             if (!itemstack.isEmpty()) {
+                                 entityplayer.playerConnection.sendPacket(new PacketPlayOutEntityEquipment(this.tracker.getId(), enumitemslot, itemstack));
+@@ -425,15 +453,15 @@ public class EntityTrackerEntry {
+                     }
+ 
+                     // CraftBukkit start - Fix for nonsensical head yaw
+-                    if(this.tracker instanceof EntityLiving) {
+-                        this.headYaw = MathHelper.d(this.tracker.getHeadRotation() * 256.0F / 360.0F);
+-                        this.broadcast(new PacketPlayOutEntityHeadRotation(this.tracker, (byte) headYaw));
+-                    }
+-                    // CraftBukkit end
++                    // Antarctic - send initial head rotation only to the joining viewer; only sync headYaw if this is the first viewer
++                    if (livingTracker != null) {
++                        int initialHeadYaw = MathHelper.d(livingTracker.getHeadRotation() * 256.0F / 360.0F);
++                        if (wasUntracked) {
++                            this.headYaw = initialHeadYaw;
++                        }
++                        entityplayer.playerConnection.sendPacket(new PacketPlayOutEntityHeadRotation(livingTracker, (byte) initialHeadYaw));
+ 
+-                    if (this.tracker instanceof EntityLiving) {
+-                        EntityLiving entityliving = (EntityLiving) this.tracker;
+-                        Iterator iterator = entityliving.getEffects().iterator();
++                        Iterator iterator = livingTracker.getEffects().iterator();
+ 
+                         while (iterator.hasNext()) {
+                             MobEffect mobeffect = (MobEffect) iterator.next();
+@@ -441,6 +469,7 @@ public class EntityTrackerEntry {
+                             entityplayer.playerConnection.sendPacket(new PacketPlayOutEntityEffect(this.tracker.getId(), mobeffect));
+                         }
+                     }
++                    // CraftBukkit end
+ 
+                     if (!this.tracker.bF().isEmpty()) {
+                         entityplayer.playerConnection.sendPacket(new PacketPlayOutMount(this.tracker));
+@@ -536,8 +565,7 @@ public class EntityTrackerEntry {
+         if (this.tracker instanceof EntityPlayer) {
+             return new PacketPlayOutNamedEntitySpawn((EntityHuman) this.tracker);
+         } else if (this.tracker instanceof IAnimal) {
+-            this.headYaw = MathHelper.d(this.tracker.getHeadRotation() * 256.0F / 360.0F);
+-            return new PacketPlayOutSpawnEntityLiving((EntityLiving) this.tracker);
++            return new PacketPlayOutSpawnEntityLiving((EntityLiving) this.tracker); // Antarctic - do not clobber tracked headYaw for existing viewers
+         } else if (this.tracker instanceof EntityPainting) {
+             return new PacketPlayOutSpawnEntityPainting((EntityPainting) this.tracker);
+         } else if (this.tracker instanceof EntityItem) {
+diff --git a/test/java/net/minecraft/server/EntityTrackerEntryOptimizationTest.java b/test/java/net/minecraft/server/EntityTrackerEntryOptimizationTest.java
+new file mode 100644
+index 0000000..32e4649
+--- /dev/null
++++ b/test/java/net/minecraft/server/EntityTrackerEntryOptimizationTest.java
+@@ -0,0 +1,323 @@
++package net.minecraft.server;
++
++import com.sun.management.ThreadMXBean;
++import it.unimi.dsi.fastutil.objects.Object2BooleanMap;
++import it.unimi.dsi.fastutil.objects.Object2BooleanOpenHashMap;
++import it.unimi.dsi.fastutil.objects.ObjectIterator;
++import java.lang.management.ManagementFactory;
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.List;
++import java.util.Map;
++import org.junit.Assert;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++public class EntityTrackerEntryOptimizationTest {
++
++    private static Unsafe UNSAFE;
++    private static int nextEntityId = 1;
++
++    @BeforeClass
++    public static void setup() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        UNSAFE = (Unsafe) f.get(null);
++    }
++
++    private static final class RecordingConnection extends PlayerConnection {
++        final List<Packet<?>> packets = new ArrayList<Packet<?>>();
++        int count;
++
++        RecordingConnection() {
++            super(null, null, null);
++        }
++
++        @Override
++        public void sendPacket(Packet<?> packet) {
++            this.count++;
++            if (this.packets != null) {
++                this.packets.add(packet);
++            }
++        }
++    }
++
++    private static final class CountingConnection extends PlayerConnection {
++        int count;
++
++        CountingConnection() {
++            super(null, null, null);
++        }
++
++        @Override
++        public void sendPacket(Packet<?> packet) {
++            this.count++;
++        }
++    }
++
++    private static void setField(Class<?> owner, Object target, String name, Object value) throws Exception {
++        Field f = owner.getDeclaredField(name);
++        f.setAccessible(true);
++        f.set(target, value);
++    }
++
++    private static EntityPlayer newViewer(boolean recordList) throws Exception {
++        EntityPlayer viewer = (EntityPlayer) UNSAFE.allocateInstance(EntityPlayer.class);
++        viewer.h(nextEntityId++);
++        setField(EntityPlayer.class, viewer, "removeQueue", new java.util.LinkedList<Integer>());
++        viewer.locX = 0.0D;
++        viewer.locY = 64.0D;
++        viewer.locZ = 0.0D;
++        viewer.playerConnection = recordList ? allocateRecordingConnection() : allocateCountingConnection();
++        return viewer;
++    }
++
++    private static RecordingConnection allocateRecordingConnection() throws Exception {
++        RecordingConnection conn = (RecordingConnection) UNSAFE.allocateInstance(RecordingConnection.class);
++        Field packetsField = RecordingConnection.class.getDeclaredField("packets");
++        packetsField.setAccessible(true);
++        packetsField.set(conn, new ArrayList<Packet<?>>());
++        return conn;
++    }
++
++    private static CountingConnection allocateCountingConnection() throws Exception {
++        return (CountingConnection) UNSAFE.allocateInstance(CountingConnection.class);
++    }
++
++    private static final class StubPlayerChunkMap extends PlayerChunkMap {
++        StubPlayerChunkMap() {
++            super(null);
++        }
++
++        @Override
++        public boolean a(EntityPlayer entityplayer, int i, int j) {
++            return true;
++        }
++    }
++
++    private static WorldServer newMinimalWorldServer() throws Exception {
++        WorldServer world = (WorldServer) UNSAFE.allocateInstance(WorldServer.class);
++        StubPlayerChunkMap pcm = (StubPlayerChunkMap) UNSAFE.allocateInstance(StubPlayerChunkMap.class);
++        setField(WorldServer.class, world, "manager", pcm);
++        return world;
++    }
++
++    @SuppressWarnings("unchecked")
++    private static DataWatcher newBaseDataWatcher(Entity entity) throws Exception {
++        DataWatcher dw = new DataWatcher(entity);
++        Field flagsField = Entity.class.getDeclaredField("Z");
++        flagsField.setAccessible(true);
++        dw.register((DataWatcherObject<Byte>) flagsField.get(null), Byte.valueOf((byte) 0));
++        return dw;
++    }
++
++    private static EntityLiving newLivingTracker() throws Exception {
++        EntityZombie zombie = (EntityZombie) UNSAFE.allocateInstance(EntityZombie.class);
++        zombie.h(nextEntityId++);
++        zombie.locX = 0.0D;
++        zombie.locY = 64.0D;
++        zombie.locZ = 0.0D;
++        zombie.onGround = true;
++        zombie.attachedToPlayer = true;
++        setField(Entity.class, zombie, "passengers", Collections.emptyList());
++        zombie.datawatcher = newBaseDataWatcher(zombie);
++        Field attrField = EntityLiving.class.getDeclaredField("attributeMap");
++        attrField.setAccessible(true);
++        attrField.set(zombie, new AttributeMapServer());
++        Field effectsField = EntityLiving.class.getDeclaredField("effects");
++        effectsField.setAccessible(true);
++        effectsField.set(zombie, new java.util.HashMap<MobEffectList, MobEffect>());
++        Field handField = EntityInsentient.class.getDeclaredField("bx");
++        handField.setAccessible(true);
++        handField.set(zombie, NonNullList.a(2, ItemStack.a));
++        Field armorField = EntityInsentient.class.getDeclaredField("by");
++        armorField.setAccessible(true);
++        armorField.set(zombie, NonNullList.a(4, ItemStack.a));
++        zombie.setHeadRotation(45.0F);
++        return zombie;
++    }
++
++    @Test
++    public void testUpdatePlayerHeadRotationIsUnicastAndPreservesExistingViewerDelta() throws Exception {
++        EntityLiving zombie = newLivingTracker();
++        EntityTrackerEntry entry = new EntityTrackerEntry(zombie, 64, 64, 1, false);
++
++        // Existing viewer already tracking the zombie (headYaw == 45 deg)
++        EntityPlayer existing = newViewer(true);
++        entry.trackedPlayerMap.put(existing, Boolean.FALSE);
++
++        // Zombie rotates head to 90 deg BEFORE new viewer joins, and before next track()
++        zombie.setHeadRotation(90.0F);
++
++        // New viewer joins via updatePlayer()
++        EntityPlayer joining = newViewer(true);
++        joining.world = newMinimalWorldServer();
++        boolean prevCatcher = org.spigotmc.AsyncCatcher.enabled;
++        org.spigotmc.AsyncCatcher.enabled = false;
++        try {
++            entry.updatePlayer(joining);
++        } finally {
++            org.spigotmc.AsyncCatcher.enabled = prevCatcher;
++        }
++
++        RecordingConnection existingConn = (RecordingConnection) existing.playerConnection;
++        RecordingConnection joiningConn = (RecordingConnection) joining.playerConnection;
++
++        // Existing viewer must NOT receive a spurious head rotation packet when another player starts tracking
++        long existingHeadPackets = existingConn.packets.stream()
++                .filter(p -> p instanceof PacketPlayOutEntityHeadRotation)
++                .count();
++        Assert.assertEquals("Existing viewers must not receive broadcast head-rotation storm on new viewer join",
++                0L, existingHeadPackets);
++
++        // Joining viewer MUST receive exactly one PacketPlayOutEntityHeadRotation with the current headYaw (90 deg)
++        long joiningHeadPackets = joiningConn.packets.stream()
++                .filter(p -> p instanceof PacketPlayOutEntityHeadRotation)
++                .count();
++        Assert.assertEquals("Joining viewer must receive initial head rotation packet", 1L, joiningHeadPackets);
++
++        // Next track() must still detect the 45 -> 90 deg delta and broadcast to existing viewer
++        entry.track(Collections.<EntityHuman>emptyList());
++        long existingHeadAfterTrack = existingConn.packets.stream()
++                .filter(p -> p instanceof PacketPlayOutEntityHeadRotation)
++                .count();
++        Assert.assertEquals("Existing viewer must still receive head rotation delta on next track()",
++                1L, existingHeadAfterTrack);
++    }
++
++    @Test
++    public void testFirstUpdateTeleportAndMoveLookBranchParity() throws Exception {
++        EntityLiving zombie = newLivingTracker();
++        EntityTrackerEntry entry = new EntityTrackerEntry(zombie, 64, 64, 1, false);
++        entry.a = 1; // past tick 0
++
++        EntityPlayer fresh = newViewer(true);
++        EntityPlayer steady = newViewer(true);
++        entry.trackedPlayerMap.put(fresh, Boolean.TRUE);
++        entry.trackedPlayerMap.put(steady, Boolean.FALSE);
++
++        // Move slightly -> fresh gets Teleport & flips to false; steady gets RelEntityMove
++        zombie.locX = 1.0D;
++        entry.track(Collections.<EntityHuman>emptyList());
++
++        RecordingConnection freshConn = (RecordingConnection) fresh.playerConnection;
++        RecordingConnection steadyConn = (RecordingConnection) steady.playerConnection;
++
++        Assert.assertTrue("Fresh viewer must receive PacketPlayOutEntityTeleport on first update",
++                freshConn.packets.stream().anyMatch(p -> p instanceof PacketPlayOutEntityTeleport));
++        Assert.assertFalse("Fresh viewer flag must clear after first teleport",
++                entry.trackedPlayerMap.get(fresh));
++        Assert.assertTrue("Steady viewer must receive PacketPlayOutRelEntityMove",
++                steadyConn.packets.stream().anyMatch(p -> p instanceof PacketPlayOutEntity.PacketPlayOutRelEntityMove));
++
++        freshConn.packets.clear();
++        steadyConn.packets.clear();
++
++        // Rotate only -> both get PacketPlayOutEntityLook
++        zombie.yaw = 30.0F;
++        entry.track(Collections.<EntityHuman>emptyList());
++        Assert.assertTrue(freshConn.packets.stream().anyMatch(p -> p instanceof PacketPlayOutEntity.PacketPlayOutEntityLook));
++        Assert.assertTrue(steadyConn.packets.stream().anyMatch(p -> p instanceof PacketPlayOutEntity.PacketPlayOutEntityLook));
++
++        freshConn.packets.clear();
++        steadyConn.packets.clear();
++
++        // Move AND rotate -> both get PacketPlayOutRelEntityMoveLook
++        zombie.locZ = 1.0D;
++        zombie.yaw = 60.0F;
++        entry.track(Collections.<EntityHuman>emptyList());
++        Assert.assertTrue(freshConn.packets.stream().anyMatch(p -> p instanceof PacketPlayOutEntity.PacketPlayOutRelEntityMoveLook));
++        Assert.assertTrue(steadyConn.packets.stream().anyMatch(p -> p instanceof PacketPlayOutEntity.PacketPlayOutRelEntityMoveLook));
++
++        // Arrow with zero move/rotate still sends RelEntityMoveLook (vanilla parity)
++        EntityTippedArrow arrow = (EntityTippedArrow) UNSAFE.allocateInstance(EntityTippedArrow.class);
++        arrow.h(nextEntityId++);
++        arrow.locX = 0.0D;
++        arrow.locY = 64.0D;
++        arrow.locZ = 0.0D;
++        arrow.onGround = true;
++        setField(Entity.class, arrow, "passengers", Collections.emptyList());
++        arrow.datawatcher = newBaseDataWatcher(arrow);
++        EntityTrackerEntry arrowEntry = new EntityTrackerEntry(arrow, 64, 64, 1, false);
++        EntityPlayer arrowViewer = newViewer(true);
++        arrowEntry.trackedPlayerMap.put(arrowViewer, Boolean.FALSE);
++        arrowEntry.track(Collections.<EntityHuman>emptyList());
++
++        RecordingConnection arrowConn = (RecordingConnection) arrowViewer.playerConnection;
++        Assert.assertTrue("Arrow must emit RelEntityMoveLook even with zero delta",
++                arrowConn.packets.stream().anyMatch(p -> p instanceof PacketPlayOutEntity.PacketPlayOutRelEntityMoveLook));
++        Assert.assertEquals("Non-EntityLiving must never emit PacketPlayOutEntityHeadRotation",
++                0L, arrowConn.packets.stream().filter(p -> p instanceof PacketPlayOutEntityHeadRotation).count());
++    }
++
++    @Test
++    public void testFastIteratorEliminatesViewerEntryBoxingOverhead() throws Exception {
++        Object2BooleanOpenHashMap<EntityPlayer> map = new Object2BooleanOpenHashMap<EntityPlayer>(64);
++        for (int i = 0; i < 64; ++i) {
++            map.put(newViewer(false), false);
++        }
++        Packet<?> pkt = new PacketPlayOutEntity.PacketPlayOutRelEntityMove(1, 16L, 0L, 0L, true);
++
++        final int warmup = 10_000;
++        final int measured = 50_000;
++
++        for (int i = 0; i < warmup; ++i) {
++            deliverBaseline(map, pkt);
++            deliverFast(map, pkt);
++        }
++
++        ThreadMXBean bean = (ThreadMXBean) ManagementFactory.getThreadMXBean();
++        long tid = Thread.currentThread().getId();
++
++        long a0 = bean.getThreadAllocatedBytes(tid);
++        long t0 = System.nanoTime();
++        for (int i = 0; i < measured; ++i) {
++            deliverBaseline(map, pkt);
++        }
++        long baseNs = System.nanoTime() - t0;
++        long baseAlloc = Math.max(0L, bean.getThreadAllocatedBytes(tid) - a0);
++
++        long a1 = bean.getThreadAllocatedBytes(tid);
++        long t1 = System.nanoTime();
++        for (int i = 0; i < measured; ++i) {
++            deliverFast(map, pkt);
++        }
++        long fastNs = System.nanoTime() - t1;
++        long fastAlloc = Math.max(0L, bean.getThreadAllocatedBytes(tid) - a1);
++
++        long delivered = 0;
++        for (EntityPlayer p : map.keySet()) {
++            delivered += ((CountingConnection) p.playerConnection).count;
++        }
++
++        System.out.printf(
++                "[perf] EntityTrackerEntry viewer loop (%d x 64 viewers): baseline=%.2f ms (alloc=%.2f MB) vs fastIterator=%.2f ms (alloc=%.2f MB), speedup=%.2fx (sent=%d)%n",
++                measured, baseNs / 1e6, baseAlloc / (1024.0 * 1024.0),
++                fastNs / 1e6, fastAlloc / (1024.0 * 1024.0),
++                (double) baseNs / Math.max(1L, fastNs), delivered);
++
++        Assert.assertTrue("fastIterator must allocate far less than boxing entrySet (base=" + baseAlloc + ", fast=" + fastAlloc + ")",
++                fastAlloc * 10L < baseAlloc);
++    }
++
++    private static void deliverBaseline(Map<EntityPlayer, Boolean> map, Packet<?> pkt) {
++        for (Map.Entry<EntityPlayer, Boolean> viewer : map.entrySet()) {
++            if (!viewer.getValue()) {
++                viewer.getKey().playerConnection.sendPacket(pkt);
++            }
++        }
++    }
++
++    private static void deliverFast(Object2BooleanOpenHashMap<EntityPlayer> map, Packet<?> pkt) {
++        ObjectIterator<Object2BooleanMap.Entry<EntityPlayer>> it = map.object2BooleanEntrySet().fastIterator();
++        while (it.hasNext()) {
++            Object2BooleanMap.Entry<EntityPlayer> viewer = it.next();
++            if (!viewer.getBooleanValue()) {
++                viewer.getKey().playerConnection.sendPacket(pkt);
++            }
++        }
++    }
++}
