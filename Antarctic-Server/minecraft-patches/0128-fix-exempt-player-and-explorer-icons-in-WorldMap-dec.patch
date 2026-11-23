@@ -1,0 +1,121 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 00:36:04 +0700
+Subject: [PATCH 128/128] fix: exempt player and explorer icons in WorldMap
+ decoration limit
+
+
+diff --git a/main/java/net/minecraft/server/WorldMap.java b/main/java/net/minecraft/server/WorldMap.java
+index d348d39..a018d0b 100644
+--- a/main/java/net/minecraft/server/WorldMap.java
++++ b/main/java/net/minecraft/server/WorldMap.java
+@@ -283,7 +283,9 @@ public class WorldMap extends PersistentBase {
+         }
+ 
+         // Dionysus start - limit decorations
+-        if (countMapIcon(this.decorations) >= com.destroystokyo.paper.config.toml.modules.fixes.MapDecorations.limit) {
++        if (!isExemptMapIcon(mapicon_type)
++                && !this.decorations.containsKey(s)
++                && countMapIcon(this.decorations) >= com.destroystokyo.paper.config.toml.modules.fixes.MapDecorations.limit) {
+             return;
+         }
+         // Dionysus end
+@@ -293,18 +295,27 @@ public class WorldMap extends PersistentBase {
+     // Dionysus start - limit decorations
+     // Not all map decorations need to be prevented
+     // See https://minecraft.fandom.com/wiki/Map#Map_icons
++    private static boolean isExemptMapIcon(MapIcon.Type type) {
++        if (type == null) {
++            return false;
++        }
++        switch (type) {
++            case PLAYER_OFF_MAP:
++            case PLAYER_OFF_LIMITS:
++            case PLAYER:
++            case MANSION:
++            case MONUMENT:
++                return true;
++            default:
++                return false;
++        }
++    }
++
+     private int countMapIcon(Map<UUID, MapIcon> icons) {
+         int count = 0;
+         for (MapIcon icon : icons.values()) {
+-            switch (MapIcon.Type.a(icon.getType())) {
+-                case PLAYER_OFF_MAP:
+-                case PLAYER_OFF_LIMITS:
+-                case PLAYER:
+-                case MANSION:
+-                case MONUMENT:
+-                    continue;
+-                default:
+-                    count++;
++            if (!isExemptMapIcon(MapIcon.Type.a(icon.getType()))) {
++                count++;
+             }
+         }
+         return count;
+diff --git a/test/java/net/minecraft/server/WorldMapDecorationLimitTest.java b/test/java/net/minecraft/server/WorldMapDecorationLimitTest.java
+new file mode 100644
+index 0000000..908a3a1
+--- /dev/null
++++ b/test/java/net/minecraft/server/WorldMapDecorationLimitTest.java
+@@ -0,0 +1,56 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.config.toml.modules.fixes.MapDecorations;
++import java.lang.reflect.Method;
++import java.util.UUID;
++import org.junit.Assert;
++import org.junit.Test;
++
++public class WorldMapDecorationLimitTest {
++
++    @Test
++    public void testExemptIconsAndExistingKeysBypassLimit() throws Exception {
++        int prevLimit = MapDecorations.limit;
++        try {
++            MapDecorations.limit = 2;
++            WorldMap map = new WorldMap("map_0");
++            map.scale = 0;
++            map.centerX = 0;
++            map.centerZ = 0;
++
++            Method addIcon = WorldMap.class.getDeclaredMethod("a", MapIcon.Type.class, World.class, UUID.class, double.class, double.class, double.class);
++            addIcon.setAccessible(true);
++
++            UUID frame1 = UUID.randomUUID();
++            UUID frame2 = UUID.randomUUID();
++            UUID frame3 = UUID.randomUUID();
++            UUID player = UUID.randomUUID();
++            UUID mansion = UUID.randomUUID();
++            UUID monument = UUID.randomUUID();
++
++            addIcon.invoke(map, MapIcon.Type.FRAME, null, frame1, 0.0D, 0.0D, 0.0D);
++            addIcon.invoke(map, MapIcon.Type.FRAME, null, frame2, 10.0D, 10.0D, 0.0D);
++            // 3rd non-exempt icon exceeds limit=2 and must be rejected
++            addIcon.invoke(map, MapIcon.Type.FRAME, null, frame3, 20.0D, 20.0D, 0.0D);
++
++            Assert.assertTrue(map.decorations.containsKey(frame1));
++            Assert.assertTrue(map.decorations.containsKey(frame2));
++            Assert.assertFalse("New non-exempt decoration past limit must be rejected", map.decorations.containsKey(frame3));
++
++            // Updating existing key must still succeed even when at limit
++            addIcon.invoke(map, MapIcon.Type.FRAME, null, frame1, 32.0D, 32.0D, 90.0D);
++            Assert.assertEquals(64, map.decorations.get(frame1).getX());
++
++            // Exempt icons (PLAYER, MANSION, MONUMENT) must still be added past limit
++            addIcon.invoke(map, MapIcon.Type.PLAYER, null, player, 0.0D, 0.0D, 0.0D);
++            addIcon.invoke(map, MapIcon.Type.MANSION, null, mansion, 5.0D, 5.0D, 0.0D);
++            addIcon.invoke(map, MapIcon.Type.MONUMENT, null, monument, -5.0D, -5.0D, 0.0D);
++
++            Assert.assertTrue("PLAYER icon must be exempted from decoration limit", map.decorations.containsKey(player));
++            Assert.assertTrue("MANSION icon must be exempted from decoration limit", map.decorations.containsKey(mansion));
++            Assert.assertTrue("MONUMENT icon must be exempted from decoration limit", map.decorations.containsKey(monument));
++        } finally {
++            MapDecorations.limit = prevLimit;
++        }
++    }
++}
