@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 00:40:05 +0700
+Subject: [PATCH 130/130] fix: make PlayerList name lookup null-safe,
+ locale-free and zero-alloc
+
+
+diff --git a/main/java/net/minecraft/server/PlayerList.java b/main/java/net/minecraft/server/PlayerList.java
+index 18361e4..ec1987a 100644
+--- a/main/java/net/minecraft/server/PlayerList.java
++++ b/main/java/net/minecraft/server/PlayerList.java
+@@ -73,19 +73,34 @@ public abstract class PlayerList {
+ 
+     // CraftBukkit start
+     private final CraftServer cserver;
+-    private final Map<String,EntityPlayer> playersByName = new it.unimi.dsi.fastutil.objects.Object2ObjectOpenCustomHashMap<String, EntityPlayer>(
+-        new it.unimi.dsi.fastutil.Hash.Strategy<String>() {
+-            @Override
+-            public int hashCode(String o) {
+-                return o.toLowerCase().hashCode();
++    static final it.unimi.dsi.fastutil.Hash.Strategy<String> CASE_INSENSITIVE_NAME_STRATEGY = new it.unimi.dsi.fastutil.Hash.Strategy<String>() {
++        @Override
++        public int hashCode(String o) {
++            if (o == null) {
++                return 0;
+             }
++            int h = 0;
++            for (int i = 0, len = o.length(); i < len; ++i) {
++                char c = o.charAt(i);
++                if (c >= 'A' && c <= 'Z') {
++                    c = (char) (c + 32);
++                } else if (c >= 128) {
++                    c = Character.toLowerCase(Character.toUpperCase(c));
++                }
++                h = 31 * h + c;
++            }
++            return h;
++        }
+ 
+-            @Override
+-            public boolean equals(String a, String b) {
+-                return a.equalsIgnoreCase(b);
++        @Override
++        public boolean equals(String a, String b) {
++            if (a == b) {
++                return true;
+             }
++            return a != null && b != null && a.equalsIgnoreCase(b);
+         }
+-    );
++    };
++    private final Map<String,EntityPlayer> playersByName = new it.unimi.dsi.fastutil.objects.Object2ObjectOpenCustomHashMap<String, EntityPlayer>(CASE_INSENSITIVE_NAME_STRATEGY);
+     @Nullable String collideRuleTeamName; // Paper - Team name used for collideRule
+ 
+     public PlayerList(MinecraftServer minecraftserver) {
+diff --git a/test/java/net/minecraft/server/PlayerListLookupStrategyTest.java b/test/java/net/minecraft/server/PlayerListLookupStrategyTest.java
+new file mode 100644
+index 0000000..f3b5dea
+--- /dev/null
++++ b/test/java/net/minecraft/server/PlayerListLookupStrategyTest.java
+@@ -0,0 +1,43 @@
++package net.minecraft.server;
++
++import java.lang.reflect.Field;
++import java.util.Locale;
++import java.util.Map;
++import org.junit.Assert;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++public class PlayerListLookupStrategyTest {
++
++    @Test
++    public void testNullSafeAndTurkishLocaleCaseInsensitiveLookup() throws Exception {
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        Unsafe unsafe = (Unsafe) f.get(null);
++
++        it.unimi.dsi.fastutil.Hash.Strategy<String> strategy = PlayerList.CASE_INSENSITIVE_NAME_STRATEGY;
++        Map<String, EntityPlayer> map = new it.unimi.dsi.fastutil.objects.Object2ObjectOpenCustomHashMap<>(strategy);
++        EntityPlayer p1 = (EntityPlayer) unsafe.allocateInstance(EntityPlayer.class);
++
++        Locale prevLocale = Locale.getDefault();
++        try {
++            // Turkish locale previously broke "I".toLowerCase() != "i"
++            Locale.setDefault(Locale.forLanguageTag("tr-TR"));
++
++            map.put("IIlPlayer_01", p1);
++            Assert.assertSame("Case-insensitive lookup must work under Turkish locale", p1, map.get("iilplayer_01"));
++            Assert.assertSame(p1, map.get("IILPLAYER_01"));
++            Assert.assertEquals(strategy.hashCode("IIlPlayer_01"), strategy.hashCode("iilplayer_01"));
++
++            // Null keys must never throw NPE
++            Assert.assertNull(map.get(null));
++            Assert.assertFalse(map.containsKey(null));
++            Assert.assertNull(map.remove(null));
++            Assert.assertTrue(strategy.equals(null, null));
++            Assert.assertFalse(strategy.equals("abc", null));
++            Assert.assertFalse(strategy.equals(null, "abc"));
++        } finally {
++            Locale.setDefault(prevLocale);
++        }
++    }
++}
