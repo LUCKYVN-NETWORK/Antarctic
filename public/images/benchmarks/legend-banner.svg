@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1140 86" width="1140" height="86" role="img" aria-label="Antarctic vs Paper 1.12.2 Benchmark Legend">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#0D1117"/>
+      <stop offset="50%" stop-color="#111827"/>
+      <stop offset="100%" stop-color="#0D1117"/>
+    </linearGradient>
+    <linearGradient id="topBar" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#38BDF8"/>
+      <stop offset="50%" stop-color="#6366F1"/>
+      <stop offset="100%" stop-color="#8B5CF6"/>
+    </linearGradient>
+    <linearGradient id="cyanBar" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#38BDF8"/>
+      <stop offset="100%" stop-color="#0284C7"/>
+    </linearGradient>
+    <linearGradient id="violetBar" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#A78BFA"/>
+      <stop offset="100%" stop-color="#7C3AED"/>
+    </linearGradient>
+  </defs>
+  <rect x="1" y="1" width="1138" height="84" rx="12" fill="url(#bg)" stroke="#1E293B" stroke-width="1.5"/>
+  <rect x="1" y="1" width="1138" height="3" rx="1.5" fill="url(#topBar)"/>
+
+  <text x="24" y="34" fill="#F8FAFC" font-family="ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif" font-size="14" font-weight="700" letter-spacing="0.4">SIMULATION BENCHMARK SERIES</text>
+  <text x="24" y="57" fill="#94A3B8" font-family="ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif" font-size="11.5">Lower is better on all latency &amp; heap allocation bars · Averaged over 2 alternating headless JVM runs per build (JDK 21.0.13 · G1GC 2 GB)</text>
+
+  <!-- Legend pills on the right -->
+  <g transform="translate(650, 20)">
+    <rect x="0" y="0" width="152" height="46" rx="8" fill="#161E2E" stroke="#334155" stroke-width="1"/>
+    <rect x="12" y="16" width="14" height="14" rx="4" fill="#64748B"/>
+    <text x="34" y="22" fill="#E2E8F0" font-family="ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif" font-size="11.5" font-weight="600">Paper 1.12.2</text>
+    <text x="34" y="36" fill="#94A3B8" font-family="ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif" font-size="10">Upstream Baseline</text>
+  </g>
+  <g transform="translate(812, 20)">
+    <rect x="0" y="0" width="148" height="46" rx="8" fill="#0F2133" stroke="#0EA5E9" stroke-opacity="0.45" stroke-width="1"/>
+    <rect x="12" y="16" width="14" height="14" rx="4" fill="url(#cyanBar)"/>
+    <text x="34" y="22" fill="#F0F9FF" font-family="ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif" font-size="11.5" font-weight="600">Antarctic</text>
+    <text x="34" y="36" fill="#7DD3FC" font-family="ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif" font-size="10">Default Config</text>
+  </g>
+  <g transform="translate(970, 20)">
+    <rect x="0" y="0" width="148" height="46" rx="8" fill="#1C1633" stroke="#8B5CF6" stroke-opacity="0.5" stroke-width="1"/>
+    <rect x="12" y="16" width="14" height="14" rx="4" fill="url(#violetBar)"/>
+    <text x="34" y="22" fill="#F5F3FF" font-family="ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif" font-size="11.5" font-weight="600">Antarctic</text>
+    <text x="34" y="36" fill="#C4B5FD" font-family="ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif" font-size="10">Opt-in TOML</text>
+  </g>
+</svg>

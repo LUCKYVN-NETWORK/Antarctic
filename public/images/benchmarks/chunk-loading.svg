@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 322" width="560" height="322" role="img" aria-label="Chunk Loading and Generation Benchmark">
+  <defs>
+    <linearGradient id="cardBg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0F172A"/>
+      <stop offset="100%" stop-color="#0B1120"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#38BDF8"/>
+      <stop offset="100%" stop-color="#6366F1"/>
+    </linearGradient>
+    <linearGradient id="cyanBar" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#38BDF8"/>
+      <stop offset="100%" stop-color="#0284C7"/>
+    </linearGradient>
+    <linearGradient id="violetBar" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#A78BFA"/>
+      <stop offset="100%" stop-color="#7C3AED"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="1" y="1" width="558" height="320" rx="14" fill="url(#cardBg)" stroke="#1E293B" stroke-width="1.5"/>
+  <rect x="1" y="1" width="558" height="3.5" rx="1.75" fill="url(#accent)"/>
+
+  <!-- Header -->
+  <text x="22" y="34" fill="#38BDF8" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" font-weight="700">01 · CHUNK PIPELINE</text>
+  <text x="22" y="56" fill="#F8FAFC" font-family="ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif" font-size="17" font-weight="700">Chunk Loading &amp; Generation</text>
+  <text x="22" y="74" fill="#94A3B8" font-family="ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif" font-size="11.5">225 Overworld chunks generated + 3×225 cold Anvil reloads</text>
+
+  <!-- Highlight Pill -->
+  <rect x="424" y="22" width="114" height="26" rx="13" fill="#064E3B" fill-opacity="0.55" stroke="#10B981" stroke-opacity="0.65" stroke-width="1"/>
+  <text x="481" y="39" text-anchor="middle" fill="#34D399" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" font-weight="700">-21.6% alloc</text>
+
+  <line x1="22" y1="88" x2="538" y2="88" stroke="#1E293B" stroke-width="1"/>
+
+  <!-- Section A: Generation Latency (ms/chunk) max=9.29 -> width=320 -->
+  <text x="22" y="108" fill="#CBD5E1" font-family="ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif" font-size="11.5" font-weight="600">GENERATION LATENCY (ms / chunk · lower is better)</text>
+
+  <!-- Paper 9.29 -->
+  <text x="22" y="131" fill="#94A3B8" font-family="ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif" font-size="11.5">Paper 1.12.2</text>
+  <rect x="130" y="118" width="318" height="17" rx="5" fill="#1E293B"/>
+  <rect x="130" y="118" width="318" height="17" rx="5" fill="#64748B"/>
+  <text x="456" y="131" fill="#CBD5E1" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" font-weight="600">9.29 ms</text>
+
+  <!-- Antarctic Default 8.46 (-8.9%) -->
+  <text x="22" y="155" fill="#E0F2FE" font-family="ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif" font-size="11.5">Antarctic Def.</text>
+  <rect x="130" y="142" width="318" height="17" rx="5" fill="#1E293B"/>
+  <rect x="130" y="142" width="290" height="17" rx="5" fill="url(#cyanBar)"/>
+  <text x="456" y="155" fill="#7DD3FC" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" font-weight="700">8.46 ms</text>
+
+  <!-- Antarctic Opt-in 8.31 (-10.6%) -->
+  <text x="22" y="179" fill="#EDE9FE" font-family="ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif" font-size="11.5">Antarctic Opt.</text>
+  <rect x="130" y="166" width="318" height="17" rx="5" fill="#1E293B"/>
+  <rect x="130" y="166" width="284" height="17" rx="5" fill="url(#violetBar)"/>
+  <text x="456" y="179" fill="#C4B5FD" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" font-weight="700">8.31 ms</text>
+
+  <!-- Section B: Heap Allocation (MB/chunk) max=2.90 -> width=318 -->
+  <text x="22" y="208" fill="#CBD5E1" font-family="ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif" font-size="11.5" font-weight="600">HEAP ALLOCATION (MB / chunk · lower is better)</text>
+
+  <!-- Paper 2.90 -->
+  <text x="22" y="231" fill="#94A3B8" font-family="ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif" font-size="11.5">Paper 1.12.2</text>
+  <rect x="130" y="218" width="318" height="17" rx="5" fill="#1E293B"/>
+  <rect x="130" y="218" width="318" height="17" rx="5" fill="#64748B"/>
+  <text x="456" y="231" fill="#CBD5E1" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" font-weight="600">2.90 MB</text>
+
+  <!-- Antarctic Default 2.28 (-21.6%) -->
+  <text x="22" y="255" fill="#E0F2FE" font-family="ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif" font-size="11.5">Antarctic Def.</text>
+  <rect x="130" y="242" width="318" height="17" rx="5" fill="#1E293B"/>
+  <rect x="130" y="242" width="250" height="17" rx="5" fill="url(#cyanBar)"/>
+  <text x="456" y="255" fill="#7DD3FC" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" font-weight="700">2.28 MB</text>
+
+  <!-- Antarctic Opt-in 2.28 (-21.4%) -->
+  <text x="22" y="279" fill="#EDE9FE" font-family="ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif" font-size="11.5">Antarctic Opt.</text>
+  <rect x="130" y="266" width="318" height="17" rx="5" fill="#1E293B"/>
+  <rect x="130" y="266" width="250" height="17" rx="5" fill="url(#violetBar)"/>
+  <text x="456" y="279" fill="#C4B5FD" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" font-weight="700">2.28 MB</text>
+
+  <!-- Footer -->
+  <rect x="22" y="294" width="516" height="18" rx="4" fill="#111C30"/>
+  <text x="30" y="306.5" fill="#94A3B8" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="10.2">Throughput: 108.1 → 118.2 (+9.4% Def) / 120.4 chunks/s (+11.4% Opt) · Reload: ~1.45 ms/chunk</text>
+</svg>
