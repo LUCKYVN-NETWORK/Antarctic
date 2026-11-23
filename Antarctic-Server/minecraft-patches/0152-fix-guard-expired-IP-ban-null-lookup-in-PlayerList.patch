@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 02:01:39 +0700
+Subject: [PATCH 152/152] fix: guard expired IP ban null lookup in PlayerList
+
+
+diff --git a/main/java/net/minecraft/server/PlayerList.java b/main/java/net/minecraft/server/PlayerList.java
+index ec1987a..473656c 100644
+--- a/main/java/net/minecraft/server/PlayerList.java
++++ b/main/java/net/minecraft/server/PlayerList.java
+@@ -565,6 +565,7 @@ public abstract class PlayerList {
+ 
+         // NeonPaper start - Fix MC-158900
+         GameProfileBanEntry gameprofilebanentry;
++        IpBanEntry ipbanentry; // Antarctic - null-safe single IP ban lookup
+         if (getProfileBans().isBanned(gameprofile) && (gameprofilebanentry = getProfileBans().get(gameprofile)) != null) {
+         // NeonPaper end
+ 
+@@ -578,8 +579,7 @@ public abstract class PlayerList {
+         } else if (!this.isWhitelisted(gameprofile, event)) { // Paper
+             // return "You are not white-listed on this server!";
+             //event.disallow(PlayerLoginEvent.Result.KICK_WHITELIST, org.spigotmc.SpigotConfig.whitelistMessage); // Spigot // Paper - moved to isWhitelisted
+-        } else if (getIPBans().isBanned(socketaddress) && !getIPBans().get(socketaddress).hasExpired()) {
+-            IpBanEntry ipbanentry = this.l.get(socketaddress);
++        } else if ((ipbanentry = resolveActiveIpBan(getIPBans(), socketaddress)) != null) { // Antarctic - guard expired null lookup
+ 
+             s = "Your IP address is banned from this server!\nReason: " + ipbanentry.getReason();
+             if (ipbanentry.getExpires() != null) {
+@@ -603,6 +603,17 @@ public abstract class PlayerList {
+         return entity;
+     }
+ 
++    // Antarctic start - avoid NPE when an IP ban expires between isBanned() and get()
++    @Nullable
++    static IpBanEntry resolveActiveIpBan(IpBanList ipBans, SocketAddress socketaddress) {
++        if (socketaddress == null || !ipBans.isBanned(socketaddress)) {
++            return null;
++        }
++        IpBanEntry entry = ipBans.get(socketaddress);
++        return (entry != null && !entry.hasExpired()) ? entry : null;
++    }
++    // Antarctic end
++
+     public EntityPlayer processLogin(GameProfile gameprofile, EntityPlayer player) { // CraftBukkit - added EntityPlayer
+         /* CraftBukkit startMoved up
+         UUID uuid = EntityHuman.a(gameprofile);
+diff --git a/test/java/net/minecraft/server/PlayerListIpBanNullGuardTest.java b/test/java/net/minecraft/server/PlayerListIpBanNullGuardTest.java
+new file mode 100644
+index 0000000..972a211
+--- /dev/null
++++ b/test/java/net/minecraft/server/PlayerListIpBanNullGuardTest.java
+@@ -0,0 +1,62 @@
++package net.minecraft.server;
++
++import java.io.File;
++import java.net.InetSocketAddress;
++import java.net.SocketAddress;
++import java.util.Date;
++import org.junit.Assert;
++import org.junit.Test;
++
++public class PlayerListIpBanNullGuardTest {
++
++    @Test
++    public void testExpiredRacyAndActiveIpBanResolution() {
++        SocketAddress addr = new InetSocketAddress("203.0.113.10", 25565);
++
++        // Simulate a race where isBanned() returns true right before get() evicts/returns null
++        IpBanList racyList = new IpBanList(new File("banned-ips-test.json")) {
++            @Override
++            public boolean isBanned(SocketAddress socketaddress) {
++                return true;
++            }
++
++            @Override
++            public IpBanEntry get(SocketAddress socketaddress) {
++                return null;
++            }
++        };
++        Assert.assertNull("Null entry from get() after isBanned()==true must return null without NPE",
++                PlayerList.resolveActiveIpBan(racyList, addr));
++
++        // Expired entry returned by get() must also resolve to null
++        final IpBanEntry expired = new IpBanEntry("203.0.113.10", new Date(0L), "test", new Date(1000L), "old");
++        IpBanList expiredList = new IpBanList(new File("banned-ips-test.json")) {
++            @Override
++            public boolean isBanned(SocketAddress socketaddress) {
++                return true;
++            }
++
++            @Override
++            public IpBanEntry get(SocketAddress socketaddress) {
++                return expired;
++            }
++        };
++        Assert.assertNull("Expired IP ban must return null", PlayerList.resolveActiveIpBan(expiredList, addr));
++
++        // Active entry must be returned intact
++        final IpBanEntry active = new IpBanEntry("203.0.113.10", new Date(), "test", new Date(System.currentTimeMillis() + 600_000L), "active");
++        IpBanList activeList = new IpBanList(new File("banned-ips-test.json")) {
++            @Override
++            public boolean isBanned(SocketAddress socketaddress) {
++                return true;
++            }
++
++            @Override
++            public IpBanEntry get(SocketAddress socketaddress) {
++                return active;
++            }
++        };
++        Assert.assertSame("Active IP ban must be returned", active, PlayerList.resolveActiveIpBan(activeList, addr));
++        Assert.assertNull("Null socketaddress must return null safely", PlayerList.resolveActiveIpBan(activeList, null));
++    }
++}
