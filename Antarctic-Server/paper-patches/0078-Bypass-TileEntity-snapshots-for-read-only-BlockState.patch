@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Sun, 18 Oct 2026 17:40:11 +0700
-Subject: [PATCH 078/139] Bypass TileEntity snapshots for read-only BlockState
+Subject: [PATCH 078/140] Bypass TileEntity snapshots for read-only BlockState
  queries
 
 - Backport Leaf MC 0171 & Server-Paper 0044 (EMC TileEntity snapshot bypass)

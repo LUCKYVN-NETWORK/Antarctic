@@ -1,0 +1,180 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 01:12:54 +0700
+Subject: [PATCH 140/140] fix: replace Waitable synchronized wait with
+ ReentrantLock
+
+
+diff --git a/main/java/org/bukkit/craftbukkit/util/Waitable.java b/main/java/org/bukkit/craftbukkit/util/Waitable.java
+index 5cd1154..0b175d6 100644
+--- a/main/java/org/bukkit/craftbukkit/util/Waitable.java
++++ b/main/java/org/bukkit/craftbukkit/util/Waitable.java
+@@ -1,6 +1,8 @@
+ package org.bukkit.craftbukkit.util;
+ 
+ import java.util.concurrent.ExecutionException;
++import java.util.concurrent.locks.Condition;
++import java.util.concurrent.locks.ReentrantLock;
+ 
+ 
+ public abstract class Waitable<T> implements Runnable {
+@@ -9,38 +11,51 @@ public abstract class Waitable<T> implements Runnable {
+         RUNNING,
+         FINISHED,
+     }
++    private final ReentrantLock lock = new ReentrantLock();
++    private final Condition finished = lock.newCondition();
+     Throwable t = null;
+     T value = null;
+     Status status = Status.WAITING;
+ 
+     public final void run() {
+-        synchronized (this) {
++        lock.lock();
++        try {
+             if (status != Status.WAITING) {
+                 throw new IllegalStateException("Invalid state " + status);
+             }
+             status = Status.RUNNING;
++        } finally {
++            lock.unlock();
+         }
+         try {
+             value = evaluate();
+         } catch (Throwable t) {
+             this.t = t;
+         } finally {
+-            synchronized (this) {
++            lock.lock();
++            try {
+                 status = Status.FINISHED;
+-                this.notifyAll();
++                finished.signalAll();
++            } finally {
++                lock.unlock();
+             }
+         }
+     }
+ 
+     protected abstract T evaluate();
+ 
+-    public synchronized T get() throws InterruptedException, ExecutionException {
+-        while (status != Status.FINISHED) {
+-            this.wait();
+-        }
+-        if (t != null) {
+-            throw new ExecutionException(t);
++    public T get() throws InterruptedException, ExecutionException {
++        lock.lock();
++        try {
++            while (status != Status.FINISHED) {
++                finished.await();
++            }
++            if (t != null) {
++                throw new ExecutionException(t);
++            }
++            return value;
++        } finally {
++            lock.unlock();
+         }
+-        return value;
+     }
+ }
+diff --git a/test/java/org/bukkit/craftbukkit/util/WaitableLockTest.java b/test/java/org/bukkit/craftbukkit/util/WaitableLockTest.java
+new file mode 100644
+index 0000000..24c87b7
+--- /dev/null
++++ b/test/java/org/bukkit/craftbukkit/util/WaitableLockTest.java
+@@ -0,0 +1,92 @@
++package org.bukkit.craftbukkit.util;
++
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.Future;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicInteger;
++import org.junit.Assert;
++import org.junit.Test;
++
++public class WaitableLockTest {
++
++    @Test
++    public void testVirtualThreadWaitableCompletesAndPropagatesExceptions() throws Exception {
++        Waitable<String> ok = new Waitable<String>() {
++            @Override
++            protected String evaluate() {
++                return "done";
++            }
++        };
++
++        Waitable<String> fail = new Waitable<String>() {
++            @Override
++            protected String evaluate() {
++                throw new IllegalArgumentException("boom");
++            }
++        };
++
++        ExecutorService vt = Executors.newVirtualThreadPerTaskExecutor();
++        try {
++            Future<String> f1 = vt.submit(ok::get);
++            Future<String> f2 = vt.submit(fail::get);
++
++            ok.run();
++            fail.run();
++
++            Assert.assertEquals("done", f1.get(5, TimeUnit.SECONDS));
++            try {
++                f2.get(5, TimeUnit.SECONDS);
++                Assert.fail("Expected ExecutionException");
++            } catch (ExecutionException expected) {
++                Assert.assertTrue(expected.getCause() instanceof ExecutionException);
++                Assert.assertTrue(expected.getCause().getCause() instanceof IllegalArgumentException);
++            }
++
++            // Re-running finished waitable must still throw IllegalStateException
++            try {
++                ok.run();
++                Assert.fail("Expected IllegalStateException on second run()");
++            } catch (IllegalStateException expected) {
++                // expected
++            }
++
++            // Fan out 64 virtual threads waiting simultaneously (> carrier count) to verify zero pinning deadlock
++            int count = 64;
++            Waitable<Integer>[] waitables = new Waitable[count];
++            CountDownLatch started = new CountDownLatch(count);
++            AtomicInteger sum = new AtomicInteger();
++            Future<?>[] futures = new Future<?>[count];
++            for (int i = 0; i < count; ++i) {
++                final int val = i + 1;
++                waitables[i] = new Waitable<Integer>() {
++                    @Override
++                    protected Integer evaluate() {
++                        return val;
++                    }
++                };
++                final Waitable<Integer> w = waitables[i];
++                futures[i] = vt.submit(() -> {
++                    started.countDown();
++                    try {
++                        sum.addAndGet(w.get());
++                    } catch (Exception e) {
++                        throw new RuntimeException(e);
++                    }
++                });
++            }
++            Assert.assertTrue(started.await(5, TimeUnit.SECONDS));
++            for (int i = 0; i < count; ++i) {
++                waitables[i].run();
++            }
++            for (Future<?> f : futures) {
++                f.get(5, TimeUnit.SECONDS);
++            }
++            Assert.assertEquals(count * (count + 1) / 2, sum.get());
++        } finally {
++            vt.shutdownNow();
++        }
++    }
++}
