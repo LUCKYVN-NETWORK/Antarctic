@@ -1,0 +1,408 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 00:17:14 +0700
+Subject: [PATCH 123/123] fix: make EnchantmentManager re-entrant and remove
+ static modifiers
+
+
+diff --git a/main/java/net/minecraft/server/EnchantmentManager.java b/main/java/net/minecraft/server/EnchantmentManager.java
+index c74d00b..948e97b 100644
+--- a/main/java/net/minecraft/server/EnchantmentManager.java
++++ b/main/java/net/minecraft/server/EnchantmentManager.java
+@@ -12,24 +12,18 @@ import java.util.Map.Entry;
+ 
+ public class EnchantmentManager {
+ 
+-    private static final EnchantmentManager.EnchantmentModifierProtection a = new EnchantmentManager.EnchantmentModifierProtection(null);
+-    private static final EnchantmentManager.EnchantmentModifierDamage b = new EnchantmentManager.EnchantmentModifierDamage(null);
+-    private static final EnchantmentManager.EnchantmentModifierThorns c = new EnchantmentManager.EnchantmentModifierThorns(null);
+-    private static final EnchantmentManager.EnchantmentModifierArthropods d = new EnchantmentManager.EnchantmentModifierArthropods(null);
+-
+     public static int getEnchantmentLevel(Enchantment enchantment, ItemStack itemstack) {
+         if (itemstack.isEmpty()) {
+             return 0;
+         } else {
+             NBTTagList nbttaglist = itemstack.getEnchantments();
+ 
+-            for (int i = 0; i < nbttaglist.size(); ++i) {
++            for (int i = 0, len = nbttaglist.size(); i < len; ++i) {
+                 NBTTagCompound nbttagcompound = nbttaglist.get(i);
+                 Enchantment enchantment1 = Enchantment.c(nbttagcompound.getShort("id"));
+-                short short0 = nbttagcompound.getShort("lvl");
+ 
+                 if (enchantment1 == enchantment) {
+-                    return short0;
++                    return nbttagcompound.getShort("lvl");
+                 }
+             }
+ 
+@@ -83,46 +77,37 @@ public class EnchantmentManager {
+ 
+     }
+ 
+-    private static void a(EnchantmentManager.EnchantmentModifier enchantmentmanager_enchantmentmodifier, ItemStack itemstack) {
+-        if (!itemstack.isEmpty()) {
+-            NBTTagList nbttaglist = itemstack.getEnchantments();
+-
+-            for (int i = 0; i < nbttaglist.size(); ++i) {
+-                short short0 = nbttaglist.get(i).getShort("id");
+-                short short1 = nbttaglist.get(i).getShort("lvl");
+-
+-                if (Enchantment.c(short0) != null) {
+-                    enchantmentmanager_enchantmentmodifier.a(Enchantment.c(short0), short1);
++    // Antarctic start - re-entrant, leak-free, single-lookup enchantment modifiers (fixes MC-128547 re-entrant Thorns NPE)
++    public static int a(Iterable<ItemStack> iterable, DamageSource damagesource) {
++        int total = 0;
++        for (ItemStack itemstack : iterable) {
++            if (!itemstack.isEmpty()) {
++                NBTTagList nbttaglist = itemstack.getEnchantments();
++                for (int i = 0, len = nbttaglist.size(); i < len; ++i) {
++                    NBTTagCompound tag = nbttaglist.get(i);
++                    Enchantment enchantment = Enchantment.c(tag.getShort("id"));
++                    if (enchantment != null) {
++                        total += enchantment.a((int) tag.getShort("lvl"), damagesource);
++                    }
+                 }
+             }
+-
+         }
+-    }
+-
+-    private static void a(EnchantmentManager.EnchantmentModifier enchantmentmanager_enchantmentmodifier, Iterable<ItemStack> iterable) {
+-        Iterator iterator = iterable.iterator();
+-
+-        while (iterator.hasNext()) {
+-            ItemStack itemstack = (ItemStack) iterator.next();
+-
+-            a(enchantmentmanager_enchantmentmodifier, itemstack);
+-        }
+-
+-    }
+-
+-    public static int a(Iterable<ItemStack> iterable, DamageSource damagesource) {
+-        EnchantmentManager.a.a = 0;
+-        EnchantmentManager.a.b = damagesource;
+-        a((EnchantmentManager.EnchantmentModifier) EnchantmentManager.a, iterable);
+-        EnchantmentManager.a.b = null; // Reaper - Fix MC-128547
+-        return EnchantmentManager.a.a;
++        return total;
+     }
+ 
+     public static float a(ItemStack itemstack, EnumMonsterType enummonstertype) {
+-        EnchantmentManager.b.a = 0.0F;
+-        EnchantmentManager.b.b = enummonstertype;
+-        a((EnchantmentManager.EnchantmentModifier) EnchantmentManager.b, itemstack);
+-        return EnchantmentManager.b.a;
++        float total = 0.0F;
++        if (!itemstack.isEmpty()) {
++            NBTTagList nbttaglist = itemstack.getEnchantments();
++            for (int i = 0, len = nbttaglist.size(); i < len; ++i) {
++                NBTTagCompound tag = nbttaglist.get(i);
++                Enchantment enchantment = Enchantment.c(tag.getShort("id"));
++                if (enchantment != null) {
++                    total += enchantment.a((int) tag.getShort("lvl"), enummonstertype);
++                }
++            }
++        }
++        return total;
+     }
+ 
+     public static float a(EntityLiving entityliving) {
+@@ -131,39 +116,56 @@ public class EnchantmentManager {
+         return i > 0 ? EnchantmentSweeping.e(i) : 0.0F;
+     }
+ 
++    private static void applyPostHurt(EntityLiving entityliving, Entity entity, ItemStack itemstack) {
++        if (!itemstack.isEmpty()) {
++            NBTTagList nbttaglist = itemstack.getEnchantments();
++            for (int i = 0, len = nbttaglist.size(); i < len; ++i) {
++                NBTTagCompound tag = nbttaglist.get(i);
++                Enchantment enchantment = Enchantment.c(tag.getShort("id"));
++                if (enchantment != null) {
++                    enchantment.b(entityliving, entity, tag.getShort("lvl"));
++                }
++            }
++        }
++    }
++
+     public static void a(EntityLiving entityliving, Entity entity) {
+-        EnchantmentManager.c.b = entity;
+-        EnchantmentManager.c.a = entityliving;
+         if (entityliving != null) {
+-            a((EnchantmentManager.EnchantmentModifier) EnchantmentManager.c, entityliving.aQ());
++            for (ItemStack itemstack : entityliving.aQ()) {
++                applyPostHurt(entityliving, entity, itemstack);
++            }
+         }
+ 
+         if (entity instanceof EntityHuman) {
+-            a((EnchantmentManager.EnchantmentModifier) EnchantmentManager.c, entityliving.getItemInMainHand());
++            applyPostHurt(entityliving, entity, entityliving.getItemInMainHand());
+         }
++    }
+ 
+-        // Reaper start - Fix MC-128547
+-        EnchantmentManager.c.b = null;
+-        EnchantmentManager.c.a = null;
+-        // Reaper end
++    private static void applyPostAttack(EntityLiving entityliving, Entity entity, ItemStack itemstack) {
++        if (!itemstack.isEmpty()) {
++            NBTTagList nbttaglist = itemstack.getEnchantments();
++            for (int i = 0, len = nbttaglist.size(); i < len; ++i) {
++                NBTTagCompound tag = nbttaglist.get(i);
++                Enchantment enchantment = Enchantment.c(tag.getShort("id"));
++                if (enchantment != null) {
++                    enchantment.a(entityliving, entity, tag.getShort("lvl"));
++                }
++            }
++        }
+     }
+ 
+     public static void b(EntityLiving entityliving, Entity entity) {
+-        EnchantmentManager.d.a = entityliving;
+-        EnchantmentManager.d.b = entity;
+         if (entityliving != null) {
+-            a((EnchantmentManager.EnchantmentModifier) EnchantmentManager.d, entityliving.aQ());
++            for (ItemStack itemstack : entityliving.aQ()) {
++                applyPostAttack(entityliving, entity, itemstack);
++            }
+         }
+ 
+         if (entityliving instanceof EntityHuman) {
+-            a((EnchantmentManager.EnchantmentModifier) EnchantmentManager.d, entityliving.getItemInMainHand());
++            applyPostAttack(entityliving, entity, entityliving.getItemInMainHand());
+         }
+-
+-        // Reaper start - Fix MC-128547
+-        EnchantmentManager.d.b = null;
+-        EnchantmentManager.d.a = null;
+-        // Reaper end
+     }
++    // Antarctic end
+ 
+     public static int a(Enchantment enchantment, EntityLiving entityliving) {
+         List list = enchantment.a(entityliving);
+@@ -361,73 +363,4 @@ public class EnchantmentManager {
+ 
+         return arraylist;
+     }
+-
+-    static final class EnchantmentModifierArthropods implements EnchantmentManager.EnchantmentModifier {
+-
+-        public EntityLiving a;
+-        public Entity b;
+-
+-        private EnchantmentModifierArthropods() {}
+-
+-        public void a(Enchantment enchantment, int i) {
+-            enchantment.a(this.a, this.b, i);
+-        }
+-
+-        EnchantmentModifierArthropods(Object object) {
+-            this();
+-        }
+-    }
+-
+-    static final class EnchantmentModifierThorns implements EnchantmentManager.EnchantmentModifier {
+-
+-        public EntityLiving a;
+-        public Entity b;
+-
+-        private EnchantmentModifierThorns() {}
+-
+-        public void a(Enchantment enchantment, int i) {
+-            enchantment.b(this.a, this.b, i);
+-        }
+-
+-        EnchantmentModifierThorns(Object object) {
+-            this();
+-        }
+-    }
+-
+-    static final class EnchantmentModifierDamage implements EnchantmentManager.EnchantmentModifier {
+-
+-        public float a;
+-        public EnumMonsterType b;
+-
+-        private EnchantmentModifierDamage() {}
+-
+-        public void a(Enchantment enchantment, int i) {
+-            this.a += enchantment.a(i, this.b);
+-        }
+-
+-        EnchantmentModifierDamage(Object object) {
+-            this();
+-        }
+-    }
+-
+-    static final class EnchantmentModifierProtection implements EnchantmentManager.EnchantmentModifier {
+-
+-        public int a;
+-        public DamageSource b;
+-
+-        private EnchantmentModifierProtection() {}
+-
+-        public void a(Enchantment enchantment, int i) {
+-            this.a += enchantment.a(i, this.b);
+-        }
+-
+-        EnchantmentModifierProtection(Object object) {
+-            this();
+-        }
+-    }
+-
+-    interface EnchantmentModifier {
+-
+-        void a(Enchantment enchantment, int i);
+-    }
+ }
+diff --git a/test/java/net/minecraft/server/EnchantmentManagerReentrancyTest.java b/test/java/net/minecraft/server/EnchantmentManagerReentrancyTest.java
+new file mode 100644
+index 0000000..d960a18
+--- /dev/null
++++ b/test/java/net/minecraft/server/EnchantmentManagerReentrancyTest.java
+@@ -0,0 +1,144 @@
++package net.minecraft.server;
++
++import java.lang.reflect.Field;
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.List;
++import java.util.Random;
++import org.junit.Assert;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++public class EnchantmentManagerReentrancyTest {
++
++    private static Unsafe unsafe;
++
++    @BeforeClass
++    public static void setup() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        unsafe = (Unsafe) f.get(null);
++    }
++
++    private static final class StubLiving extends EntityLiving {
++        List<ItemStack> armor = Collections.emptyList();
++        ItemStack mainHand = ItemStack.a;
++        int damageReceived;
++        boolean triggerReentrantThorns;
++
++        StubLiving() {
++            super(null);
++        }
++
++        @Override
++        public Iterable<ItemStack> getArmorItems() {
++            return armor;
++        }
++
++        @Override
++        public Iterable<ItemStack> aQ() {
++            return armor;
++        }
++
++        @Override
++        public ItemStack getEquipment(EnumItemSlot slot) {
++            if (slot == EnumItemSlot.MAINHAND) {
++                return mainHand;
++            }
++            if (slot == EnumItemSlot.CHEST && !armor.isEmpty()) {
++                return armor.get(0);
++            }
++            if (slot == EnumItemSlot.LEGS && armor.size() > 1) {
++                return armor.get(1);
++            }
++            return ItemStack.a;
++        }
++
++        @Override
++        public void setSlot(EnumItemSlot slot, ItemStack stack) {
++        }
++
++        @Override
++        public EnumMainHand getMainHand() {
++            return EnumMainHand.RIGHT;
++        }
++
++        @Override
++        public boolean damageEntity(DamageSource damagesource, float f) {
++            damageReceived++;
++            if (triggerReentrantThorns && damagesource.getEntity() instanceof EntityLiving) {
++                triggerReentrantThorns = false;
++                // Simulate re-entrant Thorns retaliation while outer defender's armor loop is still active
++                EnchantmentManager.a(this, damagesource.getEntity());
++            }
++            return true;
++        }
++    }
++
++    private static StubLiving newStubLiving(Random rng, List<ItemStack> armor) throws Exception {
++        StubLiving entity = (StubLiving) unsafe.allocateInstance(StubLiving.class);
++        entity.random = rng;
++        entity.armor = armor;
++        entity.mainHand = ItemStack.a;
++        return entity;
++    }
++
++    private static ItemStack enchantedItem(Item item, Enchantment ench, int level) {
++        ItemStack stack = new ItemStack(item);
++        stack.addEnchantment(ench, level);
++        return stack;
++    }
++
++    @Test
++    public void testReentrantThornsDoesNotThrowNPE() throws Exception {
++        // Random that always returns 0.0f so Thorns (chance 0.15 * level) always procs
++        Random alwaysProc = new Random() {
++            @Override
++            public float nextFloat() {
++                return 0.0F;
++            }
++
++            @Override
++            public int nextInt(int bound) {
++                return 0;
++            }
++        };
++
++        ItemStack chest = enchantedItem(Items.DIAMOND_CHESTPLATE, Enchantments.THORNS, 3);
++        ItemStack legs = enchantedItem(Items.DIAMOND_LEGGINGS, Enchantments.THORNS, 3);
++        ItemStack attackerChest = enchantedItem(Items.DIAMOND_CHESTPLATE, Enchantments.THORNS, 3);
++
++        StubLiving defender = newStubLiving(alwaysProc, Arrays.asList(chest, legs));
++        StubLiving attacker = newStubLiving(alwaysProc, Collections.singletonList(attackerChest));
++        attacker.triggerReentrantThorns = true;
++
++        // Previously threw NullPointerException on defender's 2nd Thorns armor piece
++        // because re-entrant EnchantmentManager.a(attacker, defender) nulled static c.a/c.b.
++        EnchantmentManager.a(defender, attacker);
++
++        Assert.assertEquals("Attacker must receive Thorns damage from both defender pieces", 2, attacker.damageReceived);
++        Assert.assertEquals("Defender must receive re-entrant Thorns damage from attacker", 1, defender.damageReceived);
++    }
++
++    @Test
++    public void testProtectionDamageAndLevelParity() {
++        ItemStack helm = enchantedItem(Items.DIAMOND_HELMET, Enchantments.PROTECTION_ENVIRONMENTAL, 4);
++        helm.addEnchantment(Enchantments.DURABILITY, 3);
++        ItemStack boots = enchantedItem(Items.DIAMOND_BOOTS, Enchantments.PROTECTION_FALL, 4);
++
++        Assert.assertEquals(4, EnchantmentManager.getEnchantmentLevel(Enchantments.PROTECTION_ENVIRONMENTAL, helm));
++        Assert.assertEquals(3, EnchantmentManager.getEnchantmentLevel(Enchantments.DURABILITY, helm));
++        Assert.assertEquals(0, EnchantmentManager.getEnchantmentLevel(Enchantments.THORNS, helm));
++        Assert.assertEquals(0, EnchantmentManager.getEnchantmentLevel(Enchantments.THORNS, ItemStack.a));
++
++        int fallProt = EnchantmentManager.a(Arrays.asList(helm, boots), DamageSource.FALL);
++        // Prot IV = 4, Feather Falling IV = 12 -> total 16
++        Assert.assertEquals(16, fallProt);
++
++        ItemStack sword = enchantedItem(Items.DIAMOND_SWORD, Enchantments.DAMAGE_UNDEAD, 5);
++        Assert.assertEquals(12.5F, EnchantmentManager.a(sword, EnumMonsterType.UNDEAD), 0.0001F);
++        Assert.assertEquals(0.0F, EnchantmentManager.a(sword, EnumMonsterType.UNDEFINED), 0.0001F);
++    }
++}
