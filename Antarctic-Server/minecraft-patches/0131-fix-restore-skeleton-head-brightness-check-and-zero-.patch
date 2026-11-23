@@ -1,0 +1,357 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 00:47:00 +0700
+Subject: [PATCH 131/131] fix: restore skeleton head brightness check and
+ zero-alloc sun burn
+
+
+diff --git a/main/java/net/minecraft/server/Chunk.java b/main/java/net/minecraft/server/Chunk.java
+index 5ddac41..a608f4a 100644
+--- a/main/java/net/minecraft/server/Chunk.java
++++ b/main/java/net/minecraft/server/Chunk.java
+@@ -730,18 +730,22 @@ public class Chunk {
+ 
+     public final int getLightSubtracted(BlockPosition blockposition, int i) { return this.a(blockposition, i); } // Paper - OBFHELPER
+     public int a(BlockPosition blockposition, int i) {
+-        int j = blockposition.getX() & 15;
+-        int k = blockposition.getY();
+-        int l = blockposition.getZ() & 15;
+-        ChunkSection chunksection = this.sections[k >> 4];
++        return this.getLightSubtracted(blockposition.getX(), blockposition.getY(), blockposition.getZ(), i);
++    }
++
++    // Antarctic start - zero-alloc primitive coordinate light and skylight helpers
++    public int getLightSubtracted(int x, int y, int z, int i) {
++        int j = x & 15;
++        int l = z & 15;
++        ChunkSection chunksection = this.sections[y >> 4];
+ 
+         if (chunksection == Chunk.a) {
+             return this.world.worldProvider.m() && i < EnumSkyBlock.SKY.c ? EnumSkyBlock.SKY.c - i : 0;
+         } else {
+-            int i1 = !this.world.worldProvider.m() ? 0 : chunksection.b(j, k & 15, l);
++            int i1 = !this.world.worldProvider.m() ? 0 : chunksection.b(j, y & 15, l);
+ 
+             i1 -= i;
+-            int j1 = chunksection.c(j, k & 15, l);
++            int j1 = chunksection.c(j, y & 15, l);
+ 
+             if (j1 > i1) {
+                 i1 = j1;
+@@ -751,6 +755,11 @@ public class Chunk {
+         }
+     }
+ 
++    public boolean canSeeSky(int x, int y, int z) {
++        return y >= this.heightMap[(z & 15) << 4 | (x & 15)];
++    }
++    // Antarctic end
++
+     public void a(Entity entity) {
+         this.t = true;
+         int i = MathHelper.floor(entity.locX / 16.0D);
+diff --git a/main/java/net/minecraft/server/Entity.java b/main/java/net/minecraft/server/Entity.java
+index a308b6e..edad4bf 100644
+--- a/main/java/net/minecraft/server/Entity.java
++++ b/main/java/net/minecraft/server/Entity.java
+@@ -1272,6 +1272,16 @@ public abstract class Entity implements ICommandListener, KeyedObject { // Paper
+     }
+ 
+     public float aw() {
++        // Antarctic start - zero-alloc primitive coordinate brightness lookup
++        if (com.destroystokyo.paper.config.toml.modules.optimizations.SunBurn.optimizeSunBurnTick) {
++            int x = MathHelper.floor(this.locX);
++            int z = MathHelper.floor(this.locZ);
++            if (this.world.getChunkIfLoaded(x >> 4, z >> 4) != null) {
++                return this.world.getBrightness(x, MathHelper.floor(this.locY + (double) this.getHeadHeight()), z);
++            }
++            return 0.0F;
++        }
++        // Antarctic end
+         BlockPosition.MutableBlockPosition blockposition_mutableblockposition = new BlockPosition.MutableBlockPosition(MathHelper.floor(this.locX), 0, MathHelper.floor(this.locZ));
+ 
+         if (this.world.isLoaded(blockposition_mutableblockposition)) {
+diff --git a/main/java/net/minecraft/server/EntitySkeletonAbstract.java b/main/java/net/minecraft/server/EntitySkeletonAbstract.java
+index ccfce70..8ea741f 100644
+--- a/main/java/net/minecraft/server/EntitySkeletonAbstract.java
++++ b/main/java/net/minecraft/server/EntitySkeletonAbstract.java
+@@ -59,42 +59,15 @@ public abstract class EntitySkeletonAbstract extends EntityMonster implements IR
+         return EnumMonsterType.UNDEAD;
+     }
+ 
+-    // Leaf start - Optimize sun burn tick (backport of Leaf MC 0044 / Gale 0083)
+-    private BlockPosition cachedSkeletonPos;
+-    private double lastSkelX = Double.NaN;
+-    private double lastSkelY = Double.NaN;
+-    private double lastSkelZ = Double.NaN;
+-    private boolean lastInBoat;
+-
+-    private BlockPosition getSkeletonBlockPosition() {
+-        boolean inBoat = this.bJ() instanceof EntityBoat;
+-        if (this.cachedSkeletonPos == null || this.locX != this.lastSkelX || this.locY != this.lastSkelY || this.locZ != this.lastSkelZ || inBoat != this.lastInBoat) {
+-            this.lastSkelX = this.locX;
+-            this.lastSkelY = this.locY;
+-            this.lastSkelZ = this.locZ;
+-            this.lastInBoat = inBoat;
+-            BlockPosition pos = new BlockPosition(this.locX, (double) Math.round(this.locY), this.locZ);
+-            this.cachedSkeletonPos = inBoat ? pos.up() : pos;
+-        }
+-        return this.cachedSkeletonPos;
+-    }
+-    // Leaf end
+-
+     public void n() {
+         if (this.world.D() && !this.world.isClientSide) {
+-            // Leaf start - Optimize sun burn tick (backport of Leaf MC 0044 / Gale 0083)
+-            float f;
+-            BlockPosition blockposition = null;
+-            if (com.destroystokyo.paper.config.toml.modules.optimizations.SunBurn.optimizeSunBurnTick) {
+-                blockposition = this.getSkeletonBlockPosition();
+-                f = this.aw(blockposition);
+-            } else {
+-                f = this.aw();
+-                blockposition = this.bJ() instanceof EntityBoat ? (new BlockPosition(this.locX, (double) Math.round(this.locY), this.locZ)).up() : new BlockPosition(this.locX, (double) Math.round(this.locY), this.locZ);
+-            }
++            // Antarctic start - restore vanilla head brightness check and zero-alloc primitive sky check
++            float f = this.aw();
+ 
+-            if (f > 0.5F && this.random.nextFloat() * 30.0F < (f - 0.4F) * 2.0F && this.world.h(blockposition)) {
+-            // Leaf end
++            if (f > 0.5F && this.random.nextFloat() * 30.0F < (f - 0.4F) * 2.0F && (com.destroystokyo.paper.config.toml.modules.optimizations.SunBurn.optimizeSunBurnTick
++                    ? this.world.canSeeSky(MathHelper.floor(this.locX), MathHelper.floor((double) Math.round(this.locY)) + (this.bJ() instanceof EntityBoat ? 1 : 0), MathHelper.floor(this.locZ))
++                    : this.world.h(this.bJ() instanceof EntityBoat ? (new BlockPosition(this.locX, (double) Math.round(this.locY), this.locZ)).up() : new BlockPosition(this.locX, (double) Math.round(this.locY), this.locZ)))) {
++            // Antarctic end
+                 boolean flag = true;
+                 ItemStack itemstack = this.getEquipment(EnumItemSlot.HEAD);
+ 
+diff --git a/main/java/net/minecraft/server/EntityZombie.java b/main/java/net/minecraft/server/EntityZombie.java
+index 90695b5..08d7e93 100644
+--- a/main/java/net/minecraft/server/EntityZombie.java
++++ b/main/java/net/minecraft/server/EntityZombie.java
+@@ -119,38 +119,15 @@ public class EntityZombie extends EntityMonster {
+         super.a(datawatcherobject);
+     }
+ 
+-    // Leaf start - Optimize sun burn tick (backport of Leaf MC 0044 / Gale 0083)
+-    private BlockPosition cachedEyePos;
+-    private double lastEyeX = Double.NaN;
+-    private double lastEyeY = Double.NaN;
+-    private double lastEyeZ = Double.NaN;
+-
+-    private BlockPosition getEyeBlockPosition() {
+-        double headY = this.locY + (double) this.getHeadHeight();
+-        if (this.cachedEyePos == null || this.locX != this.lastEyeX || headY != this.lastEyeY || this.locZ != this.lastEyeZ) {
+-            this.lastEyeX = this.locX;
+-            this.lastEyeY = headY;
+-            this.lastEyeZ = this.locZ;
+-            this.cachedEyePos = new BlockPosition(this.locX, headY, this.locZ);
+-        }
+-        return this.cachedEyePos;
+-    }
+-    // Leaf end
+-
+     public void n() {
+         if (this.world.D() && !this.world.isClientSide && !this.isBaby() && this.p()) {
+-            // Leaf start - Optimize sun burn tick (backport of Leaf MC 0044 / Gale 0083)
+-            float f;
+-            BlockPosition eyePos = null;
+-            if (com.destroystokyo.paper.config.toml.modules.optimizations.SunBurn.optimizeSunBurnTick) {
+-                eyePos = this.getEyeBlockPosition();
+-                f = this.aw(eyePos);
+-            } else {
+-                f = this.aw();
+-            }
++            // Antarctic start - zero-alloc primitive brightness and skylight checks (removes 40B per-entity cache)
++            float f = this.aw();
+ 
+-            if (f > 0.5F && this.random.nextFloat() * 30.0F < (f - 0.4F) * 2.0F && this.world.h(eyePos != null ? eyePos : new BlockPosition(this.locX, this.locY + (double) this.getHeadHeight(), this.locZ))) {
+-            // Leaf end
++            if (f > 0.5F && this.random.nextFloat() * 30.0F < (f - 0.4F) * 2.0F && (com.destroystokyo.paper.config.toml.modules.optimizations.SunBurn.optimizeSunBurnTick
++                    ? this.world.canSeeSky(MathHelper.floor(this.locX), MathHelper.floor(this.locY + (double) this.getHeadHeight()), MathHelper.floor(this.locZ))
++                    : this.world.h(new BlockPosition(this.locX, this.locY + (double) this.getHeadHeight(), this.locZ)))) {
++            // Antarctic end
+                 boolean flag = true;
+                 ItemStack itemstack = this.getEquipment(EnumItemSlot.HEAD);
+ 
+diff --git a/main/java/net/minecraft/server/World.java b/main/java/net/minecraft/server/World.java
+index c10b387..50b3256 100644
+--- a/main/java/net/minecraft/server/World.java
++++ b/main/java/net/minecraft/server/World.java
+@@ -696,6 +696,50 @@ public abstract class World implements IBlockAccess {
+         return this.getChunkAtWorldCoords(blockposition).c(blockposition);
+     }
+ 
++    // Antarctic start - zero-alloc primitive coordinate skylight and brightness helpers
++    public boolean canSeeSky(int x, int y, int z) {
++        Chunk chunk = this.getChunkIfLoaded(x >> 4, z >> 4);
++        return (chunk != null ? chunk : this.getChunkAt(x >> 4, z >> 4)).canSeeSky(x, y, z);
++    }
++
++    public int getLightLevel(int x, int y, int z, boolean checkNeighbors) {
++        if (x >= -30000000 && z >= -30000000 && x < 30000000 && z < 30000000) {
++            if (checkNeighbors && y >= 0 && y < 256) {
++                Chunk chunk = this.getChunkIfLoaded(x >> 4, z >> 4);
++                IBlockData state = chunk != null ? chunk.getBlockData(x, y, z) : this.getChunkAt(x >> 4, z >> 4).getBlockData(x, y, z);
++                if (state.f()) {
++                    int max = this.getLightLevel(x, y + 1, z, false);
++                    int east = this.getLightLevel(x + 1, y, z, false);
++                    int west = this.getLightLevel(x - 1, y, z, false);
++                    int south = this.getLightLevel(x, y, z + 1, false);
++                    int north = this.getLightLevel(x, y, z - 1, false);
++                    if (east > max) max = east;
++                    if (west > max) max = west;
++                    if (south > max) max = south;
++                    if (north > max) max = north;
++                    return max;
++                }
++            }
++            if (y < 0) {
++                return 0;
++            }
++            if (y >= 256) {
++                y = 255;
++            }
++            Chunk chunk = this.getChunkIfLoaded(x >> 4, z >> 4);
++            if (chunk == null) {
++                return 0;
++            }
++            return chunk.getLightSubtracted(x, y, z, this.L);
++        }
++        return 15;
++    }
++
++    public float getBrightness(int x, int y, int z) {
++        return this.worldProvider.o()[this.getLightLevel(x, y, z, true)];
++    }
++    // Antarctic end
++
+     public boolean i(BlockPosition blockposition) {
+         if (blockposition.getY() >= this.getSeaLevel()) {
+             return this.h(blockposition);
+diff --git a/test/java/net/minecraft/server/SunBurnTickTest.java b/test/java/net/minecraft/server/SunBurnTickTest.java
+index 6a77bb3..8af1591 100644
+--- a/test/java/net/minecraft/server/SunBurnTickTest.java
++++ b/test/java/net/minecraft/server/SunBurnTickTest.java
+@@ -1,44 +1,98 @@
+ package net.minecraft.server;
+ 
+ import com.destroystokyo.paper.config.toml.modules.optimizations.SunBurn;
++import java.lang.reflect.Field;
+ import org.junit.Assert;
++import org.junit.BeforeClass;
+ import org.junit.Test;
++import sun.misc.Unsafe;
+ 
+ public class SunBurnTickTest {
+ 
++    private static Unsafe unsafe;
++
++    @BeforeClass
++    public static void setup() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        unsafe = (Unsafe) f.get(null);
++    }
++
+     @Test
+     public void testSunBurnOptimizationConfigDefault() {
+         Assert.assertTrue("SunBurn.optimizeSunBurnTick should be enabled by default", SunBurn.optimizeSunBurnTick);
+     }
+ 
+     @Test
+-    public void testEyePositionCalculationParity() {
+-        double locX = 12.34;
+-        double locY = 64.0;
+-        double locZ = -56.78;
+-        float headHeight = 1.74F;
+-
+-        double headY = locY + (double) headHeight;
+-        BlockPosition expected = new BlockPosition(locX, headY, locZ);
+-
+-        Assert.assertEquals(MathHelper.floor(locX), expected.getX());
+-        Assert.assertEquals(MathHelper.floor(headY), expected.getY());
+-        Assert.assertEquals(MathHelper.floor(locZ), expected.getZ());
+-    }
++    public void testPrimitiveLightAndSkyHelpersMatchBlockPositionBaseline() throws Exception {
++        World world = (World) unsafe.allocateInstance(WorldServer.class);
++        Field pcField = World.class.getDeclaredField("paperConfig");
++        pcField.setAccessible(true);
++        pcField.set(world, unsafe.allocateInstance(com.destroystokyo.paper.PaperWorldConfig.class));
++        WorldProviderNormal provider = new WorldProviderNormal();
++        provider.f = true; // hasSkyLight = true (Overworld)
++        provider.a();
++        Field wpField = World.class.getDeclaredField("worldProvider");
++        wpField.setAccessible(true);
++        wpField.set(world, provider);
+ 
+-    @Test
+-    public void testSkeletonPositionCalculationParity() {
+-        double locX = -10.5;
+-        double locY = 70.2;
+-        double locZ = 45.9;
++        Chunk chunk = (Chunk) unsafe.allocateInstance(Chunk.class);
++        Field cwField = Chunk.class.getDeclaredField("world");
++        cwField.setAccessible(true);
++        cwField.set(chunk, world);
++        ChunkSection[] sections = new ChunkSection[16];
++        sections[4] = new ChunkSection(64, true);
++        // Feet at y=64 dark (light 0), head at y=65 bright (sky light 15)
++        sections[4].a(5, 0, 5, 0);
++        sections[4].b(5, 0, 5, 0);
++        sections[4].a(5, 1, 5, 15);
++        sections[4].b(5, 1, 5, 0);
++        Field secField = Chunk.class.getDeclaredField("sections");
++        secField.setAccessible(true);
++        secField.set(chunk, sections);
++        int[] heightMap = new int[256];
++        heightMap[(5 & 15) << 4 | (5 & 15)] = 65;
++        Field hmField = Chunk.class.getDeclaredField("heightMap");
++        hmField.setAccessible(true);
++        hmField.set(chunk, heightMap);
++
++        ChunkProviderServer cps = (ChunkProviderServer) unsafe.allocateInstance(ChunkProviderServer.class);
++        Field cpsWorldField = ChunkProviderServer.class.getDeclaredField("world");
++        cpsWorldField.setAccessible(true);
++        cpsWorldField.set(cps, world);
++        cps.chunks = new it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<>();
++        cps.chunks.put(ChunkCoordIntPair.a(0, 0), chunk);
++        Field cpField = World.class.getDeclaredField("chunkProvider");
++        cpField.setAccessible(true);
++        cpField.set(world, cps);
++
++        // Verify primitive brightness and canSeeSky match BlockPosition methods across feet and head
++        for (int y = 64; y <= 66; ++y) {
++            BlockPosition pos = new BlockPosition(5, y, 5);
++            Assert.assertEquals(world.n(pos), world.getBrightness(5, y, 5), 0.0F);
++            Assert.assertEquals(world.h(pos), world.canSeeSky(5, y, 5));
++        }
+ 
+-        BlockPosition expectedNormal = new BlockPosition(locX, (double) Math.round(locY), locZ);
+-        BlockPosition expectedBoat = expectedNormal.up();
++        // Verify skeleton Entity.aw() checks HEAD (y=65, bright 1.0F) rather than FEET (y=64, dark 0.0F)
++        EntitySkeleton skeleton = (EntitySkeleton) unsafe.allocateInstance(EntitySkeleton.class);
++        skeleton.world = world;
++        skeleton.locX = 5.5D;
++        skeleton.locY = 64.0D;
++        skeleton.locZ = 5.5D;
++        skeleton.length = 1.99F;
+ 
+-        Assert.assertEquals(MathHelper.floor(locX), expectedNormal.getX());
+-        Assert.assertEquals((int) Math.round(locY), expectedNormal.getY());
+-        Assert.assertEquals(MathHelper.floor(locZ), expectedNormal.getZ());
++        boolean prev = SunBurn.optimizeSunBurnTick;
++        try {
++            SunBurn.optimizeSunBurnTick = false;
++            float vanillaBrightness = skeleton.aw();
++            SunBurn.optimizeSunBurnTick = true;
++            float optimizedBrightness = skeleton.aw();
+ 
+-        Assert.assertEquals(expectedNormal.getY() + 1, expectedBoat.getY());
++            Assert.assertEquals("Optimized skeleton aw() must match vanilla head brightness (1.0F)", vanillaBrightness, optimizedBrightness, 0.0F);
++            Assert.assertTrue("Head brightness at y=65 must be > 0.5F even though feet at y=64 are dark", optimizedBrightness > 0.5F);
++        } finally {
++            SunBurn.optimizeSunBurnTick = prev;
++        }
+     }
+ }

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Wed, 18 Nov 2026 12:09:52 +0700
-Subject: [PATCH 093/130] fix(physics): preserve thin block collisions in voxel
+Subject: [PATCH 093/131] fix(physics): preserve thin block collisions in voxel
  fast path
 
 Material flags cannot prove collision absence: carpet and lily pads require canonical block dispatch. Classify each state once per World collision probe.
