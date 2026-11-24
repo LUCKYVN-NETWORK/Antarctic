@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Tue, 24 Nov 2026 12:59:57 +0700
-Subject: [PATCH 171/174] perf: eliminate per-step allocations in
+Subject: [PATCH 171/175] perf: eliminate per-step allocations in
  World.rayTrace
 
 

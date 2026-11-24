@@ -1,0 +1,845 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 15:49:17 +0700
+Subject: [PATCH 175/175] perf: replace BlockFlowing DFS with wave BFS and
+ optimize fluid lookups
+
+
+diff --git a/main/java/net/minecraft/server/BlockFlowing.java b/main/java/net/minecraft/server/BlockFlowing.java
+index 31b0655..3a76925 100644
+--- a/main/java/net/minecraft/server/BlockFlowing.java
++++ b/main/java/net/minecraft/server/BlockFlowing.java
+@@ -23,6 +23,9 @@ public class BlockFlowing extends BlockFluids {
+     }
+ 
+     public void b(World world, BlockPosition blockposition, IBlockData iblockdata, Random random) {
++        int bx = blockposition.getX();
++        int by = blockposition.getY();
++        int bz = blockposition.getZ();
+         int i = ((Integer) iblockdata.get(BlockFlowing.LEVEL)).intValue();
+         byte b0 = 1;
+ 
+@@ -30,7 +33,7 @@ public class BlockFlowing extends BlockFluids {
+             b0 = 2;
+         }
+ 
+-        int j = this.getFlowSpeed(world, blockposition); // Paper
++        int j = this.getFlowSpeed(world, bx, by, bz); // Paper
+         int k;
+ 
+         if (i > 0) {
+@@ -38,9 +41,10 @@ public class BlockFlowing extends BlockFluids {
+ 
+             this.a = 0;
+ 
+-            // Antarctic start - indexed loop over the cached horizontal directions (N, E, S, W) instead of an Iterator over a fresh array
++            // Antarctic start - primitive coordinate horizontal scan (N, E, S, W)
+             for (int n = 0; n < 4; ++n) {
+-                l = this.a(world, blockposition.shift(HORIZONTAL_DIRECTIONS[n]), l);
++                EnumDirection dir = HORIZONTAL_DIRECTIONS[n];
++                l = this.a(world, bx + dir.getAdjacentX(), by, bz + dir.getAdjacentZ(), l);
+             }
+             // Antarctic end
+ 
+@@ -50,7 +54,7 @@ public class BlockFlowing extends BlockFluids {
+                 i1 = -1;
+             }
+ 
+-            k = this.x(world.getType(blockposition.up()));
++            k = this.x(world.getType(bx, by + 1, bz));
+             if (k >= 0) {
+                 if (k >= 8) {
+                     i1 = k;
+@@ -60,7 +64,7 @@ public class BlockFlowing extends BlockFluids {
+             }
+ 
+             if (this.a >= 2 && this.material == Material.WATER) {
+-                IBlockData iblockdata1 = world.getType(blockposition.down());
++                IBlockData iblockdata1 = world.getType(bx, by - 1, bz);
+ 
+                 if (iblockdata1.getMaterial().isBuildable()) {
+                     i1 = 0;
+@@ -90,16 +94,16 @@ public class BlockFlowing extends BlockFluids {
+             this.f(world, blockposition, iblockdata);
+         }
+ 
+-        if (world.getType(blockposition).getBlock().getBlockData().getMaterial() != material) return; // Paper - Stop updating flowing block if material has changed
++        if (world.getType(bx, by, bz).getBlock().getBlockData().getMaterial() != material) return; // Paper - Stop updating flowing block if material has changed
+         // Antarctic start - skip the CraftBlock, the events and the dispatch entirely when no plugin listens to BlockFromToEvent
+         final boolean fromToListeners = BlockFromToEvent.getHandlerList().getRegisteredListeners().length != 0;
+-        org.bukkit.block.Block source = fromToListeners ? world.getWorld().getBlockAt(blockposition.getX(), blockposition.getY(), blockposition.getZ()) : null; // CraftBukkit
++        org.bukkit.block.Block source = fromToListeners ? world.getWorld().getBlockAt(bx, by, bz) : null; // CraftBukkit
+         // Antarctic end
+-        IBlockData iblockdata2 = world.getType(blockposition.down());
++        IBlockData iblockdata2 = world.getType(bx, by - 1, bz);
+ 
+-        if (this.h(world, blockposition.down(), iblockdata2)) {
++        if (this.h(world, blockposition, iblockdata2)) {
+             // CraftBukkit start
+-            if (!canFlowTo(world, blockposition, EnumDirection.DOWN)) { return; } // Paper // Antarctic - coordinate based, same result as the Bukkit-side check
++            if (!canFlowTo(world, bx, bz, EnumDirection.DOWN)) { return; } // Paper // Antarctic - coordinate based, same result as the Bukkit-side check
+             if (fromToListeners) { // Antarctic
+             BlockFromToEvent event = new BlockFromToEvent(source, BlockFace.DOWN);
+             world.getServer().getPluginManager().callEvent(event);
+@@ -110,21 +114,22 @@ public class BlockFlowing extends BlockFluids {
+             } // Antarctic
+             // CraftBukkit end
+ 
+-            if (this.material == Material.LAVA && world.getType(blockposition.down()).getMaterial() == Material.WATER) {
++            BlockPosition downPos = new BlockPosition(bx, by - 1, bz);
++            if (this.material == Material.LAVA && iblockdata2.getMaterial() == Material.WATER) {
+                 // CraftBukkit start
+-                if (org.bukkit.craftbukkit.event.CraftEventFactory.handleBlockFormEvent(world, blockposition.down(), Blocks.STONE.getBlockData(), null)) {
+-                    this.fizz(world, blockposition.down());
++                if (org.bukkit.craftbukkit.event.CraftEventFactory.handleBlockFormEvent(world, downPos, Blocks.STONE.getBlockData(), null)) {
++                    this.fizz(world, downPos);
+                 }
+                 // CraftBukkit end
+                 return;
+             }
+ 
+             if (i >= 8) {
+-                this.flow(world, blockposition.down(), iblockdata2, i);
++                this.flow(world, downPos, iblockdata2, i);
+             } else {
+-                this.flow(world, blockposition.down(), iblockdata2, i + 8);
++                this.flow(world, downPos, iblockdata2, i + 8);
+             }
+-        } else if (i >= 0 && (i == 0 || this.g(world, blockposition.down(), iblockdata2))) {
++        } else if (i >= 0 && (i == 0 || this.blocksFlow(iblockdata2))) {
+             int flowMask = this.getFlowDirections(world, blockposition); // Antarctic - bit n set = HORIZONTAL_DIRECTIONS[n]; was an EnumSet
+ 
+             k = i + b0;
+@@ -147,7 +152,7 @@ public class BlockFlowing extends BlockFluids {
+                 EnumDirection enumdirection1 = HORIZONTAL_DIRECTIONS[bit];
+ 
+                 // CraftBukkit start
+-                if (!canFlowTo(world, blockposition, enumdirection1)) { continue; } // Paper
++                if (!canFlowTo(world, bx, bz, enumdirection1)) { continue; } // Paper
+                 if (fromToListeners) {
+                 BlockFromToEvent event = new BlockFromToEvent(source, org.bukkit.craftbukkit.block.CraftBlock.notchToBlockFace(enumdirection1));
+                 world.getServer().getPluginManager().callEvent(event);
+@@ -156,7 +161,9 @@ public class BlockFlowing extends BlockFluids {
+                     continue;
+                 }
+                 }
+-                this.flow(world, blockposition.shift(enumdirection1), world.getType(blockposition.shift(enumdirection1)), k);
++                int nx = bx + enumdirection1.getAdjacentX();
++                int nz = bz + enumdirection1.getAdjacentZ();
++                this.flow(world, new BlockPosition(nx, by, nz), world.getType(nx, by, nz), k);
+                 // CraftBukkit end
+             }
+             // Antarctic end
+@@ -167,7 +174,11 @@ public class BlockFlowing extends BlockFluids {
+     // Paper start
+     // Antarctic - same check as before (CraftWorld.isChunkLoaded -> ChunkProviderServer.isLoaded) without needing a CraftBlock
+     private boolean canFlowTo(World world, BlockPosition source, EnumDirection direction) {
+-        return world.getChunkIfLoaded((source.getX() + direction.getAdjacentX()) >> 4, (source.getZ() + direction.getAdjacentZ()) >> 4) != null;
++        return this.canFlowTo(world, source.getX(), source.getZ(), direction);
++    }
++
++    private boolean canFlowTo(World world, int bx, int bz, EnumDirection direction) {
++        return world.getChunkIfLoaded((bx + direction.getAdjacentX()) >> 4, (bz + direction.getAdjacentZ()) >> 4) != null;
+     }
+     // Paper end
+ 
+@@ -186,84 +197,181 @@ public class BlockFlowing extends BlockFluids {
+ 
+     }
+ 
+-    // Antarctic start - allocation-free slope search. Same traversal and results as the old a(...)/b(World)/c(...):
+-    // one getType per probed position (the old g(...) re-read the position it was just handed), one mutable position
+-    // instead of a BlockPosition per probe, ints instead of an EnumSet. Search order stays NORTH, EAST, SOUTH, WEST.
+-    private static final EnumDirection[] HORIZONTAL_DIRECTIONS = {EnumDirection.NORTH, EnumDirection.EAST, EnumDirection.SOUTH, EnumDirection.WEST};
++    // Antarctic start - allocation-free multi-source wave BFS with 2x2 chunk cache.
++    private static final EnumDirection[] HORIZONTAL_DIRECTIONS = EnumDirection.HORIZONTAL;
+     // Application order = EnumDirection ordinal order (NORTH, SOUTH, WEST, EAST), expressed as indexes into HORIZONTAL_DIRECTIONS.
+     private static final int[] FLOW_ORDER_BITS = {0, 2, 3, 1};
++    private static final int[] DX = {0, 1, 0, -1};
++    private static final int[] DZ = {-1, 0, 1, 0};
++
++    private static final class FlowBfsState {
++        final byte[] cellState = new byte[121]; // 1=blocked, 2=open, 3=drop
++        final byte[] reachMask = new byte[121];
++        final int[] stamp = new int[121];
++        final byte[] queueA = new byte[64];
++        final byte[] queueB = new byte[64];
++        final Chunk[] chunks = new Chunk[4];
++        int nextStamp = 10;
++    }
++
++    private static final ThreadLocal<FlowBfsState> FLOW_BFS_STATE = ThreadLocal.withInitial(FlowBfsState::new);
+ 
+     private int slopeLimit(World world) {
+         return this.material == Material.LAVA && !world.worldProvider.l() ? 2 : 4;
+     }
+ 
+-    private int slopeDistance(World world, BlockPosition.MutableBlockPosition pos, int x, int y, int z, int depth, int limit, EnumDirection from) {
+-        int best = 1000;
+-
+-        for (int n = 0; n < 4; ++n) {
+-            EnumDirection direction = HORIZONTAL_DIRECTIONS[n];
+-
+-            if (direction != from) {
+-                int nx = x + direction.getAdjacentX();
+-                int nz = z + direction.getAdjacentZ();
+-                IBlockData iblockdata = world.getType(pos.c(nx, y, nz));
+-
+-                if (!this.blocksFlow(iblockdata) && (iblockdata.getMaterial() != this.material || ((Integer) iblockdata.get(BlockFlowing.LEVEL)).intValue() > 0)) {
+-                    if (!this.blocksFlow(world.getType(pos.c(nx, y - 1, nz)))) {
+-                        return depth;
+-                    }
+-
+-                    if (depth < limit) {
+-                        int k = this.slopeDistance(world, pos, nx, y, nz, depth + 1, limit, direction.opposite());
+-
+-                        if (k < best) {
+-                            best = k;
+-                        }
+-                    }
+-                }
+-            }
++    private static IBlockData getFluidType(World world, Chunk[] chunks, int baseCx, int baseCz, boolean useCache, int x, int y, int z) {
++        if (!useCache) {
++            return world.getType(x, y, z);
+         }
+-
+-        return best;
++        int cIdx = (((x >> 4) - baseCx) << 1) | ((z >> 4) - baseCz);
++        Chunk c = chunks[cIdx];
++        if (c == null) {
++            c = chunks[cIdx] = world.getChunkAt(x >> 4, z >> 4);
++        }
++        return c.getBlockData(x, y, z);
+     }
+ 
+     /** @return bit n set when HORIZONTAL_DIRECTIONS[n] is a best flow direction */
+-    private int getFlowDirections(World world, BlockPosition blockposition) {
+-        int best = 1000;
+-        int mask = 0;
++    int getFlowDirections(World world, BlockPosition blockposition) {
+         int limit = this.slopeLimit(world);
+         int x = blockposition.getX();
+         int y = blockposition.getY();
+         int z = blockposition.getZ();
+-        BlockPosition.MutableBlockPosition pos = new BlockPosition.MutableBlockPosition();
+-
+-        for (int n = 0; n < 4; ++n) {
+-            EnumDirection direction = HORIZONTAL_DIRECTIONS[n];
+-            int nx = x + direction.getAdjacentX();
+-            int nz = z + direction.getAdjacentZ();
+-            IBlockData iblockdata = world.getType(pos.c(nx, y, nz));
+ 
+-            if (!this.blocksFlow(iblockdata) && (iblockdata.getMaterial() != this.material || ((Integer) iblockdata.get(BlockFlowing.LEVEL)).intValue() > 0)) {
+-                int j;
+-
+-                if (this.blocksFlow(world.getType(pos.c(nx, y - 1, nz)))) {
+-                    j = this.slopeDistance(world, pos, nx, y, nz, 1, limit, direction.opposite());
++        FlowBfsState bfs = FLOW_BFS_STATE.get();
++        if (bfs.nextStamp > Integer.MAX_VALUE - 32) {
++            java.util.Arrays.fill(bfs.stamp, 0);
++            bfs.nextStamp = 10;
++        }
++        int baseStamp = bfs.nextStamp;
++        bfs.nextStamp = baseStamp + 10;
++
++        byte[] cellState = bfs.cellState;
++        byte[] reachMask = bfs.reachMask;
++        int[] stamp = bfs.stamp;
++        Chunk[] chunks = bfs.chunks;
++        boolean useCache = !world.captureTreeGeneration;
++        int baseCx = (x - 5) >> 4;
++        int baseCz = (z - 5) >> 4;
++
++        // Pre-stamp origin (dx=0, dz=0 -> idx=60) so wave expansion never loops back through origin
++        stamp[60] = baseStamp;
++
++        int wave0Stamp = baseStamp + 1;
++        int dropMask = 0;
++        int traversableMask = 0;
++        byte[] curQueue = bfs.queueA;
++        byte[] nextQueue = bfs.queueB;
++        int curSize = 0;
++
++        try {
++            for (int n = 0; n < 4; ++n) {
++                int nx = x + DX[n];
++                int nz = z + DZ[n];
++                int idx = (DX[n] + 5) * 11 + (DZ[n] + 5);
++                IBlockData dataY = getFluidType(world, chunks, baseCx, baseCz, useCache, nx, y, nz);
++
++                if (!this.blocksFlow(dataY) && (dataY.getMaterial() != this.material || ((Integer) dataY.get(BlockFlowing.LEVEL)).intValue() > 0)) {
++                    byte bit = (byte) (1 << n);
++                    traversableMask |= bit;
++                    IBlockData dataBelow = getFluidType(world, chunks, baseCx, baseCz, useCache, nx, y - 1, nz);
++                    if (!this.blocksFlow(dataBelow)) {
++                        dropMask |= bit;
++                        cellState[idx] = 3;
++                    } else {
++                        cellState[idx] = 2;
++                        reachMask[idx] = bit;
++                        curQueue[curSize++] = (byte) idx;
++                    }
++                    stamp[idx] = wave0Stamp;
+                 } else {
+-                    j = 0;
++                    cellState[idx] = 1;
++                    stamp[idx] = wave0Stamp;
+                 }
++            }
++
++            if (dropMask != 0) {
++                return dropMask;
++            }
++            if (curSize == 0) {
++                return 0;
++            }
++
++            for (int wave = 1; wave <= limit; ++wave) {
++                int waveStamp = baseStamp + 1 + wave;
++                int nextSize = 0;
++                boolean expandNext = wave < limit;
++
++                for (int qi = 0; qi < curSize; ++qi) {
++                    int idx = curQueue[qi] & 0xFF;
++                    byte pMask = reachMask[idx];
++                    int dx = (idx / 11) - 5;
++                    int dz = (idx % 11) - 5;
++                    int cx = x + dx;
++                    int cz = z + dz;
++
++                    for (int n = 0; n < 4; ++n) {
++                        int ndx = dx + DX[n];
++                        int ndz = dz + DZ[n];
++                        int nidx = (ndx + 5) * 11 + (ndz + 5);
++                        int existingStamp = stamp[nidx];
++
++                        if (existingStamp >= baseStamp && existingStamp < waveStamp) {
++                            continue;
++                        }
++                        if (existingStamp == waveStamp) {
++                            byte merged = (byte) (reachMask[nidx] | pMask);
++                            reachMask[nidx] = merged;
++                            if (cellState[nidx] == 3) {
++                                dropMask |= merged;
++                            }
++                            continue;
++                        }
+ 
+-                if (j < best) {
+-                    mask = 0;
++                        int nx = cx + DX[n];
++                        int nz = cz + DZ[n];
++                        IBlockData dataY = getFluidType(world, chunks, baseCx, baseCz, useCache, nx, y, nz);
++                        stamp[nidx] = waveStamp;
++
++                        if (!this.blocksFlow(dataY) && (dataY.getMaterial() != this.material || ((Integer) dataY.get(BlockFlowing.LEVEL)).intValue() > 0)) {
++                            IBlockData dataBelow = getFluidType(world, chunks, baseCx, baseCz, useCache, nx, y - 1, nz);
++                            if (!this.blocksFlow(dataBelow)) {
++                                cellState[nidx] = 3;
++                                reachMask[nidx] = pMask;
++                                dropMask |= pMask;
++                            } else {
++                                cellState[nidx] = 2;
++                                reachMask[nidx] = pMask;
++                                if (expandNext && dropMask == 0) {
++                                    nextQueue[nextSize++] = (byte) nidx;
++                                }
++                            }
++                        } else {
++                            cellState[nidx] = 1;
++                        }
++                    }
+                 }
+ 
+-                if (j <= best) {
+-                    mask |= 1 << n;
+-                    best = j;
++                if (dropMask != 0) {
++                    return dropMask;
++                }
++                if (nextSize == 0) {
++                    break;
+                 }
++                byte[] tmp = curQueue;
++                curQueue = nextQueue;
++                nextQueue = tmp;
++                curSize = nextSize;
+             }
+-        }
+ 
+-        return mask;
++            return traversableMask;
++        } finally {
++            chunks[0] = null;
++            chunks[1] = null;
++            chunks[2] = null;
++            chunks[3] = null;
++        }
+     }
+ 
+     /** The body of {@link #g(World, BlockPosition, IBlockData)} for a state the caller has already read. */
+@@ -281,7 +389,11 @@ public class BlockFlowing extends BlockFluids {
+     }
+ 
+     protected int a(World world, BlockPosition blockposition, int i) {
+-        int j = this.x(world.getType(blockposition));
++        return this.a(world, blockposition.getX(), blockposition.getY(), blockposition.getZ(), i);
++    }
++
++    private int a(World world, int x, int y, int z, int i) {
++        int j = this.x(world.getType(x, y, z));
+ 
+         if (j < 0) {
+             return i;
+@@ -301,7 +413,7 @@ public class BlockFlowing extends BlockFluids {
+     private boolean h(World world, BlockPosition blockposition, IBlockData iblockdata) {
+         Material material = iblockdata.getMaterial();
+ 
+-        return material != this.material && material != Material.LAVA && !this.g(world, blockposition, iblockdata);
++        return material != this.material && material != Material.LAVA && !this.blocksFlow(iblockdata);
+     }
+ 
+     public void onPlace(World world, BlockPosition blockposition, IBlockData iblockdata) {
+@@ -316,14 +428,18 @@ public class BlockFlowing extends BlockFluids {
+      * Paper - Get flow speed. Throttle if its water and flowing adjacent to lava
+      */
+     public int getFlowSpeed(World world, BlockPosition blockposition) {
++        return this.getFlowSpeed(world, blockposition.getX(), blockposition.getY(), blockposition.getZ());
++    }
++
++    private int getFlowSpeed(World world, int x, int y, int z) {
+         if (this.material == Material.LAVA) {
+             return world.worldProvider.isSkyMissing() ? world.paperConfig.lavaFlowSpeedNether : world.paperConfig.lavaFlowSpeedNormal;
+         }
+         if (this.material == Material.WATER && (
+-                world.getType(blockposition.north(1)).getBlock().material == Material.LAVA ||
+-                        world.getType(blockposition.south(1)).getBlock().material == Material.LAVA ||
+-                        world.getType(blockposition.west(1)).getBlock().material == Material.LAVA ||
+-                        world.getType(blockposition.east(1)).getBlock().material == Material.LAVA)) {
++                world.getType(x, y, z - 1).getBlock().material == Material.LAVA ||
++                        world.getType(x, y, z + 1).getBlock().material == Material.LAVA ||
++                        world.getType(x - 1, y, z).getBlock().material == Material.LAVA ||
++                        world.getType(x + 1, y, z).getBlock().material == Material.LAVA)) {
+             return world.paperConfig.waterOverLavaFlowSpeed;
+         }
+         return super.a(world);
+diff --git a/main/java/net/minecraft/server/BlockFluids.java b/main/java/net/minecraft/server/BlockFluids.java
+index a06fbf2..f558d98 100644
+--- a/main/java/net/minecraft/server/BlockFluids.java
++++ b/main/java/net/minecraft/server/BlockFluids.java
+@@ -91,20 +91,26 @@ public abstract class BlockFluids extends Block {
+         double d0 = 0.0D;
+         double d1 = 0.0D;
+         double d2 = 0.0D;
++        int bx = blockposition.getX();
++        int by = blockposition.getY();
++        int bz = blockposition.getZ();
+         int i = this.y(iblockdata);
+         BlockPosition.PooledBlockPosition blockposition_pooledblockposition = BlockPosition.PooledBlockPosition.s();
+-        Iterator iterator = EnumDirection.EnumDirectionLimit.HORIZONTAL.iterator();
+ 
+-        while (iterator.hasNext()) {
+-            EnumDirection enumdirection = (EnumDirection) iterator.next();
++        for (int idx = 0; idx < 4; ++idx) {
++            EnumDirection enumdirection = EnumDirection.HORIZONTAL[idx];
++            int nx = bx + enumdirection.getAdjacentX();
++            int nz = bz + enumdirection.getAdjacentZ();
+ 
+-            blockposition_pooledblockposition.j(blockposition).d(enumdirection);
+-            int j = this.y(iblockaccess.getType(blockposition_pooledblockposition));
++            blockposition_pooledblockposition.c(nx, by, nz);
++            IBlockData neighborData = iblockaccess.getType(blockposition_pooledblockposition);
++            int j = this.y(neighborData);
+             int k;
+ 
+             if (j < 0) {
+-                if (!iblockaccess.getType(blockposition_pooledblockposition).getMaterial().isSolid()) {
+-                    j = this.y(iblockaccess.getType(blockposition_pooledblockposition.down()));
++                if (!neighborData.getMaterial().isSolid()) {
++                    blockposition_pooledblockposition.c(nx, by - 1, nz);
++                    j = this.y(iblockaccess.getType(blockposition_pooledblockposition));
+                     if (j >= 0) {
+                         k = j - (i - 8);
+                         d0 += (double) (enumdirection.getAdjacentX() * k);
+@@ -112,7 +118,7 @@ public abstract class BlockFluids extends Block {
+                         d2 += (double) (enumdirection.getAdjacentZ() * k);
+                     }
+                 }
+-            } else if (j >= 0) {
++            } else {
+                 k = j - i;
+                 d0 += (double) (enumdirection.getAdjacentX() * k);
+                 d1 += (double) (enumdirection.getAdjacentY() * k);
+@@ -123,13 +129,14 @@ public abstract class BlockFluids extends Block {
+         Vec3D vec3d = new Vec3D(d0, d1, d2);
+ 
+         if (((Integer) iblockdata.get(BlockFluids.LEVEL)).intValue() >= 8) {
+-            Iterator iterator1 = EnumDirection.EnumDirectionLimit.HORIZONTAL.iterator();
+-
+-            while (iterator1.hasNext()) {
+-                EnumDirection enumdirection1 = (EnumDirection) iterator1.next();
+-
+-                blockposition_pooledblockposition.j(blockposition).d(enumdirection1);
+-                if (this.a(iblockaccess, (BlockPosition) blockposition_pooledblockposition, enumdirection1) || this.a(iblockaccess, blockposition_pooledblockposition.up(), enumdirection1)) {
++            for (int idx = 0; idx < 4; ++idx) {
++                EnumDirection enumdirection1 = EnumDirection.HORIZONTAL[idx];
++                int nx = bx + enumdirection1.getAdjacentX();
++                int nz = bz + enumdirection1.getAdjacentZ();
++
++                blockposition_pooledblockposition.c(nx, by, nz);
++                if (this.a(iblockaccess, (BlockPosition) blockposition_pooledblockposition, enumdirection1)
++                        || this.a(iblockaccess, (BlockPosition) blockposition_pooledblockposition.c(nx, by + 1, nz), enumdirection1)) {
+                     vec3d = vec3d.a().add(0.0D, -6.0D, 0.0D);
+                     break;
+                 }
+@@ -159,13 +166,14 @@ public abstract class BlockFluids extends Block {
+     public boolean e(World world, BlockPosition blockposition, IBlockData iblockdata) {
+         if (this.material == Material.LAVA) {
+             boolean flag = false;
+-            EnumDirection[] aenumdirection = EnumDirection.values();
+-            int i = aenumdirection.length;
++            int bx = blockposition.getX();
++            int by = blockposition.getY();
++            int bz = blockposition.getZ();
+ 
+-            for (int j = 0; j < i; ++j) {
+-                EnumDirection enumdirection = aenumdirection[j];
++            for (int j = 0; j < EnumDirection.VALUES.length; ++j) {
++                EnumDirection enumdirection = EnumDirection.VALUES[j];
+ 
+-                if (enumdirection != EnumDirection.DOWN && world.getType(blockposition.shift(enumdirection)).getMaterial() == Material.WATER) {
++                if (enumdirection != EnumDirection.DOWN && world.getType(bx + enumdirection.getAdjacentX(), by + enumdirection.getAdjacentY(), bz + enumdirection.getAdjacentZ()).getMaterial() == Material.WATER) {
+                     flag = true;
+                     break;
+                 }
+diff --git a/main/java/net/minecraft/server/BlockStationary.java b/main/java/net/minecraft/server/BlockStationary.java
+index 2a741c1..e0cc396 100644
+--- a/main/java/net/minecraft/server/BlockStationary.java
++++ b/main/java/net/minecraft/server/BlockStationary.java
+@@ -88,13 +88,14 @@ public class BlockStationary extends BlockFluids {
+     }
+ 
+     protected boolean c(World world, BlockPosition blockposition) {
+-        EnumDirection[] aenumdirection = EnumDirection.values();
+-        int i = aenumdirection.length;
++        int bx = blockposition.getX();
++        int by = blockposition.getY();
++        int bz = blockposition.getZ();
+ 
+-        for (int j = 0; j < i; ++j) {
+-            EnumDirection enumdirection = aenumdirection[j];
++        for (int j = 0; j < EnumDirection.VALUES.length; ++j) {
++            EnumDirection enumdirection = EnumDirection.VALUES[j];
+ 
+-            if (this.d(world, blockposition.shift(enumdirection))) {
++            if (this.d(world, bx + enumdirection.getAdjacentX(), by + enumdirection.getAdjacentY(), bz + enumdirection.getAdjacentZ())) {
+                 return true;
+             }
+         }
+@@ -103,6 +104,10 @@ public class BlockStationary extends BlockFluids {
+     }
+ 
+     private boolean d(World world, BlockPosition blockposition) {
+-        return blockposition.getY() >= 0 && blockposition.getY() < 256 && !world.isLoaded(blockposition) ? false : world.getType(blockposition).getMaterial().isBurnable();
++        return this.d(world, blockposition.getX(), blockposition.getY(), blockposition.getZ());
++    }
++
++    private boolean d(World world, int x, int y, int z) {
++        return y >= 0 && y < 256 && world.getChunkIfLoaded(x >> 4, z >> 4) == null ? false : world.getType(x, y, z).getMaterial().isBurnable();
+     }
+ }
+diff --git a/test/java/net/minecraft/server/FluidWaveBfsAndParityTest.java b/test/java/net/minecraft/server/FluidWaveBfsAndParityTest.java
+new file mode 100644
+index 0000000..7344c62
+--- /dev/null
++++ b/test/java/net/minecraft/server/FluidWaveBfsAndParityTest.java
+@@ -0,0 +1,288 @@
++package net.minecraft.server;
++
++import com.sun.management.ThreadMXBean;
++import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
++import java.lang.management.ManagementFactory;
++import java.lang.reflect.Field;
++import java.util.Random;
++import org.junit.Assert;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++public class FluidWaveBfsAndParityTest {
++
++    private static Unsafe unsafe;
++
++    @BeforeClass
++    public static void init() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        unsafe = (Unsafe) f.get(null);
++    }
++
++    private static final class TestWorld extends World {
++        final Long2ObjectOpenHashMap<Chunk> map = new Long2ObjectOpenHashMap<>();
++
++        TestWorld() {
++            super(null, null, null, null, false, null, null);
++        }
++
++        @Override
++        protected IChunkProvider n() {
++            return null;
++        }
++
++        @Override
++        public Chunk getChunkIfLoaded(int x, int z) {
++            return map.get(ChunkCoordIntPair.a(x, z));
++        }
++
++        @Override
++        public Chunk getChunkAt(int x, int z) {
++            return map.get(ChunkCoordIntPair.a(x, z));
++        }
++
++        @Override
++        public boolean isChunkLoaded(int x, int z, boolean allowEmpty) {
++            return map.containsKey(ChunkCoordIntPair.a(x, z));
++        }
++    }
++
++    private static final class TestChunkProviderServer extends ChunkProviderServer {
++        Long2ObjectOpenHashMap<Chunk> map;
++
++        TestChunkProviderServer() {
++            super(null, null, null);
++        }
++
++        @Override
++        public Chunk getChunkIfLoaded(int x, int z) {
++            return map.get(ChunkCoordIntPair.a(x, z));
++        }
++
++        @Override
++        public Chunk getChunkAt(int x, int z) {
++            return map.get(ChunkCoordIntPair.a(x, z));
++        }
++    }
++
++    private static TestWorld createWorld(boolean nether) throws Exception {
++        TestWorld world = (TestWorld) unsafe.allocateInstance(TestWorld.class);
++        Field mapField = TestWorld.class.getDeclaredField("map");
++        mapField.setAccessible(true);
++        Long2ObjectOpenHashMap<Chunk> map = new Long2ObjectOpenHashMap<>();
++        mapField.set(world, map);
++
++        Field wpField = World.class.getDeclaredField("worldProvider");
++        wpField.setAccessible(true);
++        wpField.set(world, nether ? new WorldProviderHell() : new WorldProviderNormal());
++
++        for (int cx = 0; cx <= 2; cx++) {
++            for (int cz = 0; cz <= 2; cz++) {
++                Chunk c = (Chunk) unsafe.allocateInstance(Chunk.class);
++                Field wf = Chunk.class.getDeclaredField("world");
++                wf.setAccessible(true);
++                wf.set(c, world);
++                Field lx = Chunk.class.getDeclaredField("locX");
++                lx.setAccessible(true);
++                lx.setInt(c, cx);
++                Field lz = Chunk.class.getDeclaredField("locZ");
++                lz.setAccessible(true);
++                lz.setInt(c, cz);
++                Field sf = Chunk.class.getDeclaredField("sections");
++                sf.setAccessible(true);
++                ChunkSection[] secs = new ChunkSection[16];
++                for (int i = 0; i < 16; i++) {
++                    secs[i] = Chunk.a;
++                }
++                secs[4] = new ChunkSection(64, true);
++                secs[3] = new ChunkSection(48, true);
++                sf.set(c, secs);
++                map.put(ChunkCoordIntPair.a(cx, cz), c);
++            }
++        }
++
++        TestChunkProviderServer cps = (TestChunkProviderServer) unsafe.allocateInstance(TestChunkProviderServer.class);
++        cps.map = map;
++        world.chunkProvider = cps;
++        return world;
++    }
++
++    private static void setBlock(TestWorld world, int x, int y, int z, IBlockData data) {
++        Chunk c = world.getChunkIfLoaded(x >> 4, z >> 4);
++        c.getSections()[y >> 4].setType(x & 15, y & 15, z & 15, data);
++    }
++
++    private static boolean vanillaBlocksFlow(IBlockData iblockdata) {
++        Block block = iblockdata.getBlock();
++        return !(block instanceof BlockDoor) && block != Blocks.STANDING_SIGN && block != Blocks.LADDER && block != Blocks.REEDS
++                ? (block.material != Material.PORTAL && block.material != Material.J ? block.material.isSolid() : true)
++                : true;
++    }
++
++    private static int vanillaSlopeDistance(BlockFlowing flowing, World world, BlockPosition.MutableBlockPosition pos, int x, int y, int z, int depth, int limit, EnumDirection from) {
++        int best = 1000;
++        for (int n = 0; n < 4; ++n) {
++            EnumDirection direction = EnumDirection.HORIZONTAL[n];
++            if (direction != from) {
++                int nx = x + direction.getAdjacentX();
++                int nz = z + direction.getAdjacentZ();
++                IBlockData iblockdata = world.getType(pos.c(nx, y, nz));
++                if (!vanillaBlocksFlow(iblockdata) && (iblockdata.getMaterial() != flowing.material || iblockdata.get(BlockFlowing.LEVEL).intValue() > 0)) {
++                    if (!vanillaBlocksFlow(world.getType(pos.c(nx, y - 1, nz)))) {
++                        return depth;
++                    }
++                    if (depth < limit) {
++                        int k = vanillaSlopeDistance(flowing, world, pos, nx, y, nz, depth + 1, limit, direction.opposite());
++                        if (k < best) {
++                            best = k;
++                        }
++                    }
++                }
++            }
++        }
++        return best;
++    }
++
++    private static int vanillaGetFlowDirections(BlockFlowing flowing, World world, BlockPosition blockposition) {
++        int best = 1000;
++        int mask = 0;
++        int limit = flowing.material == Material.LAVA && !world.worldProvider.l() ? 2 : 4;
++        int x = blockposition.getX();
++        int y = blockposition.getY();
++        int z = blockposition.getZ();
++        BlockPosition.MutableBlockPosition pos = new BlockPosition.MutableBlockPosition();
++        for (int n = 0; n < 4; ++n) {
++            EnumDirection direction = EnumDirection.HORIZONTAL[n];
++            int nx = x + direction.getAdjacentX();
++            int nz = z + direction.getAdjacentZ();
++            IBlockData iblockdata = world.getType(pos.c(nx, y, nz));
++            if (!vanillaBlocksFlow(iblockdata) && (iblockdata.getMaterial() != flowing.material || iblockdata.get(BlockFlowing.LEVEL).intValue() > 0)) {
++                int j;
++                if (vanillaBlocksFlow(world.getType(pos.c(nx, y - 1, nz)))) {
++                    j = vanillaSlopeDistance(flowing, world, pos, nx, y, nz, 1, limit, direction.opposite());
++                } else {
++                    j = 0;
++                }
++                if (j < best) {
++                    mask = 0;
++                }
++                if (j <= best) {
++                    mask |= 1 << n;
++                    best = j;
++                }
++            }
++        }
++        return mask;
++    }
++
++    private static void clearArena(TestWorld world, int cx, int cz) {
++        for (int dx = -6; dx <= 6; dx++) {
++            for (int dz = -6; dz <= 6; dz++) {
++                setBlock(world, cx + dx, 64, cz + dz, Blocks.AIR.getBlockData());
++                setBlock(world, cx + dx, 63, cz + dz, Blocks.STONE.getBlockData());
++            }
++        }
++    }
++
++    @Test
++    public void testWaveBfsParity() throws Exception {
++        TestWorld overworld = createWorld(false);
++        TestWorld nether = createWorld(true);
++        BlockFlowing water = (BlockFlowing) Blocks.FLOWING_WATER;
++        BlockFlowing lava = (BlockFlowing) Blocks.FLOWING_LAVA;
++
++        // Test across chunk boundary (15, 64, 16) and interior (20, 64, 20)
++        BlockPosition[] origins = {
++            new BlockPosition(15, 64, 16),
++            new BlockPosition(20, 64, 20)
++        };
++
++        Random rng = new Random(0xC0FFEE1234L);
++        int checks = 0;
++        for (BlockPosition origin : origins) {
++            for (int trial = 0; trial < 120; trial++) {
++                TestWorld w = (trial % 3 == 2) ? nether : overworld;
++                BlockFlowing fluid = (trial % 2 == 0) ? water : lava;
++                clearArena(w, origin.getX(), origin.getZ());
++
++                // Populate random obstacles at y=64 and drops at y=63
++                for (int dx = -5; dx <= 5; dx++) {
++                    for (int dz = -5; dz <= 5; dz++) {
++                        if (dx == 0 && dz == 0) continue;
++                        int r = rng.nextInt(10);
++                        if (r == 0) {
++                            setBlock(w, origin.getX() + dx, 64, origin.getZ() + dz, Blocks.STONE.getBlockData());
++                        } else if (r == 1) {
++                            setBlock(w, origin.getX() + dx, 64, origin.getZ() + dz, Blocks.LADDER.getBlockData());
++                        } else if (r == 2) {
++                            setBlock(w, origin.getX() + dx, 64, origin.getZ() + dz, fluid.getBlockData().set(BlockFlowing.LEVEL, 0));
++                        }
++                        if (rng.nextInt(8) == 0) {
++                            setBlock(w, origin.getX() + dx, 63, origin.getZ() + dz, Blocks.AIR.getBlockData());
++                        }
++                    }
++                }
++
++                int expected = vanillaGetFlowDirections(fluid, w, origin);
++                int actual = fluid.getFlowDirections(w, origin);
++                Assert.assertEquals("Mismatch at trial=" + trial + " origin=" + origin + " fluid=" + fluid, expected, actual);
++                checks++;
++            }
++        }
++        Assert.assertTrue(checks >= 240);
++    }
++
++    @Test
++    public void testWaveBfsBenchmark() throws Exception {
++        TestWorld world = createWorld(false);
++        BlockFlowing water = (BlockFlowing) Blocks.FLOWING_WATER;
++        BlockPosition flatOrigin = new BlockPosition(20, 64, 20);
++        clearArena(world, 20, 20);
++
++        BlockPosition dropOrigin = new BlockPosition(36, 64, 20);
++        clearArena(world, 36, 20);
++        setBlock(world, 36, 63, 19, Blocks.AIR.getBlockData()); // immediate NORTH drop
++
++        ThreadMXBean bean = (ThreadMXBean) ManagementFactory.getThreadMXBean();
++        long tid = Thread.currentThread().getId();
++
++        for (int i = 0; i < 3000; i++) {
++            vanillaGetFlowDirections(water, world, flatOrigin);
++            water.getFlowDirections(world, flatOrigin);
++            vanillaGetFlowDirections(water, world, dropOrigin);
++            water.getFlowDirections(world, dropOrigin);
++        }
++        bean.getThreadAllocatedBytes(tid);
++
++        final int iters = 2000;
++        long vAlloc0 = bean.getThreadAllocatedBytes(tid);
++        long vT0 = System.nanoTime();
++        int sink = 0;
++        for (int i = 0; i < iters; i++) {
++            sink += vanillaGetFlowDirections(water, world, flatOrigin);
++            sink += vanillaGetFlowDirections(water, world, dropOrigin);
++        }
++        long vNs = System.nanoTime() - vT0;
++        long vBytes = bean.getThreadAllocatedBytes(tid) - vAlloc0;
++
++        long oAlloc0 = bean.getThreadAllocatedBytes(tid);
++        long oT0 = System.nanoTime();
++        for (int i = 0; i < iters; i++) {
++            sink += water.getFlowDirections(world, flatOrigin);
++            sink += water.getFlowDirections(world, dropOrigin);
++        }
++        long oNs = System.nanoTime() - oT0;
++        long oBytes = bean.getThreadAllocatedBytes(tid) - oAlloc0;
++
++        double speedup = (double) vNs / (double) Math.max(1L, oNs);
++        System.out.println(String.format(
++                "C2_BENCH vanilla_ns=%d opt_ns=%d speedup=%.2fx vanilla_bytes=%d opt_bytes=%d sink=%d",
++                vNs, oNs, speedup, vBytes, oBytes, sink));
++
++        Assert.assertTrue("Wave BFS must allocate <= 64 bytes (ThreadMXBean jitter), got " + oBytes, oBytes <= 64L);
++        Assert.assertTrue("Expected speedup > 3.0x, got " + speedup, speedup > 3.0D);
++    }
++}
