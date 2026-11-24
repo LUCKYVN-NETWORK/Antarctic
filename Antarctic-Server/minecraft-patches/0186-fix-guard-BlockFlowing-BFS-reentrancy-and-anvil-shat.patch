@@ -1,0 +1,283 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 20:05:42 +0700
+Subject: [PATCH 186/186] fix: guard BlockFlowing BFS reentrancy and anvil
+ shatter null position
+
+
+diff --git a/main/java/net/minecraft/server/BlockFlowing.java b/main/java/net/minecraft/server/BlockFlowing.java
+index 3a76925..b5145c9 100644
+--- a/main/java/net/minecraft/server/BlockFlowing.java
++++ b/main/java/net/minecraft/server/BlockFlowing.java
+@@ -115,6 +115,9 @@ public class BlockFlowing extends BlockFluids {
+             // CraftBukkit end
+ 
+             BlockPosition downPos = new BlockPosition(bx, by - 1, bz);
++            if (fromToListeners) {
++                iblockdata2 = world.getType(bx, by - 1, bz);
++            }
+             if (this.material == Material.LAVA && iblockdata2.getMaterial() == Material.WATER) {
+                 // CraftBukkit start
+                 if (org.bukkit.craftbukkit.event.CraftEventFactory.handleBlockFormEvent(world, downPos, Blocks.STONE.getBlockData(), null)) {
+@@ -212,6 +215,7 @@ public class BlockFlowing extends BlockFluids {
+         final byte[] queueB = new byte[64];
+         final Chunk[] chunks = new Chunk[4];
+         int nextStamp = 10;
++        boolean inUse;
+     }
+ 
+     private static final ThreadLocal<FlowBfsState> FLOW_BFS_STATE = ThreadLocal.withInitial(FlowBfsState::new);
+@@ -240,6 +244,12 @@ public class BlockFlowing extends BlockFluids {
+         int z = blockposition.getZ();
+ 
+         FlowBfsState bfs = FLOW_BFS_STATE.get();
++        boolean pooled = !bfs.inUse;
++        if (pooled) {
++            bfs.inUse = true;
++        } else {
++            bfs = new FlowBfsState();
++        }
+         if (bfs.nextStamp > Integer.MAX_VALUE - 32) {
+             java.util.Arrays.fill(bfs.stamp, 0);
+             bfs.nextStamp = 10;
+@@ -371,6 +381,9 @@ public class BlockFlowing extends BlockFluids {
+             chunks[1] = null;
+             chunks[2] = null;
+             chunks[3] = null;
++            if (pooled) {
++                bfs.inUse = false;
++            }
+         }
+     }
+ 
+diff --git a/main/java/net/minecraft/server/EntityFallingBlock.java b/main/java/net/minecraft/server/EntityFallingBlock.java
+index 04463d5..8fe4062 100644
+--- a/main/java/net/minecraft/server/EntityFallingBlock.java
++++ b/main/java/net/minecraft/server/EntityFallingBlock.java
+@@ -147,10 +147,10 @@ public class EntityFallingBlock extends Entity {
+                     this.motY *= -0.5D;
+                     if (iblockdata.getBlock() != Blocks.PISTON_EXTENSION) {
+                         this.die();
++                        if (blockposition == null) {
++                            blockposition = new BlockPosition(bx, by, bz);
++                        }
+                         if (!this.f) {
+-                            if (blockposition == null) {
+-                                blockposition = new BlockPosition(bx, by, bz);
+-                            }
+                             // CraftBukkit start
+                             if (this.world.a(block, blockposition, true, EnumDirection.UP, (Entity) null) && (flag1 || !BlockFalling.x(this.world.getType(bx, by - 1, bz)))) {
+                                 if (!CraftEventFactory.callEntityChangeBlockEventAllowed(this, blockposition, this.block.getBlock(), this.block.getBlock().toLegacyData(this.block))) {
+diff --git a/test/java/net/minecraft/server/FluidReentrancyAndAnvilShatterTest.java b/test/java/net/minecraft/server/FluidReentrancyAndAnvilShatterTest.java
+new file mode 100644
+index 0000000..6353071
+--- /dev/null
++++ b/test/java/net/minecraft/server/FluidReentrancyAndAnvilShatterTest.java
+@@ -0,0 +1,207 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.PaperWorldConfig;
++import com.destroystokyo.paper.antixray.ChunkPacketBlockController;
++import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.HashSet;
++import java.util.Random;
++import java.util.Set;
++import org.junit.Assert;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import org.spigotmc.SpigotWorldConfig;
++import sun.misc.Unsafe;
++
++public class FluidReentrancyAndAnvilShatterTest {
++
++    private static Unsafe unsafe;
++
++    @BeforeClass
++    public static void init() throws Exception {
++        DispenserRegistry.c();
++        org.spigotmc.AsyncCatcher.enabled = false;
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        unsafe = (Unsafe) f.get(null);
++    }
++
++    private static Chunk createChunk(World world, int cx, int cz) throws Exception {
++        Chunk c = (Chunk) unsafe.allocateInstance(Chunk.class);
++        Field wf = Chunk.class.getDeclaredField("world");
++        wf.setAccessible(true);
++        wf.set(c, world);
++        Field lx = Chunk.class.getDeclaredField("locX");
++        lx.setAccessible(true);
++        lx.setInt(c, cx);
++        Field lz = Chunk.class.getDeclaredField("locZ");
++        lz.setAccessible(true);
++        lz.setInt(c, cz);
++        Field sf = Chunk.class.getDeclaredField("sections");
++        sf.setAccessible(true);
++        ChunkSection[] secs = new ChunkSection[16];
++        for (int i = 0; i < 16; i++) {
++            secs[i] = Chunk.a;
++        }
++        secs[4] = new ChunkSection(64, true);
++        sf.set(c, secs);
++        int[] hard = new int[16];
++        hard[4] = 1;
++        unsafe.putObject(c, unsafe.objectFieldOffset(Chunk.class.getDeclaredField("hardCollidableCounts")), hard);
++        unsafe.putObject(c, unsafe.objectFieldOffset(Chunk.class.getDeclaredField("heightMap")), new int[256]);
++        @SuppressWarnings("unchecked")
++        java.util.List<Entity>[] slices = new java.util.List[16];
++        for (int i = 0; i < 16; i++) {
++            slices[i] = new ArrayList<>();
++        }
++        unsafe.putObject(c, unsafe.objectFieldOffset(Chunk.class.getDeclaredField("entitySlices")), slices);
++        unsafe.putObject(c, unsafe.objectFieldOffset(Chunk.class.getDeclaredField("entityCounts")), new co.aikar.util.Counter<>());
++        return c;
++    }
++
++    private static final class ReentrantFluidWorld extends WorldServer {
++        final Long2ObjectOpenHashMap<Chunk> map = new Long2ObjectOpenHashMap<>();
++        boolean triggeredNested = false;
++        int nestedResult;
++
++        ReentrantFluidWorld() {
++            super(null, null, null, 0, null, null, null);
++        }
++
++        @Override
++        public Chunk getChunkIfLoaded(int x, int z) {
++            return map.get(ChunkCoordIntPair.a(x, z));
++        }
++
++        @Override
++        public Chunk getChunkAt(int x, int z) {
++            Chunk c = map.get(ChunkCoordIntPair.a(x, z));
++            if (c == null) {
++                try {
++                    c = createChunk(this, x, z);
++                    map.put(ChunkCoordIntPair.a(x, z), c);
++                    if (!triggeredNested) {
++                        triggeredNested = true;
++                        // Simulate WorldGenLiquids calling BlockFlowing re-entrantly during neighbor chunk population
++                        nestedResult = ((BlockFlowing) Blocks.FLOWING_WATER).getFlowDirections(this, new BlockPosition((x << 4) + 8, 65, (z << 4) + 8));
++                    }
++                } catch (Exception e) {
++                    throw new RuntimeException(e);
++                }
++            }
++            return c;
++        }
++
++        @Override
++        public boolean isChunkLoaded(int x, int z, boolean allowEmpty) {
++            return map.containsKey(ChunkCoordIntPair.a(x, z));
++        }
++    }
++
++    @SuppressWarnings("unchecked")
++    private static ReentrantFluidWorld createWorld() throws Exception {
++        ReentrantFluidWorld world = (ReentrantFluidWorld) unsafe.allocateInstance(ReentrantFluidWorld.class);
++        Field mapField = ReentrantFluidWorld.class.getDeclaredField("map");
++        mapField.setAccessible(true);
++        Long2ObjectOpenHashMap<Chunk> map = new Long2ObjectOpenHashMap<>();
++        mapField.set(world, map);
++
++        world.worldData = new WorldData();
++        world.u = new ArrayList<>();
++        world.J = new int[32768];
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("players")), new ArrayList<>());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("j")), new ArrayList<>());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("f")), new HashSet<>());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("entityList")), new ArrayList<>());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("tileEntityListTick")), new World.TickableTileEntityList());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("b")), new ArrayList<>());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("tileEntityListUnload")), new HashSet<>());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("random")), new Random(42L));
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("spigotConfig")), unsafe.allocateInstance(SpigotWorldConfig.class));
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("paperConfig")), unsafe.allocateInstance(PaperWorldConfig.class));
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("chunkPacketBlockController")), new ChunkPacketBlockController() {});
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("pendingLight")), new me.stella.antarctic.collection.PendingLightRegistry(256));
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("methodProfiler")), new MethodProfiler());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("P")), new WorldBorder());
++        world.worldProvider = new WorldProviderNormal();
++        world.worldProvider.a(world);
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("chunkProvider")), new IChunkProvider() {
++            @Override
++            public Chunk getLoadedChunkAt(int x, int z) {
++                return world.getChunkIfLoaded(x, z);
++            }
++
++            @Override
++            public Chunk getChunkAt(int x, int z) {
++                return world.getChunkAt(x, z);
++            }
++
++            @Override
++            public boolean unloadChunks() {
++                return false;
++            }
++
++            @Override
++            public String getName() {
++                return "test";
++            }
++
++            @Override
++            public boolean e(int x, int z) {
++                return world.isChunkLoaded(x, z, true);
++            }
++        });
++
++        Chunk c0 = createChunk(world, 0, 0);
++        // Stone floor at y=64 except drop hole at x=16 (in chunk 1,0)
++        for (int x = 10; x < 16; x++) {
++            for (int z = 4; z <= 12; z++) {
++                c0.getSections()[4].setType(x, 0, z, Blocks.STONE.getBlockData());
++            }
++        }
++        map.put(ChunkCoordIntPair.a(0, 0), c0);
++        return world;
++    }
++
++    @Test
++    public void testBlockFlowingReentrantBfsDoesNotCorruptOrCrash() throws Exception {
++        ReentrantFluidWorld world = createWorld();
++        // Flow source at x=15, y=65, z=8 (1 block from unloaded chunk 1,0)
++        int outerMask = ((BlockFlowing) Blocks.FLOWING_WATER).getFlowDirections(world, new BlockPosition(15, 65, 8));
++        Assert.assertTrue("Nested getFlowDirections must have triggered during getChunkAt", world.triggeredNested);
++        Assert.assertTrue("Nested flow mask should be non-zero", world.nestedResult != 0);
++        // BlockFlowing uses DX = {0, 1, 0, -1}, DZ = {-1, 0, 1, 0} (NORTH=0, EAST=1, SOUTH=2, WEST=3)
++        int eastBit = 1 << 1;
++        Assert.assertTrue("Outer flow must still find EAST drop into chunk (1,0), mask=" + outerMask, (outerMask & eastBit) != 0);
++    }
++
++    @Test
++    public void testShatteringFallingAnvilDoesNotNpe() throws Exception {
++        ReentrantFluidWorld world = createWorld();
++        final BlockPosition[] shatteredPos = new BlockPosition[1];
++        IWorldAccess access = (IWorldAccess) java.lang.reflect.Proxy.newProxyInstance(
++            IWorldAccess.class.getClassLoader(),
++            new Class<?>[] { IWorldAccess.class },
++            (proxy, method, args) -> {
++                if ("a".equals(method.getName()) && args != null && args.length == 4
++                    && args[1] instanceof Integer && ((Integer) args[1]) == 1029) {
++                    shatteredPos[0] = (BlockPosition) args[2];
++                }
++                return null;
++            }
++        );
++        world.u.add(access);
++        Chunk c0 = world.getChunkAt(0, 0);
++        c0.getSections()[4].setType(8, 0, 8, Blocks.STONE.getBlockData());
++        EntityFallingBlock anvil = new EntityFallingBlock(world, 8.5D, 65.0D, 8.5D, Blocks.ANVIL.getBlockData());
++        anvil.motY = -0.1D;
++        anvil.ticksLived = 1;
++        Field fField = EntityFallingBlock.class.getDeclaredField("f");
++        fField.setAccessible(true);
++        fField.setBoolean(anvil, true); // Shattered anvil
++        anvil.B_();
++        Assert.assertTrue(anvil.dead);
++        Assert.assertEquals(new BlockPosition(8, 65, 8), shatteredPos[0]);
++    }
++}
