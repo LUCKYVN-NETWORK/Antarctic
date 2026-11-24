@@ -1,0 +1,1179 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 12:16:23 +0700
+Subject: [PATCH 166/166] perf: eliminate allocations and locks in
+ PathfinderNormal, Navigation and ChunkCache
+
+
+diff --git a/main/java/net/minecraft/server/ChunkCache.java b/main/java/net/minecraft/server/ChunkCache.java
+index 786d1dd..abc85f5 100644
+--- a/main/java/net/minecraft/server/ChunkCache.java
++++ b/main/java/net/minecraft/server/ChunkCache.java
+@@ -54,16 +54,16 @@ public class ChunkCache implements IBlockAccess {
+         return this.c[i][j].a(blockposition, chunk_enumtileentitystate);
+     }
+ 
+-    public IBlockData getType(BlockPosition blockposition) {
+-        if (blockposition.getY() >= 0 && blockposition.getY() < 256) {
+-            int i = (blockposition.getX() >> 4) - this.a;
+-            int j = (blockposition.getZ() >> 4) - this.b;
++    public IBlockData getType(int x, int y, int z) {
++        if (y >= 0 && y < 256) {
++            int i = (x >> 4) - this.a;
++            int j = (z >> 4) - this.b;
+ 
+             if (i >= 0 && i < this.c.length && j >= 0 && j < this.c[i].length) {
+                 Chunk chunk = this.c[i][j];
+ 
+                 if (chunk != null) {
+-                    return chunk.getBlockData(blockposition);
++                    return chunk.a(x, y, z);
+                 }
+             }
+         }
+@@ -71,6 +71,10 @@ public class ChunkCache implements IBlockAccess {
+         return Blocks.AIR.getBlockData();
+     }
+ 
++    public IBlockData getType(BlockPosition blockposition) {
++        return this.getType(blockposition.getX(), blockposition.getY(), blockposition.getZ());
++    }
++
+     public boolean isEmpty(BlockPosition blockposition) {
+         return this.getType(blockposition).getMaterial() == Material.AIR;
+     }
+diff --git a/main/java/net/minecraft/server/EntityInsentient.java b/main/java/net/minecraft/server/EntityInsentient.java
+index 03e14c8..a2e2968 100644
+--- a/main/java/net/minecraft/server/EntityInsentient.java
++++ b/main/java/net/minecraft/server/EntityInsentient.java
+@@ -40,7 +40,15 @@ public abstract class EntityInsentient extends EntityLiving {
+     public float[] dropChanceArmor;
+     // public boolean canPickUpLoot; // CraftBukkit - moved up to EntityLiving
+     public boolean persistent;
+-    private final Map<PathType, Float> bB;
++    private static final float[] DEFAULT_PATH_MALUS;
++    static {
++        PathType[] types = PathType.values();
++        DEFAULT_PATH_MALUS = new float[types.length];
++        for (int idx = 0; idx < types.length; ++idx) {
++            DEFAULT_PATH_MALUS[idx] = types[idx].a();
++        }
++    }
++    private final float[] antarcticPathMalus;
+     private MinecraftKey bC;
+     private long bD;
+     private boolean bE;
+@@ -54,7 +62,7 @@ public abstract class EntityInsentient extends EntityLiving {
+         this.dropChanceHand = new float[2];
+         this.by = NonNullList.a(4, ItemStack.a);
+         this.dropChanceArmor = new float[4];
+-        this.bB = Maps.newEnumMap(PathType.class);
++        this.antarcticPathMalus = DEFAULT_PATH_MALUS.clone();
+         this.goalSelector = new PathfinderGoalSelector(world != null && world.methodProfiler != null ? world.methodProfiler : null);
+         this.targetSelector = new PathfinderGoalSelector(world != null && world.methodProfiler != null ? world.methodProfiler : null);
+         this.lookController = new ControllerLook(this);
+@@ -86,13 +94,15 @@ public abstract class EntityInsentient extends EntityLiving {
+     }
+ 
+     public float a(PathType pathtype) {
+-        Float ofloat = (Float) this.bB.get(pathtype);
+-
+-        return ofloat == null ? pathtype.a() : ofloat.floatValue();
++        return this.antarcticPathMalus[pathtype.ordinal()];
+     }
+ 
+     public void a(PathType pathtype, float f) {
+-        this.bB.put(pathtype, Float.valueOf(f));
++        this.antarcticPathMalus[pathtype.ordinal()] = f;
++    }
++
++    final float getPathMalusByOrdinal(int ord) {
++        return this.antarcticPathMalus[ord];
+     }
+ 
+     protected EntityAIBodyControl s() {
+diff --git a/main/java/net/minecraft/server/Navigation.java b/main/java/net/minecraft/server/Navigation.java
+new file mode 100644
+index 0000000..3f96ab4
+--- /dev/null
++++ b/main/java/net/minecraft/server/Navigation.java
+@@ -0,0 +1,269 @@
++package net.minecraft.server;
++
++import java.util.Iterator;
++
++public class Navigation extends NavigationAbstract {
++
++    private boolean i;
++    private final BlockPosition.MutableBlockPosition scratchNavPos = new BlockPosition.MutableBlockPosition();
++
++    public Navigation(EntityInsentient entityinsentient, World world) {
++        super(entityinsentient, world);
++    }
++
++    protected Pathfinder a() {
++        this.h = new PathfinderNormal();
++        this.h.a(true);
++        return new Pathfinder(this.h);
++    }
++
++    protected boolean b() {
++        return this.a.onGround || this.h() && this.q() || this.a.isPassenger();
++    }
++
++    protected Vec3D c() {
++        return new Vec3D(this.a.locX, (double) this.s(), this.a.locZ);
++    }
++
++    public PathEntity b(BlockPosition blockposition) {
++        if (this.b.getType(blockposition).getMaterial() == Material.AIR) {
++            int bx = blockposition.getX();
++            int by = blockposition.getY() - 1;
++            int bz = blockposition.getZ();
++
++            while (by > 0 && this.b.getType(this.scratchNavPos.c(bx, by, bz)).getMaterial() == Material.AIR) {
++                --by;
++            }
++
++            if (by > 0) {
++                return super.b(new BlockPosition(bx, by + 1, bz));
++            }
++
++            while (by < this.b.getHeight() && this.b.getType(this.scratchNavPos.c(bx, by, bz)).getMaterial() == Material.AIR) {
++                ++by;
++            }
++
++            blockposition = new BlockPosition(bx, by, bz);
++        }
++
++        if (!this.b.getType(blockposition).getMaterial().isBuildable()) {
++            return super.b(blockposition);
++        } else {
++            int bx = blockposition.getX();
++            int by = blockposition.getY() + 1;
++            int bz = blockposition.getZ();
++
++            while (by < this.b.getHeight() && this.b.getType(this.scratchNavPos.c(bx, by, bz)).getMaterial().isBuildable()) {
++                ++by;
++            }
++
++            return super.b(new BlockPosition(bx, by, bz));
++        }
++    }
++
++    public PathEntity a(Entity entity) {
++        return this.b(new BlockPosition(entity));
++    }
++
++    private int s() {
++        if (this.a.isInWater() && this.h()) {
++            int i = (int) this.a.getBoundingBox().b;
++            int bx = MathHelper.floor(this.a.locX);
++            int bz = MathHelper.floor(this.a.locZ);
++            Block block = this.b.getType(this.scratchNavPos.c(bx, i, bz)).getBlock();
++            int j = 0;
++
++            do {
++                if (block != Blocks.FLOWING_WATER && block != Blocks.WATER) {
++                    return i;
++                }
++
++                ++i;
++                block = this.b.getType(this.scratchNavPos.c(bx, i, bz)).getBlock();
++                ++j;
++            } while (j <= 16);
++
++            return (int) this.a.getBoundingBox().b;
++        } else {
++            return (int) (this.a.getBoundingBox().b + 0.5D);
++        }
++    }
++
++    protected void q_() {
++        super.q_();
++        if (this.i) {
++            if (this.b.h(this.scratchNavPos.c(MathHelper.floor(this.a.locX), (int) (this.a.getBoundingBox().b + 0.5D), MathHelper.floor(this.a.locZ)))) {
++                return;
++            }
++
++            for (int i = 0; i < this.c.d(); ++i) {
++                PathPoint pathpoint = this.c.a(i);
++
++                if (this.b.h(this.scratchNavPos.c(pathpoint.a, pathpoint.b, pathpoint.c))) {
++                    this.c.b(i - 1);
++                    return;
++                }
++            }
++        }
++
++    }
++
++    protected boolean a(Vec3D vec3d, Vec3D vec3d1, int i, int j, int k) {
++        int l = MathHelper.floor(vec3d.x);
++        int i1 = MathHelper.floor(vec3d.z);
++        double d0 = vec3d1.x - vec3d.x;
++        double d1 = vec3d1.z - vec3d.z;
++        double d2 = d0 * d0 + d1 * d1;
++
++        if (d2 < 1.0E-8D) {
++            return false;
++        } else {
++            double d3 = 1.0D / Math.sqrt(d2);
++
++            d0 *= d3;
++            d1 *= d3;
++            i += 2;
++            k += 2;
++            if (!this.a(l, (int) vec3d.y, i1, i, j, k, vec3d, d0, d1)) {
++                return false;
++            } else {
++                i -= 2;
++                k -= 2;
++                double d4 = 1.0D / Math.abs(d0);
++                double d5 = 1.0D / Math.abs(d1);
++                double d6 = (double) l - vec3d.x;
++                double d7 = (double) i1 - vec3d.z;
++
++                if (d0 >= 0.0D) {
++                    ++d6;
++                }
++
++                if (d1 >= 0.0D) {
++                    ++d7;
++                }
++
++                d6 /= d0;
++                d7 /= d1;
++                int j1 = d0 < 0.0D ? -1 : 1;
++                int k1 = d1 < 0.0D ? -1 : 1;
++                int l1 = MathHelper.floor(vec3d1.x);
++                int i2 = MathHelper.floor(vec3d1.z);
++                int j2 = l1 - l;
++                int k2 = i2 - i1;
++
++                do {
++                    if (j2 * j1 <= 0 && k2 * k1 <= 0) {
++                        return true;
++                    }
++
++                    if (d6 < d7) {
++                        d6 += d4;
++                        l += j1;
++                        j2 = l1 - l;
++                    } else {
++                        d7 += d5;
++                        i1 += k1;
++                        k2 = i2 - i1;
++                    }
++                } while (this.a(l, (int) vec3d.y, i1, i, j, k, vec3d, d0, d1));
++
++                return false;
++            }
++        }
++    }
++
++    private boolean a(int i, int j, int k, int l, int i1, int j1, Vec3D vec3d, double d0, double d1) {
++        int k1 = i - l / 2;
++        int l1 = k - j1 / 2;
++
++        if (!this.b(k1, j, l1, l, i1, j1, vec3d, d0, d1)) {
++            return false;
++        } else {
++            for (int i2 = k1; i2 < k1 + l; ++i2) {
++                for (int j2 = l1; j2 < l1 + j1; ++j2) {
++                    double d2 = (double) i2 + 0.5D - vec3d.x;
++                    double d3 = (double) j2 + 0.5D - vec3d.z;
++
++                    if (d2 * d0 + d3 * d1 >= 0.0D) {
++                        PathType pathtype = this.h.a(this.b, i2, j - 1, j2, this.a, l, i1, j1, true, true);
++
++                        if (pathtype == PathType.WATER) {
++                            return false;
++                        }
++
++                        if (pathtype == PathType.LAVA) {
++                            return false;
++                        }
++
++                        if (pathtype == PathType.OPEN) {
++                            return false;
++                        }
++
++                        pathtype = this.h.a(this.b, i2, j, j2, this.a, l, i1, j1, true, true);
++                        float f = this.a.a(pathtype);
++
++                        if (f < 0.0F || f >= 8.0F) {
++                            return false;
++                        }
++
++                        if (pathtype == PathType.DAMAGE_FIRE || pathtype == PathType.DANGER_FIRE || pathtype == PathType.DAMAGE_OTHER) {
++                            return false;
++                        }
++                    }
++                }
++            }
++
++            return true;
++        }
++    }
++
++    private boolean b(int i, int j, int k, int l, int i1, int j1, Vec3D vec3d, double d0, double d1) {
++        int endX = i + l;
++        int endY = j + i1;
++        int endZ = k + j1;
++
++        for (int x = i; x < endX; ++x) {
++            double d2 = (double) x + 0.5D - vec3d.x;
++            for (int z = k; z < endZ; ++z) {
++                double d3 = (double) z + 0.5D - vec3d.z;
++                if (d2 * d0 + d3 * d1 < 0.0D) {
++                    continue;
++                }
++                for (int y = j; y < endY; ++y) {
++                    this.scratchNavPos.c(x, y, z);
++                    Block block = this.b.getType(this.scratchNavPos).getBlock();
++
++                    if (!block.b(this.b, this.scratchNavPos)) {
++                        return false;
++                    }
++                }
++            }
++        }
++
++        return true;
++    }
++
++    public void a(boolean flag) {
++        this.h.b(flag);
++    }
++
++    public void b(boolean flag) {
++        this.h.a(flag);
++    }
++
++    public boolean g() {
++        return this.h.c();
++    }
++
++    public void c(boolean flag) {
++        this.h.c(flag);
++    }
++
++    public boolean h() {
++        return this.h.e();
++    }
++
++    public void d(boolean flag) {
++        this.i = flag;
++    }
++}
+diff --git a/main/java/net/minecraft/server/NavigationAbstract.java b/main/java/net/minecraft/server/NavigationAbstract.java
+index 935b2e8..62db07e 100644
+--- a/main/java/net/minecraft/server/NavigationAbstract.java
++++ b/main/java/net/minecraft/server/NavigationAbstract.java
+@@ -23,6 +23,7 @@ public abstract class NavigationAbstract {
+     protected PathfinderAbstract h;
+     private BlockPosition q;
+     private final Pathfinder r;
++    protected final BlockPosition.MutableBlockPosition scratchAbsPos = new BlockPosition.MutableBlockPosition();
+ 
+     public NavigationAbstract(EntityInsentient entityinsentient, World world) {
+         this.k = Vec3D.a;
+@@ -75,7 +76,7 @@ public abstract class NavigationAbstract {
+         } else if (this.c != null && !this.c.b() && blockposition.equals(this.q)) {
+             return this.c;
+         } else {
+-            if (!new com.destroystokyo.paper.event.entity.EntityPathfindEvent(getEntity().getBukkitEntity(), MCUtil.toLocation(getEntity().world, blockposition), null).callEvent()) { return null; } // Paper
++            if (com.destroystokyo.paper.event.entity.EntityPathfindEvent.getHandlerList().getRegisteredListeners().length > 0 && !new com.destroystokyo.paper.event.entity.EntityPathfindEvent(getEntity().getBukkitEntity(), MCUtil.toLocation(getEntity().world, blockposition), null).callEvent()) { return null; } // Paper
+             this.q = blockposition;
+             float f = this.i();
+ 
+@@ -101,7 +102,7 @@ public abstract class NavigationAbstract {
+             if (this.c != null && !this.c.b() && blockposition.equals(this.q)) {
+                 return this.c;
+             } else {
+-                if (!new com.destroystokyo.paper.event.entity.EntityPathfindEvent(getEntity().getBukkitEntity(), MCUtil.toLocation(entity.world, blockposition), entity.getBukkitEntity()).callEvent()) { return null; } // Paper
++                if (com.destroystokyo.paper.event.entity.EntityPathfindEvent.getHandlerList().getRegisteredListeners().length > 0 && !new com.destroystokyo.paper.event.entity.EntityPathfindEvent(getEntity().getBukkitEntity(), MCUtil.toLocation(entity.world, blockposition), entity.getBukkitEntity()).callEvent()) { return null; } // Paper
+                 this.q = blockposition;
+                 float f = this.i();
+ 
+@@ -194,11 +195,10 @@ public abstract class NavigationAbstract {
+             this.m();
+             if (!this.o()) {
+                 vec3d = this.c.a((Entity) this.a);
+-                BlockPosition blockposition = (new BlockPosition(vec3d)).down();
+-                AxisAlignedBB axisalignedbb = this.b.getType(blockposition).e(this.b, blockposition);
++                this.scratchAbsPos.c(MathHelper.floor(vec3d.x), MathHelper.floor(vec3d.y) - 1, MathHelper.floor(vec3d.z));
++                AxisAlignedBB axisalignedbb = this.b.getType(this.scratchAbsPos).e(this.b, this.scratchAbsPos);
+ 
+-                vec3d = vec3d.a(0.0D, 1.0D - axisalignedbb.e, 0.0D);
+-                this.a.getControllerMove().a(vec3d.x, vec3d.y, vec3d.z, this.d);
++                this.a.getControllerMove().a(vec3d.x, vec3d.y + (1.0D - axisalignedbb.e), vec3d.z, this.d);
+             }
+         }
+     }
+@@ -293,7 +293,7 @@ public abstract class NavigationAbstract {
+             for (int i = 0; i < this.c.d(); ++i) {
+                 PathPoint pathpoint = this.c.a(i);
+                 PathPoint pathpoint1 = i + 1 < this.c.d() ? this.c.a(i + 1) : null;
+-                IBlockData iblockdata = this.b.getType(new BlockPosition(pathpoint.a, pathpoint.b, pathpoint.c));
++                IBlockData iblockdata = this.b.getType(this.scratchAbsPos.c(pathpoint.a, pathpoint.b, pathpoint.c));
+                 Block block = iblockdata.getBlock();
+ 
+                 if (block == Blocks.cauldron) {
+diff --git a/main/java/net/minecraft/server/Pathfinder.java b/main/java/net/minecraft/server/Pathfinder.java
+new file mode 100644
+index 0000000..37ad10f
+--- /dev/null
++++ b/main/java/net/minecraft/server/Pathfinder.java
+@@ -0,0 +1,119 @@
++package net.minecraft.server;
++
++import javax.annotation.Nullable;
++
++public class Pathfinder {
++
++    private final Path a = new Path();
++    private final PathPoint[] c = new PathPoint[32];
++    private final PathfinderAbstract d;
++
++    public Pathfinder(PathfinderAbstract pathfinderabstract) {
++        this.d = pathfinderabstract;
++    }
++
++    @Nullable
++    public PathEntity a(IBlockAccess iblockaccess, EntityInsentient entityinsentient, Entity entity, float f) {
++        return this.a(iblockaccess, entityinsentient, entity.locX, entity.getBoundingBox().b, entity.locZ, f);
++    }
++
++    @Nullable
++    public PathEntity a(IBlockAccess iblockaccess, EntityInsentient entityinsentient, BlockPosition blockposition, float f) {
++        return this.a(iblockaccess, entityinsentient, (double) ((float) blockposition.getX() + 0.5F), (double) ((float) blockposition.getY() + 0.5F), (double) ((float) blockposition.getZ() + 0.5F), f);
++    }
++
++    @Nullable
++    private PathEntity a(IBlockAccess iblockaccess, EntityInsentient entityinsentient, double d0, double d1, double d2, float f) {
++        this.a.a();
++        this.d.a(iblockaccess, entityinsentient);
++        PathPoint pathpoint = this.d.b();
++        PathPoint pathpoint1 = this.d.a(d0, d1, d2);
++        PathEntity pathentity = this.a(pathpoint, pathpoint1, f);
++
++        this.d.a();
++        return pathentity;
++    }
++
++    @Nullable
++    private PathEntity a(PathPoint pathpoint, PathPoint pathpoint1, float f) {
++        pathpoint.e = 0.0F;
++        pathpoint.f = pathpoint.c(pathpoint1);
++        pathpoint.g = pathpoint.f;
++        this.a.a();
++        this.a.a(pathpoint);
++        PathPoint pathpoint2 = pathpoint;
++        int i = 0;
++
++        while (!this.a.e()) {
++            ++i;
++            if (i >= 200) {
++                break;
++            }
++
++            PathPoint pathpoint3 = this.a.c();
++
++            if (pathpoint3.equals(pathpoint1)) {
++                pathpoint2 = pathpoint1;
++                break;
++            }
++
++            if (pathpoint3.c(pathpoint1) < pathpoint2.c(pathpoint1)) {
++                pathpoint2 = pathpoint3;
++            }
++
++            pathpoint3.i = true;
++            int j = this.d.a(this.c, pathpoint3, pathpoint1, f);
++
++            for (int k = 0; k < j; ++k) {
++                PathPoint pathpoint4 = this.c[k];
++                float f1 = pathpoint3.c(pathpoint4);
++
++                pathpoint4.j = pathpoint3.j + f1;
++                pathpoint4.k = f1 + pathpoint4.l;
++                float f2 = pathpoint3.e + pathpoint4.k;
++
++                if (pathpoint4.j < f && (!pathpoint4.a() || f2 < pathpoint4.e)) {
++                    pathpoint4.h = pathpoint3;
++                    pathpoint4.e = f2;
++                    pathpoint4.f = pathpoint4.c(pathpoint1) + pathpoint4.l;
++                    if (pathpoint4.a()) {
++                        this.a.a(pathpoint4, pathpoint4.e + pathpoint4.f);
++                    } else {
++                        pathpoint4.g = pathpoint4.e + pathpoint4.f;
++                        this.a.a(pathpoint4);
++                    }
++                }
++            }
++        }
++
++        if (pathpoint2 == pathpoint) {
++            return null;
++        } else {
++            PathEntity pathentity = this.a(pathpoint, pathpoint2);
++
++            return pathentity;
++        }
++    }
++
++    private PathEntity a(PathPoint pathpoint, PathPoint pathpoint1) {
++        int i = 1;
++
++        PathPoint pathpoint2;
++
++        for (pathpoint2 = pathpoint1; pathpoint2.h != null; pathpoint2 = pathpoint2.h) {
++            ++i;
++        }
++
++        PathPoint[] apathpoint = new PathPoint[i];
++
++        pathpoint2 = pathpoint1;
++        --i;
++
++        for (apathpoint[i] = pathpoint1; pathpoint2.h != null; apathpoint[i] = pathpoint2) {
++            pathpoint2 = pathpoint2.h;
++            --i;
++        }
++
++        return new PathEntity(apathpoint);
++    }
++}
+diff --git a/main/java/net/minecraft/server/PathfinderNormal.java b/main/java/net/minecraft/server/PathfinderNormal.java
+new file mode 100644
+index 0000000..b67f5eb
+--- /dev/null
++++ b/main/java/net/minecraft/server/PathfinderNormal.java
+@@ -0,0 +1,410 @@
++package net.minecraft.server;
++
++import com.google.common.collect.Sets;
++import java.util.EnumSet;
++import java.util.HashSet;
++import java.util.Iterator;
++import javax.annotation.Nullable;
++
++public class PathfinderNormal extends PathfinderAbstract {
++
++    private static final PathType[] PATH_TYPES = PathType.values();
++    private static final int FENCE_BIT = 1 << PathType.FENCE.ordinal();
++    protected float j;
++    private final BlockPosition.MutableBlockPosition scratchPos = new BlockPosition.MutableBlockPosition();
++    private final BlockPosition.MutableBlockPosition scratchPos2 = new BlockPosition.MutableBlockPosition();
++
++    public PathfinderNormal() {}
++
++    public void a(IBlockAccess iblockaccess, EntityInsentient entityinsentient) {
++        super.a(iblockaccess, entityinsentient);
++        this.j = entityinsentient.a(PathType.WATER);
++    }
++
++    public void a() {
++        this.b.a(PathType.WATER, this.j);
++        super.a();
++    }
++
++    public PathPoint b() {
++        int i;
++        int bx = MathHelper.floor(this.b.locX);
++        int bz = MathHelper.floor(this.b.locZ);
++
++        if (this.e() && this.b.isInWater()) {
++            i = (int) this.b.getBoundingBox().b;
++
++            for (Block block = this.getBlockDataFast(this.a, bx, i, bz, this.scratchPos).getBlock(); block == Blocks.FLOWING_WATER || block == Blocks.WATER; block = this.getBlockDataFast(this.a, bx, i, bz, this.scratchPos).getBlock()) {
++                ++i;
++            }
++        } else if (this.b.onGround) {
++            i = MathHelper.floor(this.b.getBoundingBox().b + 0.5D);
++        } else {
++            int by = MathHelper.floor(this.b.locY);
++            while (by > 0) {
++                IBlockData data = this.getBlockDataFast(this.a, bx, by, bz, this.scratchPos);
++                if (data.getMaterial() != Material.AIR && !data.getBlock().b(this.a, this.scratchPos.c(bx, by, bz))) {
++                    break;
++                }
++                --by;
++            }
++
++            i = by + 1;
++        }
++
++        PathType pathtype = this.a(this.b, bx, i, bz);
++
++        if (this.b.a(pathtype) < 0.0F) {
++            AxisAlignedBB bb = this.b.getBoundingBox();
++            int minX = MathHelper.floor(bb.a);
++            int maxX = MathHelper.floor(bb.d);
++            int minZ = MathHelper.floor(bb.c);
++            int maxZ = MathHelper.floor(bb.f);
++
++            if (this.b.a(this.a(this.b, minX, i, minZ)) >= 0.0F) {
++                return this.a(minX, i, minZ);
++            }
++            if (maxZ != minZ && this.b.a(this.a(this.b, minX, i, maxZ)) >= 0.0F) {
++                return this.a(minX, i, maxZ);
++            }
++            if (maxX != minX && this.b.a(this.a(this.b, maxX, i, minZ)) >= 0.0F) {
++                return this.a(maxX, i, minZ);
++            }
++            if (maxX != minX && maxZ != minZ && this.b.a(this.a(this.b, maxX, i, maxZ)) >= 0.0F) {
++                return this.a(maxX, i, maxZ);
++            }
++        }
++
++        return this.a(bx, i, bz);
++    }
++
++    public PathPoint a(double d0, double d1, double d2) {
++        return this.a(MathHelper.floor(d0), MathHelper.floor(d1), MathHelper.floor(d2));
++    }
++
++    public int a(PathPoint[] apathpoint, PathPoint pathpoint, PathPoint pathpoint1, float f) {
++        int i = 0;
++        int j = 0;
++        PathType pathtype = this.a(this.b, pathpoint.a, pathpoint.b + 1, pathpoint.c);
++
++        if (this.b.a(pathtype) >= 0.0F) {
++            j = MathHelper.d(Math.max(1.0F, this.b.P));
++        }
++
++        this.scratchPos.c(pathpoint.a, pathpoint.b - 1, pathpoint.c);
++        double d0 = (double) pathpoint.b - (1.0D - this.getBlockDataFast(this.a, pathpoint.a, pathpoint.b - 1, pathpoint.c, this.scratchPos).e(this.a, this.scratchPos).e);
++        PathPoint pathpoint2 = this.a(pathpoint.a, pathpoint.b, pathpoint.c + 1, j, d0, EnumDirection.SOUTH);
++        PathPoint pathpoint3 = this.a(pathpoint.a - 1, pathpoint.b, pathpoint.c, j, d0, EnumDirection.WEST);
++        PathPoint pathpoint4 = this.a(pathpoint.a + 1, pathpoint.b, pathpoint.c, j, d0, EnumDirection.EAST);
++        PathPoint pathpoint5 = this.a(pathpoint.a, pathpoint.b, pathpoint.c - 1, j, d0, EnumDirection.NORTH);
++
++        if (pathpoint2 != null && !pathpoint2.i && pathpoint2.a(pathpoint1) < f) {
++            apathpoint[i++] = pathpoint2;
++        }
++
++        if (pathpoint3 != null && !pathpoint3.i && pathpoint3.a(pathpoint1) < f) {
++            apathpoint[i++] = pathpoint3;
++        }
++
++        if (pathpoint4 != null && !pathpoint4.i && pathpoint4.a(pathpoint1) < f) {
++            apathpoint[i++] = pathpoint4;
++        }
++
++        if (pathpoint5 != null && !pathpoint5.i && pathpoint5.a(pathpoint1) < f) {
++            apathpoint[i++] = pathpoint5;
++        }
++
++        boolean flag = pathpoint5 == null || pathpoint5.m == PathType.OPEN || pathpoint5.l != 0.0F;
++        boolean flag1 = pathpoint2 == null || pathpoint2.m == PathType.OPEN || pathpoint2.l != 0.0F;
++        boolean flag2 = pathpoint4 == null || pathpoint4.m == PathType.OPEN || pathpoint4.l != 0.0F;
++        boolean flag3 = pathpoint3 == null || pathpoint3.m == PathType.OPEN || pathpoint3.l != 0.0F;
++        PathPoint pathpoint6;
++
++        if (flag && flag3) {
++            pathpoint6 = this.a(pathpoint.a - 1, pathpoint.b, pathpoint.c - 1, j, d0, EnumDirection.NORTH);
++            if (pathpoint6 != null && !pathpoint6.i && pathpoint6.a(pathpoint1) < f) {
++                apathpoint[i++] = pathpoint6;
++            }
++        }
++
++        if (flag && flag2) {
++            pathpoint6 = this.a(pathpoint.a + 1, pathpoint.b, pathpoint.c - 1, j, d0, EnumDirection.NORTH);
++            if (pathpoint6 != null && !pathpoint6.i && pathpoint6.a(pathpoint1) < f) {
++                apathpoint[i++] = pathpoint6;
++            }
++        }
++
++        if (flag1 && flag3) {
++            pathpoint6 = this.a(pathpoint.a - 1, pathpoint.b, pathpoint.c + 1, j, d0, EnumDirection.SOUTH);
++            if (pathpoint6 != null && !pathpoint6.i && pathpoint6.a(pathpoint1) < f) {
++                apathpoint[i++] = pathpoint6;
++            }
++        }
++
++        if (flag1 && flag2) {
++            pathpoint6 = this.a(pathpoint.a + 1, pathpoint.b, pathpoint.c + 1, j, d0, EnumDirection.SOUTH);
++            if (pathpoint6 != null && !pathpoint6.i && pathpoint6.a(pathpoint1) < f) {
++                apathpoint[i++] = pathpoint6;
++            }
++        }
++
++        return i;
++    }
++
++    @Nullable
++    private PathPoint a(int i, int j, int k, int l, double d0, EnumDirection enumdirection) {
++        PathPoint pathpoint = null;
++        this.scratchPos.c(i, j - 1, k);
++        double d1 = (double) j - (1.0D - this.getBlockDataFast(this.a, i, j - 1, k, this.scratchPos).e(this.a, this.scratchPos).e);
++
++        if (d1 - d0 > 1.125D) {
++            return null;
++        } else {
++            PathType pathtype = this.a(this.b, i, j, k);
++            float f = this.b.a(pathtype);
++            double d2 = (double) this.b.width / 2.0D;
++
++            if (f >= 0.0F) {
++                pathpoint = this.a(i, j, k);
++                pathpoint.m = pathtype;
++                pathpoint.l = Math.max(pathpoint.l, f);
++            }
++
++            if (pathtype == PathType.WALKABLE) {
++                return pathpoint;
++            } else {
++                if (pathpoint == null && l > 0 && pathtype != PathType.FENCE && pathtype != PathType.TRAPDOOR) {
++                    pathpoint = this.a(i, j + 1, k, l - 1, d0, enumdirection);
++                    if (pathpoint != null && (pathpoint.m == PathType.OPEN || pathpoint.m == PathType.WALKABLE) && this.b.width < 1.0F) {
++                        double d3 = (double) (i - enumdirection.getAdjacentX()) + 0.5D;
++                        double d4 = (double) (k - enumdirection.getAdjacentZ()) + 0.5D;
++                        AxisAlignedBB axisalignedbb = new AxisAlignedBB(d3 - d2, (double) j + 0.001D, d4 - d2, d3 + d2, (double) ((float) j + this.b.length), d4 + d2);
++                        this.scratchPos.c(i, j, k);
++                        AxisAlignedBB axisalignedbb1 = this.getBlockDataFast(this.a, i, j, k, this.scratchPos).e(this.a, this.scratchPos);
++                        AxisAlignedBB axisalignedbb2 = axisalignedbb.b(0.0D, axisalignedbb1.e - 0.002D, 0.0D);
++
++                        if (this.b.world.a(axisalignedbb2)) {
++                            pathpoint = null;
++                        }
++                    }
++                }
++
++                if (pathtype == PathType.OPEN) {
++                    AxisAlignedBB axisalignedbb3 = new AxisAlignedBB((double) i - d2 + 0.5D, (double) j + 0.001D, (double) k - d2 + 0.5D, (double) i + d2 + 0.5D, (double) ((float) j + this.b.length), (double) k + d2 + 0.5D);
++
++                    if (this.b.world.a(axisalignedbb3)) {
++                        return null;
++                    }
++
++                    if (this.b.width >= 1.0F) {
++                        PathType pathtype1 = this.a(this.b, i, j - 1, k);
++
++                        if (pathtype1 == PathType.BLOCKED) {
++                            pathpoint = this.a(i, j, k);
++                            pathpoint.m = PathType.WALKABLE;
++                            pathpoint.l = Math.max(pathpoint.l, f);
++                            return pathpoint;
++                        }
++                    }
++
++                    int i1 = 0;
++
++                    while (j > 0 && pathtype == PathType.OPEN) {
++                        --j;
++                        if (i1++ >= this.b.bg()) {
++                            return null;
++                        }
++
++                        pathtype = this.a(this.b, i, j, k);
++                        f = this.b.a(pathtype);
++                        if (pathtype != PathType.OPEN && f >= 0.0F) {
++                            pathpoint = this.a(i, j, k);
++                            pathpoint.m = pathtype;
++                            pathpoint.l = Math.max(pathpoint.l, f);
++                            break;
++                        }
++
++                        if (f < 0.0F) {
++                            return null;
++                        }
++                    }
++                }
++
++                return pathpoint;
++            }
++        }
++    }
++
++    public PathType a(IBlockAccess iblockaccess, int i, int j, int k, EntityInsentient entityinsentient, int l, int i1, int j1, boolean flag, boolean flag1) {
++        int mask = 0;
++        PathType pathtype = PathType.BLOCKED;
++        int ex = -1;
++        int ey = -1;
++        int ez = -1;
++        boolean entityCoordsComputed = false;
++
++        for (int k1 = 0; k1 < l; ++k1) {
++            for (int l1 = 0; l1 < i1; ++l1) {
++                for (int i2 = 0; i2 < j1; ++i2) {
++                    PathType pathtype1 = this.a(iblockaccess, k1 + i, l1 + j, i2 + k);
++
++                    if (pathtype1 == PathType.DOOR_WOOD_CLOSED && flag && flag1) {
++                        pathtype1 = PathType.WALKABLE;
++                    }
++
++                    if (pathtype1 == PathType.DOOR_OPEN && !flag1) {
++                        pathtype1 = PathType.BLOCKED;
++                    }
++
++                    if (pathtype1 == PathType.RAIL) {
++                        if (!entityCoordsComputed) {
++                            ex = MathHelper.floor(entityinsentient.locX);
++                            ey = MathHelper.floor(entityinsentient.locY);
++                            ez = MathHelper.floor(entityinsentient.locZ);
++                            entityCoordsComputed = true;
++                        }
++                        if (!(this.getBlockDataFast(iblockaccess, ex, ey, ez, this.scratchPos2).getBlock() instanceof BlockMinecartTrackAbstract)
++                                && !(this.getBlockDataFast(iblockaccess, ex, ey - 1, ez, this.scratchPos2).getBlock() instanceof BlockMinecartTrackAbstract)) {
++                            pathtype1 = PathType.FENCE;
++                        }
++                    }
++
++                    if (k1 == 0 && l1 == 0 && i2 == 0) {
++                        pathtype = pathtype1;
++                    }
++
++                    mask |= 1 << pathtype1.ordinal();
++                }
++            }
++        }
++
++        if ((mask & FENCE_BIT) != 0) {
++            return PathType.FENCE;
++        } else {
++            PathType pathtype1 = PathType.BLOCKED;
++            float bestMalus = entityinsentient.getPathMalusByOrdinal(PathType.BLOCKED.ordinal());
++
++            while (mask != 0) {
++                int ord = Integer.numberOfTrailingZeros(mask);
++                mask &= mask - 1;
++                float malus = entityinsentient.getPathMalusByOrdinal(ord);
++                if (malus < 0.0F) {
++                    return PATH_TYPES[ord];
++                }
++                if (malus >= bestMalus) {
++                    bestMalus = malus;
++                    pathtype1 = PATH_TYPES[ord];
++                }
++            }
++
++            if (pathtype == PathType.OPEN && bestMalus == 0.0F) {
++                return PathType.OPEN;
++            } else {
++                return pathtype1;
++            }
++        }
++    }
++
++    public PathType a(IBlockAccess iblockaccess, int i, int j, int k, int l, int i1, int j1, boolean flag, boolean flag1, EnumSet<PathType> enumset, PathType pathtype, BlockPosition blockposition) {
++        for (int k1 = 0; k1 < l; ++k1) {
++            for (int l1 = 0; l1 < i1; ++l1) {
++                for (int i2 = 0; i2 < j1; ++i2) {
++                    int j2 = k1 + i;
++                    int k2 = l1 + j;
++                    int l2 = i2 + k;
++                    PathType pathtype1 = this.a(iblockaccess, j2, k2, l2);
++
++                    if (pathtype1 == PathType.DOOR_WOOD_CLOSED && flag && flag1) {
++                        pathtype1 = PathType.WALKABLE;
++                    }
++
++                    if (pathtype1 == PathType.DOOR_OPEN && !flag1) {
++                        pathtype1 = PathType.BLOCKED;
++                    }
++
++                    if (pathtype1 == PathType.RAIL && !(iblockaccess.getType(blockposition).getBlock() instanceof BlockMinecartTrackAbstract) && !(iblockaccess.getType(blockposition.down()).getBlock() instanceof BlockMinecartTrackAbstract)) {
++                        pathtype1 = PathType.FENCE;
++                    }
++
++                    if (k1 == 0 && l1 == 0 && i2 == 0) {
++                        pathtype = pathtype1;
++                    }
++
++                    enumset.add(pathtype1);
++                }
++            }
++        }
++
++        return pathtype;
++    }
++
++    private PathType a(EntityInsentient entityinsentient, BlockPosition blockposition) {
++        return this.a(entityinsentient, blockposition.getX(), blockposition.getY(), blockposition.getZ());
++    }
++
++    private PathType a(EntityInsentient entityinsentient, int i, int j, int k) {
++        return this.a(this.a, i, j, k, entityinsentient, this.d, this.e, this.f, this.d(), this.c());
++    }
++
++    private IBlockData getBlockDataFast(IBlockAccess access, int x, int y, int z, BlockPosition.MutableBlockPosition pos) {
++        if (access instanceof ChunkCache) {
++            return ((ChunkCache) access).getType(x, y, z);
++        }
++        return access.getType(pos.c(x, y, z));
++    }
++
++    public PathType a(IBlockAccess iblockaccess, int i, int j, int k) {
++        PathType pathtype = this.b(iblockaccess, i, j, k);
++
++        if (pathtype == PathType.OPEN && j >= 1) {
++            IBlockData belowData = this.getBlockDataFast(iblockaccess, i, j - 1, k, this.scratchPos2);
++            Block block = belowData.getBlock();
++            PathType pathtype1 = this.classifyBlock(iblockaccess, belowData, i, j - 1, k);
++
++            pathtype = pathtype1 != PathType.WALKABLE && pathtype1 != PathType.OPEN && pathtype1 != PathType.WATER && pathtype1 != PathType.LAVA ? PathType.WALKABLE : PathType.OPEN;
++            if (pathtype1 == PathType.DAMAGE_FIRE || block == Blocks.df) {
++                pathtype = PathType.DAMAGE_FIRE;
++            }
++
++            if (pathtype1 == PathType.DAMAGE_CACTUS) {
++                pathtype = PathType.DAMAGE_CACTUS;
++            }
++        }
++
++        pathtype = this.a(iblockaccess, i, j, k, pathtype);
++        return pathtype;
++    }
++
++    public PathType a(IBlockAccess iblockaccess, int i, int j, int k, PathType pathtype) {
++        if (pathtype != PathType.WALKABLE) {
++            return pathtype;
++        }
++
++        for (int l = -1; l <= 1; ++l) {
++            for (int i1 = -1; i1 <= 1; ++i1) {
++                if (l != 0 || i1 != 0) {
++                    Block block = this.getBlockDataFast(iblockaccess, l + i, j, i1 + k, this.scratchPos2).getBlock();
++
++                    if (block == Blocks.CACTUS) {
++                        pathtype = PathType.DANGER_CACTUS;
++                    } else if (block == Blocks.FIRE) {
++                        pathtype = PathType.DANGER_FIRE;
++                    }
++                }
++            }
++        }
++
++        return pathtype;
++    }
++
++    protected PathType classifyBlock(IBlockAccess iblockaccess, IBlockData iblockdata, int i, int j, int k) {
++        Block block = iblockdata.getBlock();
++        Material material = iblockdata.getMaterial();
++
++        return material == Material.AIR ? PathType.OPEN : (block != Blocks.TRAPDOOR && block != Blocks.IRON_TRAPDOOR && block != Blocks.WATERLILY ? (block == Blocks.FIRE ? PathType.DAMAGE_FIRE : (block == Blocks.CACTUS ? PathType.DAMAGE_CACTUS : (block instanceof BlockDoor && material == Material.WOOD && !((Boolean) iblockdata.get(BlockDoor.OPEN)).booleanValue() ? PathType.DOOR_WOOD_CLOSED : (block instanceof BlockDoor && material == Material.ORE && !((Boolean) iblockdata.get(BlockDoor.OPEN)).booleanValue() ? PathType.DOOR_IRON_CLOSED : (block instanceof BlockDoor && ((Boolean) iblockdata.get(BlockDoor.OPEN)).booleanValue() ? PathType.DOOR_OPEN : (block instanceof BlockMinecartTrackAbstract ? PathType.RAIL : (!(block instanceof BlockFence) && !(block instanceof BlockCobbleWall) && (!(block instanceof BlockFenceGate) || ((Boolean) iblockdata.get(BlockFenceGate.OPEN)).booleanValue()) ? (material == Material.WATER ? PathType.WATER : (material == Material.LAVA ? PathType.LAVA : (block.b(iblockaccess, this.scratchPos2.c(i, j, k)) ? PathType.OPEN : PathType.BLOCKED))) : PathType.FENCE))))))) : PathType.TRAPDOOR);
++    }
++
++    protected PathType b(IBlockAccess iblockaccess, int i, int j, int k) {
++        return this.classifyBlock(iblockaccess, this.getBlockDataFast(iblockaccess, i, j, k, this.scratchPos2), i, j, k);
++    }
++}
+diff --git a/test/java/net/minecraft/server/PathfindingAllocAndParityTest.java b/test/java/net/minecraft/server/PathfindingAllocAndParityTest.java
+new file mode 100644
+index 0000000..dbd9429
+--- /dev/null
++++ b/test/java/net/minecraft/server/PathfindingAllocAndParityTest.java
+@@ -0,0 +1,209 @@
++package net.minecraft.server;
++
++import com.sun.management.ThreadMXBean;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++import java.lang.management.ManagementFactory;
++import java.lang.reflect.Field;
++import java.util.EnumMap;
++import java.util.EnumSet;
++import java.util.Map;
++
++import static org.junit.Assert.*;
++
++public class PathfindingAllocAndParityTest {
++
++    private static Unsafe UNSAFE;
++
++    @BeforeClass
++    public static void setup() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        UNSAFE = (Unsafe) f.get(null);
++    }
++
++    private static Chunk createTestChunk(int cx, int cz) throws Exception {
++        Chunk chunk = (Chunk) UNSAFE.allocateInstance(Chunk.class);
++        Field sectionsField = Chunk.class.getDeclaredField("sections");
++        sectionsField.setAccessible(true);
++        ChunkSection[] sections = new ChunkSection[16];
++        sections[0] = new ChunkSection(0, true);
++        sections[4] = new ChunkSection(64, true);
++        sectionsField.set(chunk, sections);
++        Field locXField = Chunk.class.getDeclaredField("locX");
++        locXField.setAccessible(true);
++        locXField.setInt(chunk, cx);
++        Field locZField = Chunk.class.getDeclaredField("locZ");
++        locZField.setAccessible(true);
++        locZField.setInt(chunk, cz);
++        return chunk;
++    }
++
++    private static ChunkCache createTestChunkCache() throws Exception {
++        ChunkCache cache = (ChunkCache) UNSAFE.allocateInstance(ChunkCache.class);
++        Chunk chunk = createTestChunk(0, 0);
++        ChunkSection sec = chunk.getSections()[4];
++        IBlockData stone = Blocks.STONE.getBlockData();
++        IBlockData fence = Blocks.FENCE.getBlockData();
++        IBlockData water = Blocks.WATER.getBlockData();
++        IBlockData lava = Blocks.LAVA.getBlockData();
++        IBlockData fire = Blocks.FIRE.getBlockData();
++        IBlockData cactus = Blocks.CACTUS.getBlockData();
++        IBlockData doorClosed = Blocks.WOODEN_DOOR.getBlockData().set(BlockDoor.OPEN, Boolean.FALSE);
++        IBlockData doorOpen = Blocks.WOODEN_DOOR.getBlockData().set(BlockDoor.OPEN, Boolean.TRUE);
++        IBlockData ironDoor = Blocks.IRON_DOOR.getBlockData().set(BlockDoor.OPEN, Boolean.FALSE);
++        IBlockData trapdoor = Blocks.TRAPDOOR.getBlockData();
++        IBlockData rail = Blocks.RAIL.getBlockData();
++        IBlockData magma = Blocks.df.getBlockData();
++
++        for (int x = 0; x < 16; ++x) {
++            for (int z = 0; z < 16; ++z) {
++                sec.setType(x, 0, z, stone); // y = 64
++            }
++        }
++        sec.setType(2, 1, 2, fence);
++        sec.setType(3, 1, 2, water);
++        sec.setType(4, 1, 2, lava);
++        sec.setType(5, 1, 2, fire);
++        sec.setType(6, 1, 2, cactus);
++        sec.setType(7, 1, 2, doorClosed);
++        sec.setType(8, 1, 2, doorOpen);
++        sec.setType(9, 1, 2, ironDoor);
++        sec.setType(10, 1, 2, trapdoor);
++        sec.setType(11, 1, 2, rail);
++        sec.setType(12, 0, 2, magma);
++        sec.setType(13, 1, 2, stone);
++
++        Chunk[][] grid = new Chunk[][]{{chunk}};
++        Field cField = ChunkCache.class.getDeclaredField("c");
++        cField.setAccessible(true);
++        cField.set(cache, grid);
++        return cache;
++    }
++
++    private static EntityZombie createTestZombie(double x, double y, double z) throws Exception {
++        EntityZombie zombie = (EntityZombie) UNSAFE.allocateInstance(EntityZombie.class);
++        Field malusField = EntityInsentient.class.getDeclaredField("antarcticPathMalus");
++        malusField.setAccessible(true);
++        PathType[] types = PathType.values();
++        float[] malus = new float[types.length];
++        for (int i = 0; i < types.length; ++i) {
++            malus[i] = types[i].a();
++        }
++        malusField.set(zombie, malus);
++        zombie.width = 0.6F;
++        zombie.length = 1.95F;
++        zombie.locX = x;
++        zombie.locY = y;
++        zombie.locZ = z;
++        return zombie;
++    }
++
++    private static PathType vanillaRef(PathfinderNormal pf, IBlockAccess access, int i, int j, int k, EntityInsentient mob,
++                                       int l, int i1, int j1, boolean flag, boolean flag1, Map<PathType, Float> malusMap) {
++        EnumSet<PathType> enumset = EnumSet.noneOf(PathType.class);
++        PathType pathtype = PathType.BLOCKED;
++        BlockPosition blockposition = new BlockPosition(mob);
++        pathtype = pf.a(access, i, j, k, l, i1, j1, flag, flag1, enumset, pathtype, blockposition);
++        if (enumset.contains(PathType.FENCE)) {
++            return PathType.FENCE;
++        }
++        PathType pathtype1 = PathType.BLOCKED;
++        for (PathType pt : enumset) {
++            Float m = malusMap.get(pt);
++            float mv = m == null ? pt.a() : m.floatValue();
++            if (mv < 0.0F) {
++                return pt;
++            }
++            Float m1 = malusMap.get(pathtype1);
++            float mv1 = m1 == null ? pathtype1.a() : m1.floatValue();
++            if (mv >= mv1) {
++                pathtype1 = pt;
++            }
++        }
++        Float m1 = malusMap.get(pathtype1);
++        float mv1 = m1 == null ? pathtype1.a() : m1.floatValue();
++        return (pathtype == PathType.OPEN && mv1 == 0.0F) ? PathType.OPEN : pathtype1;
++    }
++
++    @Test
++    public void testPathfinderNormalParity() throws Exception {
++        ChunkCache cache = createTestChunkCache();
++        EntityZombie mob = createTestZombie(2.5, 65.0, 2.5);
++        PathfinderNormal pf = new PathfinderNormal();
++        pf.a((IBlockAccess) cache, mob);
++
++        Map<PathType, Float> malusMap = new EnumMap<PathType, Float>(PathType.class);
++        for (boolean canOpen : new boolean[]{false, true}) {
++            for (boolean canEnter : new boolean[]{false, true}) {
++                for (int x = 1; x <= 14; ++x) {
++                    for (int z = 1; z <= 3; ++z) {
++                        for (int y = 64; y <= 66; ++y) {
++                            PathType expected = vanillaRef(pf, cache, x, y, z, mob, 1, 2, 1, canOpen, canEnter, malusMap);
++                            PathType actual = pf.a(cache, x, y, z, mob, 1, 2, 1, canOpen, canEnter);
++                            assertEquals("Parity mismatch at (" + x + "," + y + "," + z + ") open=" + canOpen + " enter=" + canEnter, expected, actual);
++                        }
++                    }
++                }
++            }
++        }
++
++        // Custom malus overrides
++        mob.a(PathType.WATER, 0.0F);
++        malusMap.put(PathType.WATER, 0.0F);
++        mob.a(PathType.DANGER_FIRE, -1.0F);
++        malusMap.put(PathType.DANGER_FIRE, -1.0F);
++        for (int x = 1; x <= 14; ++x) {
++            PathType expected = vanillaRef(pf, cache, x, 65, 2, mob, 1, 2, 1, true, true, malusMap);
++            PathType actual = pf.a(cache, x, 65, 2, mob, 1, 2, 1, true, true);
++            assertEquals("Custom malus parity mismatch at x=" + x, expected, actual);
++        }
++    }
++
++    @Test
++    public void testPathfinderNormalBenchmark() throws Exception {
++        ChunkCache cache = createTestChunkCache();
++        EntityZombie mob = createTestZombie(2.5, 65.0, 2.5);
++        PathfinderNormal pf = new PathfinderNormal();
++        pf.a((IBlockAccess) cache, mob);
++
++        Map<PathType, Float> malusMap = new EnumMap<PathType, Float>(PathType.class);
++        ThreadMXBean threadBean = (ThreadMXBean) ManagementFactory.getThreadMXBean();
++        long tid = Thread.currentThread().getId();
++
++        long sink = 0L;
++        for (int w = 0; w < 2000; ++w) {
++            int x = 1 + (w % 13);
++            sink += vanillaRef(pf, cache, x, 65, 2, mob, 1, 2, 1, true, true, malusMap).ordinal();
++            sink += pf.a(cache, x, 65, 2, mob, 1, 2, 1, true, true).ordinal();
++        }
++
++        int evals = 20000;
++        long a0 = threadBean.getThreadAllocatedBytes(tid);
++        long t0 = System.nanoTime();
++        for (int i = 0; i < evals; ++i) {
++            int x = 1 + (i % 13);
++            sink += vanillaRef(pf, cache, x, 65, 2, mob, 1, 2, 1, true, true, malusMap).ordinal();
++        }
++        long vanillaNs = System.nanoTime() - t0;
++        long vanillaBytes = Math.max(0L, threadBean.getThreadAllocatedBytes(tid) - a0);
++
++        a0 = threadBean.getThreadAllocatedBytes(tid);
++        t0 = System.nanoTime();
++        for (int i = 0; i < evals; ++i) {
++            int x = 1 + (i % 13);
++            sink += pf.a(cache, x, 65, 2, mob, 1, 2, 1, true, true).ordinal();
++        }
++        long optNs = System.nanoTime() - t0;
++        long optBytes = Math.max(0L, threadBean.getThreadAllocatedBytes(tid) - a0);
++
++        System.out.printf("B2_BENCH path20k_vanilla_ns=%d path20k_opt_ns=%d speedup=%.2fx vanilla_bytes=%d opt_bytes=%d blackhole=%d%n",
++                vanillaNs, optNs, (double) vanillaNs / Math.max(1L, optNs), vanillaBytes, optBytes, sink);
++
++        assertTrue("Expected PathfinderNormal speedup > 1.5x, got " + vanillaNs + " vs " + optNs, optNs * 1.5 < vanillaNs);
++        assertTrue("Expected optBytes < vanillaBytes / 2, got " + optBytes + " vs " + vanillaBytes, optBytes * 2L < vanillaBytes);
++    }
++}
