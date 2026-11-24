@@ -1,0 +1,276 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 20:12:21 +0700
+Subject: [PATCH 187/187] fix: restore Stronghold world assignment and Spigot
+ custom structure seeds
+
+
+diff --git a/main/java/net/minecraft/server/WorldGenCaves.java b/main/java/net/minecraft/server/WorldGenCaves.java
+index 47aabc4..79c310b 100644
+--- a/main/java/net/minecraft/server/WorldGenCaves.java
++++ b/main/java/net/minecraft/server/WorldGenCaves.java
+@@ -148,15 +148,15 @@ public class WorldGenCaves extends WorldGenBase {
+ 
+                             for (int i4 = l2; i4 < i3; ++i4) {
+                                 double d13 = ((double) (i4 + k * 16) + 0.5D - d2) / d6;
+-                                double horizSq = d12Sq + d13 * d13;
++                                double d13Sq = d13 * d13;
+                                 boolean flag3 = false;
+ 
+-                                if (horizSq < 1.0D) {
++                                if (d12Sq + d13Sq < 1.0D) {
+                                     int colBase = (j3 << 12) | (i4 << 8);
+                                     for (int j4 = k2; j4 > j2; --j4) {
+                                         double d14 = ((double) (j4 - 1) + 0.5D - d1) / d7;
+ 
+-                                        if (d14 > -0.7D && horizSq + d14 * d14 < 1.0D) {
++                                        if (d14 > -0.7D && (d12Sq + d14 * d14) + d13Sq < 1.0D) {
+                                             char rawId = raw[colBase | j4];
+                                             if (rawId == 0) {
+                                                 continue;
+diff --git a/main/java/net/minecraft/server/WorldGenLargeFeature.java b/main/java/net/minecraft/server/WorldGenLargeFeature.java
+index f56c938..7f806f6 100644
+--- a/main/java/net/minecraft/server/WorldGenLargeFeature.java
++++ b/main/java/net/minecraft/server/WorldGenLargeFeature.java
+@@ -43,7 +43,7 @@ public class WorldGenLargeFeature extends StructureGenerator {
+     // Antarctic start - scan 1-4 overlapping grid cells instead of 289 chunks
+     @Override
+     public void a(World world, int i, int j, ChunkSnapshot chunksnapshot) {
+-        this.scanGridStructure(world, i, j, chunksnapshot, this.d, 8, 14357617, false);
++        this.scanGridStructure(world, i, j, chunksnapshot, this.d, 8, world.spigotConfig.largeFeatureSeed, false); // Spigot
+     }
+     // Antarctic end
+ 
+@@ -61,7 +61,7 @@ public class WorldGenLargeFeature extends StructureGenerator {
+ 
+         int i1 = i / this.d;
+         int j1 = j / this.d;
+-        Random random = this.g.a(i1, j1, 14357617);
++        Random random = this.g.a(i1, j1, this.g.spigotConfig.largeFeatureSeed); // Spigot
+ 
+         i1 *= this.d;
+         j1 *= this.d;
+@@ -90,7 +90,7 @@ public class WorldGenLargeFeature extends StructureGenerator {
+ 
+     public BlockPosition getNearestGeneratedFeature(World world, BlockPosition blockposition, boolean flag) {
+         this.g = world;
+-        return a(world, this, blockposition, this.d, 8, 14357617, false, 100, flag);
++        return a(world, this, blockposition, this.d, 8, world.spigotConfig.largeFeatureSeed, false, 100, flag); // Spigot
+     }
+ 
+     protected StructureStart b(int i, int j) {
+diff --git a/main/java/net/minecraft/server/WorldGenMonument.java b/main/java/net/minecraft/server/WorldGenMonument.java
+index 8f11088..e505085 100644
+--- a/main/java/net/minecraft/server/WorldGenMonument.java
++++ b/main/java/net/minecraft/server/WorldGenMonument.java
+@@ -46,7 +46,7 @@ public class WorldGenMonument extends StructureGenerator {
+     // Antarctic start - scan 1-4 overlapping grid cells instead of 289 chunks
+     @Override
+     public void a(World world, int i, int j, ChunkSnapshot chunksnapshot) {
+-        this.scanGridStructure(world, i, j, chunksnapshot, this.d, this.h, 10387313, true);
++        this.scanGridStructure(world, i, j, chunksnapshot, this.d, this.h, world.spigotConfig.monumentSeed, true); // Spigot
+     }
+     // Antarctic end
+ 
+@@ -64,7 +64,7 @@ public class WorldGenMonument extends StructureGenerator {
+ 
+         int i1 = i / this.d;
+         int j1 = j / this.d;
+-        Random random = this.g.a(i1, j1, 10387313);
++        Random random = this.g.a(i1, j1, this.g.spigotConfig.monumentSeed); // Spigot
+ 
+         i1 *= this.d;
+         j1 *= this.d;
+@@ -87,7 +87,7 @@ public class WorldGenMonument extends StructureGenerator {
+ 
+     public BlockPosition getNearestGeneratedFeature(World world, BlockPosition blockposition, boolean flag) {
+         this.g = world;
+-        return a(world, this, blockposition, this.d, this.h, 10387313, true, 100, flag);
++        return a(world, this, blockposition, this.d, this.h, world.spigotConfig.monumentSeed, true, 100, flag); // Spigot
+     }
+ 
+     protected StructureStart b(int i, int j) {
+diff --git a/main/java/net/minecraft/server/WorldGenStronghold.java b/main/java/net/minecraft/server/WorldGenStronghold.java
+index 6af41d0..24fd292 100644
+--- a/main/java/net/minecraft/server/WorldGenStronghold.java
++++ b/main/java/net/minecraft/server/WorldGenStronghold.java
+@@ -57,6 +57,7 @@ public class WorldGenStronghold extends StructureGenerator {
+     }
+ 
+     public BlockPosition getNearestGeneratedFeature(World world, BlockPosition blockposition, boolean flag) {
++        this.g = world; // Paper
+         if (!this.b) {
+             this.c();
+             this.b = true;
+diff --git a/main/java/net/minecraft/server/WorldGenVillage.java b/main/java/net/minecraft/server/WorldGenVillage.java
+index 1e5567f..12d93ce 100644
+--- a/main/java/net/minecraft/server/WorldGenVillage.java
++++ b/main/java/net/minecraft/server/WorldGenVillage.java
+@@ -42,7 +42,7 @@ public class WorldGenVillage extends StructureGenerator {
+     // Antarctic start - scan 1-4 overlapping grid cells instead of 289 chunks
+     @Override
+     public void a(World world, int i, int j, ChunkSnapshot chunksnapshot) {
+-        this.scanGridStructure(world, i, j, chunksnapshot, this.d, 8, 10387312, false);
++        this.scanGridStructure(world, i, j, chunksnapshot, this.d, 8, world.spigotConfig.villageSeed, false); // Spigot
+     }
+     // Antarctic end
+ 
+@@ -60,7 +60,7 @@ public class WorldGenVillage extends StructureGenerator {
+ 
+         int i1 = i / this.d;
+         int j1 = j / this.d;
+-        Random random = this.g.a(i1, j1, 10387312);
++        Random random = this.g.a(i1, j1, this.g.spigotConfig.villageSeed); // Spigot
+ 
+         i1 *= this.d;
+         j1 *= this.d;
+@@ -79,7 +79,7 @@ public class WorldGenVillage extends StructureGenerator {
+ 
+     public BlockPosition getNearestGeneratedFeature(World world, BlockPosition blockposition, boolean flag) {
+         this.g = world;
+-        return a(world, this, blockposition, this.d, 8, 10387312, false, 100, flag);
++        return a(world, this, blockposition, this.d, 8, world.spigotConfig.villageSeed, false, 100, flag); // Spigot
+     }
+ 
+     protected StructureStart b(int i, int j) {
+diff --git a/test/java/net/minecraft/server/StructureSeedAndStrongholdParityTest.java b/test/java/net/minecraft/server/StructureSeedAndStrongholdParityTest.java
+new file mode 100644
+index 0000000..a2dcdd1
+--- /dev/null
++++ b/test/java/net/minecraft/server/StructureSeedAndStrongholdParityTest.java
+@@ -0,0 +1,135 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.PaperWorldConfig;
++import java.lang.reflect.Field;
++import java.util.HashSet;
++import java.util.Random;
++import java.util.Set;
++import org.junit.Assert;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import org.spigotmc.SpigotWorldConfig;
++import sun.misc.Unsafe;
++
++public class StructureSeedAndStrongholdParityTest {
++
++    private static Unsafe unsafe;
++
++    @BeforeClass
++    public static void init() throws Exception {
++        DispenserRegistry.c();
++        org.spigotmc.AsyncCatcher.enabled = false;
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        unsafe = (Unsafe) f.get(null);
++    }
++
++    private static final class SeedRecordingWorld extends WorldServer {
++        final Set<Integer> salts = new HashSet<>();
++
++        SeedRecordingWorld() {
++            super(null, null, null, 0, null, null, null);
++        }
++
++        @Override
++        public Random a(int i, int j, int k) {
++            salts.add(k);
++            return new Random((long) i * 341873128712L + (long) j * 132897987541L + 12345L + (long) k);
++        }
++
++        @Override
++        public WorldChunkManager getWorldChunkManager() {
++            return new WorldChunkManager(new WorldData()) {
++                @Override
++                public BiomeBase getBiome(BlockPosition blockposition) {
++                    return Biomes.d;
++                }
++
++                @Override
++                public boolean a(int i, int j, int k, java.util.List<BiomeBase> list) {
++                    return false;
++                }
++            };
++        }
++
++        @Override
++        public PersistentBase a(Class<? extends PersistentBase> oclass, String s) {
++            return null;
++        }
++
++        @Override
++        public void a(String s, PersistentBase persistentbase) {
++        }
++    }
++
++    private static SeedRecordingWorld createWorld() throws Exception {
++        SeedRecordingWorld world = (SeedRecordingWorld) unsafe.allocateInstance(SeedRecordingWorld.class);
++        unsafe.putObject(world, unsafe.objectFieldOffset(SeedRecordingWorld.class.getDeclaredField("salts")), new HashSet<>());
++        world.worldData = new WorldData();
++        SpigotWorldConfig spigot = (SpigotWorldConfig) unsafe.allocateInstance(SpigotWorldConfig.class);
++        spigot.saveStructureInfo = false;
++        spigot.largeFeatureSeed = 111111;
++        spigot.monumentSeed = 222222;
++        spigot.villageSeed = 333333;
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("spigotConfig")), spigot);
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("paperConfig")), unsafe.allocateInstance(PaperWorldConfig.class));
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("random")), new Random(42L));
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("methodProfiler")), new MethodProfiler());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("P")), new WorldBorder());
++        world.worldProvider = new WorldProviderNormal();
++        world.worldProvider.a(world);
++        return world;
++    }
++
++    @Test
++    public void testStrongholdGetNearestGeneratedFeatureAssignsWorldBeforeInit() throws Exception {
++        SeedRecordingWorld world = createWorld();
++        WorldGenStronghold stronghold = new WorldGenStronghold();
++        BlockPosition nearest = stronghold.getNearestGeneratedFeature(world, new BlockPosition(0, 64, 0), false);
++        Assert.assertNotNull(nearest);
++        Assert.assertSame(world, stronghold.g);
++    }
++
++    @Test
++    public void testCustomSpigotStructureSeedsAreUsedInScanAndLookup() throws Exception {
++        SeedRecordingWorld world = createWorld();
++        ChunkSnapshot snapshot = new ChunkSnapshot();
++
++        WorldGenLargeFeature largeFeature = new WorldGenLargeFeature();
++        largeFeature.a(world, 0, 0, snapshot);
++        largeFeature.getNearestGeneratedFeature(world, new BlockPosition(0, 64, 0), false);
++        Assert.assertTrue("Expected custom largeFeatureSeed 111111", world.salts.contains(111111));
++        Assert.assertFalse("Hardcoded vanilla salt 14357617 must not be used", world.salts.contains(14357617));
++
++        world.salts.clear();
++        WorldGenMonument monument = new WorldGenMonument();
++        monument.a(world, 0, 0, snapshot);
++        monument.getNearestGeneratedFeature(world, new BlockPosition(0, 64, 0), false);
++        Assert.assertTrue("Expected custom monumentSeed 222222", world.salts.contains(222222));
++        Assert.assertFalse("Hardcoded vanilla salt 10387313 must not be used", world.salts.contains(10387313));
++
++        world.salts.clear();
++        WorldGenVillage village = new WorldGenVillage();
++        village.a(world, 0, 0, snapshot);
++        village.getNearestGeneratedFeature(world, new BlockPosition(0, 64, 0), false);
++        Assert.assertTrue("Expected custom villageSeed 333333", world.salts.contains(333333));
++        Assert.assertFalse("Hardcoded vanilla salt 10387312 must not be used", world.salts.contains(10387312));
++    }
++
++    @Test
++    public void testWorldGenCavesAssociativityMatchesVanilla() throws Exception {
++        SeedRecordingWorld world = createWorld();
++        ChunkSnapshot snapshot = new ChunkSnapshot();
++        IBlockData stone = Blocks.STONE.getBlockData();
++        for (int x = 0; x < 16; x++) {
++            for (int z = 0; z < 16; z++) {
++                for (int y = 1; y < 60; y++) {
++                    snapshot.a(x, y, z, stone);
++                }
++            }
++        }
++        WorldGenCaves caves = new WorldGenCaves();
++        caves.a(world, 0, 0, snapshot);
++        Assert.assertNotNull(snapshot.a(0, 10, 0));
++    }
++}
