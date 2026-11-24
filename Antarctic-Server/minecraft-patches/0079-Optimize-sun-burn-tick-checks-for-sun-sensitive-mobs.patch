@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Sun, 18 Oct 2026 18:16:34 +0700
-Subject: [PATCH 079/187] Optimize sun burn tick checks for sun-sensitive mobs
+Subject: [PATCH 079/188] Optimize sun burn tick checks for sun-sensitive mobs
 
 - Cache eye and skeleton block positions to eliminate redundant BlockPosition heap allocations during sun burn ticks
 

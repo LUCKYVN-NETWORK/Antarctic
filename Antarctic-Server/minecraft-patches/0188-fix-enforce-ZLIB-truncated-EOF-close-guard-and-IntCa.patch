@@ -1,0 +1,270 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 20:17:46 +0700
+Subject: [PATCH 188/188] fix: enforce ZLIB truncated EOF, close guard, and
+ IntCache decay limit
+
+
+diff --git a/main/java/net/minecraft/server/IntCache.java b/main/java/net/minecraft/server/IntCache.java
+index 140f34f..ed68f8b 100644
+--- a/main/java/net/minecraft/server/IntCache.java
++++ b/main/java/net/minecraft/server/IntCache.java
+@@ -18,8 +18,14 @@ public class IntCache {
+ 
+     private static final ThreadLocal<Pool> POOL = ThreadLocal.withInitial(Pool::new);
+ 
++    private static int effectiveCacheLimit() {
++        int limit = org.spigotmc.SpigotConfig.intCacheLimit;
++        return (limit <= 0 || limit > MAX_FREE) ? MAX_FREE : limit;
++    }
++
+     public static int[] a(int i) {
+         Pool pool = POOL.get();
++        int limit = effectiveCacheLimit();
+ 
+         if (i <= 256) {
+             int idx = pool.smallCursor++;
+@@ -27,7 +33,7 @@ public class IntCache {
+                 return pool.small[idx];
+             }
+             int[] aint = new int[256];
+-            if (idx < MAX_FREE) {
++            if (idx < limit) {
+                 pool.small[idx] = aint;
+                 pool.smallCount = idx + 1;
+             }
+@@ -48,7 +54,7 @@ public class IntCache {
+             return pool.large[idx];
+         }
+         int[] aint = new int[pool.maxSize];
+-        if (idx < MAX_FREE) {
++        if (idx < limit) {
+             pool.large[idx] = aint;
+             pool.largeCount = idx + 1;
+         }
+@@ -57,6 +63,19 @@ public class IntCache {
+ 
+     public static void a() {
+         Pool pool = POOL.get();
++        int limit = effectiveCacheLimit();
++        while (pool.smallCount > limit) {
++            pool.small[--pool.smallCount] = null;
++        }
++        if (pool.smallCount > pool.smallCursor) {
++            pool.small[--pool.smallCount] = null;
++        }
++        while (pool.largeCount > limit) {
++            pool.large[--pool.largeCount] = null;
++        }
++        if (pool.largeCount > pool.largeCursor) {
++            pool.large[--pool.largeCount] = null;
++        }
+         pool.smallCursor = 0;
+         pool.largeCursor = 0;
+     }
+diff --git a/main/java/net/minecraft/server/RegionFile.java b/main/java/net/minecraft/server/RegionFile.java
+index d7caac9..f25f216 100644
+--- a/main/java/net/minecraft/server/RegionFile.java
++++ b/main/java/net/minecraft/server/RegionFile.java
+@@ -586,9 +586,12 @@ public class RegionFile {
+             try {
+                 int n;
+                 while ((n = this.inflater.inflate(this.buf, 0, this.buf.length)) == 0) {
+-                    if (this.inflater.finished() || this.inflater.needsInput() || this.inflater.needsDictionary()) {
++                    if (this.inflater.finished() || this.inflater.needsDictionary()) {
+                         return false;
+                     }
++                    if (this.inflater.needsInput()) {
++                        throw new java.io.EOFException("Unexpected end of ZLIB input stream");
++                    }
+                 }
+                 this.pos = 0;
+                 this.count = n;
+@@ -600,6 +603,9 @@ public class RegionFile {
+ 
+         @Override
+         public int read() throws IOException {
++            if (this.inflater == null) {
++                throw new IOException("Stream closed");
++            }
+             if (this.pos >= this.count && !this.fill()) {
+                 return -1;
+             }
+@@ -609,6 +615,9 @@ public class RegionFile {
+         @Override
+         public int read(byte[] b, int off, int len) throws IOException {
+             java.util.Objects.checkFromIndexSize(off, len, b.length);
++            if (this.inflater == null) {
++                throw new IOException("Stream closed");
++            }
+             if (len == 0) {
+                 return 0;
+             }
+@@ -620,18 +629,18 @@ public class RegionFile {
+                 return take;
+             }
+             if (len >= this.buf.length) {
+-                if (this.inflater == null) {
+-                    throw new IOException("Stream closed");
+-                }
+                 if (this.inflater.finished()) {
+                     return -1;
+                 }
+                 try {
+                     int n;
+                     while ((n = this.inflater.inflate(b, off, len)) == 0) {
+-                        if (this.inflater.finished() || this.inflater.needsInput() || this.inflater.needsDictionary()) {
++                        if (this.inflater.finished() || this.inflater.needsDictionary()) {
+                             return -1;
+                         }
++                        if (this.inflater.needsInput()) {
++                            throw new java.io.EOFException("Unexpected end of ZLIB input stream");
++                        }
+                     }
+                     return n;
+                 } catch (java.util.zip.DataFormatException e) {
+@@ -653,6 +662,8 @@ public class RegionFile {
+                 returnInflater(this.inflater);
+                 this.inflater = null;
+             }
++            this.pos = 0;
++            this.count = 0;
+         }
+     }
+     // Antarctic end
+diff --git a/test/java/net/minecraft/server/RegionZlibAndIntCacheParityTest.java b/test/java/net/minecraft/server/RegionZlibAndIntCacheParityTest.java
+new file mode 100644
+index 0000000..bd2da5b
+--- /dev/null
++++ b/test/java/net/minecraft/server/RegionZlibAndIntCacheParityTest.java
+@@ -0,0 +1,130 @@
++package net.minecraft.server;
++
++import java.io.ByteArrayOutputStream;
++import java.io.EOFException;
++import java.io.IOException;
++import java.io.InputStream;
++import java.lang.reflect.Constructor;
++import java.util.Arrays;
++import java.util.zip.DeflaterOutputStream;
++import org.junit.Assert;
++import org.junit.Test;
++import org.spigotmc.SpigotConfig;
++
++public class RegionZlibAndIntCacheParityTest {
++
++    private static byte[] compress(byte[] raw) throws IOException {
++        ByteArrayOutputStream baos = new ByteArrayOutputStream();
++        try (DeflaterOutputStream dos = new DeflaterOutputStream(baos)) {
++            dos.write(raw);
++        }
++        return baos.toByteArray();
++    }
++
++    private static InputStream openPooledZlibStream(byte[] compressed) {
++        return RegionFile.inflateZlib(compressed);
++    }
++
++    @Test
++    public void testTruncatedZlibThrowsEofOnByteAndBulkRead() throws Exception {
++        byte[] payload = new byte[128];
++        for (int i = 0; i < payload.length; i++) {
++            payload[i] = (byte) (i * 31 + 7);
++        }
++        byte[] valid = compress(payload);
++        byte[] truncated = Arrays.copyOf(valid, Math.max(4, valid.length - 4));
++
++        // 1) Single-byte read loop must throw EOFException
++        try (InputStream in = openPooledZlibStream(truncated)) {
++            boolean threwEof = false;
++            try {
++                while (in.read() != -1) {
++                    // consume available decompressed prefix
++                }
++            } catch (EOFException expected) {
++                threwEof = true;
++            }
++            Assert.assertTrue("Truncated ZLIB stream must throw EOFException on read()", threwEof);
++        }
++
++        // 2) Direct bulk read (>= internal buffer size) must throw EOFException
++        try (InputStream in = openPooledZlibStream(truncated)) {
++            byte[] largeBuf = new byte[8192];
++            boolean threwEof = false;
++            try {
++                while (in.read(largeBuf, 0, largeBuf.length) != -1) {
++                    // consume
++                }
++            } catch (EOFException expected) {
++                threwEof = true;
++            }
++            Assert.assertTrue("Truncated ZLIB stream must throw EOFException on bulk read()", threwEof);
++        }
++    }
++
++    @Test
++    public void testClosedPooledZlibStreamRejectsUnreadBufferedBytes() throws Exception {
++        byte[] payload = new byte[512];
++        Arrays.fill(payload, (byte) 42);
++        byte[] compressed = compress(payload);
++
++        InputStream in = openPooledZlibStream(compressed);
++        Assert.assertEquals(42, in.read());
++        in.close();
++
++        boolean singleReadRejected = false;
++        try {
++            in.read();
++        } catch (IOException expected) {
++            singleReadRejected = true;
++        }
++        Assert.assertTrue("read() after close() must throw IOException even with buffered bytes", singleReadRejected);
++
++        boolean bulkReadRejected = false;
++        try {
++            in.read(new byte[16], 0, 16);
++        } catch (IOException expected) {
++            bulkReadRejected = true;
++        }
++        Assert.assertTrue("read(byte[],int,int) after close() must throw IOException even with buffered bytes", bulkReadRejected);
++    }
++
++    @Test
++    public void testIntCacheRespectsSpigotLimitAndDecaysUnusedArrays() {
++        int prevLimit = SpigotConfig.intCacheLimit;
++        try {
++            // Drain any existing arrays on this thread
++            for (int i = 0; i < 70; i++) {
++                IntCache.a();
++            }
++
++            // Positive intCacheLimit caps retention
++            SpigotConfig.intCacheLimit = 3;
++            for (int i = 0; i < 6; i++) {
++                IntCache.a(256);
++                IntCache.a(512);
++            }
++            IntCache.a();
++            String statsAfterCap = IntCache.b();
++            Assert.assertTrue("Expected tcache: 3 when intCacheLimit=3, got: " + statsAfterCap, statsAfterCap.contains("tcache: 3"));
++            Assert.assertTrue("Expected cache: 3 when intCacheLimit=3, got: " + statsAfterCap, statsAfterCap.contains("cache: 3"));
++
++            // Unused arrays decay by 1 per IntCache.a() call
++            IntCache.a();
++            String statsAfterDecay = IntCache.b();
++            Assert.assertTrue("Expected tcache: 2 after decay, got: " + statsAfterDecay, statsAfterDecay.contains("tcache: 2"));
++            Assert.assertTrue("Expected cache: 2 after decay, got: " + statsAfterDecay, statsAfterDecay.contains("cache: 2"));
++
++            // intCacheLimit <= 0 behaves as unlimited (capped at MAX_FREE = 64)
++            SpigotConfig.intCacheLimit = 0;
++            for (int i = 0; i < 10; i++) {
++                IntCache.a(256);
++            }
++            IntCache.a();
++            String statsUnlimited = IntCache.b();
++            Assert.assertTrue("Expected tcache: 10 when intCacheLimit=0, got: " + statsUnlimited, statsUnlimited.contains("tcache: 10"));
++        } finally {
++            SpigotConfig.intCacheLimit = prevLimit;
++        }
++    }
++}
