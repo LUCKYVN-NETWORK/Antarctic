@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Tue, 17 Nov 2026 16:18:18 +0700
-Subject: [PATCH 090/194] Reduce allocations and lookups in BlockFlowing
+Subject: [PATCH 090/195] Reduce allocations and lookups in BlockFlowing
 
 - Slope search (getFlowDirections/slopeDistance) now uses ints and one MutableBlockPosition, and reads each probed position once (the old g() re-read the position it was just handed). Traversal, results and tie handling are unchanged.
 - The old EnumSet iterated in EnumDirection ordinal order (NORTH, SOUTH, WEST, EAST); flow is still applied in exactly that order (it decides event order and tick sequence ids), searched in NORTH, EAST, SOUTH, WEST as before.

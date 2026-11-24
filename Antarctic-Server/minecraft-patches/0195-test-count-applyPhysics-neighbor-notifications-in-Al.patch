@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 23:11:29 +0700
+Subject: [PATCH 195/195] test: count applyPhysics neighbor notifications in
+ AlternateCurrentRedstoneTest
+
+
+diff --git a/test/java/net/minecraft/server/AlternateCurrentRedstoneTest.java b/test/java/net/minecraft/server/AlternateCurrentRedstoneTest.java
+index 12cf651..af79a54 100644
+--- a/test/java/net/minecraft/server/AlternateCurrentRedstoneTest.java
++++ b/test/java/net/minecraft/server/AlternateCurrentRedstoneTest.java
+@@ -90,6 +90,12 @@ public class AlternateCurrentRedstoneTest {
+             return true;
+         }
+ 
++        @Override
++        public void applyPhysics(BlockPosition pos, Block block, boolean flag) {
++            this.neighborNotifyCount.addAndGet(6);
++            super.applyPhysics(pos, block, flag);
++        }
++
+         @Override
+         public void a(BlockPosition pos, Block block, BlockPosition fromPos) {
+             this.neighborNotifyCount.incrementAndGet();
