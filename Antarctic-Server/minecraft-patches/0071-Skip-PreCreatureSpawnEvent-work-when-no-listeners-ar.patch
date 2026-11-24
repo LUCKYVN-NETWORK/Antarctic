@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Sun, 18 Oct 2026 14:52:19 +0700
-Subject: [PATCH 071/172] Skip PreCreatureSpawnEvent work when no listeners are
+Subject: [PATCH 071/173] Skip PreCreatureSpawnEvent work when no listeners are
  registered
 
 - Hoist a PreCreatureSpawnEvent.getHandlerList().getRegisteredListeners().length != 0 check into the natural spawn loop in SpawnerCreature so the event, its Location snapshot and the dispatch are skipped entirely when no plugin listens (backport of Leaf MC 0264)

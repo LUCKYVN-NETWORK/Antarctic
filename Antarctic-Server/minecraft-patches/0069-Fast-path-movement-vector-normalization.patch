@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Sun, 18 Oct 2026 12:33:14 +0700
-Subject: [PATCH 069/172] Fast-path movement vector normalization
+Subject: [PATCH 069/173] Fast-path movement vector normalization
 
 - Backport Leaf MC 0298 (skip sqrt in vector normalization) to Vec3D
 - Import Vec3D from the mapped 1.12.2 reference sources into the patched source tree

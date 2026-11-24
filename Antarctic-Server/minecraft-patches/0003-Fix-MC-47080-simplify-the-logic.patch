@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: nopjmp <kthompson@hey.com>
 Date: Fri, 5 Feb 2021 00:08:31 -0600
-Subject: [PATCH 003/172] Fix MC-47080 simplify the logic
+Subject: [PATCH 003/173] Fix MC-47080 simplify the logic
 
 - Simplify everyoneDeeplySleeping into a single pass that only counts actual sleepers
 - Backported from Dionysus 0012 by nopjmp, original notices retained; see licenses/Dionysus-MIT.md

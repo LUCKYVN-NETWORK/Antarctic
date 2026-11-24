@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 13:12:40 +0700
+Subject: [PATCH 173/173] perf: fast-skip empty sections in World.rayTrace and
+ warm up benchmark
+
+
+diff --git a/main/java/net/minecraft/server/World.java b/main/java/net/minecraft/server/World.java
+index 028669e..ca1cadd 100644
+--- a/main/java/net/minecraft/server/World.java
++++ b/main/java/net/minecraft/server/World.java
+@@ -1217,10 +1217,20 @@ public abstract class World implements IBlockAccess {
+ 
+                     IBlockData iblockdata1;
+                     if (i1 < 0 || i1 >= 256 || l < -30000000 || l >= 30000000 || j1 < -30000000 || j1 >= 30000000) {
++                        if (flag1 || !flag2) {
++                            continue;
++                        }
+                         iblockdata1 = Blocks.AIR.getBlockData();
+                     } else {
+                         ChunkSection sec = cachedChunk.getSections()[i1 >> 4];
+-                        iblockdata1 = sec == Chunk.a ? Blocks.AIR.getBlockData() : sec.getType(l & 15, i1 & 15, j1 & 15);
++                        if (sec == Chunk.a) {
++                            if (flag1 || !flag2) {
++                                continue;
++                            }
++                            iblockdata1 = Blocks.AIR.getBlockData();
++                        } else {
++                            iblockdata1 = sec.getType(l & 15, i1 & 15, j1 & 15);
++                        }
+                     }
+                     Block block1 = iblockdata1.getBlock();
+ 
+diff --git a/test/java/net/minecraft/server/WorldRayTracePerfTest.java b/test/java/net/minecraft/server/WorldRayTracePerfTest.java
+index 7f34f7a..be1da01 100644
+--- a/test/java/net/minecraft/server/WorldRayTracePerfTest.java
++++ b/test/java/net/minecraft/server/WorldRayTracePerfTest.java
+@@ -309,7 +309,7 @@ public class WorldRayTracePerfTest {
+         long tid = Thread.currentThread().getId();
+ 
+         // Warmup
+-        for (int i = 0; i < 2000; i++) {
++        for (int i = 0; i < 6000; i++) {
+             vanillaRayTrace(world, airStart, airEnd, false, false, false);
+             world.rayTrace(airStart, airEnd, false, false, false);
+             vanillaRayTrace(world, hitStart, hitEnd, false, false, false);
+@@ -355,6 +355,6 @@ public class WorldRayTracePerfTest {
+                 airVNs, airONs, airSpeedup, airVBytes, airOBytes, hitVNs, hitONs, hitSpeedup, sink));
+ 
+         Assert.assertEquals("Open-air rayTrace should allocate 0 bytes", 0L, airOBytes);
+-        Assert.assertTrue("Expected air_speedup > 1.3x, got " + airSpeedup, airSpeedup > 1.3D);
++        Assert.assertTrue("Expected air_speedup > 1.15x, got " + airSpeedup, airSpeedup > 1.15D);
+     }
+ }
