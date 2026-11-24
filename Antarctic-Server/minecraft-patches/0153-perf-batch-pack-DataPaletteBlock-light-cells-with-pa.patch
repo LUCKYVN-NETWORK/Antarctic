@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Tue, 24 Nov 2026 02:03:58 +0700
-Subject: [PATCH 153/157] perf: batch-pack DataPaletteBlock light cells with
+Subject: [PATCH 153/158] perf: batch-pack DataPaletteBlock light cells with
  palette lookup table
 
 

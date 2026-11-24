@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Sun, 18 Oct 2026 12:30:19 +0700
-Subject: [PATCH 068/157] Use platform floor in MathHelper.floor
+Subject: [PATCH 068/158] Use platform floor in MathHelper.floor
 
 - Backport Leaf MC 0007 (use platform math functions) to MathHelper
 - Import MathHelper from the mapped 1.12.2 reference sources into the patched source tree

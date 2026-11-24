@@ -1,0 +1,1049 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 10:46:38 +0700
+Subject: [PATCH 158/158] perf: accelerate StructureGenerator lookups and
+ recreateStructures
+
+
+diff --git a/main/java/net/minecraft/server/StructureGenerator.java b/main/java/net/minecraft/server/StructureGenerator.java
+index f4dfba8..207cd0b 100644
+--- a/main/java/net/minecraft/server/StructureGenerator.java
++++ b/main/java/net/minecraft/server/StructureGenerator.java
+@@ -17,6 +17,111 @@ public abstract class StructureGenerator extends WorldGenBase {
+     protected Long2ObjectMap<StructureStart> c = new Long2ObjectOpenHashMap(1024);
+     protected Long2ObjectMap<StructureStart> allStructures = new Long2ObjectOpenHashMap(1024); // Paper - Holds ref to structures for every chunk its part of, where as the one above this only holds the vanilla oriented ones.
+ 
++    // Antarctic start - cached world-seed multipliers, grid candidate scan, and O(1) population chunk index
++    private boolean seedMulInitialized;
++    private long cachedWorldSeed;
++    private long cachedSeedMulX;
++    private long cachedSeedMulZ;
++    private final Long2ObjectOpenHashMap<Object> structuresByPopChunk = new Long2ObjectOpenHashMap<>(256);
++    private int indexedStructureCount;
++
++    protected final void ensureSeedMultipliers(long worldSeed) {
++        if (!this.seedMulInitialized || this.cachedWorldSeed != worldSeed) {
++            this.f.setSeed(worldSeed);
++            this.cachedSeedMulX = this.f.nextLong();
++            this.cachedSeedMulZ = this.f.nextLong();
++            this.cachedWorldSeed = worldSeed;
++            this.seedMulInitialized = true;
++        }
++    }
++
++    protected final long getSeedMulX() {
++        return this.cachedSeedMulX;
++    }
++
++    protected final long getSeedMulZ() {
++        return this.cachedSeedMulZ;
++    }
++
++    protected final void scanGridStructure(World world, int chunkX, int chunkZ, ChunkSnapshot snapshot,
++                                           int spacing, int separation, int salt, boolean triangular) {
++        int bound = spacing - separation;
++        if (spacing <= 0 || bound <= 0) {
++            super.a(world, chunkX, chunkZ, snapshot);
++            return;
++        }
++        int radius = this.e;
++        this.g = world;
++        if (this.a == null) {
++            synchronized (this) {
++                this.a(world);
++            }
++        }
++        int minChunkX = chunkX - radius;
++        int maxChunkX = chunkX + radius;
++        int minChunkZ = chunkZ - radius;
++        int maxChunkZ = chunkZ + radius;
++        int minCellX = Math.floorDiv(minChunkX, spacing);
++        int maxCellX = Math.floorDiv(maxChunkX, spacing);
++        int minCellZ = Math.floorDiv(minChunkZ, spacing);
++        int maxCellZ = Math.floorDiv(maxChunkZ, spacing);
++
++        long worldSeed = world.getSeed();
++        boolean mulReady = false;
++
++        for (int gx = minCellX; gx <= maxCellX; ++gx) {
++            for (int gz = minCellZ; gz <= maxCellZ; ++gz) {
++                Random random = world.a(gx, gz, salt);
++                int candX = gx * spacing + (triangular ? (random.nextInt(bound) + random.nextInt(bound)) / 2 : random.nextInt(bound));
++                int candZ = gz * spacing + (triangular ? (random.nextInt(bound) + random.nextInt(bound)) / 2 : random.nextInt(bound));
++                if (candX >= minChunkX && candX <= maxChunkX && candZ >= minChunkZ && candZ <= maxChunkZ) {
++                    if (!mulReady) {
++                        this.ensureSeedMultipliers(worldSeed);
++                        mulReady = true;
++                    }
++                    long seed = ((long) candX * this.cachedSeedMulX) ^ ((long) candZ * this.cachedSeedMulZ) ^ worldSeed;
++                    this.f.setSeed(seed);
++                    this.a(world, candX, candZ, chunkX, chunkZ, snapshot);
++                }
++            }
++        }
++    }
++
++    @SuppressWarnings("unchecked")
++    private void indexStructureForPopulation(StructureStart structurestart) {
++        ++this.indexedStructureCount;
++        StructureBoundingBox bb = structurestart.b();
++        if (bb == null) {
++            return;
++        }
++        int minCX = (bb.a - 8) >> 4;
++        int maxCX = (bb.d - 8) >> 4;
++        int minCZ = (bb.c - 8) >> 4;
++        int maxCZ = (bb.f - 8) >> 4;
++        for (int cx = minCX; cx <= maxCX; ++cx) {
++            for (int cz = minCZ; cz <= maxCZ; ++cz) {
++                long key = ChunkCoordIntPair.a(cx, cz);
++                Object existing = this.structuresByPopChunk.get(key);
++                if (existing == null) {
++                    this.structuresByPopChunk.put(key, structurestart);
++                } else if (existing instanceof StructureStart) {
++                    if (existing != structurestart) {
++                        java.util.List<StructureStart> list = new java.util.ArrayList<>(2);
++                        list.add((StructureStart) existing);
++                        list.add(structurestart);
++                        this.structuresByPopChunk.put(key, list);
++                    }
++                } else {
++                    java.util.List<StructureStart> list = (java.util.List<StructureStart>) existing;
++                    if (!list.contains(structurestart)) {
++                        list.add(structurestart);
++                    }
++                }
++            }
++        }
++    }
++    // Antarctic end
++
+     public StructureGenerator() {}
+ 
+     public String getName() { return a(); } // Paper // OBFHELPER
+@@ -81,6 +186,36 @@ public abstract class StructureGenerator extends WorldGenBase {
+         int i = (chunkcoordintpair.x << 4) + 8;
+         int j = (chunkcoordintpair.z << 4) + 8;
+         boolean flag = false;
++        if (this.indexedStructureCount == this.c.size()) {
++            Object entry = this.structuresByPopChunk.get(ChunkCoordIntPair.a(chunkcoordintpair.x, chunkcoordintpair.z));
++            if (entry == null) {
++                timing.stopTiming(); // Paper
++                return false;
++            }
++            if (entry instanceof StructureStart) {
++                StructureStart structurestart = (StructureStart) entry;
++                if (structurestart.a() && structurestart.a(chunkcoordintpair) && structurestart.b().a(i, j, i + 15, j + 15)) {
++                    structurestart.a(world, random, new StructureBoundingBox(i, j, i + 15, j + 15));
++                    structurestart.b(chunkcoordintpair);
++                    flag = true;
++                    this.a(structurestart.e(), structurestart.f(), structurestart);
++                }
++            } else {
++                @SuppressWarnings("unchecked")
++                List<StructureStart> list = (List<StructureStart>) entry;
++                for (int idx = 0, size = list.size(); idx < size; ++idx) {
++                    StructureStart structurestart = list.get(idx);
++                    if (structurestart.a() && structurestart.a(chunkcoordintpair) && structurestart.b().a(i, j, i + 15, j + 15)) {
++                        structurestart.a(world, random, new StructureBoundingBox(i, j, i + 15, j + 15));
++                        structurestart.b(chunkcoordintpair);
++                        flag = true;
++                        this.a(structurestart.e(), structurestart.f(), structurestart);
++                    }
++                }
++            }
++            timing.stopTiming(); // Paper
++            return flag;
++        }
+         ObjectIterator objectiterator = this.c.values().iterator();
+ 
+         while (objectiterator.hasNext()) {
+@@ -211,6 +346,7 @@ public abstract class StructureGenerator extends WorldGenBase {
+ 
+     // Paper start
+     private void populateStructure(StructureStart structurestart) {
++        indexStructureForPopulation(structurestart); // Antarctic - index for O(1) chunk population lookup
+         for (StructurePiece piece : structurestart.getStructurePieces()) {
+             populateStructure(structurestart, piece.getBoundingBox());
+         }
+diff --git a/main/java/net/minecraft/server/WorldGenLargeFeature.java b/main/java/net/minecraft/server/WorldGenLargeFeature.java
+index 7a76544..f56c938 100644
+--- a/main/java/net/minecraft/server/WorldGenLargeFeature.java
++++ b/main/java/net/minecraft/server/WorldGenLargeFeature.java
+@@ -40,6 +40,13 @@ public class WorldGenLargeFeature extends StructureGenerator {
+         return "Temple";
+     }
+ 
++    // Antarctic start - scan 1-4 overlapping grid cells instead of 289 chunks
++    @Override
++    public void a(World world, int i, int j, ChunkSnapshot chunksnapshot) {
++        this.scanGridStructure(world, i, j, chunksnapshot, this.d, 8, 14357617, false);
++    }
++    // Antarctic end
++
+     protected boolean a(int i, int j) {
+         int k = i;
+         int l = j;
+@@ -54,7 +61,7 @@ public class WorldGenLargeFeature extends StructureGenerator {
+ 
+         int i1 = i / this.d;
+         int j1 = j / this.d;
+-        Random random = this.g.a(i1, j1, this.g.spigotConfig.largeFeatureSeed); // Spigot
++        Random random = this.g.a(i1, j1, 14357617);
+ 
+         i1 *= this.d;
+         j1 *= this.d;
+@@ -83,7 +90,7 @@ public class WorldGenLargeFeature extends StructureGenerator {
+ 
+     public BlockPosition getNearestGeneratedFeature(World world, BlockPosition blockposition, boolean flag) {
+         this.g = world;
+-        return a(world, this, blockposition, this.d, 8, this.g.spigotConfig.largeFeatureSeed, false, 100, flag); // Spigot
++        return a(world, this, blockposition, this.d, 8, 14357617, false, 100, flag);
+     }
+ 
+     protected StructureStart b(int i, int j) {
+diff --git a/main/java/net/minecraft/server/WorldGenMineshaft.java b/main/java/net/minecraft/server/WorldGenMineshaft.java
+new file mode 100644
+index 0000000..f60e078
+--- /dev/null
++++ b/main/java/net/minecraft/server/WorldGenMineshaft.java
+@@ -0,0 +1,110 @@
++package net.minecraft.server;
++
++import java.util.Iterator;
++import java.util.Map;
++import java.util.Map.Entry;
++
++public class WorldGenMineshaft extends StructureGenerator {
++
++    private double a = 0.004D;
++
++    public WorldGenMineshaft() {}
++
++    public String a() {
++        return "Mineshaft";
++    }
++
++    public WorldGenMineshaft(Map<String, String> map) {
++        Iterator iterator = map.entrySet().iterator();
++
++        while (iterator.hasNext()) {
++            Entry entry = (Entry) iterator.next();
++
++            if (((String) entry.getKey()).equals("chance")) {
++                this.a = MathHelper.a((String) entry.getValue(), this.a);
++            }
++        }
++
++    }
++
++    // Antarctic start - non-synchronized 48-bit LCG pre-filter before StructureGenerator.a
++    @Override
++    public void a(World world, int i, int j, ChunkSnapshot chunksnapshot) {
++        this.g = world;
++        long worldSeed = world.getSeed();
++        this.ensureSeedMultipliers(worldSeed);
++        long mulX = this.getSeedMulX();
++        long mulZ = this.getSeedMulZ();
++        int radius = this.e;
++        double chance = this.a;
++
++        for (int j1 = i - radius; j1 <= i + radius; ++j1) {
++            long xMul = (long) j1 * mulX;
++            for (int k1 = j - radius; k1 <= j + radius; ++k1) {
++                long seed = xMul ^ ((long) k1 * mulZ) ^ worldSeed;
++                long state = (seed ^ 0x5DEECE66DL) & 0xFFFFFFFFFFFFL;
++                state = (state * 0x5DEECE66DL + 0xBL) & 0xFFFFFFFFFFFFL; // skip StructureGenerator.a's f.nextInt()
++                state = (state * 0x5DEECE66DL + 0xBL) & 0xFFFFFFFFFFFFL;
++                int hi = (int) (state >>> 22);
++                state = (state * 0x5DEECE66DL + 0xBL) & 0xFFFFFFFFFFFFL;
++                int lo = (int) (state >>> 21);
++                if ((((long) hi << 27) + lo) * 0x1.0p-53 < chance) {
++                    this.f.setSeed(seed);
++                    this.a(world, j1, k1, i, j, chunksnapshot);
++                }
++            }
++        }
++    }
++    // Antarctic end
++
++    protected boolean a(int i, int j) {
++        return this.f.nextDouble() < this.a && this.f.nextInt(80) < Math.max(Math.abs(i), Math.abs(j));
++    }
++
++    public BlockPosition getNearestGeneratedFeature(World world, BlockPosition blockposition, boolean flag) {
++        boolean flag1 = true;
++        int i = blockposition.getX() >> 4;
++        int j = blockposition.getZ() >> 4;
++
++        for (int k = 0; k <= 1000; ++k) {
++            for (int l = -k; l <= k; ++l) {
++                boolean flag2 = l == -k || l == k;
++
++                for (int i1 = -k; i1 <= k; ++i1) {
++                    boolean flag3 = i1 == -k || i1 == k;
++
++                    if (flag2 || flag3) {
++                        int j1 = i + l;
++                        int k1 = j + i1;
++
++                        this.f.setSeed((long) (j1 ^ k1) ^ world.getSeed());
++                        this.f.nextInt();
++                        if (this.a(j1, k1) && (!flag || !world.b(j1, k1))) {
++                            return new BlockPosition((j1 << 4) + 8, 64, (k1 << 4) + 8);
++                        }
++                    }
++                }
++            }
++        }
++
++        return null;
++    }
++
++    protected StructureStart b(int i, int j) {
++        BiomeBase biomebase = this.g.getBiome(new BlockPosition((i << 4) + 8, 64, (j << 4) + 8));
++        WorldGenMineshaft.Type worldgenmineshaft_type = biomebase instanceof BiomeMesa ? WorldGenMineshaft.Type.MESA : WorldGenMineshaft.Type.NORMAL;
++
++        return new WorldGenMineshaftStart(this.g, this.f, i, j, worldgenmineshaft_type);
++    }
++
++    public static enum Type {
++
++        NORMAL, MESA;
++
++        private Type() {}
++
++        public static WorldGenMineshaft.Type a(int i) {
++            return i >= 0 && i < values().length ? values()[i] : WorldGenMineshaft.Type.NORMAL;
++        }
++    }
++}
+diff --git a/main/java/net/minecraft/server/WorldGenMonument.java b/main/java/net/minecraft/server/WorldGenMonument.java
+index 927d9bc..8f11088 100644
+--- a/main/java/net/minecraft/server/WorldGenMonument.java
++++ b/main/java/net/minecraft/server/WorldGenMonument.java
+@@ -43,6 +43,13 @@ public class WorldGenMonument extends StructureGenerator {
+         return "Monument";
+     }
+ 
++    // Antarctic start - scan 1-4 overlapping grid cells instead of 289 chunks
++    @Override
++    public void a(World world, int i, int j, ChunkSnapshot chunksnapshot) {
++        this.scanGridStructure(world, i, j, chunksnapshot, this.d, this.h, 10387313, true);
++    }
++    // Antarctic end
++
+     protected boolean a(int i, int j) {
+         int k = i;
+         int l = j;
+@@ -57,7 +64,7 @@ public class WorldGenMonument extends StructureGenerator {
+ 
+         int i1 = i / this.d;
+         int j1 = j / this.d;
+-        Random random = this.g.a(i1, j1, this.g.spigotConfig.monumentSeed); // Spigot
++        Random random = this.g.a(i1, j1, 10387313);
+ 
+         i1 *= this.d;
+         j1 *= this.d;
+@@ -80,7 +87,7 @@ public class WorldGenMonument extends StructureGenerator {
+ 
+     public BlockPosition getNearestGeneratedFeature(World world, BlockPosition blockposition, boolean flag) {
+         this.g = world;
+-        return a(world, this, blockposition, this.d, this.h, this.g.spigotConfig.monumentSeed, true, 100, flag); // Spigot
++        return a(world, this, blockposition, this.d, this.h, 10387313, true, 100, flag);
+     }
+ 
+     protected StructureStart b(int i, int j) {
+diff --git a/main/java/net/minecraft/server/WorldGenStronghold.java b/main/java/net/minecraft/server/WorldGenStronghold.java
+index a3b958e..6af41d0 100644
+--- a/main/java/net/minecraft/server/WorldGenStronghold.java
++++ b/main/java/net/minecraft/server/WorldGenStronghold.java
+@@ -13,6 +13,7 @@ public class WorldGenStronghold extends StructureGenerator {
+     private final List<BiomeBase> a;
+     private boolean b;
+     private ChunkCoordIntPair[] d;
++    private it.unimi.dsi.fastutil.longs.LongOpenHashSet strongholdCoords; // Antarctic - O(1) stronghold lookup
+     private double h;
+     private int i;
+ 
+@@ -56,7 +57,6 @@ public class WorldGenStronghold extends StructureGenerator {
+     }
+ 
+     public BlockPosition getNearestGeneratedFeature(World world, BlockPosition blockposition, boolean flag) {
+-        this.g = world; // Paper
+         if (!this.b) {
+             this.c();
+             this.b = true;
+@@ -86,25 +86,42 @@ public class WorldGenStronghold extends StructureGenerator {
+         return blockposition1;
+     }
+ 
++    // Antarctic start - O(1) stronghold coordinate lookup & bounding-radius scan
++    @Override
++    public void a(World world, int i, int j, ChunkSnapshot chunksnapshot) {
++        this.g = world;
++        if (!this.b) {
++            synchronized (this) {
++                if (!this.b) {
++                    this.c();
++                    this.b = true;
++                }
++            }
++        }
++        int radius = this.e;
++        long worldSeed = world.getSeed();
++        boolean mulReady = false;
++        for (ChunkCoordIntPair p : this.d) {
++            if (p != null && Math.abs(p.x - i) <= radius && Math.abs(p.z - j) <= radius) {
++                if (!mulReady) {
++                    this.ensureSeedMultipliers(worldSeed);
++                    mulReady = true;
++                }
++                this.f.setSeed(((long) p.x * this.getSeedMulX()) ^ ((long) p.z * this.getSeedMulZ()) ^ worldSeed);
++                this.a(world, p.x, p.z, i, j, chunksnapshot);
++            }
++        }
++    }
++
+     protected boolean a(int i, int j) {
+         if (!this.b) {
+             this.c();
+             this.b = true;
+         }
+ 
+-        ChunkCoordIntPair[] achunkcoordintpair = this.d;
+-        int k = achunkcoordintpair.length;
+-
+-        for (int l = 0; l < k; ++l) {
+-            ChunkCoordIntPair chunkcoordintpair = achunkcoordintpair[l];
+-
+-            if (i == chunkcoordintpair.x && j == chunkcoordintpair.z) {
+-                return true;
+-            }
+-        }
+-
+-        return false;
++        return this.strongholdCoords != null && this.strongholdCoords.contains(ChunkCoordIntPair.a(i, j));
+     }
++    // Antarctic end
+ 
+     private void c() {
+         this.a(this.g);
+@@ -155,6 +172,14 @@ public class WorldGenStronghold extends StructureGenerator {
+             }
+         }
+ 
++        it.unimi.dsi.fastutil.longs.LongOpenHashSet coords = new it.unimi.dsi.fastutil.longs.LongOpenHashSet(this.d.length);
++        for (ChunkCoordIntPair p : this.d) {
++            if (p != null) {
++                coords.add(ChunkCoordIntPair.a(p.x, p.z));
++            }
++        }
++        this.strongholdCoords = coords;
++
+     }
+ 
+     protected StructureStart b(int i, int j) {
+diff --git a/main/java/net/minecraft/server/WorldGenVillage.java b/main/java/net/minecraft/server/WorldGenVillage.java
+index fd82756..1e5567f 100644
+--- a/main/java/net/minecraft/server/WorldGenVillage.java
++++ b/main/java/net/minecraft/server/WorldGenVillage.java
+@@ -39,6 +39,13 @@ public class WorldGenVillage extends StructureGenerator {
+         return "Village";
+     }
+ 
++    // Antarctic start - scan 1-4 overlapping grid cells instead of 289 chunks
++    @Override
++    public void a(World world, int i, int j, ChunkSnapshot chunksnapshot) {
++        this.scanGridStructure(world, i, j, chunksnapshot, this.d, 8, 10387312, false);
++    }
++    // Antarctic end
++
+     protected boolean a(int i, int j) {
+         int k = i;
+         int l = j;
+@@ -53,7 +60,7 @@ public class WorldGenVillage extends StructureGenerator {
+ 
+         int i1 = i / this.d;
+         int j1 = j / this.d;
+-        Random random = this.g.a(i1, j1, this.g.spigotConfig.villageSeed); // Spigot
++        Random random = this.g.a(i1, j1, 10387312);
+ 
+         i1 *= this.d;
+         j1 *= this.d;
+diff --git a/main/java/net/minecraft/server/WorldGenWoodlandMansion.java b/main/java/net/minecraft/server/WorldGenWoodlandMansion.java
+new file mode 100644
+index 0000000..adcfb92
+--- /dev/null
++++ b/main/java/net/minecraft/server/WorldGenWoodlandMansion.java
+@@ -0,0 +1,163 @@
++package net.minecraft.server;
++
++import com.google.common.collect.Lists;
++import java.util.Arrays;
++import java.util.Iterator;
++import java.util.LinkedList;
++import java.util.List;
++import java.util.Random;
++
++public class WorldGenWoodlandMansion extends StructureGenerator {
++
++    private final int b = 80;
++    private final int d = 20;
++    public static final List<BiomeBase> a = Arrays.asList(new BiomeBase[] { Biomes.E, Biomes.ab});
++    private final ChunkProviderGenerate h;
++
++    public WorldGenWoodlandMansion(ChunkProviderGenerate chunkprovidergenerate) {
++        this.h = chunkprovidergenerate;
++    }
++
++    public String a() {
++        return "Mansion";
++    }
++
++    // Antarctic start - scan 1-4 overlapping grid cells instead of 289 chunks
++    @Override
++    public void a(World world, int i, int j, ChunkSnapshot chunksnapshot) {
++        this.scanGridStructure(world, i, j, chunksnapshot, 80, 20, 10387319, true);
++    }
++    // Antarctic end
++
++    protected boolean a(int i, int j) {
++        int k = i;
++        int l = j;
++
++        if (i < 0) {
++            k = i - 79;
++        }
++
++        if (j < 0) {
++            l = j - 79;
++        }
++
++        int i1 = k / 80;
++        int j1 = l / 80;
++        Random random = this.g.a(i1, j1, 10387319);
++
++        i1 *= 80;
++        j1 *= 80;
++        i1 += (random.nextInt(60) + random.nextInt(60)) / 2;
++        j1 += (random.nextInt(60) + random.nextInt(60)) / 2;
++        if (i == i1 && j == j1) {
++            boolean flag = this.g.getWorldChunkManager().a(i * 16 + 8, j * 16 + 8, 32, WorldGenWoodlandMansion.a);
++
++            if (flag) {
++                return true;
++            }
++        }
++
++        return false;
++    }
++
++    public BlockPosition getNearestGeneratedFeature(World world, BlockPosition blockposition, boolean flag) {
++        this.g = world;
++        WorldChunkManager worldchunkmanager = world.getWorldChunkManager();
++
++        return worldchunkmanager.c() && worldchunkmanager.d() != Biomes.E ? null : a(world, this, blockposition, 80, 20, 10387319, true, 100, flag);
++    }
++
++    protected StructureStart b(int i, int j) {
++        return new WorldGenWoodlandMansion.a(this.g, this.h, this.f, i, j);
++    }
++
++    public static class a extends StructureStart {
++
++        private boolean c;
++
++        public a() {}
++
++        public a(World world, ChunkProviderGenerate chunkprovidergenerate, Random random, int i, int j) {
++            super(i, j);
++            this.a(world, chunkprovidergenerate, random, i, j);
++        }
++
++        private void a(World world, ChunkProviderGenerate chunkprovidergenerate, Random random, int i, int j) {
++            EnumBlockRotation enumblockrotation = EnumBlockRotation.values()[random.nextInt(EnumBlockRotation.values().length)];
++            ChunkSnapshot chunksnapshot = new ChunkSnapshot();
++
++            chunkprovidergenerate.a(i, j, chunksnapshot);
++            byte b0 = 5;
++            byte b1 = 5;
++
++            if (enumblockrotation == EnumBlockRotation.CLOCKWISE_90) {
++                b0 = -5;
++            } else if (enumblockrotation == EnumBlockRotation.CLOCKWISE_180) {
++                b0 = -5;
++                b1 = -5;
++            } else if (enumblockrotation == EnumBlockRotation.COUNTERCLOCKWISE_90) {
++                b1 = -5;
++            }
++
++            int k = chunksnapshot.a(7, 7);
++            int l = chunksnapshot.a(7, 7 + b1);
++            int i1 = chunksnapshot.a(7 + b0, 7);
++            int j1 = chunksnapshot.a(7 + b0, 7 + b1);
++            int k1 = Math.min(Math.min(k, l), Math.min(i1, j1));
++
++            if (k1 < 60) {
++                this.c = false;
++            } else {
++                BlockPosition blockposition = new BlockPosition(i * 16 + 8, k1 + 1, j * 16 + 8);
++                LinkedList linkedlist = Lists.newLinkedList();
++
++                WorldGenWoodlandMansionPieces.a(world.getDataManager().h(), blockposition, enumblockrotation, linkedlist, random);
++                this.a.addAll(linkedlist);
++                this.d();
++                this.c = true;
++            }
++        }
++
++        public void a(World world, Random random, StructureBoundingBox structureboundingbox) {
++            super.a(world, random, structureboundingbox);
++            int i = this.b.b;
++
++            for (int j = structureboundingbox.a; j <= structureboundingbox.d; ++j) {
++                for (int k = structureboundingbox.c; k <= structureboundingbox.f; ++k) {
++                    BlockPosition blockposition = new BlockPosition(j, i, k);
++
++                    if (!world.isEmpty(blockposition) && this.b.b((BaseBlockPosition) blockposition)) {
++                        boolean flag = false;
++                        Iterator iterator = this.a.iterator();
++
++                        while (iterator.hasNext()) {
++                            StructurePiece structurepiece = (StructurePiece) iterator.next();
++
++                            if (structurepiece.l.b((BaseBlockPosition) blockposition)) {
++                                flag = true;
++                                break;
++                            }
++                        }
++
++                        if (flag) {
++                            for (int l = i - 1; l > 1; --l) {
++                                BlockPosition blockposition1 = new BlockPosition(j, l, k);
++
++                                if (!world.isEmpty(blockposition1) && !world.getType(blockposition1).getMaterial().isLiquid()) {
++                                    break;
++                                }
++
++                                world.setTypeAndData(blockposition1, Blocks.COBBLESTONE.getBlockData(), 2);
++                            }
++                        }
++                    }
++                }
++            }
++
++        }
++
++        public boolean a() {
++            return this.c;
++        }
++    }
++}
+diff --git a/test/java/net/minecraft/server/StructureGeneratorPerfTest.java b/test/java/net/minecraft/server/StructureGeneratorPerfTest.java
+new file mode 100644
+index 0000000..3441564
+--- /dev/null
++++ b/test/java/net/minecraft/server/StructureGeneratorPerfTest.java
+@@ -0,0 +1,401 @@
++package net.minecraft.server;
++
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++import java.util.ArrayList;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Random;
++import java.util.Set;
++
++import static org.junit.Assert.*;
++
++public class StructureGeneratorPerfTest {
++
++    @BeforeClass
++    public static void setup() {
++        DispenserRegistry.c();
++    }
++
++    private static Random worldSeededRandom(long worldSeed, int cellX, int cellZ, int salt) {
++        long seed = (long) cellX * 341873128712L + (long) cellZ * 132897987541L + worldSeed + (long) salt;
++        return new Random(seed);
++    }
++
++    private static Set<Long> vanillaGridScan(long worldSeed, int chunkX, int chunkZ, int radius, int spacing, int separation, int salt, boolean triangular) {
++        Set<Long> hits = new HashSet<>();
++        int bound = spacing - separation;
++        for (int j1 = chunkX - radius; j1 <= chunkX + radius; ++j1) {
++            for (int k1 = chunkZ - radius; k1 <= chunkZ + radius; ++k1) {
++                int i = j1 < 0 ? j1 - (spacing - 1) : j1;
++                int j = k1 < 0 ? k1 - (spacing - 1) : k1;
++                int gx = i / spacing;
++                int gz = j / spacing;
++                Random r = worldSeededRandom(worldSeed, gx, gz, salt);
++                int cx = gx * spacing + (triangular ? (r.nextInt(bound) + r.nextInt(bound)) / 2 : r.nextInt(bound));
++                int cz = gz * spacing + (triangular ? (r.nextInt(bound) + r.nextInt(bound)) / 2 : r.nextInt(bound));
++                if (j1 == cx && k1 == cz) {
++                    hits.add(ChunkCoordIntPair.a(j1, k1));
++                }
++            }
++        }
++        return hits;
++    }
++
++    private static Set<Long> optimizedGridScan(long worldSeed, int chunkX, int chunkZ, int radius, int spacing, int separation, int salt, boolean triangular) {
++        Set<Long> hits = new HashSet<>();
++        int bound = spacing - separation;
++        int minChunkX = chunkX - radius;
++        int maxChunkX = chunkX + radius;
++        int minChunkZ = chunkZ - radius;
++        int maxChunkZ = chunkZ + radius;
++        int minCellX = Math.floorDiv(minChunkX, spacing);
++        int maxCellX = Math.floorDiv(maxChunkX, spacing);
++        int minCellZ = Math.floorDiv(minChunkZ, spacing);
++        int maxCellZ = Math.floorDiv(maxChunkZ, spacing);
++
++        for (int gx = minCellX; gx <= maxCellX; ++gx) {
++            for (int gz = minCellZ; gz <= maxCellZ; ++gz) {
++                Random r = worldSeededRandom(worldSeed, gx, gz, salt);
++                int cx = gx * spacing + (triangular ? (r.nextInt(bound) + r.nextInt(bound)) / 2 : r.nextInt(bound));
++                int cz = gz * spacing + (triangular ? (r.nextInt(bound) + r.nextInt(bound)) / 2 : r.nextInt(bound));
++                if (cx >= minChunkX && cx <= maxChunkX && cz >= minChunkZ && cz <= maxChunkZ) {
++                    hits.add(ChunkCoordIntPair.a(cx, cz));
++                }
++            }
++        }
++        return hits;
++    }
++
++    @Test
++    public void testGridCandidateScanParityPositiveAndNegativeQuadrants() {
++        long[] seeds = { 0L, 123456789L, -98765432101234L };
++        int[][] configs = {
++                { 32, 8, 10387312, 0 }, // Village
++                { 32, 5, 10387313, 1 }, // Monument
++                { 80, 20, 10387319, 1 } // Mansion
++        };
++        int[] coords = { -200, -161, -160, -80, -33, -32, -31, -9, -8, -1, 0, 1, 8, 9, 31, 32, 33, 80, 160, 200 };
++
++        for (long seed : seeds) {
++            for (int[] cfg : configs) {
++                int spacing = cfg[0], sep = cfg[1], salt = cfg[2];
++                boolean tri = cfg[3] == 1;
++                for (int cx : coords) {
++                    for (int cz : coords) {
++                        Set<Long> expected = vanillaGridScan(seed, cx, cz, 8, spacing, sep, salt, tri);
++                        Set<Long> actual = optimizedGridScan(seed, cx, cz, 8, spacing, sep, salt, tri);
++                        assertEquals("Grid mismatch at seed=" + seed + " cx=" + cx + " cz=" + cz + " spacing=" + spacing,
++                                expected, actual);
++                    }
++                }
++            }
++        }
++    }
++
++    @Test
++    public void testMineshaftLcgPreFilterParity() {
++        long[] seeds = { 1L, 0xCAFEBABEL, -424242424242L };
++        double chance = 0.004D;
++        Random rng = new Random();
++
++        for (long worldSeed : seeds) {
++            rng.setSeed(worldSeed);
++            long mulX = rng.nextLong();
++            long mulZ = rng.nextLong();
++
++            for (int idx = 0; idx < 20000; ++idx) {
++                int cx = (idx % 200) - 100;
++                int cz = (idx / 200) - 50;
++                long seed = ((long) cx * mulX) ^ ((long) cz * mulZ) ^ worldSeed;
++
++                rng.setSeed(seed);
++                rng.nextInt(); // StructureGenerator.a's f.nextInt()
++                boolean expected = rng.nextDouble() < chance;
++
++                long state = (seed ^ 0x5DEECE66DL) & 0xFFFFFFFFFFFFL;
++                state = (state * 0x5DEECE66DL + 0xBL) & 0xFFFFFFFFFFFFL;
++                state = (state * 0x5DEECE66DL + 0xBL) & 0xFFFFFFFFFFFFL;
++                int hi = (int) (state >>> 22);
++                state = (state * 0x5DEECE66DL + 0xBL) & 0xFFFFFFFFFFFFL;
++                int lo = (int) (state >>> 21);
++                boolean actual = (((long) hi << 27) + lo) * 0x1.0p-53 < chance;
++
++                assertEquals("Mineshaft LCG mismatch at cx=" + cx + " cz=" + cz, expected, actual);
++            }
++        }
++    }
++
++    private static final class TestStructureStart extends StructureStart {
++        TestStructureStart(int chunkX, int chunkZ, StructureBoundingBox bb) {
++            super(chunkX, chunkZ);
++            this.b = bb;
++        }
++
++        @Override
++        public boolean a() {
++            return true;
++        }
++
++        @Override
++        public void a(World world, Random random, StructureBoundingBox structureboundingbox) {
++            // marker: do nothing in unit test
++        }
++    }
++
++    private static final class TestStructureGenerator extends StructureGenerator {
++        private final it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<Object> popIndexRef;
++
++        @SuppressWarnings("unchecked")
++        TestStructureGenerator() throws Exception {
++            java.lang.reflect.Field f = StructureGenerator.class.getDeclaredField("structuresByPopChunk");
++            f.setAccessible(true);
++            this.popIndexRef = (it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<Object>) f.get(this);
++        }
++
++        @Override
++        public String a() {
++            return "TestStruct";
++        }
++
++        @Override
++        public BlockPosition getNearestGeneratedFeature(World world, BlockPosition blockposition, boolean flag) {
++            return null;
++        }
++
++        @Override
++        protected boolean a(int i, int j) {
++            return false;
++        }
++
++        @Override
++        protected StructureStart b(int i, int j) {
++            return null;
++        }
++
++        void addSyntheticStart(int cx, int cz, StructureBoundingBox bb) throws Exception {
++            long key = ChunkCoordIntPair.a(cx, cz);
++            if (this.c.containsKey(key)) {
++                return;
++            }
++            TestStructureStart start = new TestStructureStart(cx, cz, bb);
++            this.c.put(key, start);
++            java.lang.reflect.Method m = StructureGenerator.class.getDeclaredMethod("indexStructureForPopulation", StructureStart.class);
++            m.setAccessible(true);
++            m.invoke(this, start);
++        }
++
++        @SuppressWarnings("unchecked")
++        Set<StructureStart> queryIndexed(ChunkCoordIntPair pair) {
++            Object entry = this.popIndexRef.get(ChunkCoordIntPair.a(pair.x, pair.z));
++            Set<StructureStart> out = new HashSet<>();
++            int i = (pair.x << 4) + 8;
++            int j = (pair.z << 4) + 8;
++            if (entry instanceof StructureStart) {
++                StructureStart s = (StructureStart) entry;
++                if (s.a() && s.a(pair) && s.b().a(i, j, i + 15, j + 15)) {
++                    out.add(s);
++                }
++            } else if (entry instanceof List) {
++                for (StructureStart s : (List<StructureStart>) entry) {
++                    if (s.a() && s.a(pair) && s.b().a(i, j, i + 15, j + 15)) {
++                        out.add(s);
++                    }
++                }
++            }
++            return out;
++        }
++
++        @SuppressWarnings("unchecked")
++        int countIndexed(ChunkCoordIntPair pair) {
++            Object entry = this.popIndexRef.get(ChunkCoordIntPair.a(pair.x, pair.z));
++            if (entry == null) {
++                return 0;
++            }
++            int i = (pair.x << 4) + 8;
++            int j = (pair.z << 4) + 8;
++            int hits = 0;
++            if (entry instanceof StructureStart) {
++                StructureStart s = (StructureStart) entry;
++                if (s.a() && s.a(pair) && s.b().a(i, j, i + 15, j + 15)) {
++                    ++hits;
++                }
++            } else {
++                List<StructureStart> list = (List<StructureStart>) entry;
++                for (int idx = 0, sz = list.size(); idx < sz; ++idx) {
++                    StructureStart s = list.get(idx);
++                    if (s.a() && s.a(pair) && s.b().a(i, j, i + 15, j + 15)) {
++                        ++hits;
++                    }
++                }
++            }
++            return hits;
++        }
++
++        int countLinear(ChunkCoordIntPair pair) {
++            int i = (pair.x << 4) + 8;
++            int j = (pair.z << 4) + 8;
++            int hits = 0;
++            for (StructureStart s : this.c.values()) {
++                if (s.a() && s.a(pair) && s.b().a(i, j, i + 15, j + 15)) {
++                    ++hits;
++                }
++            }
++            return hits;
++        }
++
++        Set<StructureStart> queryLinear(ChunkCoordIntPair pair) {
++            Set<StructureStart> out = new HashSet<>();
++            int i = (pair.x << 4) + 8;
++            int j = (pair.z << 4) + 8;
++            for (StructureStart s : this.c.values()) {
++                if (s.a() && s.a(pair) && s.b().a(i, j, i + 15, j + 15)) {
++                    out.add(s);
++                }
++            }
++            return out;
++        }
++    }
++
++    @Test
++    public void testPopulationChunkIndexParity() throws Exception {
++        TestStructureGenerator gen = new TestStructureGenerator();
++        Random rng = new Random(0xA4A4A4A4L);
++
++        // Edge boundary boxes around x = 7, 8, 23, 24 and negative coords
++        gen.addSyntheticStart(0, 0, new StructureBoundingBox(7, 0, 7, 24, 64, 24));
++        gen.addSyntheticStart(-1, -1, new StructureBoundingBox(-24, 0, -24, 8, 64, 8));
++
++        for (int s = 0; s < 198; ++s) {
++            int x1 = rng.nextInt(320) - 160;
++            int z1 = rng.nextInt(320) - 160;
++            int w = 8 + rng.nextInt(64);
++            int d = 8 + rng.nextInt(64);
++            gen.addSyntheticStart(x1 >> 4, z1 >> 4, new StructureBoundingBox(x1, 10, z1, x1 + w, 80, z1 + d));
++        }
++
++        for (int cx = -12; cx <= 14; ++cx) {
++            for (int cz = -12; cz <= 14; ++cz) {
++                ChunkCoordIntPair pair = new ChunkCoordIntPair(cx, cz);
++                assertEquals("Pop index mismatch at " + cx + "," + cz, gen.queryLinear(pair), gen.queryIndexed(pair));
++            }
++        }
++    }
++
++    @Test
++    public void testStructureLookupBenchmarks() throws Exception {
++        long worldSeed = 77777777L;
++        Random rng = new Random(worldSeed);
++        long mulX = rng.nextLong();
++        long mulZ = rng.nextLong();
++        double chance = 0.004D;
++
++        TestStructureGenerator gen = new TestStructureGenerator();
++        for (int s = 0; s < 200; ++s) {
++            int x1 = (s % 20 - 10) * 64;
++            int z1 = (s / 20 - 5) * 64;
++            gen.addSyntheticStart(x1 >> 4, z1 >> 4, new StructureBoundingBox(x1, 10, z1, x1 + 40, 80, z1 + 40));
++        }
++
++        long blackhole = 0L;
++        for (int i = 0; i < 600; ++i) {
++            int cx = (i % 40) - 20;
++            int cz = (i / 40) - 10;
++            blackhole ^= vanillaGridScan(worldSeed, cx, cz, 8, 32, 8, 10387312, false).size();
++            blackhole ^= optimizedGridScan(worldSeed, cx, cz, 8, 32, 8, 10387312, false).size();
++
++            for (int dx = -8; dx <= 8; ++dx) {
++                for (int dz = -8; dz <= 8; ++dz) {
++                    long seed = ((long) (cx + dx) * mulX) ^ ((long) (cz + dz) * mulZ) ^ worldSeed;
++                    rng.setSeed(seed);
++                    rng.nextInt();
++                    if (rng.nextDouble() < chance) blackhole++;
++
++                    long state = (seed ^ 0x5DEECE66DL) & 0xFFFFFFFFFFFFL;
++                    state = (state * 0x5DEECE66DL + 0xBL) & 0xFFFFFFFFFFFFL;
++                    state = (state * 0x5DEECE66DL + 0xBL) & 0xFFFFFFFFFFFFL;
++                    int hi = (int) (state >>> 22);
++                    state = (state * 0x5DEECE66DL + 0xBL) & 0xFFFFFFFFFFFFL;
++                    int lo = (int) (state >>> 21);
++                    if ((((long) hi << 27) + lo) * 0x1.0p-53 < chance) blackhole++;
++                }
++            }
++
++            ChunkCoordIntPair pair = new ChunkCoordIntPair(cx, cz);
++            blackhole ^= gen.countLinear(pair) ^ gen.countIndexed(pair);
++        }
++
++        int gridIters = 1500;
++        long t0 = System.nanoTime();
++        for (int i = 0; i < gridIters; ++i) {
++            blackhole ^= vanillaGridScan(worldSeed, (i % 64) - 32, (i / 64) - 16, 8, 32, 8, 10387312, false).size();
++        }
++        long vanillaGridNs = (System.nanoTime() - t0) / gridIters;
++
++        t0 = System.nanoTime();
++        for (int i = 0; i < gridIters; ++i) {
++            blackhole ^= optimizedGridScan(worldSeed, (i % 64) - 32, (i / 64) - 16, 8, 32, 8, 10387312, false).size();
++        }
++        long optGridNs = (System.nanoTime() - t0) / gridIters;
++
++        int mineIters = 2000;
++        t0 = System.nanoTime();
++        for (int i = 0; i < mineIters; ++i) {
++            int cx = (i % 64) - 32;
++            int cz = (i / 64) - 16;
++            for (int dx = -8; dx <= 8; ++dx) {
++                for (int dz = -8; dz <= 8; ++dz) {
++                    long seed = ((long) (cx + dx) * mulX) ^ ((long) (cz + dz) * mulZ) ^ worldSeed;
++                    rng.setSeed(seed);
++                    rng.nextInt();
++                    if (rng.nextDouble() < chance) blackhole++;
++                }
++            }
++        }
++        long vanillaMineNs = (System.nanoTime() - t0) / mineIters;
++
++        t0 = System.nanoTime();
++        for (int i = 0; i < mineIters; ++i) {
++            int cx = (i % 64) - 32;
++            int cz = (i / 64) - 16;
++            for (int dx = -8; dx <= 8; ++dx) {
++                long xMul = (long) (cx + dx) * mulX;
++                for (int dz = -8; dz <= 8; ++dz) {
++                    long seed = xMul ^ ((long) (cz + dz) * mulZ) ^ worldSeed;
++                    long state = (seed ^ 0x5DEECE66DL) & 0xFFFFFFFFFFFFL;
++                    state = (state * 0x5DEECE66DL + 0xBL) & 0xFFFFFFFFFFFFL;
++                    state = (state * 0x5DEECE66DL + 0xBL) & 0xFFFFFFFFFFFFL;
++                    int hi = (int) (state >>> 22);
++                    state = (state * 0x5DEECE66DL + 0xBL) & 0xFFFFFFFFFFFFL;
++                    int lo = (int) (state >>> 21);
++                    if ((((long) hi << 27) + lo) * 0x1.0p-53 < chance) blackhole++;
++                }
++            }
++        }
++        long optMineNs = (System.nanoTime() - t0) / mineIters;
++
++        int popIters = 5000;
++        t0 = System.nanoTime();
++        for (int i = 0; i < popIters; ++i) {
++            blackhole ^= gen.countLinear(new ChunkCoordIntPair((i % 40) - 20, (i / 40) - 10));
++        }
++        long vanillaPopNs = (System.nanoTime() - t0) / popIters;
++
++        t0 = System.nanoTime();
++        for (int i = 0; i < popIters; ++i) {
++            blackhole ^= gen.countIndexed(new ChunkCoordIntPair((i % 40) - 20, (i / 40) - 10));
++        }
++        long optPopNs = (System.nanoTime() - t0) / popIters;
++
++        System.out.printf("A4_BENCH grid_vanilla_ns=%d grid_opt_ns=%d grid_speedup=%.2fx mine_vanilla_ns=%d mine_opt_ns=%d mine_speedup=%.2fx pop_vanilla_ns=%d pop_opt_ns=%d pop_speedup=%.2fx blackhole=%d%n",
++                vanillaGridNs, optGridNs, (double) vanillaGridNs / Math.max(1L, optGridNs),
++                vanillaMineNs, optMineNs, (double) vanillaMineNs / Math.max(1L, optMineNs),
++                vanillaPopNs, optPopNs, (double) vanillaPopNs / Math.max(1L, optPopNs),
++                blackhole);
++
++        assertTrue("Expected grid scan speedup > 5x", optGridNs * 5.0 < vanillaGridNs);
++        assertTrue("Expected mineshaft LCG speedup > 3x", optMineNs * 3.0 < vanillaMineNs);
++        assertTrue("Expected pop index speedup > 5x", optPopNs * 5.0 < vanillaPopNs);
++    }
++}
