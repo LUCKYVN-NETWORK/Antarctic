@@ -1,0 +1,1024 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 10:19:36 +0700
+Subject: [PATCH 156/156] perf: optimize Anvil chunk load/save, pool Inflater
+ and fix stream leak
+
+
+diff --git a/main/java/net/minecraft/server/ChunkRegionLoader.java b/main/java/net/minecraft/server/ChunkRegionLoader.java
+index 8dc06d2..bde566c 100644
+--- a/main/java/net/minecraft/server/ChunkRegionLoader.java
++++ b/main/java/net/minecraft/server/ChunkRegionLoader.java
+@@ -491,18 +491,14 @@ public class ChunkRegionLoader implements IChunkLoader, IAsyncChunkSaver {
+         for (int k = 0; k < nbttaglist.size(); ++k) {
+             NBTTagCompound nbttagcompound1 = nbttaglist.get(k);
+             byte b0 = nbttagcompound1.getByte("Y");
+-            ChunkSection chunksection = new ChunkSection(b0 << 4, flag1, world.chunkPacketBlockController.getPredefinedBlockData(chunk, b0)); // Paper - Anti-Xray - Add predefined block data
++            NibbleArray emittedLight = new NibbleArray(nbttagcompound1.getByteArray("BlockLight"));
++            NibbleArray skyLight = flag1 ? new NibbleArray(nbttagcompound1.getByteArray("SkyLight")) : null;
++            ChunkSection chunksection = new ChunkSection(b0 << 4, world.chunkPacketBlockController.getPredefinedBlockData(chunk, b0), emittedLight, skyLight); // Paper - Anti-Xray // Antarctic - avoid throwaway light NibbleArrays
+             byte[] abyte = nbttagcompound1.getByteArray("Blocks");
+             NibbleArray nibblearray = new NibbleArray(nbttagcompound1.getByteArray("Data"));
+             NibbleArray nibblearray1 = nbttagcompound1.hasKeyOfType("Add", 7) ? new NibbleArray(nbttagcompound1.getByteArray("Add")) : null;
+ 
+-            chunksection.getBlocks().a(abyte, nibblearray, nibblearray1);
+-            chunksection.a(new NibbleArray(nbttagcompound1.getByteArray("BlockLight")));
+-            if (flag1) {
+-                chunksection.b(new NibbleArray(nbttagcompound1.getByteArray("SkyLight")));
+-            }
+-
+-            chunksection.recalcBlockCounts();
++            chunksection.loadFromAnvil(abyte, nibblearray, nibblearray1); // Antarctic - single-pass decode and block counts
+             achunksection[b0] = chunksection;
+         }
+ 
+diff --git a/main/java/net/minecraft/server/ChunkSection.java b/main/java/net/minecraft/server/ChunkSection.java
+index f174abe..53341f8 100644
+--- a/main/java/net/minecraft/server/ChunkSection.java
++++ b/main/java/net/minecraft/server/ChunkSection.java
+@@ -27,6 +27,26 @@ public class ChunkSection {
+ 
+     }
+ 
++    // Antarctic start - direct light array constructor and single-pass Anvil loader
++    ChunkSection(int i, IBlockData[] predefinedBlockData, NibbleArray emittedLight, @javax.annotation.Nullable NibbleArray skyLight) {
++        this.yPos = i;
++        this.blockIds = new DataPaletteBlock(predefinedBlockData);
++        this.emittedLight = emittedLight;
++        this.skyLight = skyLight;
++    }
++
++    void loadFromAnvil(byte[] blocks, NibbleArray dataNibbles, @javax.annotation.Nullable NibbleArray addNibbles) {
++        this.blockIds.loadFromAnvil(blocks, dataNibbles, addNibbles, this);
++    }
++
++    void setBlockCounts(int nonEmpty, int ticking, int fluids, int fireOrLava) {
++        this.nonEmptyBlockCount = nonEmpty;
++        this.tickingBlockCount = ticking;
++        this.fluidCount = fluids;
++        this.fireOrLavaCount = fireOrLava;
++    }
++    // Antarctic end
++
+     // Paper start - Anti-Xray - Support default constructor
+     public ChunkSection(int y, boolean flag, char[] blockIds) {
+         this(y, flag, blockIds, null);
+diff --git a/main/java/net/minecraft/server/DataBits.java b/main/java/net/minecraft/server/DataBits.java
+index 401dc7c..ee1a069 100644
+--- a/main/java/net/minecraft/server/DataBits.java
++++ b/main/java/net/minecraft/server/DataBits.java
+@@ -21,16 +21,16 @@ public class DataBits {
+         //Validate.inclusiveBetween(0L, (long) (this.d - 1), (long) i); // Paper
+         //Validate.inclusiveBetween(0L, this.c, (long) j); // Paper
+         int k = i * this.b;
+-        int l = k / 64;
+-        int i1 = ((i + 1) * this.b - 1) / 64;
+-        int j1 = k % 64;
++        int l = k >>> 6;
++        int i1 = (k + this.b - 1) >>> 6;
++        int j1 = k & 63;
+ 
+         this.a[l] = this.a[l] & ~(this.c << j1) | ((long) j & this.c) << j1;
+         if (l != i1) {
+             int k1 = 64 - j1;
+             int l1 = this.b - k1;
+ 
+-            this.a[i1] = this.a[i1] >>> l1 << l1 | ((long) j & this.c) >> k1;
++            this.a[i1] = this.a[i1] >>> l1 << l1 | ((long) j & this.c) >>> k1;
+         }
+ 
+     }
+@@ -38,9 +38,9 @@ public class DataBits {
+     public int a(int i) {
+         //Validate.inclusiveBetween(0L, (long) (this.d - 1), (long) i); // Paper
+         int j = i * this.b;
+-        int k = j / 64;
+-        int l = ((i + 1) * this.b - 1) / 64;
+-        int i1 = j % 64;
++        int k = j >>> 6;
++        int l = (j + this.b - 1) >>> 6;
++        int i1 = j & 63;
+ 
+         if (k == l) {
+             return (int) (this.a[k] >>> i1 & this.c);
+diff --git a/main/java/net/minecraft/server/DataPaletteBlock.java b/main/java/net/minecraft/server/DataPaletteBlock.java
+index e551808..2416569 100644
+--- a/main/java/net/minecraft/server/DataPaletteBlock.java
++++ b/main/java/net/minecraft/server/DataPaletteBlock.java
+@@ -220,57 +220,307 @@ public class DataPaletteBlock implements DataPaletteExpandable {
+         packetdataserializer.a(this.b.a());
+     }
+ 
++    // Antarctic start - fast LUT exportData and single-pass Anvil loader
++    private static final class AnvilLoadScratch {
++        final short[] legacyToSlot = new short[4096];
++        final int[] touchedLegacy = new int[4096];
++        final IBlockData[] uniqueStates = new IBlockData[4096];
++        final int[] slotCounts = new int[4096];
++        final int[] slotToPalette = new int[4096];
++        final short[] blockSlots = new short[4096];
++        boolean sawAir;
++
++        AnvilLoadScratch() {
++            java.util.Arrays.fill(this.legacyToSlot, (short) -1);
++        }
++    }
++
++    private static short registerUniqueLegacy(AnvilLoadScratch scratch, int id, int slot) {
++        IBlockData data = resolveLegacyBlockData(id);
++        short s = (short) slot;
++        scratch.legacyToSlot[id] = s;
++        scratch.touchedLegacy[slot] = id;
++        scratch.uniqueStates[slot] = data;
++        scratch.slotCounts[slot] = 1;
++        if (data == DataPaletteBlock.a) {
++            scratch.sawAir = true;
++        }
++        return s;
++    }
++
++    private static void pack4BitWords(long[] words, short[] blockSlots, int[] slotToPalette) {
++        for (int w = 0, idx = 0; w < 256; ++w, idx += 16) {
++            words[w] = ((long) slotToPalette[blockSlots[idx]])
++                    | ((long) slotToPalette[blockSlots[idx + 1]] << 4)
++                    | ((long) slotToPalette[blockSlots[idx + 2]] << 8)
++                    | ((long) slotToPalette[blockSlots[idx + 3]] << 12)
++                    | ((long) slotToPalette[blockSlots[idx + 4]] << 16)
++                    | ((long) slotToPalette[blockSlots[idx + 5]] << 20)
++                    | ((long) slotToPalette[blockSlots[idx + 6]] << 24)
++                    | ((long) slotToPalette[blockSlots[idx + 7]] << 28)
++                    | ((long) slotToPalette[blockSlots[idx + 8]] << 32)
++                    | ((long) slotToPalette[blockSlots[idx + 9]] << 36)
++                    | ((long) slotToPalette[blockSlots[idx + 10]] << 40)
++                    | ((long) slotToPalette[blockSlots[idx + 11]] << 44)
++                    | ((long) slotToPalette[blockSlots[idx + 12]] << 48)
++                    | ((long) slotToPalette[blockSlots[idx + 13]] << 52)
++                    | ((long) slotToPalette[blockSlots[idx + 14]] << 56)
++                    | ((long) slotToPalette[blockSlots[idx + 15]] << 60);
++        }
++    }
++
++    private static final ThreadLocal<AnvilLoadScratch> ANVIL_SCRATCH = ThreadLocal.withInitial(AnvilLoadScratch::new);
++
++    private static IBlockData resolveLegacyBlockData(int j1) {
++        IBlockData data = Block.REGISTRY_ID.fromId(j1);
++        if (data == null) {
++            Block block = Block.getById(j1 >> 4);
++            if (block != null) {
++                try {
++                    data = block.fromLegacyData(j1 & 0xF);
++                } catch (Exception ignored) {
++                    data = block.getBlockData();
++                }
++            }
++        }
++        return data == null ? DataPaletteBlock.a : data;
++    }
++
+     @Nullable
+     public NibbleArray exportData(byte[] abyte, NibbleArray nibblearray) {
+         NibbleArray nibblearray1 = null;
++        final int bits = this.e;
++        if (bits <= 8) {
++            final int paletteCap = 1 << bits;
++            final int[] idLut = new int[paletteCap];
++            final DataPalette palette = this.c;
++            boolean hasAdd = false;
++            for (int p = 0; p < paletteCap; ++p) {
++                IBlockData data = palette.a(p);
++                int id = Block.REGISTRY_ID.getId(data == null ? DataPaletteBlock.a : data);
++                idLut[p] = id;
++                if ((id >> 12 & 15) != 0) {
++                    hasAdd = true;
++                }
++            }
++
++            final long[] words = this.b.a();
++            if (bits == 4) {
++                final byte[] nibbleBytes = nibblearray.asBytes();
++                for (int w = 0, idx = 0, nIdx = 0; w < 256; ++w, idx += 16, nIdx += 8) {
++                    long word = words[w];
++                    for (int pair = 0; pair < 8; ++pair) {
++                        int p0 = (int) (word & 15L);
++                        int p1 = (int) ((word >>> 4) & 15L);
++                        word >>>= 8;
++
++                        int j0 = idLut[p0];
++                        int j1 = idLut[p1];
++                        int i0 = idx + (pair << 1);
++                        abyte[i0] = (byte) (j0 >> 4 & 255);
++                        abyte[i0 + 1] = (byte) (j1 >> 4 & 255);
++                        nibbleBytes[nIdx + pair] = (byte) ((j0 & 15) | ((j1 & 15) << 4));
++
++                        if (hasAdd) {
++                            int add0 = j0 >> 12 & 15;
++                            int add1 = j1 >> 12 & 15;
++                            if ((add0 | add1) != 0) {
++                                if (nibblearray1 == null) {
++                                    nibblearray1 = new NibbleArray();
++                                }
++                                if (add0 != 0) {
++                                    nibblearray1.a(i0, add0);
++                                }
++                                if (add1 != 0) {
++                                    nibblearray1.a(i0 + 1, add1);
++                                }
++                            }
++                        }
++                    }
++                }
++                return nibblearray1;
++            }
++
++            final long mask = (1L << bits) - 1L;
++            int bitIndex = 0;
++            for (int i = 0; i < 4096; ++i) {
++                int wordIdx = bitIndex >>> 6;
++                int bitOffset = bitIndex & 63;
++                bitIndex += bits;
++                int paletteIdx;
++                if (bitOffset + bits <= 64) {
++                    paletteIdx = (int) ((words[wordIdx] >>> bitOffset) & mask);
++                } else {
++                    paletteIdx = (int) (((words[wordIdx] >>> bitOffset) | (words[wordIdx + 1] << (64 - bitOffset))) & mask);
++                }
++                int j = idLut[paletteIdx];
++                if (hasAdd && (j >> 12 & 15) != 0) {
++                    if (nibblearray1 == null) {
++                        nibblearray1 = new NibbleArray();
++                    }
++                    nibblearray1.a(i, j >> 12 & 15);
++                }
++                abyte[i] = (byte) (j >> 4 & 255);
++                nibblearray.a(i, j & 15);
++            }
++            return nibblearray1;
++        }
+ 
+         for (int i = 0; i < 4096; ++i) {
+             int j = Block.REGISTRY_ID.getId(this.a(i));
+-            int k = i & 15;
+-            int l = i >> 8 & 15;
+-            int i1 = i >> 4 & 15;
+-
+             if ((j >> 12 & 15) != 0) {
+                 if (nibblearray1 == null) {
+                     nibblearray1 = new NibbleArray();
+                 }
+-
+-                nibblearray1.a(k, l, i1, j >> 12 & 15);
++                nibblearray1.a(i, j >> 12 & 15);
+             }
+-
+             abyte[i] = (byte) (j >> 4 & 255);
+-            nibblearray.a(k, l, i1, j & 15);
++            nibblearray.a(i, j & 15);
+         }
+ 
+         return nibblearray1;
+     }
+ 
+     public void a(byte[] abyte, NibbleArray nibblearray, @Nullable NibbleArray nibblearray1) {
+-        for (int i = 0; i < 4096; ++i) {
+-            int j = i & 15;
+-            int k = i >> 8 & 15;
+-            int l = i >> 4 & 15;
+-            int i1 = nibblearray1 == null ? 0 : nibblearray1.a(j, k, l);
+-            int j1 = i1 << 12 | (abyte[i] & 255) << 4 | nibblearray.a(j, k, l);
+-
+-            // CraftBukkit start - fix blocks with random data values (caused by plugins)
+-            IBlockData data = Block.REGISTRY_ID.fromId(j1);
+-            if (data == null) {
+-                Block block = Block.getById(j1 >> 4);
+-                if (block != null) {
+-                    try {
+-                        data = block.fromLegacyData(j1 & 0xF);
+-                    } catch (Exception ignored) {
+-                        data = block.getBlockData();
++        this.loadFromAnvil(abyte, nibblearray, nibblearray1, null);
++    }
++
++    void loadFromAnvil(byte[] abyte, NibbleArray nibblearray, @Nullable NibbleArray nibblearray1, @Nullable ChunkSection countsTarget) {
++        if (nibblearray1 != null) {
++            this.loadFromAnvilExtended(abyte, nibblearray, nibblearray1, countsTarget);
++            return;
++        }
++
++        final AnvilLoadScratch scratch = ANVIL_SCRATCH.get();
++        final short[] legacyToSlot = scratch.legacyToSlot;
++        final IBlockData[] uniqueStates = scratch.uniqueStates;
++        final int[] slotCounts = scratch.slotCounts;
++        final int[] slotToPalette = scratch.slotToPalette;
++        final short[] blockSlots = scratch.blockSlots;
++        final byte[] dataBytes = nibblearray.asBytes();
++
++        int uniqueCount = 0;
++        scratch.sawAir = false;
++        try {
++            for (int p = 0; p < 2048; ++p) {
++                int i0 = p << 1;
++                int dByte = dataBytes[p] & 255;
++                int id0 = ((abyte[i0] & 255) << 4) | (dByte & 15);
++                int id1 = ((abyte[i0 + 1] & 255) << 4) | (dByte >>> 4);
++
++                short s0 = legacyToSlot[id0];
++                if (s0 < 0) {
++                    s0 = registerUniqueLegacy(scratch, id0, uniqueCount++);
++                } else {
++                    ++slotCounts[s0];
++                }
++                blockSlots[i0] = s0;
++
++                short s1 = legacyToSlot[id1];
++                if (s1 < 0) {
++                    s1 = registerUniqueLegacy(scratch, id1, uniqueCount++);
++                } else {
++                    ++slotCounts[s1];
++                }
++                blockSlots[i0 + 1] = s1;
++            }
++
++            if (countsTarget != null) {
++                int nonEmpty = 0;
++                int ticking = 0;
++                int fluids = 0;
++                int fireOrLava = 0;
++                for (int u = 0; u < uniqueCount; ++u) {
++                    IBlockData data = uniqueStates[u];
++                    Block block = data.getBlock();
++                    if (block != Blocks.AIR) {
++                        int count = slotCounts[u];
++                        nonEmpty += count;
++                        if (block.isTicking()) {
++                            ticking += count;
++                        }
++                        if (data.getMaterial().isLiquid()) {
++                            fluids += count;
++                        }
++                        if (block == Blocks.FIRE || block == Blocks.FLOWING_LAVA || block == Blocks.LAVA) {
++                            fireOrLava += count;
++                        }
+                     }
+                 }
++                countsTarget.setBlockCounts(nonEmpty, ticking, fluids, fireOrLava);
++            }
++
++            int neededEntries = (scratch.sawAir ? uniqueCount : uniqueCount + 1) + (this.predefinedBlockData == null ? 0 : this.predefinedBlockData.length);
++            int targetBits = neededEntries <= 16 ? 4 : (32 - Integer.numberOfLeadingZeros(neededEntries - 1));
++            if (targetBits > this.e) {
++                this.b(targetBits);
++            }
++
++            int bitsBefore = this.e;
++            for (int u = 0; u < uniqueCount; ++u) {
++                slotToPalette[u] = this.c.a(uniqueStates[u]);
++            }
++            if (this.e != bitsBefore) {
++                for (int u = 0; u < uniqueCount; ++u) {
++                    slotToPalette[u] = this.c.a(uniqueStates[u]);
++                }
++            }
++
++            if (this.e == 4) {
++                pack4BitWords(this.b.a(), blockSlots, slotToPalette);
++            } else {
++                for (int i = 0; i < 4096; ++i) {
++                    this.b.a(i, slotToPalette[blockSlots[i]]);
++                }
++            }
++            ++this.antarcticVersion;
++        } finally {
++            final int[] touchedLegacy = scratch.touchedLegacy;
++            for (int u = 0; u < uniqueCount; ++u) {
++                legacyToSlot[touchedLegacy[u]] = -1;
++                uniqueStates[u] = null;
+             }
+-            this.setBlockIndex(i, data);
+-            // this.setBlockIndex(i, (IBlockData) Block.REGISTRY_ID.fromId(j1));
+-            // CraftBukkit end
+         }
++    }
++
++    private void loadFromAnvilExtended(byte[] abyte, NibbleArray nibblearray, NibbleArray nibblearray1, @Nullable ChunkSection countsTarget) {
++        int lastId = -1;
++        IBlockData lastData = null;
++        int nonEmpty = 0;
++        int ticking = 0;
++        int fluids = 0;
++        int fireOrLava = 0;
++        boolean lastNotAir = false;
++        boolean lastTicking = false;
++        boolean lastLiquid = false;
++        boolean lastFireOrLava = false;
+ 
++        for (int i = 0; i < 4096; ++i) {
++            int j1 = nibblearray1.a(i) << 12 | (abyte[i] & 255) << 4 | nibblearray.a(i);
++            if (j1 != lastId) {
++                lastId = j1;
++                lastData = resolveLegacyBlockData(j1);
++                if (countsTarget != null) {
++                    Block block = lastData.getBlock();
++                    lastNotAir = block != Blocks.AIR;
++                    lastTicking = lastNotAir && block.isTicking();
++                    lastLiquid = lastData.getMaterial().isLiquid();
++                    lastFireOrLava = block == Blocks.FIRE || block == Blocks.FLOWING_LAVA || block == Blocks.LAVA;
++                }
++            }
++            this.setBlockIndex(i, lastData);
++            if (countsTarget != null && lastNotAir) {
++                ++nonEmpty;
++                if (lastTicking) ++ticking;
++                if (lastLiquid) ++fluids;
++                if (lastFireOrLava) ++fireOrLava;
++            }
++        }
++        if (countsTarget != null) {
++            countsTarget.setBlockCounts(nonEmpty, ticking, fluids, fireOrLava);
++        }
+     }
++    // Antarctic end
+ 
+     public int a() {
+         return 1 + this.c.a() + PacketDataSerializer.a(this.b.b()) + this.b.a().length * 8;
+diff --git a/main/java/net/minecraft/server/RegionFile.java b/main/java/net/minecraft/server/RegionFile.java
+index 56a0f56..d7caac9 100644
+--- a/main/java/net/minecraft/server/RegionFile.java
++++ b/main/java/net/minecraft/server/RegionFile.java
+@@ -213,7 +213,7 @@ public class RegionFile {
+                             } else if (b0 == 2) {
+                                 abyte = new byte[j1 - 1];
+                                 this.c.read(abyte);
+-                                return new DataInputStream(new BufferedInputStream(new InflaterInputStream(new ByteArrayInputStream(abyte))));
++                                return inflateZlib(abyte);
+                             } else {
+                                 return null;
+                             }
+@@ -536,6 +536,127 @@ public class RegionFile {
+         }
+     }
+ 
++    // Antarctic start - streaming Zlib InputStream with pooled Inflater and direct-inflate bypass
++    private static final java.util.concurrent.ConcurrentLinkedQueue<java.util.zip.Inflater> INFLATER_POOL = new java.util.concurrent.ConcurrentLinkedQueue<>();
++    private static final java.util.concurrent.atomic.AtomicInteger INFLATER_POOL_SIZE = new java.util.concurrent.atomic.AtomicInteger();
++    private static final int MAX_POOLED_INFLATERS = 16;
++
++    private static java.util.zip.Inflater borrowInflater() {
++        java.util.zip.Inflater inf = INFLATER_POOL.poll();
++        if (inf != null) {
++            INFLATER_POOL_SIZE.decrementAndGet();
++            inf.reset();
++            return inf;
++        }
++        return new java.util.zip.Inflater();
++    }
++
++    private static void returnInflater(java.util.zip.Inflater inf) {
++        inf.reset();
++        if (INFLATER_POOL_SIZE.incrementAndGet() <= MAX_POOLED_INFLATERS) {
++            INFLATER_POOL.offer(inf);
++        } else {
++            INFLATER_POOL_SIZE.decrementAndGet();
++            inf.end();
++        }
++    }
++
++    static DataInputStream inflateZlib(byte[] compressed) {
++        return new DataInputStream(new PooledZlibInputStream(compressed));
++    }
++
++    private static final class PooledZlibInputStream extends java.io.InputStream {
++        private java.util.zip.Inflater inflater;
++        private final byte[] buf = new byte[1024];
++        private int pos;
++        private int count;
++
++        PooledZlibInputStream(byte[] compressed) {
++            this.inflater = borrowInflater();
++            this.inflater.setInput(compressed);
++        }
++
++        private boolean fill() throws IOException {
++            if (this.inflater == null) {
++                throw new IOException("Stream closed");
++            }
++            if (this.inflater.finished()) {
++                return false;
++            }
++            try {
++                int n;
++                while ((n = this.inflater.inflate(this.buf, 0, this.buf.length)) == 0) {
++                    if (this.inflater.finished() || this.inflater.needsInput() || this.inflater.needsDictionary()) {
++                        return false;
++                    }
++                }
++                this.pos = 0;
++                this.count = n;
++                return true;
++            } catch (java.util.zip.DataFormatException e) {
++                throw new IOException("Invalid ZLIB chunk data", e);
++            }
++        }
++
++        @Override
++        public int read() throws IOException {
++            if (this.pos >= this.count && !this.fill()) {
++                return -1;
++            }
++            return this.buf[this.pos++] & 255;
++        }
++
++        @Override
++        public int read(byte[] b, int off, int len) throws IOException {
++            java.util.Objects.checkFromIndexSize(off, len, b.length);
++            if (len == 0) {
++                return 0;
++            }
++            int avail = this.count - this.pos;
++            if (avail > 0) {
++                int take = Math.min(avail, len);
++                System.arraycopy(this.buf, this.pos, b, off, take);
++                this.pos += take;
++                return take;
++            }
++            if (len >= this.buf.length) {
++                if (this.inflater == null) {
++                    throw new IOException("Stream closed");
++                }
++                if (this.inflater.finished()) {
++                    return -1;
++                }
++                try {
++                    int n;
++                    while ((n = this.inflater.inflate(b, off, len)) == 0) {
++                        if (this.inflater.finished() || this.inflater.needsInput() || this.inflater.needsDictionary()) {
++                            return -1;
++                        }
++                    }
++                    return n;
++                } catch (java.util.zip.DataFormatException e) {
++                    throw new IOException("Invalid ZLIB chunk data", e);
++                }
++            }
++            if (!this.fill()) {
++                return -1;
++            }
++            int take = Math.min(this.count, len);
++            System.arraycopy(this.buf, 0, b, off, take);
++            this.pos = take;
++            return take;
++        }
++
++        @Override
++        public void close() {
++            if (this.inflater != null) {
++                returnInflater(this.inflater);
++                this.inflater = null;
++            }
++        }
++    }
++    // Antarctic end
++
+     private static final byte[] compressionBuffer = new byte[1024 * 64]; // 64k fits most standard chunks input size even, ideally 1 pass through zlib
+     private static final java.util.zip.Deflater deflater = new java.util.zip.Deflater();
+     private static int lastDeflaterLevel = java.util.zip.Deflater.DEFAULT_COMPRESSION; // Antarctic - honor Deflate.compressionLevel
+diff --git a/main/java/net/minecraft/server/RegionFileCache.java b/main/java/net/minecraft/server/RegionFileCache.java
+index 232b2f3..3a17a20 100644
+--- a/main/java/net/minecraft/server/RegionFileCache.java
++++ b/main/java/net/minecraft/server/RegionFileCache.java
+@@ -295,13 +295,13 @@ public class RegionFileCache {
+             }
+             // Paper end
+ 
+-            DataInputStream datainputstream = regionfile.a(i & 31, j & 31);
++            try (DataInputStream datainputstream = regionfile.a(i & 31, j & 31)) {
++                if (datainputstream == null) {
++                    return null;
++                }
+ 
+-            if (datainputstream == null) {
+-                return null;
++                return NBTCompressedStreamTools.a(datainputstream);
+             }
+-
+-            return NBTCompressedStreamTools.a(datainputstream);
+         } finally {
+             releaseRegionFile(regionfile); // Antarctic
+         }
+diff --git a/test/java/net/minecraft/server/AnvilChunkLoadSavePerfTest.java b/test/java/net/minecraft/server/AnvilChunkLoadSavePerfTest.java
+new file mode 100644
+index 0000000..f0e6d8d
+--- /dev/null
++++ b/test/java/net/minecraft/server/AnvilChunkLoadSavePerfTest.java
+@@ -0,0 +1,412 @@
++package net.minecraft.server;
++
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++import java.io.BufferedInputStream;
++import java.io.ByteArrayInputStream;
++import java.io.ByteArrayOutputStream;
++import java.io.DataInputStream;
++import java.io.File;
++import java.io.IOException;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Comparator;
++import java.util.List;
++import java.util.Random;
++import java.util.zip.Deflater;
++import java.util.zip.InflaterInputStream;
++
++import static org.junit.Assert.*;
++
++public class AnvilChunkLoadSavePerfTest {
++
++    private static List<IBlockData> ALL_VALID_STATES;
++
++    @BeforeClass
++    public static void setup() {
++        DispenserRegistry.c();
++        ALL_VALID_STATES = new ArrayList<>();
++        for (IBlockData state : Block.REGISTRY_ID) {
++            if (state != null) {
++                ALL_VALID_STATES.add(state);
++            }
++        }
++        assertTrue("Expected >300 valid block states", ALL_VALID_STATES.size() > 300);
++    }
++
++    private static void vanillaExportReference(DataPaletteBlock palette, byte[] abyte, NibbleArray nibblearray, NibbleArray[] outAdd) {
++        NibbleArray nibblearray1 = null;
++        for (int i = 0; i < 4096; ++i) {
++            int j = Block.REGISTRY_ID.getId(palette.a(i));
++            int k = i & 15;
++            int l = i >> 8 & 15;
++            int i1 = i >> 4 & 15;
++            if ((j >> 12 & 15) != 0) {
++                if (nibblearray1 == null) {
++                    nibblearray1 = new NibbleArray();
++                }
++                nibblearray1.a(k, l, i1, j >> 12 & 15);
++            }
++            abyte[i] = (byte) (j >> 4 & 255);
++            nibblearray.a(k, l, i1, j & 15);
++        }
++        outAdd[0] = nibblearray1;
++    }
++
++    private static void vanillaLoadReference(DataPaletteBlock palette, byte[] abyte, NibbleArray nibblearray, NibbleArray nibblearray1) {
++        for (int i = 0; i < 4096; ++i) {
++            int j = i & 15;
++            int k = i >> 8 & 15;
++            int l = i >> 4 & 15;
++            int i1 = nibblearray1 == null ? 0 : nibblearray1.a(j, k, l);
++            int j1 = i1 << 12 | (abyte[i] & 255) << 4 | nibblearray.a(j, k, l);
++            IBlockData data = Block.REGISTRY_ID.fromId(j1);
++            if (data == null) {
++                Block block = Block.getById(j1 >> 4);
++                if (block != null) {
++                    try {
++                        data = block.fromLegacyData(j1 & 0xF);
++                    } catch (Exception ignored) {
++                        data = block.getBlockData();
++                    }
++                }
++            }
++            palette.setBlockIndex(i, data == null ? DataPaletteBlock.DEFAULT_BLOCK_DATA : data);
++        }
++    }
++
++    @Test
++    public void testDataBitsParityAcrossWidths() {
++        Random rng = new Random(0xDABA1234L);
++        for (int bits = 4; bits <= 13; ++bits) {
++            DataBits db = new DataBits(bits, 4096);
++            int[] expected = new int[4096];
++            int maxVal = (1 << bits) - 1;
++            for (int i = 0; i < 4096; ++i) {
++                int v = rng.nextInt(maxVal + 1);
++                expected[i] = v;
++                db.a(i, v);
++            }
++            for (int i = 0; i < 4096; ++i) {
++                assertEquals("DataBits mismatch at bits=" + bits + " i=" + i, expected[i], db.a(i));
++            }
++        }
++    }
++
++    private void assertSectionRoundTripParity(List<IBlockData> statesToUse, IBlockData[] predefined, boolean check4BitStay4Bit) {
++        ChunkSection expectedSection = new ChunkSection(16, true, predefined);
++        Random rng = new Random(42L + statesToUse.size());
++        for (int i = 0; i < 4096; ++i) {
++            int x = i & 15;
++            int y = (i >> 8) & 15;
++            int z = (i >> 4) & 15;
++            IBlockData state = statesToUse.get(i < statesToUse.size() ? i : rng.nextInt(statesToUse.size()));
++            expectedSection.setType(x, y, z, state);
++        }
++
++        byte[] refBlocks = new byte[4096];
++        NibbleArray refData = new NibbleArray();
++        NibbleArray[] refAddOut = new NibbleArray[1];
++        vanillaExportReference(expectedSection.getBlocks(), refBlocks, refData, refAddOut);
++
++        byte[] optBlocks = new byte[4096];
++        NibbleArray optData = new NibbleArray();
++        NibbleArray optAdd = expectedSection.getBlocks().exportData(optBlocks, optData);
++
++        assertArrayEquals(refBlocks, optBlocks);
++        assertArrayEquals(refData.asBytes(), optData.asBytes());
++        if (refAddOut[0] == null) {
++            assertNull(optAdd);
++        } else {
++            assertNotNull(optAdd);
++            assertArrayEquals(refAddOut[0].asBytes(), optAdd.asBytes());
++        }
++
++        // Load via optimized single-pass loader
++        ChunkSection actualSection = new ChunkSection(16, predefined, new NibbleArray(), new NibbleArray());
++        actualSection.loadFromAnvil(optBlocks, optData, optAdd);
++
++        assertEquals(expectedSection.getBlocks().getDataBits().a().length, actualSection.getBlocks().getDataBits().a().length);
++        if (check4BitStay4Bit) {
++            assertEquals("Expected 4-bit DataBits (256 longs) for <=16 states", 256, actualSection.getBlocks().getDataBits().a().length);
++        }
++
++        for (int y = 0; y < 16; ++y) {
++            for (int z = 0; z < 16; ++z) {
++                for (int x = 0; x < 16; ++x) {
++                    assertEquals("Block mismatch at " + x + "," + y + "," + z,
++                            expectedSection.getType(x, y, z), actualSection.getType(x, y, z));
++                }
++            }
++        }
++
++        assertEquals(expectedSection.shouldTick(), actualSection.shouldTick());
++        assertEquals(expectedSection.hasFluids(), actualSection.hasFluids());
++        assertEquals(expectedSection.hasFireOrLava(), actualSection.hasFireOrLava());
++
++        boolean tickBefore = actualSection.shouldTick();
++        boolean fluidBefore = actualSection.hasFluids();
++        boolean fireBefore = actualSection.hasFireOrLava();
++        actualSection.recalcBlockCounts();
++        assertEquals(tickBefore, actualSection.shouldTick());
++        assertEquals(fluidBefore, actualSection.hasFluids());
++        assertEquals(fireBefore, actualSection.hasFireOrLava());
++    }
++
++    @Test
++    public void testAnvilSectionLoadAndExportParityAllPaletteWidths() {
++        // 4-bit mixed
++        List<IBlockData> mixed4 = Arrays.asList(
++                Blocks.AIR.getBlockData(),
++                Blocks.STONE.getBlockData(),
++                Blocks.GRASS.getBlockData(),
++                Blocks.WATER.getBlockData(),
++                Blocks.LAVA.getBlockData(),
++                Blocks.FIRE.getBlockData()
++        );
++        assertSectionRoundTripParity(mixed4, null, true);
++
++        // Exact 16-unique-state (must remain 4-bit)
++        assertSectionRoundTripParity(ALL_VALID_STATES.subList(0, 16), null, true);
++
++        // 5-bit (24 states)
++        assertSectionRoundTripParity(ALL_VALID_STATES.subList(0, 24), null, false);
++
++        // 8-bit (140 states)
++        assertSectionRoundTripParity(ALL_VALID_STATES.subList(0, 140), null, false);
++
++        // Global palette (>256 states)
++        assertSectionRoundTripParity(ALL_VALID_STATES.subList(0, 300), null, false);
++
++        // Anti-Xray predefinedBlockData (Paper initializes 5-bit palette when predefinedBlockData != null)
++        IBlockData[] predefined = new IBlockData[] {
++                Blocks.STONE.getBlockData(), Blocks.DIAMOND_ORE.getBlockData(), Blocks.GOLD_ORE.getBlockData()
++        };
++        assertSectionRoundTripParity(mixed4, predefined, false);
++    }
++
++    @Test
++    public void testAnvilAddNibbleAndCorruptBlockFallbackParity() {
++        byte[] blocks = new byte[4096];
++        NibbleArray data = new NibbleArray();
++        NibbleArray add = new NibbleArray();
++
++        // Fill with stone (id=1, data=0) and inject corrupt metadata (id=1, data=15) + Add nibble entries
++        java.util.Arrays.fill(blocks, (byte) 1);
++        blocks[10] = (byte) 1;
++        data.a(10, 15); // unmapped stone metadata -> CraftBukkit fallback
++        add.a(25, 0);
++
++        DataPaletteBlock ref = new DataPaletteBlock();
++        vanillaLoadReference(ref, blocks, data, add);
++
++        ChunkSection optSec = new ChunkSection(0, null, new NibbleArray(), new NibbleArray());
++        optSec.loadFromAnvil(blocks, data, add);
++
++        for (int i = 0; i < 4096; ++i) {
++            assertEquals("Add/corrupt fallback mismatch at " + i, ref.a(i), optSec.getBlocks().a(i));
++        }
++
++        // Also test corrupt block without Add nibble (fast path)
++        DataPaletteBlock refNoAdd = new DataPaletteBlock();
++        vanillaLoadReference(refNoAdd, blocks, data, null);
++        ChunkSection optNoAdd = new ChunkSection(0, null, new NibbleArray(), new NibbleArray());
++        optNoAdd.loadFromAnvil(blocks, data, null);
++        for (int i = 0; i < 4096; ++i) {
++            assertEquals("Corrupt fallback (no-add) mismatch at " + i, refNoAdd.a(i), optNoAdd.getBlocks().a(i));
++        }
++    }
++
++    @Test
++    public void testRegionFileCacheWriteReadAndCleanup() throws IOException {
++        Path tempDir = Files.createTempDirectory("antarctic-region-test");
++        try {
++            File worldDir = tempDir.toFile();
++            for (int c = 0; c < 4; ++c) {
++                NBTTagCompound root = new NBTTagCompound();
++                NBTTagCompound level = new NBTTagCompound();
++                level.setInt("xPos", c);
++                level.setInt("zPos", c * 2);
++                level.setByteArray("Biomes", new byte[256]);
++                root.set("Level", level);
++                RegionFileCache.e(worldDir, c, c * 2, root);
++            }
++
++            for (int c = 0; c < 4; ++c) {
++                NBTTagCompound loaded = RegionFileCache.d(worldDir, c, c * 2);
++                assertNotNull(loaded);
++                assertEquals(c, loaded.getCompound("Level").getInt("xPos"));
++                assertEquals(c * 2, loaded.getCompound("Level").getInt("zPos"));
++            }
++
++            assertNull(RegionFileCache.d(worldDir, 15, 15));
++        } finally {
++            RegionFileCache.a();
++            Files.walk(tempDir)
++                    .sorted(Comparator.reverseOrder())
++                    .forEach(p -> {
++                        try {
++                            Files.deleteIfExists(p);
++                        } catch (IOException ignored) {
++                        }
++                    });
++        }
++    }
++
++    @Test
++    public void testAnvilLoadExportAndInflateBenchmark() throws IOException {
++        ChunkSection template = new ChunkSection(16, true);
++        IBlockData stone = Blocks.STONE.getBlockData();
++        IBlockData dirt = Blocks.DIRT.getBlockData();
++        IBlockData grass = Blocks.GRASS.getBlockData();
++        IBlockData water = Blocks.WATER.getBlockData();
++        for (int y = 0; y < 16; ++y) {
++            for (int z = 0; z < 16; ++z) {
++                for (int x = 0; x < 16; ++x) {
++                    IBlockData d = y < 10 ? stone : (y < 13 ? dirt : (y == 13 ? grass : (x < 6 ? water : Blocks.AIR.getBlockData())));
++                    if (d.getBlock() != Blocks.AIR) {
++                        template.setType(x, y, z, d);
++                    }
++                }
++            }
++        }
++
++        byte[] blocks = new byte[4096];
++        NibbleArray data = new NibbleArray();
++        template.getBlocks().exportData(blocks, data);
++        NibbleArray[] refAddOut = new NibbleArray[1];
++
++        // Compress realistic 4-section chunk NBTTagCompound for inflate + NBT parse benchmark
++        NBTTagCompound chunkNbt = new NBTTagCompound();
++        NBTTagCompound levelNbt = new NBTTagCompound();
++        levelNbt.setInt("xPos", 3);
++        levelNbt.setInt("zPos", -5);
++        levelNbt.setByteArray("Biomes", new byte[256]);
++        levelNbt.setIntArray("HeightMap", new int[256]);
++        NBTTagList sectionsList = new NBTTagList();
++        for (int sec = 0; sec < 4; ++sec) {
++            NBTTagCompound secNbt = new NBTTagCompound();
++            secNbt.setByte("Y", (byte) sec);
++            secNbt.setByteArray("Blocks", blocks.clone());
++            secNbt.setByteArray("Data", data.asBytes().clone());
++            secNbt.setByteArray("BlockLight", new byte[2048]);
++            secNbt.setByteArray("SkyLight", new byte[2048]);
++            sectionsList.add(secNbt);
++        }
++        levelNbt.set("Sections", sectionsList);
++        chunkNbt.set("Level", levelNbt);
++
++        ByteArrayOutputStream uncompressedOut = new ByteArrayOutputStream();
++        try (java.io.DataOutputStream dos = new java.io.DataOutputStream(uncompressedOut)) {
++            NBTCompressedStreamTools.a(chunkNbt, (java.io.DataOutput) dos);
++        }
++        byte[] rawPayload = uncompressedOut.toByteArray();
++        Deflater deflater = new Deflater();
++        deflater.setInput(rawPayload);
++        deflater.finish();
++        ByteArrayOutputStream compressedOut = new ByteArrayOutputStream();
++        byte[] tmp = new byte[4096];
++        while (!deflater.finished()) {
++            int n = deflater.deflate(tmp);
++            compressedOut.write(tmp, 0, n);
++        }
++        deflater.end();
++        byte[] compressed = compressedOut.toByteArray();
++
++        NibbleArray emittedLight = new NibbleArray();
++        NibbleArray skyLight = new NibbleArray();
++
++        long blackhole = 0L;
++        for (int i = 0; i < 2500; ++i) {
++            ChunkSection sRef = new ChunkSection(16, true);
++            vanillaLoadReference(sRef.getBlocks(), blocks, data, null);
++            sRef.a(emittedLight);
++            sRef.b(skyLight);
++            sRef.recalcBlockCounts();
++
++            ChunkSection sOpt = new ChunkSection(16, null, emittedLight, skyLight);
++            sOpt.loadFromAnvil(blocks, data, null);
++
++            vanillaExportReference(template.getBlocks(), blocks, data, refAddOut);
++            template.getBlocks().exportData(blocks, data);
++
++            try (DataInputStream in1 = new DataInputStream(new BufferedInputStream(new InflaterInputStream(new ByteArrayInputStream(compressed))));
++                 DataInputStream in2 = RegionFile.inflateZlib(compressed)) {
++                NBTTagCompound nbt1 = NBTCompressedStreamTools.a(in1);
++                NBTTagCompound nbt2 = NBTCompressedStreamTools.a(in2);
++                if (i == 0) {
++                    assertEquals(chunkNbt, nbt1);
++                    assertEquals(chunkNbt, nbt2);
++                }
++                blackhole ^= nbt1.getCompound("Level").getInt("xPos") ^ nbt2.getCompound("Level").getInt("zPos")
++                        ^ (sRef.shouldTick() ? 1L : 0L) ^ (sOpt.shouldTick() ? 2L : 0L);
++            }
++        }
++
++        int iters = 3000;
++        long t0 = System.nanoTime();
++        for (int i = 0; i < iters; ++i) {
++            ChunkSection sRef = new ChunkSection(16, true);
++            vanillaLoadReference(sRef.getBlocks(), blocks, data, null);
++            sRef.a(emittedLight);
++            sRef.b(skyLight);
++            sRef.recalcBlockCounts();
++            blackhole ^= sRef.hasFluids() ? 1L : 0L;
++        }
++        long vanillaLoadNs = (System.nanoTime() - t0) / iters;
++
++        t0 = System.nanoTime();
++        for (int i = 0; i < iters; ++i) {
++            ChunkSection sOpt = new ChunkSection(16, null, emittedLight, skyLight);
++            sOpt.loadFromAnvil(blocks, data, null);
++            blackhole ^= sOpt.hasFluids() ? 1L : 0L;
++        }
++        long optLoadNs = (System.nanoTime() - t0) / iters;
++
++        t0 = System.nanoTime();
++        for (int i = 0; i < iters; ++i) {
++            vanillaExportReference(template.getBlocks(), blocks, data, refAddOut);
++            blackhole ^= blocks[i & 4095];
++        }
++        long vanillaExportNs = (System.nanoTime() - t0) / iters;
++
++        t0 = System.nanoTime();
++        for (int i = 0; i < iters; ++i) {
++            template.getBlocks().exportData(blocks, data);
++            blackhole ^= blocks[i & 4095];
++        }
++        long optExportNs = (System.nanoTime() - t0) / iters;
++
++        int inflateIters = 1500;
++        t0 = System.nanoTime();
++        for (int i = 0; i < inflateIters; ++i) {
++            try (DataInputStream in = new DataInputStream(new BufferedInputStream(new InflaterInputStream(new ByteArrayInputStream(compressed))))) {
++                NBTTagCompound loaded = NBTCompressedStreamTools.a(in);
++                blackhole ^= loaded.getCompound("Level").getInt("xPos");
++            }
++        }
++        long vanillaInflateNs = (System.nanoTime() - t0) / inflateIters;
++
++        t0 = System.nanoTime();
++        for (int i = 0; i < inflateIters; ++i) {
++            try (DataInputStream in = RegionFile.inflateZlib(compressed)) {
++                NBTTagCompound loaded = NBTCompressedStreamTools.a(in);
++                blackhole ^= loaded.getCompound("Level").getInt("xPos");
++            }
++        }
++        long optInflateNs = (System.nanoTime() - t0) / inflateIters;
++
++        System.out.printf("A2_BENCH load_vanilla_ns=%d load_opt_ns=%d load_speedup=%.2fx export_vanilla_ns=%d export_opt_ns=%d export_speedup=%.2fx inflate_vanilla_ns=%d inflate_opt_ns=%d inflate_speedup=%.2fx blackhole=%d%n",
++                vanillaLoadNs, optLoadNs, (double) vanillaLoadNs / Math.max(1L, optLoadNs),
++                vanillaExportNs, optExportNs, (double) vanillaExportNs / Math.max(1L, optExportNs),
++                vanillaInflateNs, optInflateNs, (double) vanillaInflateNs / Math.max(1L, optInflateNs),
++                blackhole);
++
++        assertTrue("Expected Anvil load speedup > 1.2x, got " + vanillaLoadNs + " vs " + optLoadNs, optLoadNs * 1.2 < vanillaLoadNs);
++        assertTrue("Expected Anvil export speedup > 1.2x, got " + vanillaExportNs + " vs " + optExportNs, optExportNs * 1.2 < vanillaExportNs);
++        assertTrue("Expected Zlib inflate+NBT no regression (<= 1.05x), got " + vanillaInflateNs + " vs " + optInflateNs, optInflateNs <= vanillaInflateNs * 1.05);
++    }
++}

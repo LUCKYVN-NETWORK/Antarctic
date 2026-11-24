@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Sun, 18 Oct 2026 17:37:53 +0700
-Subject: [PATCH 076/155] Remove iterators from Inventory containers
+Subject: [PATCH 076/156] Remove iterators from Inventory containers
 
 - Backport Leaf MC 0191 (Remove iterators from Inventory)
 - Replace iterator allocations with indexed loops in isEmpty (x_) checks across TileEntityChest, TileEntityHopper, TileEntityDispenser, TileEntityFurnace, TileEntityBrewingStand, InventorySubcontainer, EntityMinecartContainer, InventoryCrafting, InventoryCraftResult, and PlayerInventory
