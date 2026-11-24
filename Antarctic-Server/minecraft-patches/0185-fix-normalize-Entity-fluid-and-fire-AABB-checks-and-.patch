@@ -1,0 +1,359 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 19:53:34 +0700
+Subject: [PATCH 185/185] fix: normalize Entity fluid and fire AABB checks and
+ snapshot item merge
+
+
+diff --git a/main/java/net/minecraft/server/Chunk.java b/main/java/net/minecraft/server/Chunk.java
+index 994b600..02ea052 100644
+--- a/main/java/net/minecraft/server/Chunk.java
++++ b/main/java/net/minecraft/server/Chunk.java
+@@ -1305,6 +1305,13 @@ public class Chunk {
+         }
+     }
+ 
++    private static final class MergeScratch {
++        final java.util.ArrayList<EntityItem> list = new java.util.ArrayList<>();
++        boolean inUse;
++    }
++
++    private static final ThreadLocal<MergeScratch> MERGE_SCRATCH = ThreadLocal.withInitial(MergeScratch::new);
++
+     void mergeNearbyItems(EntityItem self, double minX, double minY, double minZ, double maxX, double maxY, double maxZ, @Nullable Chunk selfChunk, int selfSlice) {
+         int i = MathHelper.floor((minY - 2.0D) / 16.0D);
+         int j = MathHelper.floor((maxY + 2.0D) / 16.0D);
+@@ -1312,23 +1319,43 @@ public class Chunk {
+         i = MathHelper.clamp(i, 0, this.entitySlices.length - 1);
+         j = MathHelper.clamp(j, 0, this.entitySlices.length - 1);
+ 
+-        for (int k = i; k <= j; ++k) {
+-            if (this.itemCounts[k] <= (this == selfChunk && k == selfSlice ? 1 : 0)) {
+-                continue;
+-            }
+-            List<Entity> slice = this.entitySlices[k];
+-            for (int idx = 0, len = slice.size(); idx < len; ++idx) {
+-                Entity entity = slice.get(idx);
+-                if (entity instanceof EntityItem && entity != self) {
+-                    AxisAlignedBB entityBB = entity.getBoundingBox();
+-                    if (entityBB.d > minX && entityBB.a < maxX && entityBB.e > minY && entityBB.b < maxY && entityBB.f > minZ && entityBB.c < maxZ) {
+-                        self.tryMergeWith((EntityItem) entity);
+-                        if (!self.isAlive()) {
+-                            return;
++        MergeScratch scratch = MERGE_SCRATCH.get();
++        boolean pooled = !scratch.inUse;
++        java.util.ArrayList<EntityItem> candidates;
++        if (pooled) {
++            scratch.inUse = true;
++            candidates = scratch.list;
++            candidates.clear();
++        } else {
++            candidates = new java.util.ArrayList<>();
++        }
++        try {
++            for (int k = i; k <= j; ++k) {
++                if (this.itemCounts[k] <= (this == selfChunk && k == selfSlice ? 1 : 0)) {
++                    continue;
++                }
++                List<Entity> slice = this.entitySlices[k];
++                for (int idx = 0, len = slice.size(); idx < len; ++idx) {
++                    Entity entity = slice.get(idx);
++                    if (entity instanceof EntityItem && entity != self) {
++                        AxisAlignedBB entityBB = entity.getBoundingBox();
++                        if (entityBB.d > minX && entityBB.a < maxX && entityBB.e > minY && entityBB.b < maxY && entityBB.f > minZ && entityBB.c < maxZ) {
++                            candidates.add((EntityItem) entity);
+                         }
+                     }
+                 }
+             }
++            for (int idx = 0, len = candidates.size(); idx < len; ++idx) {
++                self.tryMergeWith(candidates.get(idx));
++                if (!self.isAlive()) {
++                    return;
++                }
++            }
++        } finally {
++            candidates.clear();
++            if (pooled) {
++                scratch.inUse = false;
++            }
+         }
+     }
+ 
+diff --git a/main/java/net/minecraft/server/Entity.java b/main/java/net/minecraft/server/Entity.java
+index 2db82b2..4946b6d 100644
+--- a/main/java/net/minecraft/server/Entity.java
++++ b/main/java/net/minecraft/server/Entity.java
+@@ -1014,7 +1014,10 @@ public abstract class Entity implements ICommandListener, KeyedObject { // Paper
+             boolean flag1 = this.an();
+ 
+             AxisAlignedBB fireCheckBB = this.getBoundingBox();
+-            if (this.world.e(fireCheckBB.a + 0.001D, fireCheckBB.b + 0.001D, fireCheckBB.c + 0.001D, fireCheckBB.d - 0.001D, fireCheckBB.e - 0.001D, fireCheckBB.f - 0.001D)) {
++            double fx1 = fireCheckBB.a + 0.001D, fx2 = fireCheckBB.d - 0.001D;
++            double fy1 = fireCheckBB.b + 0.001D, fy2 = fireCheckBB.e - 0.001D;
++            double fz1 = fireCheckBB.c + 0.001D, fz2 = fireCheckBB.f - 0.001D;
++            if (this.world.e(Math.min(fx1, fx2), Math.min(fy1, fy2), Math.min(fz1, fz2), Math.max(fx1, fx2), Math.max(fy1, fy2), Math.max(fz1, fz2))) {
+                 this.burn(1);
+                 if (!flag1) {
+                     ++this.fireTicks;
+@@ -1277,7 +1280,11 @@ public abstract class Entity implements ICommandListener, KeyedObject { // Paper
+ 
+     public boolean ap() {
+         AxisAlignedBB bb = this.getBoundingBox();
+-        return this.world.a(bb.a + 0.001D, bb.b + 20.0D + 0.001D, bb.c + 0.001D, bb.d - 0.001D, bb.e - 20.0D - 0.001D, bb.f - 0.001D, Material.WATER, this);
++        double y1 = bb.b + 20.0D, y2 = bb.e - 20.0D;
++        double gMinY = Math.min(y1, y2) + 0.001D, gMaxY = Math.max(y1, y2) - 0.001D;
++        double sMinX = bb.a + 0.001D, sMaxX = bb.d - 0.001D;
++        double sMinZ = bb.c + 0.001D, sMaxZ = bb.f - 0.001D;
++        return this.world.a(Math.min(sMinX, sMaxX), Math.min(gMinY, gMaxY), Math.min(sMinZ, sMaxZ), Math.max(sMinX, sMaxX), Math.max(gMinY, gMaxY), Math.max(sMinZ, sMaxZ), Material.WATER, this);
+     }
+ 
+     public boolean aq() {
+@@ -1290,7 +1297,11 @@ public abstract class Entity implements ICommandListener, KeyedObject { // Paper
+             this.inWater = false;
+         } else {
+             AxisAlignedBB bb = this.getBoundingBox();
+-            if (this.world.a(bb.a + 0.001D, bb.b + 0.4000000059604645D + 0.001D, bb.c + 0.001D, bb.d - 0.001D, bb.e - 0.4000000059604645D - 0.001D, bb.f - 0.001D, Material.WATER, this)) {
++            double y1 = bb.b + 0.4000000059604645D, y2 = bb.e - 0.4000000059604645D;
++            double gMinY = Math.min(y1, y2) + 0.001D, gMaxY = Math.max(y1, y2) - 0.001D;
++            double sMinX = bb.a + 0.001D, sMaxX = bb.d - 0.001D;
++            double sMinZ = bb.c + 0.001D, sMaxZ = bb.f - 0.001D;
++            if (this.world.a(Math.min(sMinX, sMaxX), Math.min(gMinY, gMaxY), Math.min(sMinZ, sMaxZ), Math.max(sMinX, sMaxX), Math.max(gMinY, gMaxY), Math.max(sMinZ, sMaxZ), Material.WATER, this)) {
+                 if (!this.inWater && !this.justCreated) {
+                     this.ar();
+                 }
+@@ -1378,7 +1389,10 @@ public abstract class Entity implements ICommandListener, KeyedObject { // Paper
+ 
+     public boolean au() {
+         AxisAlignedBB bb = this.getBoundingBox();
+-        return this.world.a(bb.a + 0.10000000149011612D, bb.b + 0.4000000059604645D, bb.c + 0.10000000149011612D, bb.d - 0.10000000149011612D, bb.e - 0.4000000059604645D, bb.f - 0.10000000149011612D, Material.LAVA);
++        double lx1 = bb.a + 0.10000000149011612D, lx2 = bb.d - 0.10000000149011612D;
++        double ly1 = bb.b + 0.4000000059604645D, ly2 = bb.e - 0.4000000059604645D;
++        double lz1 = bb.c + 0.10000000149011612D, lz2 = bb.f - 0.10000000149011612D;
++        return this.world.a(Math.min(lx1, lx2), Math.min(ly1, ly2), Math.min(lz1, lz2), Math.max(lx1, lx2), Math.max(ly1, ly2), Math.max(lz1, lz2), Material.LAVA);
+     }
+ 
+     public void b(float f, float f1, float f2, float f3) {
+diff --git a/test/java/net/minecraft/server/EntityFluidAndItemMergeParityTest.java b/test/java/net/minecraft/server/EntityFluidAndItemMergeParityTest.java
+new file mode 100644
+index 0000000..88aa621
+--- /dev/null
++++ b/test/java/net/minecraft/server/EntityFluidAndItemMergeParityTest.java
+@@ -0,0 +1,217 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.PaperWorldConfig;
++import com.destroystokyo.paper.antixray.ChunkPacketBlockController;
++import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.HashSet;
++import java.util.Random;
++import org.junit.Assert;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import org.spigotmc.SpigotWorldConfig;
++import sun.misc.Unsafe;
++
++public class EntityFluidAndItemMergeParityTest {
++
++    private static Unsafe unsafe;
++
++    @BeforeClass
++    public static void init() throws Exception {
++        DispenserRegistry.c();
++        org.spigotmc.AsyncCatcher.enabled = false;
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        unsafe = (Unsafe) f.get(null);
++    }
++
++    private static final class TestWorld extends WorldServer {
++        final Long2ObjectOpenHashMap<Chunk> map = new Long2ObjectOpenHashMap<>();
++
++        TestWorld() {
++            super(null, null, null, 0, null, null, null);
++        }
++
++        @Override
++        public Chunk getChunkIfLoaded(int x, int z) {
++            return map.get(ChunkCoordIntPair.a(x, z));
++        }
++
++        @Override
++        public Chunk getChunkAt(int x, int z) {
++            return map.get(ChunkCoordIntPair.a(x, z));
++        }
++
++        @Override
++        public boolean isChunkLoaded(int x, int z, boolean allowEmpty) {
++            return map.containsKey(ChunkCoordIntPair.a(x, z));
++        }
++    }
++
++    @SuppressWarnings("unchecked")
++    private static TestWorld createWorld() throws Exception {
++        TestWorld world = (TestWorld) unsafe.allocateInstance(TestWorld.class);
++        Field mapField = TestWorld.class.getDeclaredField("map");
++        mapField.setAccessible(true);
++        Long2ObjectOpenHashMap<Chunk> map = new Long2ObjectOpenHashMap<>();
++        mapField.set(world, map);
++
++        world.worldData = new WorldData();
++        world.u = new ArrayList<>();
++        world.J = new int[32768];
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("players")), new ArrayList<>());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("j")), new ArrayList<>());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("f")), new HashSet<>());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("entityList")), new ArrayList<>());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("tileEntityListTick")), new World.TickableTileEntityList());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("b")), new ArrayList<>());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("tileEntityListUnload")), new HashSet<>());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("random")), new Random(42L));
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("spigotConfig")), unsafe.allocateInstance(SpigotWorldConfig.class));
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("paperConfig")), unsafe.allocateInstance(PaperWorldConfig.class));
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("chunkPacketBlockController")), new ChunkPacketBlockController() {});
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("pendingLight")), new me.stella.antarctic.collection.PendingLightRegistry(256));
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("methodProfiler")), new MethodProfiler());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("P")), new WorldBorder());
++        world.worldProvider = new WorldProviderNormal();
++        world.worldProvider.a(world);
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("chunkProvider")), new IChunkProvider() {
++            @Override
++            public Chunk getLoadedChunkAt(int x, int z) {
++                return map.get(ChunkCoordIntPair.a(x, z));
++            }
++
++            @Override
++            public Chunk getChunkAt(int x, int z) {
++                return map.get(ChunkCoordIntPair.a(x, z));
++            }
++
++            @Override
++            public boolean unloadChunks() {
++                return false;
++            }
++
++            @Override
++            public String getName() {
++                return "test";
++            }
++
++            @Override
++            public boolean e(int x, int z) {
++                return map.containsKey(ChunkCoordIntPair.a(x, z));
++            }
++        });
++
++        Chunk c = (Chunk) unsafe.allocateInstance(Chunk.class);
++        Field wf = Chunk.class.getDeclaredField("world");
++        wf.setAccessible(true);
++        wf.set(c, world);
++        Field lx = Chunk.class.getDeclaredField("locX");
++        lx.setAccessible(true);
++        lx.setInt(c, 0);
++        Field lz = Chunk.class.getDeclaredField("locZ");
++        lz.setAccessible(true);
++        lz.setInt(c, 0);
++        Field sf = Chunk.class.getDeclaredField("sections");
++        sf.setAccessible(true);
++        ChunkSection[] secs = new ChunkSection[16];
++        for (int i = 0; i < 16; i++) {
++            secs[i] = Chunk.a;
++        }
++        secs[4] = new ChunkSection(64, true);
++        secs[4].setType(8, 0, 8, Blocks.WATER.getBlockData());
++        secs[4].setType(10, 0, 8, Blocks.LAVA.getBlockData());
++        secs[4].setType(12, 0, 8, Blocks.FIRE.getBlockData());
++        sf.set(c, secs);
++
++        Field esf = Chunk.class.getDeclaredField("entitySlices");
++        esf.setAccessible(true);
++        java.util.List<Entity>[] slices = new java.util.List[16];
++        for (int i = 0; i < 16; i++) {
++            slices[i] = new java.util.ArrayList<>();
++        }
++        esf.set(c, slices);
++
++        Field icf = Chunk.class.getDeclaredField("itemCounts");
++        icf.setAccessible(true);
++        icf.set(c, new int[16]);
++
++        Field hcf = Chunk.class.getDeclaredField("hardCollidableCounts");
++        hcf.setAccessible(true);
++        hcf.set(c, new int[16]);
++
++        Field fc = Chunk.class.getDeclaredField("itemFrameCounts");
++        fc.setAccessible(true);
++        fc.set(c, new int[16]);
++
++        unsafe.putObject(c, unsafe.objectFieldOffset(Chunk.class.getDeclaredField("entityCounts")), new co.aikar.util.Counter<>());
++
++        map.put(ChunkCoordIntPair.a(0, 0), c);
++        return world;
++    }
++
++    @Test
++    public void testSmallEntityFluidAndFireAndApParity() throws Exception {
++        TestWorld world = createWorld();
++
++        // EntityItem (height 0.25) in water -> aq() must detect water
++        EntityItem item = new EntityItem(world, 8.5D, 64.0D, 8.5D, new ItemStack(Blocks.STONE));
++        Assert.assertTrue("EntityItem in water must be detected by aq()", item.aq());
++        // EntitySquid (height 0.8) in water -> aq() must detect water
++        EntitySquid squid = new EntitySquid(world);
++        squid.setPosition(8.5D, 64.0D, 8.5D);
++        Assert.assertTrue("EntitySquid in water must be detected by aq()", squid.aq());
++        // EntityChicken (height 0.7) in water -> aq() must detect water
++        EntityChicken chicken = new EntityChicken(world);
++        chicken.setPosition(8.5D, 64.0D, 8.5D);
++        Assert.assertTrue("EntityChicken in water must be detected by aq()", chicken.aq());
++        // Entity.ap() parity against vanilla AABB call
++        EntityZombie zombie = new EntityZombie(world);
++        zombie.setPosition(8.5D, 64.0D, 8.5D);
++        Assert.assertEquals(
++            world.a(zombie.getBoundingBox().grow(0.0D, -20.0D, 0.0D).shrink(0.001D), Material.WATER, zombie),
++            zombie.ap());
++        Assert.assertTrue("Zombie at y=64 water must return true for ap()", zombie.ap());
++
++        // Small entity in lava -> au() must detect lava
++        EntityItem lavaItem = new EntityItem(world, 10.5D, 64.0D, 8.5D, new ItemStack(Blocks.STONE));
++        Assert.assertTrue("EntityItem in lava must be detected by au()", lavaItem.au());
++
++        // Zero-width ArmorStand marker in fire -> world.e normalized check must match vanilla shrink(0.001D)
++        EntityArmorStand marker = new EntityArmorStand(world, 12.5D, 64.5D, 8.5D);
++        marker.setMarker(true);
++        AxisAlignedBB fireBB = marker.getBoundingBox();
++        double fx1 = fireBB.a + 0.001D, fx2 = fireBB.d - 0.001D;
++        double fy1 = fireBB.b + 0.001D, fy2 = fireBB.e - 0.001D;
++        double fz1 = fireBB.c + 0.001D, fz2 = fireBB.f - 0.001D;
++        Assert.assertEquals(
++            world.e(fireBB.shrink(0.001D)),
++            world.e(Math.min(fx1, fx2), Math.min(fy1, fy2), Math.min(fz1, fz2),
++                Math.max(fx1, fx2), Math.max(fy1, fy2), Math.max(fz1, fz2)));
++    }
++
++    @Test
++    public void testChunkMergeNearbyItemsSafeAgainstSliceMutation() throws Exception {
++        TestWorld world = createWorld();
++        Chunk chunk = world.getChunkIfLoaded(0, 0);
++
++        final EntityItem self = new EntityItem(world, 8.5D, 65.0D, 8.5D, new ItemStack(Blocks.STONE)) {
++            @Override
++            boolean tryMergeWith(EntityItem other) {
++                // Simulate ItemMergeEvent listener removing entities from the same slice mid-merge
++                chunk.entitySlices[4].remove(other);
++                return false;
++            }
++        };
++        EntityItem other1 = new EntityItem(world, 8.6D, 65.0D, 8.5D, new ItemStack(Blocks.STONE));
++        EntityItem other2 = new EntityItem(world, 8.7D, 65.0D, 8.5D, new ItemStack(Blocks.STONE));
++        chunk.a(self);
++        chunk.a(other1);
++        chunk.a(other2);
++
++        AxisAlignedBB box = self.getBoundingBox().grow(0.5D, 0.0D, 0.5D);
++        chunk.mergeNearbyItems(self, box.a, box.b, box.c, box.d, box.e, box.f, chunk, 4);
++        Assert.assertEquals(1, chunk.entitySlices[4].size());
++    }
++}
