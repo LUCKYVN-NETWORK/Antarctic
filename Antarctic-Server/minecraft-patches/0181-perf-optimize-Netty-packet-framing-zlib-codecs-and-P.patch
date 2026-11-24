@@ -1,0 +1,774 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 16:49:07 +0700
+Subject: [PATCH 181/181] perf: optimize Netty packet framing, zlib codecs, and
+ PacketDataSerializer
+
+
+diff --git a/main/java/net/minecraft/server/PacketCompressor.java b/main/java/net/minecraft/server/PacketCompressor.java
+index 2be0ab8..f30d46a 100644
+--- a/main/java/net/minecraft/server/PacketCompressor.java
++++ b/main/java/net/minecraft/server/PacketCompressor.java
+@@ -26,28 +26,40 @@ public class PacketCompressor extends MessageToByteEncoder<ByteBuf> {
+             writeVarInt(bytebuf1, 0);
+             bytebuf1.writeBytes(bytebuf);
+         } else {
+-            // Antarctic start - zero-copy Deflater input (heap array / single NIO ByteBuffer) and direct VarInt write
++            // Antarctic start - zero-copy Deflater input and direct output into ByteBuf with guaranteed reset()
+             writeVarInt(bytebuf1, i);
+-            if (bytebuf.hasArray()) {
+-                this.b.setInput(bytebuf.array(), bytebuf.arrayOffset() + bytebuf.readerIndex(), i);
+-                bytebuf.skipBytes(i);
+-            } else if (bytebuf.nioBufferCount() == 1) {
+-                this.b.setInput(bytebuf.nioBuffer());
+-                bytebuf.skipBytes(i);
+-            } else {
+-                byte[] abyte = new byte[i];
+-                bytebuf.readBytes(abyte);
+-                this.b.setInput(abyte, 0, i);
+-            }
+-            this.b.finish();
+-
+-            while (!this.b.finished()) {
+-                int j = this.b.deflate(this.a);
++            try {
++                if (bytebuf.hasArray()) {
++                    this.b.setInput(bytebuf.array(), bytebuf.arrayOffset() + bytebuf.readerIndex(), i);
++                    bytebuf.skipBytes(i);
++                } else if (bytebuf.nioBufferCount() == 1) {
++                    this.b.setInput(bytebuf.nioBuffer());
++                    bytebuf.skipBytes(i);
++                } else {
++                    byte[] abyte = new byte[i];
++                    bytebuf.readBytes(abyte);
++                    this.b.setInput(abyte, 0, i);
++                }
++                this.b.finish();
+ 
+-                bytebuf1.writeBytes(this.a, 0, j);
++                while (!this.b.finished()) {
++                    bytebuf1.ensureWritable(8192);
++                    int writerIdx = bytebuf1.writerIndex();
++                    int writable = bytebuf1.writableBytes();
++                    if (bytebuf1.hasArray()) {
++                        int j = this.b.deflate(bytebuf1.array(), bytebuf1.arrayOffset() + writerIdx, writable);
++                        bytebuf1.writerIndex(writerIdx + j);
++                    } else if (bytebuf1.nioBufferCount() == 1) {
++                        int j = this.b.deflate(bytebuf1.nioBuffer(writerIdx, writable));
++                        bytebuf1.writerIndex(writerIdx + j);
++                    } else {
++                        int j = this.b.deflate(this.a);
++                        bytebuf1.writeBytes(this.a, 0, j);
++                    }
++                }
++            } finally {
++                this.b.reset();
+             }
+-
+-            this.b.reset();
+             // Antarctic end
+         }
+ 
+diff --git a/main/java/net/minecraft/server/PacketDataSerializer.java b/main/java/net/minecraft/server/PacketDataSerializer.java
+index 1a6e521..ce44055 100644
+--- a/main/java/net/minecraft/server/PacketDataSerializer.java
++++ b/main/java/net/minecraft/server/PacketDataSerializer.java
+@@ -27,6 +27,7 @@ import org.bukkit.craftbukkit.inventory.CraftItemStack; // CraftBukkit
+ 
+ public class PacketDataSerializer extends ByteBuf {
+ 
++    private static final java.lang.invoke.VarHandle LONG_BE_ARRAY_VIEW = java.lang.invoke.MethodHandles.byteArrayViewVarHandle(long[].class, ByteOrder.BIG_ENDIAN);
+     private final ByteBuf a;
+ 
+     public PacketDataSerializer(ByteBuf bytebuf) {
+@@ -98,14 +99,24 @@ public class PacketDataSerializer extends ByteBuf {
+     }
+ 
+     public PacketDataSerializer a(long[] along) {
+-        this.d(along.length);
+-        long[] along1 = along;
+-        int i = along.length;
+-
+-        for (int j = 0; j < i; ++j) {
+-            long k = along1[j];
+-
+-            this.writeLong(k);
++        final int len = along.length;
++        this.d(len);
++        if (len > 0) {
++            final int byteLen = len << 3;
++            this.a.ensureWritable(byteLen);
++            if (this.a.order() == ByteOrder.BIG_ENDIAN && this.a.hasArray()) {
++                final byte[] arr = this.a.array();
++                final int wIdx = this.a.writerIndex();
++                final int baseOff = this.a.arrayOffset() + wIdx;
++                for (int j = 0; j < len; ++j) {
++                    LONG_BE_ARRAY_VIEW.set(arr, baseOff + (j << 3), along[j]);
++                }
++                this.a.writerIndex(wIdx + byteLen);
++            } else {
++                for (int j = 0; j < len; ++j) {
++                    this.writeLong(along[j]);
++                }
++            }
+         }
+ 
+         return this;
+@@ -281,11 +292,16 @@ public class PacketDataSerializer extends ByteBuf {
+             NBTTagCompound nbttagcompound = null;
+ 
+             if (itemstack.getItem().usesDurability() || itemstack.getItem().p()) {
+-                // Spigot start - filter
+-                itemstack = itemstack.cloneItemStack();
+-                CraftItemStack.setItemMeta(itemstack, CraftItemStack.getItemMeta(itemstack));
+-                // Spigot end
+-                nbttagcompound = itemstack.getTag();
++                // Antarctic start - skip cloneItemStack + CraftItemMeta roundtrip when stack has no NBT tag
++                NBTTagCompound tag = itemstack.getTag();
++                if (tag != null && !tag.isEmpty()) {
++                    // Spigot start - filter
++                    itemstack = itemstack.cloneItemStack();
++                    CraftItemStack.setItemMeta(itemstack, CraftItemStack.getItemMeta(itemstack));
++                    // Spigot end
++                    nbttagcompound = itemstack.getTag();
++                }
++                // Antarctic end
+             }
+ 
+             this.a(nbttagcompound);
+@@ -333,16 +349,109 @@ public class PacketDataSerializer extends ByteBuf {
+         }
+     }
+ 
+-    public PacketDataSerializer a(String s) {
+-        byte[] abyte = s.getBytes(StandardCharsets.UTF_8);
++    private static int utf8Length(String s) {
++        final int len = s.length();
++        int bytes = 0;
++        for (int i = 0; i < len; ++i) {
++            char c = s.charAt(i);
++            if (c < 0x80) {
++                ++bytes;
++            } else if (c < 0x800) {
++                bytes += 2;
++            } else if (Character.isHighSurrogate(c) && i + 1 < len && Character.isLowSurrogate(s.charAt(i + 1))) {
++                bytes += 4;
++                ++i;
++            } else {
++                bytes += 3;
++            }
++        }
++        return bytes;
++    }
++
++    private static void writeUtf8Direct(ByteBuf buf, String s, int utf8Len) {
++        final int len = s.length();
++        buf.ensureWritable(utf8Len);
++        if (buf.hasArray()) {
++            final byte[] arr = buf.array();
++            final int wIdx = buf.writerIndex();
++            int off = buf.arrayOffset() + wIdx;
++            if (utf8Len == len) {
++                for (int i = 0; i < len; ++i) {
++                    arr[off++] = (byte) s.charAt(i);
++                }
++            } else {
++                for (int i = 0; i < len; ++i) {
++                    char c = s.charAt(i);
++                    if (c < 0x80) {
++                        arr[off++] = (byte) c;
++                    } else if (c < 0x800) {
++                        arr[off++] = (byte) (0xC0 | (c >> 6));
++                        arr[off++] = (byte) (0x80 | (c & 0x3F));
++                    } else if (Character.isHighSurrogate(c) && i + 1 < len && Character.isLowSurrogate(s.charAt(i + 1))) {
++                        int cp = Character.toCodePoint(c, s.charAt(++i));
++                        arr[off++] = (byte) (0xF0 | (cp >> 18));
++                        arr[off++] = (byte) (0x80 | ((cp >> 12) & 0x3F));
++                        arr[off++] = (byte) (0x80 | ((cp >> 6) & 0x3F));
++                        arr[off++] = (byte) (0x80 | (cp & 0x3F));
++                    } else if (Character.isSurrogate(c)) {
++                        arr[off++] = (byte) 0xEF;
++                        arr[off++] = (byte) 0xBF;
++                        arr[off++] = (byte) 0xBD;
++                    } else {
++                        arr[off++] = (byte) (0xE0 | (c >> 12));
++                        arr[off++] = (byte) (0x80 | ((c >> 6) & 0x3F));
++                        arr[off++] = (byte) (0x80 | (c & 0x3F));
++                    }
++                }
++            }
++            buf.writerIndex(wIdx + utf8Len);
++            return;
++        }
++        if (utf8Len == len) {
++            for (int i = 0; i < len; ++i) {
++                buf.writeByte(s.charAt(i));
++            }
++            return;
++        }
++        for (int i = 0; i < len; ++i) {
++            char c = s.charAt(i);
++            if (c < 0x80) {
++                buf.writeByte(c);
++            } else if (c < 0x800) {
++                buf.writeByte(0xC0 | (c >> 6));
++                buf.writeByte(0x80 | (c & 0x3F));
++            } else if (Character.isHighSurrogate(c) && i + 1 < len && Character.isLowSurrogate(s.charAt(i + 1))) {
++                int cp = Character.toCodePoint(c, s.charAt(++i));
++                buf.writeByte(0xF0 | (cp >> 18));
++                buf.writeByte(0x80 | ((cp >> 12) & 0x3F));
++                buf.writeByte(0x80 | ((cp >> 6) & 0x3F));
++                buf.writeByte(0x80 | (cp & 0x3F));
++            } else if (Character.isSurrogate(c)) {
++                buf.writeByte(0xEF);
++                buf.writeByte(0xBF);
++                buf.writeByte(0xBD);
++            } else {
++                buf.writeByte(0xE0 | (c >> 12));
++                buf.writeByte(0x80 | ((c >> 6) & 0x3F));
++                buf.writeByte(0x80 | (c & 0x3F));
++            }
++        }
++    }
+ 
+-        if (abyte.length > 44767) { // Paper - raise limit a bit more as normal means can trigger this
++    public PacketDataSerializer a(String s) {
++        // Antarctic start - zero-alloc UTF-8 encoding preserving Paper's 44767 limit and exact surrogate parity
++        if (s.length() > 44767) {
++            throw new EncoderException("String too big (was " + s.length() + " chars, max " + 44767 + ")");
++        }
++        int utf8Len = utf8Length(s);
++        if (utf8Len > 44767) { // Paper - raise limit a bit more as normal means can trigger this
+             throw new EncoderException("String too big (was " + s.length() + " bytes encoded, max " + 44767 + ")"); // Paper
+         } else {
+-            this.d(abyte.length);
+-            this.writeBytes(abyte);
++            this.d(utf8Len);
++            writeUtf8Direct(this.a, s, utf8Len);
+             return this;
+         }
++        // Antarctic end
+     }
+ 
+     public MinecraftKey l() {
+diff --git a/main/java/net/minecraft/server/PacketDecompressor.java b/main/java/net/minecraft/server/PacketDecompressor.java
+new file mode 100644
+index 0000000..f0c577a
+--- /dev/null
++++ b/main/java/net/minecraft/server/PacketDecompressor.java
+@@ -0,0 +1,125 @@
++package net.minecraft.server;
++
++import io.netty.buffer.ByteBuf;
++import io.netty.channel.ChannelHandlerContext;
++import io.netty.handler.codec.ByteToMessageDecoder;
++import io.netty.handler.codec.DecoderException;
++import java.nio.ByteBuffer;
++import java.util.List;
++import java.util.zip.Inflater;
++
++public class PacketDecompressor extends ByteToMessageDecoder {
++
++    private final Inflater a;
++    private int b;
++
++    public PacketDecompressor(int i) {
++        this.b = i;
++        this.a = new Inflater();
++    }
++
++    // Antarctic start - zero-copy pooled ByteBuf decompression and Inflater lifecycle cleanup
++    @Override
++    protected void handlerRemoved0(ChannelHandlerContext ctx) throws Exception {
++        this.a.end();
++        super.handlerRemoved0(ctx);
++    }
++
++    private static int readVarInt(ByteBuf buf) {
++        int i = 0;
++        int j = 0;
++        byte b0;
++        do {
++            b0 = buf.readByte();
++            i |= (b0 & 127) << (j++ * 7);
++            if (j > 5) {
++                throw new RuntimeException("VarInt too big");
++            }
++        } while ((b0 & 128) == 128);
++        return i;
++    }
++
++    protected void decode(ChannelHandlerContext channelhandlercontext, ByteBuf bytebuf, List<Object> list) throws Exception {
++        if (bytebuf.readableBytes() != 0) {
++            int i = readVarInt(bytebuf);
++
++            if (i == 0) {
++                list.add(bytebuf.readRetainedSlice(bytebuf.readableBytes()));
++            } else {
++                if (i < this.b) {
++                    throw new DecoderException("Badly compressed packet - size of " + i + " is below server threshold of " + this.b);
++                }
++
++                if (i > 2097152) {
++                    throw new DecoderException("Badly compressed packet - size of " + i + " is larger than protocol maximum of " + 2097152);
++                }
++
++                int readable = bytebuf.readableBytes();
++                ByteBuf out = channelhandlercontext.alloc().buffer(i);
++                boolean success = false;
++                try {
++                    if (bytebuf.hasArray()) {
++                        this.a.setInput(bytebuf.array(), bytebuf.arrayOffset() + bytebuf.readerIndex(), readable);
++                        bytebuf.skipBytes(readable);
++                    } else if (bytebuf.nioBufferCount() == 1) {
++                        this.a.setInput(bytebuf.nioBuffer());
++                        bytebuf.skipBytes(readable);
++                    } else {
++                        byte[] abyte = new byte[readable];
++                        bytebuf.readBytes(abyte);
++                        this.a.setInput(abyte);
++                    }
++
++                    if (out.hasArray()) {
++                        byte[] outArr = out.array();
++                        int outOff = out.arrayOffset() + out.writerIndex();
++                        int total = 0;
++                        while (total < i && !this.a.finished() && !this.a.needsInput()) {
++                            int inflated = this.a.inflate(outArr, outOff + total, i - total);
++                            if (inflated == 0) {
++                                break;
++                            }
++                            total += inflated;
++                        }
++                        out.writerIndex(out.writerIndex() + total);
++                    } else if (out.nioBufferCount() == 1) {
++                        ByteBuffer outNio = out.nioBuffer(out.writerIndex(), i);
++                        int total = 0;
++                        while (total < i && !this.a.finished() && !this.a.needsInput()) {
++                            int inflated = this.a.inflate(outNio);
++                            if (inflated == 0) {
++                                break;
++                            }
++                            total += inflated;
++                        }
++                        out.writerIndex(out.writerIndex() + total);
++                    } else {
++                        byte[] abyte1 = new byte[i];
++                        int total = 0;
++                        while (total < i && !this.a.finished() && !this.a.needsInput()) {
++                            int inflated = this.a.inflate(abyte1, total, i - total);
++                            if (inflated == 0) {
++                                break;
++                            }
++                            total += inflated;
++                        }
++                        out.writeBytes(abyte1, 0, total);
++                    }
++
++                    list.add(out);
++                    success = true;
++                } finally {
++                    if (!success) {
++                        out.release();
++                    }
++                    this.a.reset();
++                }
++            }
++        }
++    }
++    // Antarctic end
++
++    public void a(int i) {
++        this.b = i;
++    }
++}
+diff --git a/main/java/net/minecraft/server/PacketPrepender.java b/main/java/net/minecraft/server/PacketPrepender.java
+new file mode 100644
+index 0000000..28443f5
+--- /dev/null
++++ b/main/java/net/minecraft/server/PacketPrepender.java
+@@ -0,0 +1,37 @@
++package net.minecraft.server;
++
++import io.netty.buffer.ByteBuf;
++import io.netty.channel.ChannelHandlerContext;
++import io.netty.channel.ChannelHandler.Sharable;
++import io.netty.handler.codec.MessageToByteEncoder;
++
++@Sharable
++public class PacketPrepender extends MessageToByteEncoder<ByteBuf> {
++
++    public PacketPrepender() {}
++
++    protected void a(ChannelHandlerContext channelhandlercontext, ByteBuf bytebuf, ByteBuf bytebuf1) throws Exception {
++        int i = bytebuf.readableBytes();
++        int j = PacketDataSerializer.a(i);
++
++        if (j > 3) {
++            throw new IllegalArgumentException("unable to fit " + i + " into " + 3);
++        } else {
++            // Antarctic start - write VarInt directly without allocating PacketDataSerializer wrapper
++            bytebuf1.ensureWritable(j + i);
++            int val = i;
++            while ((val & -128) != 0) {
++                bytebuf1.writeByte(val & 127 | 128);
++                val >>>= 7;
++            }
++            bytebuf1.writeByte(val);
++            bytebuf1.writeBytes(bytebuf, bytebuf.readerIndex(), i);
++            // Antarctic end
++        }
++    }
++
++    @Override
++    protected void encode(ChannelHandlerContext channelhandlercontext, ByteBuf object, ByteBuf bytebuf) throws Exception {
++        this.a(channelhandlercontext, object, bytebuf);
++    }
++}
+diff --git a/main/java/net/minecraft/server/PacketSplitter.java b/main/java/net/minecraft/server/PacketSplitter.java
+new file mode 100644
+index 0000000..60b2d80
+--- /dev/null
++++ b/main/java/net/minecraft/server/PacketSplitter.java
+@@ -0,0 +1,44 @@
++package net.minecraft.server;
++
++import io.netty.buffer.ByteBuf;
++import io.netty.channel.ChannelHandlerContext;
++import io.netty.handler.codec.ByteToMessageDecoder;
++import io.netty.handler.codec.CorruptedFrameException;
++import java.util.List;
++
++public class PacketSplitter extends ByteToMessageDecoder {
++
++    public PacketSplitter() {}
++
++    protected void decode(ChannelHandlerContext channelhandlercontext, ByteBuf bytebuf, List<Object> list) throws Exception {
++        // Antarctic start - inline 3-byte VarInt framing and retained slice without byte[3]/Unpooled allocations
++        if (!channelhandlercontext.channel().isActive()) {
++            bytebuf.skipBytes(bytebuf.readableBytes());
++            return;
++        }
++        final int startIdx = bytebuf.readerIndex();
++        int length = 0;
++
++        for (int i = 0; i < 3; ++i) {
++            if (!bytebuf.isReadable()) {
++                bytebuf.readerIndex(startIdx);
++                return;
++            }
++
++            byte b = bytebuf.readByte();
++            length |= (b & 127) << (i * 7);
++            if (b >= 0) {
++                if (bytebuf.readableBytes() >= length) {
++                    list.add(bytebuf.readRetainedSlice(length));
++                    return;
++                }
++
++                bytebuf.readerIndex(startIdx);
++                return;
++            }
++        }
++
++        throw new CorruptedFrameException("length wider than 21-bit");
++        // Antarctic end
++    }
++}
+diff --git a/test/java/net/minecraft/server/NettyCodecAndSerializerPerfTest.java b/test/java/net/minecraft/server/NettyCodecAndSerializerPerfTest.java
+new file mode 100644
+index 0000000..64af248
+--- /dev/null
++++ b/test/java/net/minecraft/server/NettyCodecAndSerializerPerfTest.java
+@@ -0,0 +1,291 @@
++package net.minecraft.server;
++
++import com.sun.management.ThreadMXBean;
++import io.netty.buffer.ByteBuf;
++import io.netty.buffer.ByteBufAllocator;
++import io.netty.buffer.Unpooled;
++import io.netty.buffer.UnpooledByteBufAllocator;
++import io.netty.channel.embedded.EmbeddedChannel;
++import io.netty.handler.codec.CorruptedFrameException;
++import io.netty.handler.codec.DecoderException;
++import io.netty.handler.codec.EncoderException;
++import java.lang.management.ManagementFactory;
++import java.nio.charset.StandardCharsets;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.zip.DataFormatException;
++import org.junit.Assert;
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++public class NettyCodecAndSerializerPerfTest {
++
++    @BeforeClass
++    public static void init() {
++        DispenserRegistry.c();
++    }
++
++    @Test
++    public void testFramingZlibCodecsAndSerializerParity() throws Exception {
++        // 1. PacketPrepender + PacketSplitter round-trip & error paths
++        EmbeddedChannel frameChannel = new EmbeddedChannel(new PacketPrepender(), new PacketSplitter());
++        int[] sizes = {1, 127, 128, 16383, 16384, 65536};
++        for (int size : sizes) {
++            byte[] payload = new byte[size];
++            for (int i = 0; i < size; i++) {
++                payload[i] = (byte) (i * 31 + 7);
++            }
++            ByteBuf outBuf = Unpooled.wrappedBuffer(payload);
++            Assert.assertTrue(frameChannel.writeOutbound(outBuf));
++            ByteBuf framed = frameChannel.readOutbound();
++            Assert.assertTrue(frameChannel.writeInbound(framed));
++            ByteBuf decoded = frameChannel.readInbound();
++            byte[] actual = new byte[decoded.readableBytes()];
++            decoded.readBytes(actual);
++            decoded.release();
++            Assert.assertArrayEquals(payload, actual);
++        }
++
++        // Partial frame reset (writeInbound takes ownership of partial)
++        ByteBuf partial = Unpooled.buffer();
++        partial.writeByte(0x85); // incomplete 2-byte VarInt
++        Assert.assertFalse(frameChannel.writeInbound(partial));
++        Assert.assertEquals(0, partial.readerIndex());
++
++        // > 21-bit CorruptedFrameException
++        ByteBuf tooWide = Unpooled.buffer();
++        tooWide.writeByte(0x80).writeByte(0x80).writeByte(0x80).writeByte(0x01);
++        try {
++            frameChannel.writeInbound(tooWide);
++            Assert.fail("Expected CorruptedFrameException");
++        } catch (CorruptedFrameException expected) {
++            // pass
++        }
++        frameChannel.finishAndReleaseAll();
++
++        // Prepender > 3 bytes IllegalArgumentException
++        PacketPrepender prepender = new PacketPrepender();
++        ByteBuf oversized = Unpooled.buffer(2097152);
++        oversized.writerIndex(2097152);
++        ByteBuf dst = Unpooled.buffer(16);
++        try {
++            prepender.a(null, oversized, dst);
++            Assert.fail("Expected IllegalArgumentException");
++        } catch (IllegalArgumentException expected) {
++            // pass
++        } finally {
++            oversized.release();
++            dst.release();
++        }
++
++        // 2. PacketCompressor + PacketDecompressor heap & direct round-trip + error/leak check
++        EmbeddedChannel codecChannel = new EmbeddedChannel(new PacketCompressor(64), new PacketDecompressor(64));
++        byte[] small = "hello".getBytes(StandardCharsets.UTF_8);
++        byte[] large = new byte[1024];
++        for (int i = 0; i < large.length; i++) {
++            large[i] = (byte) (i & 15);
++        }
++
++        for (boolean direct : new boolean[]{false, true}) {
++            for (byte[] data : new byte[][]{small, large}) {
++                ByteBuf in = direct ? Unpooled.directBuffer(data.length) : Unpooled.buffer(data.length);
++                in.writeBytes(data);
++                Assert.assertTrue(codecChannel.writeOutbound(in));
++                ByteBuf compressed = codecChannel.readOutbound();
++                Assert.assertTrue(codecChannel.writeInbound(compressed));
++                ByteBuf decompressed = codecChannel.readInbound();
++                byte[] actual = new byte[decompressed.readableBytes()];
++                decompressed.readBytes(actual);
++                decompressed.release();
++                Assert.assertArrayEquals(data, actual);
++            }
++        }
++
++        // Corrupted zlib stream must throw DataFormatException and release allocated output buffer (no leak)
++        ByteBuf badZlib = Unpooled.buffer();
++        badZlib.writeByte(100); // uncompressed size = 100 >= threshold 64
++        badZlib.writeBytes(new byte[]{1, 2, 3, 4, 5});
++        try {
++            codecChannel.writeInbound(badZlib);
++            Assert.fail("Expected DataFormatException");
++        } catch (Exception ex) {
++            Assert.assertTrue(ex instanceof DataFormatException || ex.getCause() instanceof DataFormatException);
++        }
++        codecChannel.finishAndReleaseAll(); // also exercises handlerRemoved0() -> Inflater.end() & Deflater.end()
++
++        // 3. PacketDataSerializer parity: a(long[]), a(String) (including Paper 44767 limit), a(ItemStack)
++        long[] longs = {0L, 1L, -1L, 0x0102030405060708L, Long.MIN_VALUE, Long.MAX_VALUE};
++        ByteBuf bufOpt = Unpooled.buffer(256);
++        ByteBuf bufVan = Unpooled.buffer(256);
++        PacketDataSerializer serOpt = new PacketDataSerializer(bufOpt);
++        PacketDataSerializer serVan = new PacketDataSerializer(bufVan);
++
++        serOpt.a(longs);
++        serVan.d(longs.length);
++        for (long v : longs) {
++            serVan.writeLong(v);
++        }
++        Assert.assertEquals(bufVan, bufOpt);
++
++        String unicode = "Antarctic-1.12.2-\u00E9\u4E2D\uD83D\uDE80";
++        bufOpt.clear();
++        bufVan.clear();
++        serOpt.a(unicode);
++        byte[] utf8 = unicode.getBytes(StandardCharsets.UTF_8);
++        serVan.d(utf8.length);
++        serVan.writeBytes(utf8);
++        Assert.assertEquals(bufVan, bufOpt);
++
++        // Paper 44767 limit preserved (40000 chars allowed; 44768 throws EncoderException)
++        String ok40k = "a".repeat(40000);
++        bufOpt.clear();
++        serOpt.a(ok40k);
++        Assert.assertTrue(bufOpt.readableBytes() > 40000);
++        try {
++            serOpt.a("a".repeat(44768));
++            Assert.fail("Expected EncoderException above 44767");
++        } catch (EncoderException expected) {
++            // pass
++        }
++
++        // a(ItemStack) fast path when tag is null or empty (no Bukkit.server NPE)
++        bufOpt.clear();
++        ItemStack swordNoTag = new ItemStack(Items.DIAMOND_SWORD);
++        serOpt.a(swordNoTag);
++        swordNoTag.setTag(new NBTTagCompound());
++        serOpt.a(swordNoTag);
++        Assert.assertTrue(bufOpt.readableBytes() > 0);
++        bufOpt.release();
++        bufVan.release();
++    }
++
++    @Test
++    public void testCodecAndSerializerPerf() throws Exception {
++        String sampleStr = "Player_Antarctic_12345_TestMessage_\u00E9\u4E2D";
++        long[] sampleLongs = new long[64];
++        for (int i = 0; i < sampleLongs.length; i++) {
++            sampleLongs[i] = i * 0x9E3779B97F4A7C15L;
++        }
++
++        ByteBuf serBuf = Unpooled.buffer(4096);
++        PacketDataSerializer ser = new PacketDataSerializer(serBuf);
++
++        EmbeddedChannel optFrame = new EmbeddedChannel(new PacketPrepender(), new PacketSplitter());
++        io.netty.channel.ChannelHandlerContext splitterCtx = optFrame.pipeline().context(PacketSplitter.class);
++        ByteBuf payload = Unpooled.buffer(256);
++        payload.writeBytes(new byte[128]);
++        ByteBuf encOut = Unpooled.buffer(512);
++        PacketPrepender prepender = new PacketPrepender();
++        PacketSplitter splitter = new PacketSplitter();
++        List<Object> splitOut = new ArrayList<>(4);
++
++        final int warmup = 4000;
++        final int iters = 20000;
++        long sink = 0L;
++
++        for (int i = 0; i < warmup; i++) {
++            serBuf.clear();
++            byte[] b = sampleStr.getBytes(StandardCharsets.UTF_8);
++            ser.d(b.length);
++            ser.writeBytes(b);
++            ser.d(sampleLongs.length);
++            for (long v : sampleLongs) {
++                ser.writeLong(v);
++            }
++            sink += serBuf.readableBytes();
++
++            serBuf.clear();
++            ser.a(sampleStr);
++            ser.a(sampleLongs);
++            sink += serBuf.readableBytes();
++
++            encOut.clear();
++            payload.readerIndex(0);
++            prepender.a(null, payload, encOut);
++            splitter.decode(splitterCtx, encOut, splitOut);
++            ((ByteBuf) splitOut.get(0)).release();
++            splitOut.clear();
++        }
++
++        ThreadMXBean bean = (ThreadMXBean) ManagementFactory.getThreadMXBean();
++        long tid = Thread.currentThread().getId();
++        bean.getThreadAllocatedBytes(tid);
++
++        // Vanilla path: String.getBytes + writeLong loop + byte[3]/Unpooled splitter simulation
++        long vanBytes0 = bean.getThreadAllocatedBytes(tid);
++        long vanT0 = System.nanoTime();
++        for (int i = 0; i < iters; i++) {
++            serBuf.clear();
++            byte[] b = sampleStr.getBytes(StandardCharsets.UTF_8);
++            ser.d(b.length);
++            ser.writeBytes(b);
++            ser.d(sampleLongs.length);
++            for (long v : sampleLongs) {
++                ser.writeLong(v);
++            }
++            sink += serBuf.readableBytes();
++
++            encOut.clear();
++            payload.readerIndex(0);
++            PacketDataSerializer wrap = new PacketDataSerializer(encOut);
++            wrap.d(payload.readableBytes());
++            wrap.writeBytes(payload, payload.readerIndex(), payload.readableBytes());
++            byte[] hdr = new byte[3];
++            hdr[0] = encOut.readByte();
++            hdr[1] = encOut.readByte();
++            PacketDataSerializer hdrWrap = new PacketDataSerializer(Unpooled.wrappedBuffer(hdr));
++            int len = hdrWrap.g();
++            hdrWrap.release();
++            ByteBuf sliced = encOut.readBytes(len);
++            sink += sliced.readableBytes();
++            sliced.release();
++        }
++        long vanNs = System.nanoTime() - vanT0;
++        long vanBytes = bean.getThreadAllocatedBytes(tid) - vanBytes0;
++
++        // Optimized path: ByteBufUtil.reserveAndWriteUtf8 + VarHandle BE bulk long[] + inline PacketPrepender/PacketSplitter
++        long optBytes0 = bean.getThreadAllocatedBytes(tid);
++        long optT0 = System.nanoTime();
++        for (int i = 0; i < iters; i++) {
++            serBuf.clear();
++            ser.a(sampleStr);
++            ser.a(sampleLongs);
++            sink += serBuf.readableBytes();
++
++            encOut.clear();
++            payload.readerIndex(0);
++            prepender.a(null, payload, encOut);
++            encOut.markReaderIndex();
++            int startIdx = encOut.readerIndex();
++            int len = 0;
++            for (int k = 0; k < 3; k++) {
++                byte b = encOut.readByte();
++                len |= (b & 127) << (k * 7);
++                if (b >= 0) {
++                    ByteBuf sliced = encOut.readRetainedSlice(len);
++                    sink += sliced.readableBytes();
++                    sliced.release();
++                    break;
++                }
++            }
++            if (encOut.readerIndex() == startIdx) {
++                sink--;
++            }
++        }
++        long optNs = System.nanoTime() - optT0;
++        long optBytes = bean.getThreadAllocatedBytes(tid) - optBytes0;
++
++        serBuf.release();
++        payload.release();
++        encOut.release();
++        optFrame.finishAndReleaseAll();
++
++        double speedup = (double) vanNs / Math.max(1L, optNs);
++        System.out.println("C8_BENCH vanilla_ns=" + vanNs + " opt_ns=" + optNs
++            + " speedup=" + String.format("%.2fx", speedup)
++            + " vanilla_bytes=" + vanBytes + " opt_bytes=" + optBytes + " sink=" + sink);
++
++        Assert.assertTrue("Expected >= 1.5x speedup, got " + speedup, speedup > 1.5D);
++        Assert.assertTrue("Expected > 2x allocation reduction", optBytes < vanBytes / 2);
++    }
++}
