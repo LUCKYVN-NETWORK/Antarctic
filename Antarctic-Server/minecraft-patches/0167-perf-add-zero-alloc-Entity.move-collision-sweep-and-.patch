@@ -1,0 +1,1196 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 12:27:31 +0700
+Subject: [PATCH 167/167] perf: add zero-alloc Entity.move collision sweep and
+ Chunk hardCollidableCounts
+
+
+diff --git a/main/java/net/minecraft/server/Chunk.java b/main/java/net/minecraft/server/Chunk.java
+index 1ed7574..3dac8e2 100644
+--- a/main/java/net/minecraft/server/Chunk.java
++++ b/main/java/net/minecraft/server/Chunk.java
+@@ -169,8 +169,48 @@ public class Chunk {
+     // Keep this synced with entitySlices.add() and entitySlices.remove()
+     private final int[] itemCounts = new int[16];
+     private final int[] inventoryEntityCounts = new int[16];
++    public final int[] hardCollidableCounts = new int[16];
+     // Paper end
+ 
++    // Antarctic start - hard-collidable entity slice detection for O(1) empty-slice skip
++    static final ClassValue<Boolean> HAS_HARD_COLLISION_BOX = new ClassValue<Boolean>() {
++        @Override
++        protected Boolean computeValue(Class<?> type) {
++            Class<?> cur = type;
++            while (cur != null && cur != Entity.class && cur != Object.class) {
++                try {
++                    cur.getDeclaredMethod("al");
++                    return Boolean.TRUE;
++                } catch (NoSuchMethodException ignored) {
++                    cur = cur.getSuperclass();
++                }
++            }
++            return Boolean.FALSE;
++        }
++    };
++
++    static final ClassValue<Boolean> HAS_ENTITY_COLLISION_BOX = new ClassValue<Boolean>() {
++        @Override
++        protected Boolean computeValue(Class<?> type) {
++            Class<?> cur = type;
++            while (cur != null && cur != Entity.class && cur != Object.class) {
++                try {
++                    cur.getDeclaredMethod("j", Entity.class);
++                    return Boolean.TRUE;
++                } catch (NoSuchMethodException ignored) {
++                    cur = cur.getSuperclass();
++                }
++            }
++            return Boolean.FALSE;
++        }
++    };
++
++    static boolean isHardCollidableEntity(Entity entity) {
++        return entity instanceof EntityBoat || entity instanceof EntityMinecartAbstract || entity instanceof EntityShulker
++                || HAS_HARD_COLLISION_BOX.get(entity.getClass());
++    }
++    // Antarctic end
++
+     // CraftBukkit start - Neighbor loaded cache for chunk lighting and entity ticking
+     private int neighbors = 0x1 << 12;
+     public long chunkKey;
+@@ -849,6 +889,9 @@ public class Chunk {
+         } else if (entity instanceof IInventory) {
+             inventoryEntityCounts[k]++;
+         }
++        if (isHardCollidableEntity(entity)) {
++            hardCollidableCounts[k]++;
++        }
+         // Paper end
+         // Antarctic start - track creature counts via stored mask to prevent persistence drift
+         byte spawnMask = computeSpawnCountMask(entity);
+@@ -886,6 +929,9 @@ public class Chunk {
+         } else if (entity instanceof IInventory) {
+             inventoryEntityCounts[i]--;
+         }
++        if (isHardCollidableEntity(entity)) {
++            hardCollidableCounts[i]--;
++        }
+         // Paper end
+         // Antarctic start - decrement creature counts via exact stored mask
+         this.untrackEntityCreatureCount(entity);
+@@ -1304,7 +1350,7 @@ public class Chunk {
+         return false;
+     }
+ 
+-    boolean hasHardEntityCollision(Entity entity, AxisAlignedBB box, double minX, double minY, double minZ, double maxX, double maxY, double maxZ) {
++    boolean hasHardEntityCollision(Entity entity, AxisAlignedBB box, double minX, double minY, double minZ, double maxX, double maxY, double maxZ, boolean callerHasEntityBox) {
+         int i = MathHelper.floor((minY - 2.0D) / 16.0D);
+         int j = MathHelper.floor((maxY + 2.0D) / 16.0D);
+ 
+@@ -1312,6 +1358,9 @@ public class Chunk {
+         j = MathHelper.clamp(j, 0, this.entitySlices.length - 1);
+ 
+         for (int k = i; k <= j; ++k) {
++            if (!callerHasEntityBox && this.hardCollidableCounts[k] <= 0) {
++                continue;
++            }
+             List<Entity> slice = this.entitySlices[k];
+             for (int idx = 0, len = slice.size(); idx < len; ++idx) {
+                 Entity entity1 = slice.get(idx);
+@@ -1349,6 +1398,54 @@ public class Chunk {
+         }
+         return false;
+     }
++
++    void collectHardEntityCollisions(Entity entity, AxisAlignedBB box, double minX, double minY, double minZ, double maxX, double maxY, double maxZ, boolean callerHasEntityBox, List<AxisAlignedBB> out) {
++        int i = MathHelper.floor((minY - 2.0D) / 16.0D);
++        int j = MathHelper.floor((maxY + 2.0D) / 16.0D);
++
++        i = MathHelper.clamp(i, 0, this.entitySlices.length - 1);
++        j = MathHelper.clamp(j, 0, this.entitySlices.length - 1);
++
++        for (int k = i; k <= j; ++k) {
++            if (!callerHasEntityBox && this.hardCollidableCounts[k] <= 0) {
++                continue;
++            }
++            List<Entity> slice = this.entitySlices[k];
++            for (int idx = 0, len = slice.size(); idx < len; ++idx) {
++                Entity entity1 = slice.get(idx);
++                if (!entity.x(entity1)) {
++                    AxisAlignedBB bb1 = entity1.getBoundingBox();
++                    if (bb1.d > minX && bb1.a < maxX && bb1.e > minY && bb1.b < maxY && bb1.f > minZ && bb1.c < maxZ && entity1 != entity && IEntitySelector.e.apply(entity1)) {
++                        AxisAlignedBB hard = entity1.al();
++                        if (hard != null && hard.c(box)) {
++                            out.add(hard);
++                        }
++                        hard = entity.j(entity1);
++                        if (hard != null && hard.c(box)) {
++                            out.add(hard);
++                        }
++                    }
++                    Entity[] aentity = entity1.bb();
++                    if (aentity != null) {
++                        for (int m = 0, alen = aentity.length; m < alen; ++m) {
++                            Entity entity2 = aentity[m];
++                            AxisAlignedBB bb2 = entity2.getBoundingBox();
++                            if (entity2 != entity && bb2.d > minX && bb2.a < maxX && bb2.e > minY && bb2.b < maxY && bb2.f > minZ && bb2.c < maxZ && IEntitySelector.e.apply(entity2) && !entity.x(entity2)) {
++                                AxisAlignedBB hard = entity2.al();
++                                if (hard != null && hard.c(box)) {
++                                    out.add(hard);
++                                }
++                                hard = entity.j(entity2);
++                                if (hard != null && hard.c(box)) {
++                                    out.add(hard);
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
+     // Antarctic end
+ 
+     public boolean a(boolean flag) {
+diff --git a/main/java/net/minecraft/server/Entity.java b/main/java/net/minecraft/server/Entity.java
+index 339a332..de1b9d3 100644
+--- a/main/java/net/minecraft/server/Entity.java
++++ b/main/java/net/minecraft/server/Entity.java
+@@ -117,6 +117,7 @@ public abstract class Entity implements ICommandListener, KeyedObject { // Paper
+     public float lastYaw;
+     public float lastPitch;
+     private AxisAlignedBB boundingBox;
++    private double[] antarcticMoveDelta;
+     public boolean onGround;
+     public boolean positionChanged;
+     public boolean B;
+@@ -713,41 +714,94 @@ public abstract class Entity implements ICommandListener, KeyedObject { // Paper
+             int k;
+             int l;
+ 
+-            // Antarctic start - skip unused getCubes collision lookup on zero delta while preserving vanilla move semantics
++            // Antarctic start - zero-alloc Entity.move collision sweep with vanilla getCubes fallback
+             if (d0 != 0.0D || d1 != 0.0D || d2 != 0.0D) {
+-                List list = this.world.getCubes(this, this.getBoundingBox().b(d0, d1, d2));
++                if (com.destroystokyo.paper.config.toml.modules.optimizations.Physics.optimizeVoxelCollisions) {
++                    double[] moveDelta = this.antarcticMoveDelta;
++                    if (moveDelta == null) {
++                        moveDelta = new double[3];
++                        this.antarcticMoveDelta = moveDelta;
++                    }
++                    if (this.world.resolveEntityMoveCollisions(this, d0, d1, d2, moveDelta)) {
++                        d0 = moveDelta[0];
++                        d1 = moveDelta[1];
++                        d2 = moveDelta[2];
++                    } else {
++                        List list = this.world.getCubes(this, this.getBoundingBox().b(d0, d1, d2));
+ 
+-                if (d1 != 0.0D) {
+-                    k = 0;
++                        if (d1 != 0.0D) {
++                            k = 0;
+ 
+-                    for (l = list.size(); k < l; ++k) {
+-                        d1 = ((AxisAlignedBB) list.get(k)).b(this.getBoundingBox(), d1);
++                            for (l = list.size(); k < l; ++k) {
++                                d1 = ((AxisAlignedBB) list.get(k)).b(this.getBoundingBox(), d1);
++                            }
++
++                            if (d1 != 0.0D) {
++                                this.a(this.getBoundingBox().d(0.0D, d1, 0.0D));
++                            }
++                        }
++
++                        if (d0 != 0.0D) {
++                            k = 0;
++
++                            for (l = list.size(); k < l; ++k) {
++                                d0 = ((AxisAlignedBB) list.get(k)).a(this.getBoundingBox(), d0);
++                            }
++
++                            if (d0 != 0.0D) {
++                                this.a(this.getBoundingBox().d(d0, 0.0D, 0.0D));
++                            }
++                        }
++
++                        if (d2 != 0.0D) {
++                            k = 0;
++
++                            for (l = list.size(); k < l; ++k) {
++                                d2 = ((AxisAlignedBB) list.get(k)).c(this.getBoundingBox(), d2);
++                            }
++
++                            if (d2 != 0.0D) {
++                                this.a(this.getBoundingBox().d(0.0D, 0.0D, d2));
++                            }
++                        }
+                     }
++                } else {
++                    List list = this.world.getCubes(this, this.getBoundingBox().b(d0, d1, d2));
+ 
+-                    this.a(this.getBoundingBox().d(0.0D, d1, 0.0D));
+-                }
++                    if (d1 != 0.0D) {
++                        k = 0;
+ 
+-                if (d0 != 0.0D) {
+-                    k = 0;
++                        for (l = list.size(); k < l; ++k) {
++                            d1 = ((AxisAlignedBB) list.get(k)).b(this.getBoundingBox(), d1);
++                        }
+ 
+-                    for (l = list.size(); k < l; ++k) {
+-                        d0 = ((AxisAlignedBB) list.get(k)).a(this.getBoundingBox(), d0);
++                        if (d1 != 0.0D) {
++                            this.a(this.getBoundingBox().d(0.0D, d1, 0.0D));
++                        }
+                     }
+ 
+                     if (d0 != 0.0D) {
+-                        this.a(this.getBoundingBox().d(d0, 0.0D, 0.0D));
+-                    }
+-                }
++                        k = 0;
+ 
+-                if (d2 != 0.0D) {
+-                    k = 0;
++                        for (l = list.size(); k < l; ++k) {
++                            d0 = ((AxisAlignedBB) list.get(k)).a(this.getBoundingBox(), d0);
++                        }
+ 
+-                    for (l = list.size(); k < l; ++k) {
+-                        d2 = ((AxisAlignedBB) list.get(k)).c(this.getBoundingBox(), d2);
++                        if (d0 != 0.0D) {
++                            this.a(this.getBoundingBox().d(d0, 0.0D, 0.0D));
++                        }
+                     }
+ 
+                     if (d2 != 0.0D) {
+-                        this.a(this.getBoundingBox().d(0.0D, 0.0D, d2));
++                        k = 0;
++
++                        for (l = list.size(); k < l; ++k) {
++                            d2 = ((AxisAlignedBB) list.get(k)).c(this.getBoundingBox(), d2);
++                        }
++
++                        if (d2 != 0.0D) {
++                            this.a(this.getBoundingBox().d(0.0D, 0.0D, d2));
++                        }
+                     }
+                 }
+             }
+@@ -2813,23 +2867,27 @@ public abstract class Entity implements ICommandListener, KeyedObject { // Paper
+ 
+     public void a(AxisAlignedBB axisalignedbb) {
+         // CraftBukkit start - block invalid bounding boxes
++        double lenX = axisalignedbb.d - axisalignedbb.a;
++        double lenY = axisalignedbb.e - axisalignedbb.b;
++        double lenZ = axisalignedbb.f - axisalignedbb.c;
++        if (lenX >= 0.0D && lenX <= 64.0D && lenY >= 0.0D && lenY <= 64.0D && lenZ >= 0.0D && lenZ <= 64.0D) {
++            this.boundingBox = axisalignedbb;
++            return;
++        }
+         double a = axisalignedbb.a,
+                 b = axisalignedbb.b,
+                 c = axisalignedbb.c,
+                 d = axisalignedbb.d,
+                 e = axisalignedbb.e,
+                 f = axisalignedbb.f;
+-        double len = axisalignedbb.d - axisalignedbb.a;
+-        if (len < 0) d = a;
+-        if (len > 64) d = a + 64.0;
++        if (lenX < 0) d = a;
++        if (lenX > 64) d = a + 64.0;
+ 
+-        len = axisalignedbb.e - axisalignedbb.b;
+-        if (len < 0) e = b;
+-        if (len > 64) e = b + 64.0;
++        if (lenY < 0) e = b;
++        if (lenY > 64) e = b + 64.0;
+ 
+-        len = axisalignedbb.f - axisalignedbb.c;
+-        if (len < 0) f = c;
+-        if (len > 64) f = c + 64.0;
++        if (lenZ < 0) f = c;
++        if (lenZ > 64) f = c + 64.0;
+         this.boundingBox = new AxisAlignedBB(a, b, c, d, e, f);
+         // CraftBukkit end
+     }
+diff --git a/main/java/net/minecraft/server/World.java b/main/java/net/minecraft/server/World.java
+index 14f9c78..ff47877 100644
+--- a/main/java/net/minecraft/server/World.java
++++ b/main/java/net/minecraft/server/World.java
+@@ -1546,21 +1546,23 @@ public abstract class World implements IBlockAccess {
+         this.a(entity, axisalignedbb, false, arraylist);
+         if (entity != null) {
+             if (entity instanceof EntityArmorStand && !entity.world.paperConfig.armorStandEntityLookups) return arraylist; // Paper
+-            List list = this.getEntities(entity, axisalignedbb.g(0.25D));
+-
+-            for (int i = 0; i < list.size(); ++i) {
+-                Entity entity1 = (Entity) list.get(i);
+-
+-                if (!entity.x(entity1)) {
+-                    AxisAlignedBB axisalignedbb1 = entity1.al();
+-
+-                    if (axisalignedbb1 != null && axisalignedbb1.c(axisalignedbb)) {
+-                        arraylist.add(axisalignedbb1);
+-                    }
++            boolean callerHasEntityBox = Chunk.HAS_ENTITY_COLLISION_BOX.get(entity.getClass());
++            double minX = axisalignedbb.a - 0.25D;
++            double minY = axisalignedbb.b - 0.25D;
++            double minZ = axisalignedbb.c - 0.25D;
++            double maxX = axisalignedbb.d + 0.25D;
++            double maxY = axisalignedbb.e + 0.25D;
++            double maxZ = axisalignedbb.f + 0.25D;
++            int minCx = MathHelper.floor((minX - 2.0D) / 16.0D);
++            int maxCx = MathHelper.floor((maxX + 2.0D) / 16.0D);
++            int minCz = MathHelper.floor((minZ - 2.0D) / 16.0D);
++            int maxCz = MathHelper.floor((maxZ + 2.0D) / 16.0D);
+ 
+-                    axisalignedbb1 = entity.j(entity1);
+-                    if (axisalignedbb1 != null && axisalignedbb1.c(axisalignedbb)) {
+-                        arraylist.add(axisalignedbb1);
++            for (int cx = minCx; cx <= maxCx; ++cx) {
++                for (int cz = minCz; cz <= maxCz; ++cz) {
++                    Chunk chunk = this.getChunkIfLoaded(cx, cz);
++                    if (chunk != null) {
++                        chunk.collectHardEntityCollisions(entity, axisalignedbb, minX, minY, minZ, maxX, maxY, maxZ, callerHasEntityBox, arraylist);
+                     }
+                 }
+             }
+@@ -1653,6 +1655,7 @@ public abstract class World implements IBlockAccess {
+             if (entity instanceof EntityArmorStand && !entity.world.paperConfig.armorStandEntityLookups) {
+                 return false;
+             }
++            boolean callerHasEntityBox = Chunk.HAS_ENTITY_COLLISION_BOX.get(entity.getClass());
+             double minX = axisalignedbb.a - 0.25D;
+             double minY = axisalignedbb.b - 0.25D;
+             double minZ = axisalignedbb.c - 0.25D;
+@@ -1667,7 +1670,7 @@ public abstract class World implements IBlockAccess {
+             for (int cx = minCx; cx <= maxCx; ++cx) {
+                 for (int cz = minCz; cz <= maxCz; ++cz) {
+                     Chunk chunk = this.getChunkIfLoaded(cx, cz);
+-                    if (chunk != null && chunk.hasHardEntityCollision(entity, axisalignedbb, minX, minY, minZ, maxX, maxY, maxZ)) {
++                    if (chunk != null && chunk.hasHardEntityCollision(entity, axisalignedbb, minX, minY, minZ, maxX, maxY, maxZ, callerHasEntityBox)) {
+                         return true;
+                     }
+                 }
+@@ -1700,7 +1703,414 @@ public abstract class World implements IBlockAccess {
+     }
+ 
+     public boolean a(AxisAlignedBB axisalignedbb) {
+-        return this.a((Entity) null, axisalignedbb, true, Lists.<AxisAlignedBB>newArrayList()); // CraftBukkit - decompile error
++        return this.hasBlockCollision(axisalignedbb);
++    }
++
++    public boolean hasBlockCollision(AxisAlignedBB axisalignedbb) {
++        int i = MathHelper.floor(axisalignedbb.a) - 1;
++        int j = MathHelper.f(axisalignedbb.d) + 1;
++        int k = MathHelper.floor(axisalignedbb.b) - 1;
++        int l = MathHelper.f(axisalignedbb.e) + 1;
++        int i1 = MathHelper.floor(axisalignedbb.c) - 1;
++        int j1 = MathHelper.f(axisalignedbb.f) + 1;
++
++        BlockPosition.MutableBlockPosition pos = null;
++        ArrayList<AxisAlignedBB> nonCubeScratch = null;
++        int cachedChunkX = Integer.MIN_VALUE;
++        int cachedChunkZ = Integer.MIN_VALUE;
++        Chunk cachedChunk = null;
++
++        for (int k1 = i; k1 < j; ++k1) {
++            for (int l1 = i1; l1 < j1; ++l1) {
++                boolean flag3 = k1 == i || k1 == j - 1;
++                boolean flag4 = l1 == i1 || l1 == j1 - 1;
++
++                if (flag3 && flag4) {
++                    continue;
++                }
++
++                int chunkX = k1 >> 4;
++                int chunkZ = l1 >> 4;
++                if (chunkX != cachedChunkX || chunkZ != cachedChunkZ) {
++                    cachedChunkX = chunkX;
++                    cachedChunkZ = chunkZ;
++                    cachedChunk = this.getChunkIfLoaded(chunkX, chunkZ);
++                }
++                if (cachedChunk == null) {
++                    continue;
++                }
++
++                for (int i2 = k; i2 < l; ++i2) {
++                    if (!flag3 && !flag4 || i2 != l - 1) {
++                        if (k1 < -30000000 || k1 >= 30000000 || l1 < -30000000 || l1 >= 30000000) {
++                            return true;
++                        }
++
++                        IBlockData iblockdata1 = cachedChunk.a(k1, i2, l1);
++                        me.stella.antarctic.spatial.FastVoxelCache.ShapeType shape = me.stella.antarctic.spatial.FastVoxelCache.classify(iblockdata1);
++                        if (shape == me.stella.antarctic.spatial.FastVoxelCache.ShapeType.EMPTY) {
++                            continue;
++                        }
++                        if (shape == me.stella.antarctic.spatial.FastVoxelCache.ShapeType.FULL_CUBE) {
++                            if (axisalignedbb.a < (double) (k1 + 1) && axisalignedbb.d > (double) k1
++                                && axisalignedbb.b < (double) (i2 + 1) && axisalignedbb.e > (double) i2
++                                && axisalignedbb.c < (double) (l1 + 1) && axisalignedbb.f > (double) l1) {
++                                return true;
++                            }
++                            continue;
++                        }
++
++                        if (pos == null) {
++                            pos = new BlockPosition.MutableBlockPosition();
++                        }
++                        if (nonCubeScratch == null) {
++                            nonCubeScratch = new ArrayList<AxisAlignedBB>(1);
++                        }
++                        pos.c(k1, i2, l1);
++                        iblockdata1.a(this, pos, axisalignedbb, nonCubeScratch, null, false);
++                        if (!nonCubeScratch.isEmpty()) {
++                            return true;
++                        }
++                    }
++                }
++            }
++        }
++
++        return false;
++    }
++
++    private static final class MoveScratch {
++        boolean inUse;
++        int[] cubes = new int[256 * 3];
++        final ArrayList<AxisAlignedBB> nonCubes = new ArrayList<AxisAlignedBB>(8);
++        final BlockPosition.MutableBlockPosition pos = new BlockPosition.MutableBlockPosition();
++
++        void ensureCubeCapacity(int count) {
++            int needed = (count + 1) * 3;
++            if (needed > this.cubes.length) {
++                this.cubes = java.util.Arrays.copyOf(this.cubes, Math.max(this.cubes.length << 1, needed));
++            }
++        }
++    }
++
++    private static final ThreadLocal<MoveScratch> MOVE_SCRATCH = ThreadLocal.withInitial(MoveScratch::new);
++
++    boolean resolveEntityMoveCollisions(Entity entity, double d0, double d1, double d2, double[] outDelta) {
++        MoveScratch scratch = MOVE_SCRATCH.get();
++        if (scratch.inUse) {
++            return false;
++        }
++        scratch.inUse = true;
++        try {
++            AxisAlignedBB bb = entity.getBoundingBox();
++            double curMinX = bb.a;
++            double curMinY = bb.b;
++            double curMinZ = bb.c;
++            double curMaxX = bb.d;
++            double curMaxY = bb.e;
++            double curMaxZ = bb.f;
++
++            double expMinX = d0 < 0.0D ? curMinX + d0 : curMinX;
++            double expMinY = d1 < 0.0D ? curMinY + d1 : curMinY;
++            double expMinZ = d2 < 0.0D ? curMinZ + d2 : curMinZ;
++            double expMaxX = d0 > 0.0D ? curMaxX + d0 : curMaxX;
++            double expMaxY = d1 > 0.0D ? curMaxY + d1 : curMaxY;
++            double expMaxZ = d2 > 0.0D ? curMaxZ + d2 : curMaxZ;
++
++            int i = MathHelper.floor(expMinX) - 1;
++            int j = MathHelper.f(expMaxX) + 1;
++            int k = MathHelper.floor(expMinY) - 1;
++            int l = MathHelper.f(expMaxY) + 1;
++            int i1 = MathHelper.floor(expMinZ) - 1;
++            int j1 = MathHelper.f(expMaxZ) + 1;
++
++            WorldBorder worldborder = this.getWorldBorder();
++            boolean flag1 = entity.bz();
++            boolean flag2 = this.g(entity);
++            IBlockData stone = Blocks.STONE.getBlockData();
++
++            int cachedChunkX = Integer.MIN_VALUE;
++            int cachedChunkZ = Integer.MIN_VALUE;
++            Chunk cachedChunk = null;
++            AxisAlignedBB expandedBB = null;
++            int cubeCount = 0;
++            boolean yOnly = (d0 == 0.0D && d2 == 0.0D);
++
++            for (int k1 = i; k1 < j; ++k1) {
++                for (int l1 = i1; l1 < j1; ++l1) {
++                    boolean flag3 = k1 == i || k1 == j - 1;
++                    boolean flag4 = l1 == i1 || l1 == j1 - 1;
++
++                    if (flag3 && flag4) {
++                        continue;
++                    }
++
++                    int chunkX = k1 >> 4;
++                    int chunkZ = l1 >> 4;
++                    if (chunkX != cachedChunkX || chunkZ != cachedChunkZ) {
++                        cachedChunkX = chunkX;
++                        cachedChunkZ = chunkZ;
++                        cachedChunk = this.getChunkIfLoaded(chunkX, chunkZ);
++                    }
++                    if (cachedChunk == null) {
++                        continue;
++                    }
++
++                    boolean outsideBorder = flag2 && !worldborder.isBlockInBounds(k1, l1);
++                    for (int i2 = k; i2 < l; ++i2) {
++                        if (!flag3 && !flag4 || i2 != l - 1) {
++                            if (flag1 == flag2) {
++                                entity.k(!flag2);
++                            }
++
++                            IBlockData iblockdata1 = outsideBorder ? stone : cachedChunk.a(k1, i2, l1);
++                            me.stella.antarctic.spatial.FastVoxelCache.ShapeType shape = me.stella.antarctic.spatial.FastVoxelCache.classify(iblockdata1);
++                            if (shape == me.stella.antarctic.spatial.FastVoxelCache.ShapeType.EMPTY) {
++                                continue;
++                            }
++                            if (shape == me.stella.antarctic.spatial.FastVoxelCache.ShapeType.FULL_CUBE) {
++                                if (expMinX < (double) (k1 + 1) && expMaxX > (double) k1
++                                        && expMinY < (double) (i2 + 1) && expMaxY > (double) i2
++                                        && expMinZ < (double) (l1 + 1) && expMaxZ > (double) l1) {
++                                    if (yOnly) {
++                                        if (curMaxX > (double) k1 && curMinX < (double) (k1 + 1)
++                                                && curMaxZ > (double) l1 && curMinZ < (double) (l1 + 1)) {
++                                            if (d1 > 0.0D && curMaxY <= (double) i2) {
++                                                double diff = (double) i2 - curMaxY;
++                                                if (diff < d1) {
++                                                    d1 = diff;
++                                                }
++                                            } else if (d1 < 0.0D && curMinY >= (double) (i2 + 1)) {
++                                                double diff = (double) (i2 + 1) - curMinY;
++                                                if (diff > d1) {
++                                                    d1 = diff;
++                                                }
++                                            }
++                                        }
++                                    } else {
++                                        scratch.ensureCubeCapacity(cubeCount);
++                                        int base = cubeCount * 3;
++                                        scratch.cubes[base] = k1;
++                                        scratch.cubes[base + 1] = i2;
++                                        scratch.cubes[base + 2] = l1;
++                                        ++cubeCount;
++                                    }
++                                }
++                                continue;
++                            }
++
++                            if (expandedBB == null) {
++                                expandedBB = new AxisAlignedBB(expMinX, expMinY, expMinZ, expMaxX, expMaxY, expMaxZ);
++                            }
++                            scratch.pos.c(k1, i2, l1);
++                            iblockdata1.a(this, scratch.pos, expandedBB, scratch.nonCubes, entity, false);
++                        }
++                    }
++                }
++            }
++
++            if (!(entity instanceof EntityArmorStand) || entity.world.paperConfig.armorStandEntityLookups) {
++                boolean callerHasEntityBox = Chunk.HAS_ENTITY_COLLISION_BOX.get(entity.getClass());
++                double eMinX = expMinX - 0.25D;
++                double eMinY = expMinY - 0.25D;
++                double eMinZ = expMinZ - 0.25D;
++                double eMaxX = expMaxX + 0.25D;
++                double eMaxY = expMaxY + 0.25D;
++                double eMaxZ = expMaxZ + 0.25D;
++                int minCx = MathHelper.floor((eMinX - 2.0D) / 16.0D);
++                int maxCx = MathHelper.floor((eMaxX + 2.0D) / 16.0D);
++                int minCz = MathHelper.floor((eMinZ - 2.0D) / 16.0D);
++                int maxCz = MathHelper.floor((eMaxZ + 2.0D) / 16.0D);
++
++                for (int cx = minCx; cx <= maxCx; ++cx) {
++                    for (int cz = minCz; cz <= maxCz; ++cz) {
++                        Chunk chunk = this.getChunkIfLoaded(cx, cz);
++                        if (chunk != null) {
++                            if (expandedBB == null) {
++                                boolean anyPotential = callerHasEntityBox;
++                                if (!anyPotential) {
++                                    int sMin = MathHelper.clamp(MathHelper.floor((eMinY - 2.0D) / 16.0D), 0, 15);
++                                    int sMax = MathHelper.clamp(MathHelper.floor((eMaxY + 2.0D) / 16.0D), 0, 15);
++                                    for (int s = sMin; s <= sMax; ++s) {
++                                        if (chunk.hardCollidableCounts[s] > 0) {
++                                            anyPotential = true;
++                                            break;
++                                        }
++                                    }
++                                }
++                                if (!anyPotential) {
++                                    continue;
++                                }
++                                expandedBB = new AxisAlignedBB(expMinX, expMinY, expMinZ, expMaxX, expMaxY, expMaxZ);
++                            }
++                            chunk.collectHardEntityCollisions(entity, expandedBB, eMinX, eMinY, eMinZ, eMaxX, eMaxY, eMaxZ, callerHasEntityBox, scratch.nonCubes);
++                        }
++                    }
++                }
++            }
++
++            if (yOnly) {
++                int nonCubeLen = scratch.nonCubes.size();
++                for (int idx = 0; idx < nonCubeLen; ++idx) {
++                    AxisAlignedBB box = scratch.nonCubes.get(idx);
++                    if (curMaxX > box.a && curMinX < box.d && curMaxZ > box.c && curMinZ < box.f) {
++                        if (d1 > 0.0D && curMaxY <= box.b) {
++                            double diff = box.b - curMaxY;
++                            if (diff < d1) {
++                                d1 = diff;
++                            }
++                        } else if (d1 < 0.0D && curMinY >= box.e) {
++                            double diff = box.e - curMinY;
++                            if (diff > d1) {
++                                d1 = diff;
++                            }
++                        }
++                    }
++                }
++                if (d1 != 0.0D) {
++                    entity.a(bb.d(0.0D, d1, 0.0D));
++                }
++                outDelta[0] = 0.0D;
++                outDelta[1] = d1;
++                outDelta[2] = 0.0D;
++                return true;
++            }
++
++            int[] cubes = scratch.cubes;
++            int cubeLim = cubeCount * 3;
++            int nonCubeLen = scratch.nonCubes.size();
++
++            if (d1 != 0.0D) {
++                for (int base = 0; base < cubeLim; base += 3) {
++                    int bx = cubes[base];
++                    int by = cubes[base + 1];
++                    int bz = cubes[base + 2];
++                    if (curMaxX > (double) bx && curMinX < (double) (bx + 1)
++                            && curMaxZ > (double) bz && curMinZ < (double) (bz + 1)) {
++                        if (d1 > 0.0D && curMaxY <= (double) by) {
++                            double diff = (double) by - curMaxY;
++                            if (diff < d1) {
++                                d1 = diff;
++                            }
++                        } else if (d1 < 0.0D && curMinY >= (double) (by + 1)) {
++                            double diff = (double) (by + 1) - curMinY;
++                            if (diff > d1) {
++                                d1 = diff;
++                            }
++                        }
++                    }
++                }
++                for (int idx = 0; idx < nonCubeLen; ++idx) {
++                    AxisAlignedBB box = scratch.nonCubes.get(idx);
++                    if (curMaxX > box.a && curMinX < box.d && curMaxZ > box.c && curMinZ < box.f) {
++                        if (d1 > 0.0D && curMaxY <= box.b) {
++                            double diff = box.b - curMaxY;
++                            if (diff < d1) {
++                                d1 = diff;
++                            }
++                        } else if (d1 < 0.0D && curMinY >= box.e) {
++                            double diff = box.e - curMinY;
++                            if (diff > d1) {
++                                d1 = diff;
++                            }
++                        }
++                    }
++                }
++                curMinY += d1;
++                curMaxY += d1;
++            }
++
++            if (d0 != 0.0D) {
++                for (int base = 0; base < cubeLim; base += 3) {
++                    int bx = cubes[base];
++                    int by = cubes[base + 1];
++                    int bz = cubes[base + 2];
++                    if (curMaxY > (double) by && curMinY < (double) (by + 1)
++                            && curMaxZ > (double) bz && curMinZ < (double) (bz + 1)) {
++                        if (d0 > 0.0D && curMaxX <= (double) bx) {
++                            double diff = (double) bx - curMaxX;
++                            if (diff < d0) {
++                                d0 = diff;
++                            }
++                        } else if (d0 < 0.0D && curMinX >= (double) (bx + 1)) {
++                            double diff = (double) (bx + 1) - curMinX;
++                            if (diff > d0) {
++                                d0 = diff;
++                            }
++                        }
++                    }
++                }
++                for (int idx = 0; idx < nonCubeLen; ++idx) {
++                    AxisAlignedBB box = scratch.nonCubes.get(idx);
++                    if (curMaxY > box.b && curMinY < box.e && curMaxZ > box.c && curMinZ < box.f) {
++                        if (d0 > 0.0D && curMaxX <= box.a) {
++                            double diff = box.a - curMaxX;
++                            if (diff < d0) {
++                                d0 = diff;
++                            }
++                        } else if (d0 < 0.0D && curMinX >= box.d) {
++                            double diff = box.d - curMinX;
++                            if (diff > d0) {
++                                d0 = diff;
++                            }
++                        }
++                    }
++                }
++                curMinX += d0;
++                curMaxX += d0;
++            }
++
++            if (d2 != 0.0D) {
++                for (int base = 0; base < cubeLim; base += 3) {
++                    int bx = cubes[base];
++                    int by = cubes[base + 1];
++                    int bz = cubes[base + 2];
++                    if (curMaxX > (double) bx && curMinX < (double) (bx + 1)
++                            && curMaxY > (double) by && curMinY < (double) (by + 1)) {
++                        if (d2 > 0.0D && curMaxZ <= (double) bz) {
++                            double diff = (double) bz - curMaxZ;
++                            if (diff < d2) {
++                                d2 = diff;
++                            }
++                        } else if (d2 < 0.0D && curMinZ >= (double) (bz + 1)) {
++                            double diff = (double) (bz + 1) - curMinZ;
++                            if (diff > d2) {
++                                d2 = diff;
++                            }
++                        }
++                    }
++                }
++                for (int idx = 0; idx < nonCubeLen; ++idx) {
++                    AxisAlignedBB box = scratch.nonCubes.get(idx);
++                    if (curMaxX > box.a && curMinX < box.d && curMaxY > box.b && curMinY < box.e) {
++                        if (d2 > 0.0D && curMaxZ <= box.c) {
++                            double diff = box.c - curMaxZ;
++                            if (diff < d2) {
++                                d2 = diff;
++                            }
++                        } else if (d2 < 0.0D && curMinZ >= box.f) {
++                            double diff = box.f - curMinZ;
++                            if (diff > d2) {
++                                d2 = diff;
++                            }
++                        }
++                    }
++                }
++                curMinZ += d2;
++                curMaxZ += d2;
++            }
++
++            if (d0 != 0.0D || d1 != 0.0D || d2 != 0.0D) {
++                entity.a(new AxisAlignedBB(curMinX, curMinY, curMinZ, curMaxX, curMaxY, curMaxZ));
++            }
++            outDelta[0] = d0;
++            outDelta[1] = d1;
++            outDelta[2] = d2;
++            return true;
++        } finally {
++            scratch.nonCubes.clear();
++            scratch.inUse = false;
++        }
+     }
+ 
+     public int a(float f) {
+diff --git a/test/java/net/minecraft/server/EntityMoveCollisionPerfTest.java b/test/java/net/minecraft/server/EntityMoveCollisionPerfTest.java
+new file mode 100644
+index 0000000..7b95b38
+--- /dev/null
++++ b/test/java/net/minecraft/server/EntityMoveCollisionPerfTest.java
+@@ -0,0 +1,397 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.PaperWorldConfig;
++import com.sun.management.ThreadMXBean;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++import java.lang.management.ManagementFactory;
++import java.lang.reflect.Field;
++import java.lang.reflect.Method;
++import java.util.ArrayList;
++import java.util.List;
++
++import static org.junit.Assert.*;
++
++public class EntityMoveCollisionPerfTest {
++
++    private static Unsafe UNSAFE;
++    private static int nextEntityId = 1;
++
++    @BeforeClass
++    public static void setup() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        UNSAFE = (Unsafe) f.get(null);
++    }
++
++    private static final class CollisionTestWorld extends World {
++        final Chunk chunk;
++
++        CollisionTestWorld(Chunk chunk) {
++            super(null, new WorldData(), new WorldProviderNormal(), new MethodProfiler(), false, null, null);
++            this.chunk = chunk;
++        }
++
++        @Override
++        protected IChunkProvider n() {
++            return null;
++        }
++
++        @Override
++        protected boolean isChunkLoaded(int i, int j, boolean flag) {
++            return i == 0 && j == 0;
++        }
++
++        @Override
++        public Chunk getChunkIfLoaded(int i, int j) {
++            return (i == 0 && j == 0) ? this.chunk : null;
++        }
++    }
++
++    private static Chunk createFixtureChunk() throws Exception {
++        Chunk chunk = (Chunk) UNSAFE.allocateInstance(Chunk.class);
++        Field sectionsField = Chunk.class.getDeclaredField("sections");
++        sectionsField.setAccessible(true);
++        ChunkSection[] sections = new ChunkSection[16];
++        for (int s = 0; s < 16; ++s) {
++            sections[s] = new ChunkSection(s << 4, true);
++        }
++        sectionsField.set(chunk, sections);
++
++        Field slicesField = Chunk.class.getDeclaredField("entitySlices");
++        slicesField.setAccessible(true);
++        @SuppressWarnings("unchecked")
++        List<Entity>[] slices = new List[16];
++        for (int s = 0; s < 16; ++s) {
++            slices[s] = new ArrayList<Entity>();
++        }
++        slicesField.set(chunk, slices);
++
++        Field hardCountsField = Chunk.class.getDeclaredField("hardCollidableCounts");
++        hardCountsField.setAccessible(true);
++        hardCountsField.set(chunk, new int[16]);
++
++        Field itemCountsField = Chunk.class.getDeclaredField("itemCounts");
++        itemCountsField.setAccessible(true);
++        itemCountsField.set(chunk, new int[16]);
++
++        Field invCountsField = Chunk.class.getDeclaredField("inventoryEntityCounts");
++        invCountsField.setAccessible(true);
++        invCountsField.set(chunk, new int[16]);
++
++        Field entityCountsField = Chunk.class.getDeclaredField("entityCounts");
++        entityCountsField.setAccessible(true);
++        entityCountsField.set(chunk, new co.aikar.util.Counter<String>());
++
++        Field entityCountField = Chunk.class.getDeclaredField("entityCount");
++        entityCountField.setAccessible(true);
++        entityCountField.set(chunk, new gnu.trove.map.hash.TObjectIntHashMap<Class>());
++
++        Field countsField = Chunk.class.getDeclaredField("antarcticCreatureCounts");
++        countsField.setAccessible(true);
++        countsField.set(chunk, new int[EnumCreatureType.values().length]);
++
++        IBlockData stone = Blocks.STONE.getBlockData();
++        IBlockData slab = Blocks.STONE_SLAB.getBlockData();
++        IBlockData stairs = Blocks.OAK_STAIRS.getBlockData();
++        IBlockData fence = Blocks.FENCE.getBlockData();
++        IBlockData soulSand = Blocks.SOUL_SAND.getBlockData();
++
++        ChunkSection sec4 = sections[4]; // y = 64..79
++        for (int x = 0; x < 16; ++x) {
++            for (int z = 0; z < 16; ++z) {
++                sec4.setType(x, 0, z, stone); // y=64 floor
++            }
++        }
++        // Stone wall at x=5, y=65..66, z=2..6
++        for (int z = 2; z <= 6; ++z) {
++            sec4.setType(5, 1, z, stone);
++            sec4.setType(5, 2, z, stone);
++        }
++        sec4.setType(8, 1, 4, slab);      // y=65
++        sec4.setType(9, 1, 4, stairs);    // y=65
++        sec4.setType(10, 1, 4, fence);    // y=65 (height 1.5)
++        sec4.setType(11, 1, 4, soulSand); // y=65 (height 0.875)
++
++        return chunk;
++    }
++
++    private static CollisionTestWorld createTestWorld() throws Exception {
++        Chunk chunk = createFixtureChunk();
++        CollisionTestWorld world = (CollisionTestWorld) UNSAFE.allocateInstance(CollisionTestWorld.class);
++        Field chunkField = CollisionTestWorld.class.getDeclaredField("chunk");
++        chunkField.setAccessible(true);
++        chunkField.set(world, chunk);
++
++        Field worldChunkField = Chunk.class.getDeclaredField("world");
++        worldChunkField.setAccessible(true);
++        worldChunkField.set(chunk, world);
++
++        Field wbField = World.class.getDeclaredField("P");
++        wbField.setAccessible(true);
++        wbField.set(world, new WorldBorder());
++
++        Field pwcField = World.class.getDeclaredField("paperConfig");
++        pwcField.setAccessible(true);
++        PaperWorldConfig pwc = (PaperWorldConfig) UNSAFE.allocateInstance(PaperWorldConfig.class);
++        pwc.armorStandEntityLookups = true;
++        pwcField.set(world, pwc);
++
++        Field cpField = World.class.getDeclaredField("chunkProvider");
++        cpField.setAccessible(true);
++        cpField.set(world, new IChunkProvider() {
++            @Override public Chunk getLoadedChunkAt(int i, int j) { return (i == 0 && j == 0) ? chunk : null; }
++            @Override public Chunk getChunkAt(int i, int j) { return (i == 0 && j == 0) ? chunk : null; }
++            @Override public boolean unloadChunks() { return false; }
++            @Override public String getName() { return "TestChunkProvider"; }
++            @Override public boolean e(int i, int j) { return i == 0 && j == 0; }
++        });
++
++        return world;
++    }
++
++    private static EntityZombie createMob(World world, double x, double y, double z) throws Exception {
++        EntityZombie e = (EntityZombie) UNSAFE.allocateInstance(EntityZombie.class);
++        e.h(nextEntityId++);
++        e.world = world;
++        e.width = 0.6F;
++        e.length = 1.95F;
++        e.locX = x;
++        e.locY = y;
++        e.locZ = z;
++        e.a(new AxisAlignedBB(x - 0.3, y, z - 0.3, x + 0.3, y + 1.95, z + 0.3));
++        return e;
++    }
++
++    private static double[] vanillaGetCubesMove(World world, Entity entity, double d0, double d1, double d2) {
++        List<AxisAlignedBB> list = world.getCubes(entity, entity.getBoundingBox().b(d0, d1, d2));
++        if (d1 != 0.0D) {
++            for (int k = 0, l = list.size(); k < l; ++k) {
++                d1 = list.get(k).b(entity.getBoundingBox(), d1);
++            }
++            entity.a(entity.getBoundingBox().d(0.0D, d1, 0.0D));
++        }
++        if (d0 != 0.0D) {
++            for (int k = 0, l = list.size(); k < l; ++k) {
++                d0 = list.get(k).a(entity.getBoundingBox(), d0);
++            }
++            if (d0 != 0.0D) {
++                entity.a(entity.getBoundingBox().d(d0, 0.0D, 0.0D));
++            }
++        }
++        if (d2 != 0.0D) {
++            for (int k = 0, l = list.size(); k < l; ++k) {
++                d2 = list.get(k).c(entity.getBoundingBox(), d2);
++            }
++            if (d2 != 0.0D) {
++                entity.a(entity.getBoundingBox().d(0.0D, 0.0D, d2));
++            }
++        }
++        return new double[]{d0, d1, d2};
++    }
++
++    @Test
++    public void testMoveCollisionAndWorldAParity() throws Exception {
++        CollisionTestWorld world = createTestWorld();
++
++        // Hard collidable counts check
++        EntityZombie z1 = createMob(world, 2.5, 65.0, 2.5);
++        EntityItem item1 = (EntityItem) UNSAFE.allocateInstance(EntityItem.class);
++        item1.h(nextEntityId++);
++        item1.world = world;
++        item1.locX = 2.5; item1.locY = 65.0; item1.locZ = 2.5;
++        item1.a(new AxisAlignedBB(2.3, 65.0, 2.3, 2.7, 65.25, 2.7));
++        EntityBoat boat = (EntityBoat) UNSAFE.allocateInstance(EntityBoat.class);
++        boat.h(nextEntityId++);
++        boat.world = world;
++        boat.locX = 3.5; boat.locY = 65.0; boat.locZ = 4.0;
++        boat.a(new AxisAlignedBB(2.8, 65.0, 3.3, 4.2, 65.5625, 4.7));
++
++        world.chunk.a(z1);
++        world.chunk.a(item1);
++        assertEquals(0, world.chunk.hardCollidableCounts[4]);
++        world.chunk.a(boat);
++        assertEquals(1, world.chunk.hardCollidableCounts[4]);
++
++        double[][] scenarios = new double[][]{
++                {2.5, 65.0, 2.5, 0.0, -0.0784, 0.0},     // resting gravity on stone floor
++                {4.6, 65.0, 4.0, 0.3, -0.0784, 0.15},    // diagonal against stone wall x=5
++                {8.4, 65.6, 4.4, 0.1, -0.2, 0.0},        // landing on slab (top 65.5)
++                {9.4, 66.1, 4.4, 0.15, -0.2, 0.05},      // landing on stairs
++                {10.4, 66.6, 4.4, 0.0, -0.2, 0.0},       // landing on fence (top 66.5)
++                {11.4, 66.0, 4.4, 0.05, -0.2, -0.05},    // landing on soul sand (top 65.875)
++                {3.5, 65.7, 4.0, 0.0, -0.25, 0.0}        // landing on boat hard collision box
++        };
++
++        double[] optDelta = new double[3];
++        for (int s = 0; s < scenarios.length; ++s) {
++            double[] sc = scenarios[s];
++            EntityZombie eRef = createMob(world, sc[0], sc[1], sc[2]);
++            EntityZombie eOpt = createMob(world, sc[0], sc[1], sc[2]);
++
++            double[] exp = vanillaGetCubesMove(world, eRef, sc[3], sc[4], sc[5]);
++            assertTrue(world.resolveEntityMoveCollisions(eOpt, sc[3], sc[4], sc[5], optDelta));
++
++            assertEquals("dx mismatch at scenario " + s, exp[0], optDelta[0], 0.0D);
++            assertEquals("dy mismatch at scenario " + s, exp[1], optDelta[1], 0.0D);
++            assertEquals("dz mismatch at scenario " + s, exp[2], optDelta[2], 0.0D);
++            assertEquals("BB mismatch at scenario " + s, eRef.getBoundingBox(), eOpt.getBoundingBox());
++        }
++
++        // Entity.a(AxisAlignedBB) clamping parity
++        AxisAlignedBB valid = new AxisAlignedBB(1, 2, 3, 2, 4, 5);
++        z1.a(valid);
++        assertSame("Valid AABB should be stored directly without copy", valid, z1.getBoundingBox());
++        z1.a(new AxisAlignedBB(1, 2, 3, 0, 100, -5));
++        assertEquals(1.0, z1.getBoundingBox().d, 0.0D);
++        assertEquals(66.0, z1.getBoundingBox().e, 0.0D);
++        assertEquals(3.0, z1.getBoundingBox().f, 0.0D);
++
++        // World.a(AxisAlignedBB) parity vs private a(null, bb, true, list)
++        Method vanillaWorldAMethod = World.class.getDeclaredMethod("a", Entity.class, AxisAlignedBB.class, boolean.class, List.class);
++        vanillaWorldAMethod.setAccessible(true);
++        AxisAlignedBB[] testBoxes = new AxisAlignedBB[]{
++                new AxisAlignedBB(2.1, 66.0, 2.1, 2.9, 67.0, 2.9),   // air
++                new AxisAlignedBB(4.8, 65.1, 3.1, 5.2, 65.9, 3.9),   // stone wall
++                new AxisAlignedBB(8.1, 65.6, 4.1, 8.9, 66.0, 4.9),   // above slab (no hit)
++                new AxisAlignedBB(8.1, 65.1, 4.1, 8.9, 65.4, 4.9),   // inside slab (hit)
++                new AxisAlignedBB(30000001.0, 65.0, 0.0, 30000002.0, 66.0, 1.0) // out of world bounds
++        };
++        for (int b = 0; b < testBoxes.length; ++b) {
++            boolean expHit = (Boolean) vanillaWorldAMethod.invoke(world, null, testBoxes[b], true, new ArrayList<AxisAlignedBB>());
++            boolean actHit = world.a(testBoxes[b]);
++            assertEquals("World.a(AABB) mismatch at " + b, expHit, actHit);
++        }
++
++        world.chunk.a(boat, 4);
++        assertEquals(0, world.chunk.hardCollidableCounts[4]);
++    }
++
++    private static double[] preB3VanillaGetCubesMove(World world, Entity entity, double d0, double d1, double d2, Method worldAMethod) throws Exception {
++        AxisAlignedBB expanded = entity.getBoundingBox().b(d0, d1, d2);
++        List<AxisAlignedBB> list = new ArrayList<AxisAlignedBB>();
++        worldAMethod.invoke(world, entity, expanded, false, list);
++        if (!(entity instanceof EntityArmorStand) || entity.world.paperConfig.armorStandEntityLookups) {
++            List<Entity> ents = world.getEntities(entity, expanded.g(0.25D));
++            for (int i = 0, sz = ents.size(); i < sz; ++i) {
++                Entity e1 = ents.get(i);
++                if (!entity.x(e1)) {
++                    AxisAlignedBB box = e1.al();
++                    if (box != null && box.c(expanded)) {
++                        list.add(box);
++                    }
++                    box = entity.j(e1);
++                    if (box != null && box.c(expanded)) {
++                        list.add(box);
++                    }
++                }
++            }
++        }
++        if (d1 != 0.0D) {
++            for (int k = 0, l = list.size(); k < l; ++k) {
++                d1 = list.get(k).b(entity.getBoundingBox(), d1);
++            }
++            entity.a(entity.getBoundingBox().d(0.0D, d1, 0.0D));
++        }
++        if (d0 != 0.0D) {
++            for (int k = 0, l = list.size(); k < l; ++k) {
++                d0 = list.get(k).a(entity.getBoundingBox(), d0);
++            }
++            if (d0 != 0.0D) {
++                entity.a(entity.getBoundingBox().d(d0, 0.0D, 0.0D));
++            }
++        }
++        if (d2 != 0.0D) {
++            for (int k = 0, l = list.size(); k < l; ++k) {
++                d2 = list.get(k).c(entity.getBoundingBox(), d2);
++            }
++            if (d2 != 0.0D) {
++                entity.a(entity.getBoundingBox().d(0.0D, 0.0D, d2));
++            }
++        }
++        return new double[]{d0, d1, d2};
++    }
++
++    @Test
++    public void testMoveCollisionAllocationAndThroughputBenchmark() throws Exception {
++        CollisionTestWorld world = createTestWorld();
++        // Populate 30 non-collidable mobs in chunk slice 4
++        for (int m = 0; m < 30; ++m) {
++            world.chunk.a(createMob(world, 2.5 + (m & 3) * 0.2, 65.0, 8.0 + (m >> 2) * 0.2));
++        }
++
++        Method worldAMethod = World.class.getDeclaredMethod("a", Entity.class, AxisAlignedBB.class, boolean.class, List.class);
++        worldAMethod.setAccessible(true);
++
++        EntityZombie eRef = createMob(world, 2.5, 65.0, 2.5);
++        EntityZombie eOpt = createMob(world, 2.5, 65.0, 2.5);
++        AxisAlignedBB restBB = new AxisAlignedBB(2.2, 65.0, 2.2, 2.8, 66.95, 2.8);
++        double[] optDelta = new double[3];
++
++        ThreadMXBean threadBean = (ThreadMXBean) ManagementFactory.getThreadMXBean();
++        long tid = Thread.currentThread().getId();
++
++        // Warmup
++        for (int w = 0; w < 2000; ++w) {
++            eRef.a(restBB);
++            preB3VanillaGetCubesMove(world, eRef, 0.0, -0.0784, 0.0, worldAMethod);
++            eOpt.a(restBB);
++            world.resolveEntityMoveCollisions(eOpt, 0.0, -0.0784, 0.0, optDelta);
++            eRef.a(restBB);
++            preB3VanillaGetCubesMove(world, eRef, 0.12, -0.0784, 0.08, worldAMethod);
++            eOpt.a(restBB);
++            world.resolveEntityMoveCollisions(eOpt, 0.12, -0.0784, 0.08, optDelta);
++        }
++
++        int iters = 10000;
++        long a0 = threadBean.getThreadAllocatedBytes(tid);
++        long t0 = System.nanoTime();
++        double blackhole = 0.0;
++        for (int i = 0; i < iters; ++i) {
++            eRef.a(restBB);
++            double[] r = preB3VanillaGetCubesMove(world, eRef, 0.0, -0.0784, 0.0, worldAMethod);
++            blackhole += r[1];
++        }
++        long restVanillaNs = System.nanoTime() - t0;
++        long restVanillaBytes = Math.max(0L, threadBean.getThreadAllocatedBytes(tid) - a0);
++
++        a0 = threadBean.getThreadAllocatedBytes(tid);
++        t0 = System.nanoTime();
++        for (int i = 0; i < iters; ++i) {
++            eOpt.a(restBB);
++            world.resolveEntityMoveCollisions(eOpt, 0.0, -0.0784, 0.0, optDelta);
++            blackhole += optDelta[1];
++        }
++        long restOptNs = System.nanoTime() - t0;
++        long restOptBytes = Math.max(0L, threadBean.getThreadAllocatedBytes(tid) - a0);
++
++        t0 = System.nanoTime();
++        for (int i = 0; i < iters; ++i) {
++            eRef.a(restBB);
++            double[] r = preB3VanillaGetCubesMove(world, eRef, 0.12, -0.0784, 0.08, worldAMethod);
++            blackhole += r[0] + r[1] + r[2];
++        }
++        long walkVanillaNs = System.nanoTime() - t0;
++
++        t0 = System.nanoTime();
++        for (int i = 0; i < iters; ++i) {
++            eOpt.a(restBB);
++            world.resolveEntityMoveCollisions(eOpt, 0.12, -0.0784, 0.08, optDelta);
++            blackhole += optDelta[0] + optDelta[1] + optDelta[2];
++        }
++        long walkOptNs = System.nanoTime() - t0;
++
++        System.out.printf("B3_BENCH rest10k_vanilla_ns=%d rest10k_opt_ns=%d rest_speedup=%.2fx rest_vanilla_bytes=%d rest_opt_bytes=%d walk10k_vanilla_ns=%d walk10k_opt_ns=%d walk_speedup=%.2fx blackhole=%.2f%n",
++                restVanillaNs, restOptNs, (double) restVanillaNs / Math.max(1L, restOptNs),
++                restVanillaBytes, restOptBytes,
++                walkVanillaNs, walkOptNs, (double) walkVanillaNs / Math.max(1L, walkOptNs),
++                blackhole);
++
++        assertEquals("Resting gravity sweep must allocate 0 bytes", 0L, restOptBytes);
++        assertTrue("Expected resting collision speedup > 1.5x, got " + restVanillaNs + " vs " + restOptNs,
++                restOptNs * 1.5 < restVanillaNs);
++    }
++}
