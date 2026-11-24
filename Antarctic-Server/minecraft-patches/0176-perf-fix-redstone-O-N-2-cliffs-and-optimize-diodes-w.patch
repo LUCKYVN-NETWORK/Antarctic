@@ -1,0 +1,1197 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 15:55:38 +0700
+Subject: [PATCH 176/176] perf: fix redstone O(N^2) cliffs and optimize diodes,
+ wire, comparator and power queries
+
+
+diff --git a/main/java/net/minecraft/server/BlockActionData.java b/main/java/net/minecraft/server/BlockActionData.java
+new file mode 100644
+index 0000000..17511e5
+--- /dev/null
++++ b/main/java/net/minecraft/server/BlockActionData.java
+@@ -0,0 +1,55 @@
++package net.minecraft.server;
++
++public class BlockActionData {
++
++    private final BlockPosition a;
++    private final Block b;
++    private final int c;
++    private final int d;
++
++    public BlockActionData(BlockPosition blockposition, Block block, int i, int j) {
++        this.a = blockposition;
++        this.c = i;
++        this.d = j;
++        this.b = block;
++    }
++
++    public BlockPosition a() {
++        return this.a;
++    }
++
++    public int b() {
++        return this.c;
++    }
++
++    public int c() {
++        return this.d;
++    }
++
++    public Block d() {
++        return this.b;
++    }
++
++    public boolean equals(Object object) {
++        if (!(object instanceof BlockActionData)) {
++            return false;
++        } else {
++            BlockActionData blockactiondata = (BlockActionData) object;
++
++            return this.a.equals(blockactiondata.a) && this.c == blockactiondata.c && this.d == blockactiondata.d && this.b == blockactiondata.b;
++        }
++    }
++
++    @Override
++    public int hashCode() {
++        int h = this.a.hashCode();
++        h = 31 * h + System.identityHashCode(this.b);
++        h = 31 * h + this.c;
++        h = 31 * h + this.d;
++        return h;
++    }
++
++    public String toString() {
++        return "TE(" + this.a + ")," + this.c + "," + this.d + "," + this.b;
++    }
++}
+diff --git a/main/java/net/minecraft/server/BlockDiodeAbstract.java b/main/java/net/minecraft/server/BlockDiodeAbstract.java
+index c91c18e..716f40a 100644
+--- a/main/java/net/minecraft/server/BlockDiodeAbstract.java
++++ b/main/java/net/minecraft/server/BlockDiodeAbstract.java
+@@ -76,13 +76,9 @@ public abstract class BlockDiodeAbstract extends BlockFacingHorizontal {
+         } else {
+             this.b(world, blockposition, iblockdata, 0);
+             world.setAir(blockposition);
+-            EnumDirection[] aenumdirection = EnumDirection.values();
+-            int i = aenumdirection.length;
+ 
+-            for (int j = 0; j < i; ++j) {
+-                EnumDirection enumdirection = aenumdirection[j];
+-
+-                world.applyPhysics(blockposition.shift(enumdirection), this, false);
++            for (int j = 0; j < EnumDirection.VALUES.length; ++j) {
++                world.applyPhysics(blockposition.shift(EnumDirection.VALUES[j]), this, false);
+             }
+ 
+         }
+@@ -173,13 +169,8 @@ public abstract class BlockDiodeAbstract extends BlockFacingHorizontal {
+ 
+     public void postBreak(World world, BlockPosition blockposition, IBlockData iblockdata) {
+         if (this.d) {
+-            EnumDirection[] aenumdirection = EnumDirection.values();
+-            int i = aenumdirection.length;
+-
+-            for (int j = 0; j < i; ++j) {
+-                EnumDirection enumdirection = aenumdirection[j];
+-
+-                world.applyPhysics(blockposition.shift(enumdirection), this, false);
++            for (int j = 0; j < EnumDirection.VALUES.length; ++j) {
++                world.applyPhysics(blockposition.shift(EnumDirection.VALUES[j]), this, false);
+             }
+         }
+ 
+@@ -199,7 +190,8 @@ public abstract class BlockDiodeAbstract extends BlockFacingHorizontal {
+     }
+ 
+     public static boolean isDiode(IBlockData iblockdata) {
+-        return Blocks.UNPOWERED_REPEATER.D(iblockdata) || Blocks.UNPOWERED_COMPARATOR.D(iblockdata);
++        Block block = iblockdata.getBlock();
++        return block == Blocks.UNPOWERED_REPEATER || block == Blocks.POWERED_REPEATER || block == Blocks.UNPOWERED_COMPARATOR || block == Blocks.POWERED_COMPARATOR || block instanceof BlockDiodeAbstract;
+     }
+ 
+     public boolean D(IBlockData iblockdata) {
+@@ -210,9 +202,9 @@ public abstract class BlockDiodeAbstract extends BlockFacingHorizontal {
+ 
+     public boolean i(World world, BlockPosition blockposition, IBlockData iblockdata) {
+         EnumDirection enumdirection = ((EnumDirection) iblockdata.get(BlockDiodeAbstract.FACING)).opposite();
+-        BlockPosition blockposition1 = blockposition.shift(enumdirection);
++        IBlockData front = world.getType(blockposition.getX() + enumdirection.getAdjacentX(), blockposition.getY() + enumdirection.getAdjacentY(), blockposition.getZ() + enumdirection.getAdjacentZ());
+ 
+-        return isDiode(world.getType(blockposition1)) ? world.getType(blockposition1).get(BlockDiodeAbstract.FACING) != enumdirection : false;
++        return isDiode(front) ? front.get(BlockDiodeAbstract.FACING) != enumdirection : false;
+     }
+ 
+     protected int E(IBlockData iblockdata) {
+diff --git a/main/java/net/minecraft/server/BlockObserver.java b/main/java/net/minecraft/server/BlockObserver.java
+index ccb69af..b36a847 100644
+--- a/main/java/net/minecraft/server/BlockObserver.java
++++ b/main/java/net/minecraft/server/BlockObserver.java
+@@ -49,8 +49,13 @@ public class BlockObserver extends BlockDirectional {
+     public void a(IBlockData iblockdata, World world, BlockPosition blockposition, Block block, BlockPosition blockposition1) {}
+ 
+     public void b(IBlockData iblockdata, World world, BlockPosition blockposition, Block block, BlockPosition blockposition1) {
+-        if (!world.isClientSide && blockposition.shift((EnumDirection) iblockdata.get(BlockObserver.FACING)).equals(blockposition1)) {
+-            this.d(iblockdata, world, blockposition);
++        if (!world.isClientSide) {
++            EnumDirection dir = (EnumDirection) iblockdata.get(BlockObserver.FACING);
++            if (blockposition.getX() + dir.getAdjacentX() == blockposition1.getX()
++                    && blockposition.getY() + dir.getAdjacentY() == blockposition1.getY()
++                    && blockposition.getZ() + dir.getAdjacentZ() == blockposition1.getZ()) {
++                this.d(iblockdata, world, blockposition);
++            }
+         }
+ 
+     }
+diff --git a/main/java/net/minecraft/server/BlockRedstoneComparator.java b/main/java/net/minecraft/server/BlockRedstoneComparator.java
+index 0f66baa..37dd64f 100644
+--- a/main/java/net/minecraft/server/BlockRedstoneComparator.java
++++ b/main/java/net/minecraft/server/BlockRedstoneComparator.java
+@@ -33,6 +33,12 @@ public class BlockRedstoneComparator extends BlockDiodeAbstract implements ITile
+         return 2;
+     }
+ 
++    @Override
++    public boolean D(IBlockData iblockdata) {
++        Block block = iblockdata.getBlock();
++        return block == Blocks.UNPOWERED_COMPARATOR || block == Blocks.POWERED_COMPARATOR;
++    }
++
+     protected IBlockData y(IBlockData iblockdata) {
+         Boolean obool = (Boolean) iblockdata.get(BlockRedstoneComparator.POWERED);
+         BlockRedstoneComparator.EnumComparatorMode blockredstonecomparator_enumcomparatormode = (BlockRedstoneComparator.EnumComparatorMode) iblockdata.get(BlockRedstoneComparator.MODE);
+@@ -78,20 +84,28 @@ public class BlockRedstoneComparator extends BlockDiodeAbstract implements ITile
+     }
+ 
+     protected int f(World world, BlockPosition blockposition, IBlockData iblockdata) {
+-        int i = super.f(world, blockposition, iblockdata);
+         EnumDirection enumdirection = (EnumDirection) iblockdata.get(BlockRedstoneComparator.FACING);
+-        BlockPosition blockposition1 = blockposition.shift(enumdirection);
+-        IBlockData iblockdata1 = world.getType(blockposition1);
++        int nx = blockposition.getX() + enumdirection.getAdjacentX();
++        int ny = blockposition.getY() + enumdirection.getAdjacentY();
++        int nz = blockposition.getZ() + enumdirection.getAdjacentZ();
++        int i = world.getBlockFacePower(nx, ny, nz, enumdirection);
++        IBlockData iblockdata1 = world.getType(nx, ny, nz);
++
++        if (i < 15 && iblockdata1.getBlock() == Blocks.REDSTONE_WIRE) {
++            i = Math.max(i, ((Integer) iblockdata1.get(BlockRedstoneWire.POWER)).intValue());
++        }
+ 
+         if (iblockdata1.n()) {
+-            i = iblockdata1.a(world, blockposition1);
++            i = iblockdata1.a(world, new BlockPosition(nx, ny, nz));
+         } else if (i < 15 && iblockdata1.l()) {
+-            blockposition1 = blockposition1.shift(enumdirection);
+-            iblockdata1 = world.getType(blockposition1);
++            nx += enumdirection.getAdjacentX();
++            ny += enumdirection.getAdjacentY();
++            nz += enumdirection.getAdjacentZ();
++            iblockdata1 = world.getType(nx, ny, nz);
+             if (iblockdata1.n()) {
+-                i = iblockdata1.a(world, blockposition1);
++                i = iblockdata1.a(world, new BlockPosition(nx, ny, nz));
+             } else if (iblockdata1.getMaterial() == Material.AIR) {
+-                EntityItemFrame entityitemframe = this.a(world, enumdirection, blockposition1);
++                EntityItemFrame entityitemframe = this.a(world, enumdirection, nx, ny, nz);
+ 
+                 if (entityitemframe != null) {
+                     i = entityitemframe.t();
+@@ -103,18 +117,9 @@ public class BlockRedstoneComparator extends BlockDiodeAbstract implements ITile
+     }
+ 
+     @Nullable
+-    private EntityItemFrame a(World world, final EnumDirection enumdirection, BlockPosition blockposition) {
+-        List list = world.a(EntityItemFrame.class, new AxisAlignedBB((double) blockposition.getX(), (double) blockposition.getY(), (double) blockposition.getZ(), (double) (blockposition.getX() + 1), (double) (blockposition.getY() + 1), (double) (blockposition.getZ() + 1)), new Predicate() {
+-            public boolean a(@Nullable Entity entity) {
+-                return entity != null && entity.getDirection() == enumdirection;
+-            }
+-
+-            public boolean apply(@Nullable Object object) {
+-                return this.a((Entity) object);
+-            }
+-        });
+-
+-        return list.size() == 1 ? (EntityItemFrame) list.get(0) : null;
++    private EntityItemFrame a(World world, EnumDirection enumdirection, int x, int y, int z) {
++        Chunk chunk = world.getChunkIfLoaded(x >> 4, z >> 4);
++        return chunk != null ? chunk.findItemFrame(x, y, z, enumdirection) : null;
+     }
+ 
+     public boolean interact(World world, BlockPosition blockposition, IBlockData iblockdata, EntityHuman entityhuman, EnumHand enumhand, EnumDirection enumdirection, float f, float f1, float f2) {
+@@ -133,11 +138,17 @@ public class BlockRedstoneComparator extends BlockDiodeAbstract implements ITile
+ 
+     protected void g(World world, BlockPosition blockposition, IBlockData iblockdata) {
+         if (!world.a(blockposition, (Block) this)) {
+-            int i = this.j(world, blockposition, iblockdata);
++            BlockRedstoneComparator.EnumComparatorMode mode = (BlockRedstoneComparator.EnumComparatorMode) iblockdata.get(BlockRedstoneComparator.MODE);
++            int inputPower = this.f(world, blockposition, iblockdata);
++            int sidePower = (mode == BlockRedstoneComparator.EnumComparatorMode.SUBTRACT || (inputPower > 0 && inputPower < 15))
++                    ? this.c((IBlockAccess) world, blockposition, iblockdata)
++                    : 0;
++            int i = (mode == BlockRedstoneComparator.EnumComparatorMode.SUBTRACT) ? Math.max(inputPower - sidePower, 0) : inputPower;
++            boolean shouldBePowered = inputPower >= 15 || (inputPower > 0 && inputPower >= sidePower);
+             TileEntity tileentity = world.getTileEntity(blockposition);
+             int j = tileentity instanceof TileEntityComparator ? ((TileEntityComparator) tileentity).a() : 0;
+ 
+-            if (i != j || this.A(iblockdata) != this.e(world, blockposition, iblockdata)) {
++            if (i != j || this.A(iblockdata) != shouldBePowered) {
+                 if (this.i(world, blockposition, iblockdata)) {
+                     world.a(blockposition, this, 2, -1);
+                 } else {
+@@ -149,7 +160,12 @@ public class BlockRedstoneComparator extends BlockDiodeAbstract implements ITile
+     }
+ 
+     private void k(World world, BlockPosition blockposition, IBlockData iblockdata) {
+-        int i = this.j(world, blockposition, iblockdata);
++        BlockRedstoneComparator.EnumComparatorMode mode = (BlockRedstoneComparator.EnumComparatorMode) iblockdata.get(BlockRedstoneComparator.MODE);
++        int inputPower = this.f(world, blockposition, iblockdata);
++        int sidePower = (mode == BlockRedstoneComparator.EnumComparatorMode.SUBTRACT || (inputPower > 0 && inputPower < 15))
++                ? this.c((IBlockAccess) world, blockposition, iblockdata)
++                : 0;
++        int i = (mode == BlockRedstoneComparator.EnumComparatorMode.SUBTRACT) ? Math.max(inputPower - sidePower, 0) : inputPower;
+         TileEntity tileentity = world.getTileEntity(blockposition);
+         int j = 0;
+ 
+@@ -160,8 +176,8 @@ public class BlockRedstoneComparator extends BlockDiodeAbstract implements ITile
+             tileentitycomparator.a(i);
+         }
+ 
+-        if (j != i || iblockdata.get(BlockRedstoneComparator.MODE) == BlockRedstoneComparator.EnumComparatorMode.COMPARE) {
+-            boolean flag = this.e(world, blockposition, iblockdata);
++        if (j != i || mode == BlockRedstoneComparator.EnumComparatorMode.COMPARE) {
++            boolean flag = inputPower >= 15 || (inputPower > 0 && inputPower >= sidePower);
+             boolean flag1 = this.A(iblockdata);
+ 
+             if (flag1 && !flag) {
+diff --git a/main/java/net/minecraft/server/BlockRedstoneTorch.java b/main/java/net/minecraft/server/BlockRedstoneTorch.java
+index 1a7b26e..66deb11 100644
+--- a/main/java/net/minecraft/server/BlockRedstoneTorch.java
++++ b/main/java/net/minecraft/server/BlockRedstoneTorch.java
+@@ -19,24 +19,20 @@ public class BlockRedstoneTorch extends BlockTorch {
+         if (list == null) {
+             list = world.redstoneUpdateInfos = new ArrayDeque<>();
+         }
+-
+-        if (flag) {
+-            list.add(new BlockRedstoneTorch.RedstoneUpdateInfo(blockposition, world.getTime()));
++        it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap counts = world.redstoneUpdateCounts;
++        if (counts == null) {
++            counts = world.redstoneUpdateCounts = new it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap();
+         }
+ 
+-        int i = 0;
+-
+-        for (BlockRedstoneTorch.RedstoneUpdateInfo blockredstonetorch_redstoneupdateinfo : list) {
+-            // Paper end
+-            if (blockredstonetorch_redstoneupdateinfo.a.equals(blockposition)) {
+-                ++i;
+-                if (i >= 8) {
+-                    return true;
+-                }
+-            }
++        long key = blockposition.asLong();
++        if (flag) {
++            BlockPosition immutable = blockposition.h();
++            list.add(new BlockRedstoneTorch.RedstoneUpdateInfo(immutable, world.getTime()));
++            counts.addTo(key, 1);
+         }
+ 
+-        return false;
++        return counts.get(key) >= 8;
++        // Paper end
+     }
+ 
+     protected BlockRedstoneTorch(boolean flag) {
+@@ -51,13 +47,8 @@ public class BlockRedstoneTorch extends BlockTorch {
+ 
+     public void onPlace(World world, BlockPosition blockposition, IBlockData iblockdata) {
+         if (this.isOn) {
+-            EnumDirection[] aenumdirection = EnumDirection.values();
+-            int i = aenumdirection.length;
+-
+-            for (int j = 0; j < i; ++j) {
+-                EnumDirection enumdirection = aenumdirection[j];
+-
+-                world.applyPhysics(blockposition.shift(enumdirection), this, false);
++            for (int j = 0; j < EnumDirection.VALUES.length; ++j) {
++                world.applyPhysics(blockposition.shift(EnumDirection.VALUES[j]), this, false);
+             }
+         }
+ 
+@@ -65,13 +56,8 @@ public class BlockRedstoneTorch extends BlockTorch {
+ 
+     public void remove(World world, BlockPosition blockposition, IBlockData iblockdata) {
+         if (this.isOn) {
+-            EnumDirection[] aenumdirection = EnumDirection.values();
+-            int i = aenumdirection.length;
+-
+-            for (int j = 0; j < i; ++j) {
+-                EnumDirection enumdirection = aenumdirection[j];
+-
+-                world.applyPhysics(blockposition.shift(enumdirection), this, false);
++            for (int j = 0; j < EnumDirection.VALUES.length; ++j) {
++                world.applyPhysics(blockposition.shift(EnumDirection.VALUES[j]), this, false);
+             }
+         }
+ 
+@@ -94,10 +80,20 @@ public class BlockRedstoneTorch extends BlockTorch {
+         // Paper start
+         ArrayDeque<BlockRedstoneTorch.RedstoneUpdateInfo> redstoneUpdateInfos = world.redstoneUpdateInfos;
+         if (redstoneUpdateInfos != null) {
++            it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap counts = world.redstoneUpdateCounts;
+             BlockRedstoneTorch.RedstoneUpdateInfo curr;
+             while ((curr = redstoneUpdateInfos.peek()) != null && world.getTime() - curr.getTime() > 60L) {
+                 redstoneUpdateInfos.poll();
+-
++                if (counts != null) {
++                    long k = curr.a.asLong();
++                    int prev = counts.addTo(k, -1);
++                    if (prev <= 1) {
++                        counts.remove(k);
++                    }
++                }
++            }
++            if (redstoneUpdateInfos.isEmpty() && counts != null && !counts.isEmpty()) {
++                counts.clear();
+             }
+         }
+         // Paper end
+diff --git a/main/java/net/minecraft/server/BlockRedstoneWire.java b/main/java/net/minecraft/server/BlockRedstoneWire.java
+index 01900cb..274102c 100644
+--- a/main/java/net/minecraft/server/BlockRedstoneWire.java
++++ b/main/java/net/minecraft/server/BlockRedstoneWire.java
+@@ -490,36 +490,65 @@ public class BlockRedstoneWire extends Block {
+                 return 0;
+             } else if (enumdirection == EnumDirection.UP) {
+                 return i;
++            } else if (enumdirection == EnumDirection.DOWN) {
++                return 0;
+             } else {
+-                EnumSet enumset = EnumSet.noneOf(EnumDirection.class);
+-                Iterator iterator = EnumDirection.EnumDirectionLimit.HORIZONTAL.iterator();
+-
+-                while (iterator.hasNext()) {
+-                    EnumDirection enumdirection1 = (EnumDirection) iterator.next();
+-
+-                    if (this.b(iblockaccess, blockposition, enumdirection1)) {
+-                        enumset.add(enumdirection1);
++                int bx = blockposition.getX();
++                int by = blockposition.getY();
++                int bz = blockposition.getZ();
++                boolean upOpaque = (iblockaccess instanceof World)
++                        ? ((World) iblockaccess).getType(bx, by + 1, bz).l()
++                        : iblockaccess.getType(blockposition.up()).l();
++                int dirMask = 0;
++
++                for (int idx = 0; idx < 4; ++idx) {
++                    EnumDirection enumdirection1 = EnumDirection.HORIZONTAL[idx];
++                    if (this.b(iblockaccess, bx, by, bz, enumdirection1, upOpaque)) {
++                        dirMask |= (1 << enumdirection1.get2DRotationValue());
+                     }
+                 }
+ 
+-                if (enumdirection.k().c() && enumset.isEmpty()) {
+-                    return i;
+-                } else if (enumset.contains(enumdirection) && !enumset.contains(enumdirection.f()) && !enumset.contains(enumdirection.e())) {
++                if (enumdirection.k().c() && dirMask == 0) {
+                     return i;
+                 } else {
+-                    return 0;
++                    int q = 1 << enumdirection.get2DRotationValue();
++                    int qLeft = 1 << enumdirection.f().get2DRotationValue();
++                    int qRight = 1 << enumdirection.e().get2DRotationValue();
++                    return (dirMask & q) != 0 && (dirMask & qLeft) == 0 && (dirMask & qRight) == 0 ? i : 0;
+                 }
+             }
+         }
+     }
+ 
+-    private boolean b(IBlockAccess iblockaccess, BlockPosition blockposition, EnumDirection enumdirection) {
+-        BlockPosition blockposition1 = blockposition.shift(enumdirection);
+-        IBlockData iblockdata = iblockaccess.getType(blockposition1);
++    private boolean b(IBlockAccess iblockaccess, int bx, int by, int bz, EnumDirection enumdirection, boolean upOpaque) {
++        int nx = bx + enumdirection.getAdjacentX();
++        int nz = bz + enumdirection.getAdjacentZ();
++        IBlockData iblockdata = (iblockaccess instanceof World)
++                ? ((World) iblockaccess).getType(nx, by, nz)
++                : iblockaccess.getType(new BlockPosition(nx, by, nz));
+         boolean flag = iblockdata.l();
+-        boolean flag1 = iblockaccess.getType(blockposition.up()).l();
+ 
+-        return !flag1 && flag && c(iblockaccess, blockposition1.up()) ? true : (a(iblockdata, enumdirection) ? true : (iblockdata.getBlock() == Blocks.POWERED_REPEATER && iblockdata.get(BlockDiodeAbstract.FACING) == enumdirection ? true : !flag && c(iblockaccess, blockposition1.down())));
++        if (!upOpaque && flag) {
++            IBlockData upData = (iblockaccess instanceof World)
++                    ? ((World) iblockaccess).getType(nx, by + 1, nz)
++                    : iblockaccess.getType(new BlockPosition(nx, by + 1, nz));
++            if (x(upData)) {
++                return true;
++            }
++        }
++        if (a(iblockdata, enumdirection)) {
++            return true;
++        }
++        if (iblockdata.getBlock() == Blocks.POWERED_REPEATER && iblockdata.get(BlockDiodeAbstract.FACING) == enumdirection) {
++            return true;
++        }
++        if (!flag) {
++            IBlockData downData = (iblockaccess instanceof World)
++                    ? ((World) iblockaccess).getType(nx, by - 1, nz)
++                    : iblockaccess.getType(new BlockPosition(nx, by - 1, nz));
++            return x(downData);
++        }
++        return false;
+     }
+ 
+     protected static boolean c(IBlockAccess iblockaccess, BlockPosition blockposition) {
+diff --git a/main/java/net/minecraft/server/BlockRepeater.java b/main/java/net/minecraft/server/BlockRepeater.java
+new file mode 100644
+index 0000000..1ab542c
+--- /dev/null
++++ b/main/java/net/minecraft/server/BlockRepeater.java
+@@ -0,0 +1,102 @@
++package net.minecraft.server;
++
++import java.util.Random;
++
++public class BlockRepeater extends BlockDiodeAbstract {
++
++    public static final BlockStateBoolean LOCKED = BlockStateBoolean.of("locked");
++    public static final BlockStateInteger DELAY = BlockStateInteger.of("delay", 1, 4);
++
++    protected BlockRepeater(boolean flag) {
++        super(flag);
++        this.w(this.blockStateList.getBlockData().set(BlockRepeater.FACING, EnumDirection.NORTH).set(BlockRepeater.DELAY, Integer.valueOf(1)).set(BlockRepeater.LOCKED, Boolean.valueOf(false)));
++    }
++
++    public String getName() {
++        return LocaleI18n.get("item.diode.name");
++    }
++
++    public IBlockData updateState(IBlockData iblockdata, IBlockAccess iblockaccess, BlockPosition blockposition) {
++        return iblockdata.set(BlockRepeater.LOCKED, Boolean.valueOf(this.b(iblockaccess, blockposition, iblockdata)));
++    }
++
++    public IBlockData a(IBlockData iblockdata, EnumBlockRotation enumblockrotation) {
++        return iblockdata.set(BlockRepeater.FACING, enumblockrotation.a((EnumDirection) iblockdata.get(BlockRepeater.FACING)));
++    }
++
++    public IBlockData a(IBlockData iblockdata, EnumBlockMirror enumblockmirror) {
++        return iblockdata.a(enumblockmirror.a((EnumDirection) iblockdata.get(BlockRepeater.FACING)));
++    }
++
++    public boolean interact(World world, BlockPosition blockposition, IBlockData iblockdata, EntityHuman entityhuman, EnumHand enumhand, EnumDirection enumdirection, float f, float f1, float f2) {
++        if (!entityhuman.abilities.mayBuild) {
++            return false;
++        } else {
++            world.setTypeAndData(blockposition, iblockdata.a((IBlockState) BlockRepeater.DELAY), 3);
++            return true;
++        }
++    }
++
++    protected int x(IBlockData iblockdata) {
++        return ((Integer) iblockdata.get(BlockRepeater.DELAY)).intValue() * 2;
++    }
++
++    @Override
++    public boolean D(IBlockData iblockdata) {
++        Block block = iblockdata.getBlock();
++        return block == Blocks.UNPOWERED_REPEATER || block == Blocks.POWERED_REPEATER;
++    }
++
++    protected IBlockData y(IBlockData iblockdata) {
++        Integer integer = (Integer) iblockdata.get(BlockRepeater.DELAY);
++        Boolean obool = (Boolean) iblockdata.get(BlockRepeater.LOCKED);
++        EnumDirection enumdirection = (EnumDirection) iblockdata.get(BlockRepeater.FACING);
++
++        return Blocks.POWERED_REPEATER.getBlockData().set(BlockRepeater.FACING, enumdirection).set(BlockRepeater.DELAY, integer).set(BlockRepeater.LOCKED, obool);
++    }
++
++    protected IBlockData z(IBlockData iblockdata) {
++        Integer integer = (Integer) iblockdata.get(BlockRepeater.DELAY);
++        Boolean obool = (Boolean) iblockdata.get(BlockRepeater.LOCKED);
++        EnumDirection enumdirection = (EnumDirection) iblockdata.get(BlockRepeater.FACING);
++
++        return Blocks.UNPOWERED_REPEATER.getBlockData().set(BlockRepeater.FACING, enumdirection).set(BlockRepeater.DELAY, integer).set(BlockRepeater.LOCKED, obool);
++    }
++
++    public Item getDropType(IBlockData iblockdata, Random random, int i) {
++        return Items.REPEATER;
++    }
++
++    public ItemStack a(World world, BlockPosition blockposition, IBlockData iblockdata) {
++        return new ItemStack(Items.REPEATER);
++    }
++
++    public boolean b(IBlockAccess iblockaccess, BlockPosition blockposition, IBlockData iblockdata) {
++        return this.c(iblockaccess, blockposition, iblockdata) > 0;
++    }
++
++    protected boolean B(IBlockData iblockdata) {
++        return isDiode(iblockdata);
++    }
++
++    public void remove(World world, BlockPosition blockposition, IBlockData iblockdata) {
++        super.remove(world, blockposition, iblockdata);
++        this.h(world, blockposition, iblockdata);
++    }
++
++    public IBlockData fromLegacyData(int i) {
++        return this.getBlockData().set(BlockRepeater.FACING, EnumDirection.fromType2(i)).set(BlockRepeater.LOCKED, Boolean.valueOf(false)).set(BlockRepeater.DELAY, Integer.valueOf(1 + (i >> 2)));
++    }
++
++    public int toLegacyData(IBlockData iblockdata) {
++        byte b0 = 0;
++        int i = b0 | ((EnumDirection) iblockdata.get(BlockRepeater.FACING)).get2DRotationValue();
++
++        i |= ((Integer) iblockdata.get(BlockRepeater.DELAY)).intValue() - 1 << 2;
++        return i;
++    }
++
++    protected BlockStateList getStateList() {
++        return new BlockStateList(this, new IBlockState[] { BlockRepeater.FACING, BlockRepeater.DELAY, BlockRepeater.LOCKED});
++    }
++}
+diff --git a/main/java/net/minecraft/server/Chunk.java b/main/java/net/minecraft/server/Chunk.java
+index dd3ba07..8e821db 100644
+--- a/main/java/net/minecraft/server/Chunk.java
++++ b/main/java/net/minecraft/server/Chunk.java
+@@ -170,6 +170,7 @@ public class Chunk {
+     private final int[] itemCounts = new int[16];
+     private final int[] inventoryEntityCounts = new int[16];
+     public final int[] hardCollidableCounts = new int[16];
++    public final int[] itemFrameCounts = new int[16];
+     // Paper end
+ 
+     // Antarctic start - hard-collidable entity slice detection for O(1) empty-slice skip
+@@ -888,6 +889,8 @@ public class Chunk {
+             itemCounts[k]++;
+         } else if (entity instanceof IInventory) {
+             inventoryEntityCounts[k]++;
++        } else if (entity instanceof EntityItemFrame) {
++            itemFrameCounts[k]++;
+         }
+         if (isHardCollidableEntity(entity)) {
+             hardCollidableCounts[k]++;
+@@ -928,6 +931,8 @@ public class Chunk {
+             itemCounts[i]--;
+         } else if (entity instanceof IInventory) {
+             inventoryEntityCounts[i]--;
++        } else if (entity instanceof EntityItemFrame) {
++            itemFrameCounts[i]--;
+         }
+         if (isHardCollidableEntity(entity)) {
+             hardCollidableCounts[i]--;
+@@ -1322,6 +1327,38 @@ public class Chunk {
+         }
+     }
+ 
++    @Nullable
++    EntityItemFrame findItemFrame(int x, int y, int z, EnumDirection dir) {
++        int i = MathHelper.clamp(MathHelper.floor((y - 2.0D) / 16.0D), 0, this.entitySlices.length - 1);
++        int j = MathHelper.clamp(MathHelper.floor((y + 1.0D + 2.0D) / 16.0D), 0, this.entitySlices.length - 1);
++        double minX = x;
++        double minY = y;
++        double minZ = z;
++        double maxX = x + 1;
++        double maxY = y + 1;
++        double maxZ = z + 1;
++        EntityItemFrame found = null;
++        for (int k = i; k <= j; ++k) {
++            if (this.itemFrameCounts[k] <= 0) {
++                continue;
++            }
++            List<Entity> slice = this.entitySlices[k];
++            for (int idx = 0, len = slice.size(); idx < len; ++idx) {
++                Entity entity = slice.get(idx);
++                if (entity instanceof EntityItemFrame && entity.getDirection() == dir) {
++                    AxisAlignedBB bb = entity.getBoundingBox();
++                    if (bb.d > minX && bb.a < maxX && bb.e > minY && bb.b < maxY && bb.f > minZ && bb.c < maxZ) {
++                        if (found != null) {
++                            return null;
++                        }
++                        found = (EntityItemFrame) entity;
++                    }
++                }
++            }
++        }
++        return found;
++    }
++
+     public <T extends Entity> void a(Class<? extends T> oclass, AxisAlignedBB axisalignedbb, List<T> list, Predicate<? super T> predicate) {
+         int i = MathHelper.floor((axisalignedbb.b - 2.0D) / 16.0D);
+         int j = MathHelper.floor((axisalignedbb.e + 2.0D) / 16.0D);
+diff --git a/main/java/net/minecraft/server/World.java b/main/java/net/minecraft/server/World.java
+index 8e28f43..7ee130e 100644
+--- a/main/java/net/minecraft/server/World.java
++++ b/main/java/net/minecraft/server/World.java
+@@ -176,6 +176,7 @@ public abstract class World implements IBlockAccess {
+     private int tileTickPosition;
+     public final Map<Explosion.CacheKey, Float> explosionDensityCache = new HashMap<>(); // Paper - Optimize explosions
+     public java.util.ArrayDeque<BlockRedstoneTorch.RedstoneUpdateInfo> redstoneUpdateInfos; // Paper - Move from Map in BlockRedstoneTorch to here
++    public it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap redstoneUpdateCounts; // Antarctic - O(1) torch burnout count mirror
+     public com.destroystokyo.paper.util.RedstoneWireTurbo redstoneWireTurbo; // Antarctic - per-world Eigencraft turbo state to avoid cross-world aliasing
+     public com.destroystokyo.paper.util.AlternateCurrentWireHandler alternateCurrentWireHandler; // Antarctic - per-world opt-in Alternate Current wire engine
+     int projectileChunkLoadsTick = Integer.MIN_VALUE; // Antarctic - per-world projectile chunk load cap
+@@ -3983,65 +3984,102 @@ public abstract class World implements IBlockAccess {
+         return this.getType(blockposition).b(this, blockposition, enumdirection);
+     }
+ 
++    int getBlockPower(int x, int y, int z, EnumDirection enumdirection) {
++        IBlockData iblockdata = this.getType(x, y, z);
++        if (!iblockdata.m()) {
++            return 0;
++        }
++        BlockPosition.PooledBlockPosition pos = BlockPosition.PooledBlockPosition.e(x, y, z);
++        try {
++            return iblockdata.b(this, pos, enumdirection);
++        } finally {
++            pos.t();
++        }
++    }
++
+     public WorldType N() {
+         return this.worldData.getType();
+     }
+ 
+     public int getBlockPower(BlockPosition blockposition) {
+-        byte b0 = 0;
+-        int i = Math.max(b0, this.getBlockPower(blockposition.down(), EnumDirection.DOWN));
++        return this.getBlockPower(blockposition.getX(), blockposition.getY(), blockposition.getZ());
++    }
+ 
++    int getBlockPower(int x, int y, int z) {
++        int i = this.getBlockPower(x, y - 1, z, EnumDirection.DOWN);
++        if (i >= 15) {
++            return i;
++        }
++        i = Math.max(i, this.getBlockPower(x, y + 1, z, EnumDirection.UP));
++        if (i >= 15) {
++            return i;
++        }
++        i = Math.max(i, this.getBlockPower(x, y, z - 1, EnumDirection.NORTH));
++        if (i >= 15) {
++            return i;
++        }
++        i = Math.max(i, this.getBlockPower(x, y, z + 1, EnumDirection.SOUTH));
++        if (i >= 15) {
++            return i;
++        }
++        i = Math.max(i, this.getBlockPower(x - 1, y, z, EnumDirection.WEST));
+         if (i >= 15) {
+             return i;
+-        } else {
+-            i = Math.max(i, this.getBlockPower(blockposition.up(), EnumDirection.UP));
+-            if (i >= 15) {
+-                return i;
+-            } else {
+-                i = Math.max(i, this.getBlockPower(blockposition.north(), EnumDirection.NORTH));
+-                if (i >= 15) {
+-                    return i;
+-                } else {
+-                    i = Math.max(i, this.getBlockPower(blockposition.south(), EnumDirection.SOUTH));
+-                    if (i >= 15) {
+-                        return i;
+-                    } else {
+-                        i = Math.max(i, this.getBlockPower(blockposition.west(), EnumDirection.WEST));
+-                        if (i >= 15) {
+-                            return i;
+-                        } else {
+-                            i = Math.max(i, this.getBlockPower(blockposition.east(), EnumDirection.EAST));
+-                            return i >= 15 ? i : i;
+-                        }
+-                    }
+-                }
+-            }
+         }
++        return Math.max(i, this.getBlockPower(x + 1, y, z, EnumDirection.EAST));
+     }
+ 
+     public boolean isBlockFacePowered(BlockPosition blockposition, EnumDirection enumdirection) {
+-        return this.getBlockFacePower(blockposition, enumdirection) > 0;
++        return this.getBlockFacePower(blockposition.getX(), blockposition.getY(), blockposition.getZ(), enumdirection) > 0;
++    }
++
++    boolean isBlockFacePowered(int x, int y, int z, EnumDirection enumdirection) {
++        return this.getBlockFacePower(x, y, z, enumdirection) > 0;
+     }
+ 
+     public int getBlockFacePower(BlockPosition blockposition, EnumDirection enumdirection) {
+-        IBlockData iblockdata = this.getType(blockposition);
++        return this.getBlockFacePower(blockposition.getX(), blockposition.getY(), blockposition.getZ(), enumdirection);
++    }
++
++    int getBlockFacePower(int x, int y, int z, EnumDirection enumdirection) {
++        IBlockData iblockdata = this.getType(x, y, z);
+ 
+-        return iblockdata.l() ? this.getBlockPower(blockposition) : iblockdata.a((IBlockAccess) this, blockposition, enumdirection);
++        if (iblockdata.l()) {
++            return this.getBlockPower(x, y, z);
++        }
++        if (!iblockdata.m()) {
++            return 0;
++        }
++        BlockPosition.PooledBlockPosition pos = BlockPosition.PooledBlockPosition.e(x, y, z);
++        try {
++            return iblockdata.a((IBlockAccess) this, pos, enumdirection);
++        } finally {
++            pos.t();
++        }
+     }
+ 
+     public boolean isBlockIndirectlyPowered(BlockPosition blockposition) {
+-        return this.getBlockFacePower(blockposition.down(), EnumDirection.DOWN) > 0 ? true : (this.getBlockFacePower(blockposition.up(), EnumDirection.UP) > 0 ? true : (this.getBlockFacePower(blockposition.north(), EnumDirection.NORTH) > 0 ? true : (this.getBlockFacePower(blockposition.south(), EnumDirection.SOUTH) > 0 ? true : (this.getBlockFacePower(blockposition.west(), EnumDirection.WEST) > 0 ? true : this.getBlockFacePower(blockposition.east(), EnumDirection.EAST) > 0))));
++        int x = blockposition.getX();
++        int y = blockposition.getY();
++        int z = blockposition.getZ();
++        return this.getBlockFacePower(x, y - 1, z, EnumDirection.DOWN) > 0
++                || this.getBlockFacePower(x, y + 1, z, EnumDirection.UP) > 0
++                || this.getBlockFacePower(x, y, z - 1, EnumDirection.NORTH) > 0
++                || this.getBlockFacePower(x, y, z + 1, EnumDirection.SOUTH) > 0
++                || this.getBlockFacePower(x - 1, y, z, EnumDirection.WEST) > 0
++                || this.getBlockFacePower(x + 1, y, z, EnumDirection.EAST) > 0;
+     }
+ 
+     public int isBlockIndirectlyGettingPowered(BlockPosition pos) { return this.z(pos); } // Paper - OBFHELPER
+     public int z(BlockPosition blockposition) {
+         int i = 0;
+-        EnumDirection[] aenumdirection = EnumDirection.values();
+-        int j = aenumdirection.length;
++        int x = blockposition.getX();
++        int y = blockposition.getY();
++        int z = blockposition.getZ();
+ 
+-        for (int k = 0; k < j; ++k) {
+-            EnumDirection enumdirection = aenumdirection[k];
+-            int l = this.getBlockFacePower(blockposition.shift(enumdirection), enumdirection);
++        for (int k = 0; k < EnumDirection.VALUES.length; ++k) {
++            EnumDirection enumdirection = EnumDirection.VALUES[k];
++            int l = this.getBlockFacePower(x + enumdirection.getAdjacentX(), y + enumdirection.getAdjacentY(), z + enumdirection.getAdjacentZ(), enumdirection);
+ 
+             if (l >= 15) {
+                 return 15;
+diff --git a/main/java/net/minecraft/server/WorldServer.java b/main/java/net/minecraft/server/WorldServer.java
+index 72d48ed..4a553a9 100644
+--- a/main/java/net/minecraft/server/WorldServer.java
++++ b/main/java/net/minecraft/server/WorldServer.java
+@@ -59,7 +59,7 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+     private final PortalTravelAgent portalTravelAgent;
+     private final SpawnerCreature spawnerCreature = new SpawnerCreature();
+     protected final VillageSiege siegeManager = new VillageSiege(this);
+-    private final WorldServer.BlockActionDataList[] U = new WorldServer.BlockActionDataList[] { new WorldServer.BlockActionDataList(null), new WorldServer.BlockActionDataList(null)};
++    private final it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet<BlockActionData>[] U = new it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet[] { new it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet<BlockActionData>(), new it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet<BlockActionData>()};
+     private int V;
+     private final java.util.ArrayDeque<NextTickListEntry> W = new java.util.ArrayDeque<NextTickListEntry>(); // Antarctic - O(1) FIFO drain instead of O(n) ArrayList head shifts
+     private final me.stella.antarctic.collection.MultiplicitySet<NextTickListEntry> currentTickBatch = new me.stella.antarctic.collection.MultiplicitySet<NextTickListEntry>(); // Antarctic - O(1) mirror of W for isBlockTickPending checks
+@@ -635,7 +635,10 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+ 
+         if (this.d && material != Material.AIR) {
+             if (block.r()) {
+-                if (this.areChunksLoadedBetween(blockposition.a(-8, -8, -8), blockposition.a(8, 8, 8))) {
++                int bx = blockposition.getX();
++                int by = blockposition.getY();
++                int bz = blockposition.getZ();
++                if (this.areChunksLoadedBetween(bx - 8, by - 8, bz - 8, bx + 8, by + 8, bz + 8)) {
+                     IBlockData iblockdata = this.getType(blockposition);
+ 
+                     if (iblockdata.getMaterial() != Material.AIR && iblockdata.getBlock() == block) {
+@@ -842,8 +845,9 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+                     this.currentTickBatch.removeOne(nextticklistentry); // Antarctic
+                     boolean flag1 = false;
+ 
+-                    if (this.isLoaded(nextticklistentry.a)) { // Antarctic - avoid allocating two BlockPositions per ticked block
+-                        IBlockData iblockdata = this.getType(nextticklistentry.a);
++                    Chunk chunk = this.getChunkIfLoaded(nextticklistentry.a.getX() >> 4, nextticklistentry.a.getZ() >> 4);
++                    if (chunk != null) { // Antarctic - single chunk lookup for loaded check + block state
++                        IBlockData iblockdata = this.captureTreeGeneration ? this.getType(nextticklistentry.a) : chunk.getBlockData(nextticklistentry.a.getX(), nextticklistentry.a.getY(), nextticklistentry.a.getZ());
+                         co.aikar.timings.Timing timing = iblockdata.getBlock().getTiming(); // Paper
+                         timing.startTiming(); // Paper
+ 
+@@ -1378,20 +1382,7 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+     }
+ 
+     public void playBlockAction(BlockPosition blockposition, Block block, int i, int j) {
+-        BlockActionData blockactiondata = new BlockActionData(blockposition, block, i, j);
+-        Iterator iterator = this.U[this.V].iterator();
+-
+-        BlockActionData blockactiondata1;
+-
+-        do {
+-            if (!iterator.hasNext()) {
+-                this.U[this.V].add(blockactiondata);
+-                return;
+-            }
+-
+-            blockactiondata1 = (BlockActionData) iterator.next();
+-        } while (!blockactiondata1.equals(blockactiondata));
+-
++        this.U[this.V].add(new BlockActionData(blockposition, block, i, j));
+     }
+ 
+     private void aq() {
+diff --git a/test/java/net/minecraft/server/RedstoneCliffsAndComponentsPerfTest.java b/test/java/net/minecraft/server/RedstoneCliffsAndComponentsPerfTest.java
+new file mode 100644
+index 0000000..196539b
+--- /dev/null
++++ b/test/java/net/minecraft/server/RedstoneCliffsAndComponentsPerfTest.java
+@@ -0,0 +1,359 @@
++package net.minecraft.server;
++
++import com.sun.management.ThreadMXBean;
++import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
++import it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet;
++import java.lang.management.ManagementFactory;
++import java.lang.reflect.Field;
++import java.lang.reflect.Method;
++import java.util.ArrayDeque;
++import java.util.ArrayList;
++import java.util.EnumSet;
++import java.util.Iterator;
++import java.util.List;
++import java.util.Random;
++import org.junit.Assert;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++public class RedstoneCliffsAndComponentsPerfTest {
++
++    private static Unsafe unsafe;
++    private static int nextEntityId = 20000;
++
++    @BeforeClass
++    public static void init() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        unsafe = (Unsafe) f.get(null);
++    }
++
++    private static final class TestWorld extends World {
++        final Long2ObjectOpenHashMap<Chunk> map = new Long2ObjectOpenHashMap<>();
++        long time;
++
++        TestWorld() {
++            super(null, null, null, null, false, null, null);
++        }
++
++        @Override
++        protected IChunkProvider n() {
++            return null;
++        }
++
++        @Override
++        public long getTime() {
++            return time;
++        }
++
++        @Override
++        public Chunk getChunkIfLoaded(int x, int z) {
++            return map.get(ChunkCoordIntPair.a(x, z));
++        }
++
++        @Override
++        public Chunk getChunkAt(int x, int z) {
++            return map.get(ChunkCoordIntPair.a(x, z));
++        }
++
++        @Override
++        public boolean isChunkLoaded(int x, int z, boolean allowEmpty) {
++            return map.containsKey(ChunkCoordIntPair.a(x, z));
++        }
++
++        @Override
++        public TileEntity getTileEntity(BlockPosition pos) {
++            return null;
++        }
++    }
++
++    private static final class TestChunkProviderServer extends ChunkProviderServer {
++        Long2ObjectOpenHashMap<Chunk> map;
++
++        TestChunkProviderServer() {
++            super(null, null, null);
++        }
++
++        @Override
++        public Chunk getChunkIfLoaded(int x, int z) {
++            return map.get(ChunkCoordIntPair.a(x, z));
++        }
++
++        @Override
++        public Chunk getChunkAt(int x, int z) {
++            return map.get(ChunkCoordIntPair.a(x, z));
++        }
++    }
++
++    @SuppressWarnings("unchecked")
++    private static TestWorld createWorld() throws Exception {
++        TestWorld world = (TestWorld) unsafe.allocateInstance(TestWorld.class);
++        Field mapField = TestWorld.class.getDeclaredField("map");
++        mapField.setAccessible(true);
++        Long2ObjectOpenHashMap<Chunk> map = new Long2ObjectOpenHashMap<>();
++        mapField.set(world, map);
++        world.worldData = new WorldData();
++        world.u = new ArrayList<>();
++
++        Chunk c = (Chunk) unsafe.allocateInstance(Chunk.class);
++        Field wf = Chunk.class.getDeclaredField("world");
++        wf.setAccessible(true);
++        wf.set(c, world);
++        Field lx = Chunk.class.getDeclaredField("locX");
++        lx.setAccessible(true);
++        lx.setInt(c, 0);
++        Field lz = Chunk.class.getDeclaredField("locZ");
++        lz.setAccessible(true);
++        lz.setInt(c, 0);
++        Field sf = Chunk.class.getDeclaredField("sections");
++        sf.setAccessible(true);
++        ChunkSection[] secs = new ChunkSection[16];
++        for (int i = 0; i < 16; i++) {
++            secs[i] = Chunk.a;
++        }
++        secs[4] = new ChunkSection(64, true);
++        secs[3] = new ChunkSection(48, true);
++        sf.set(c, secs);
++
++        Field slicesField = Chunk.class.getDeclaredField("entitySlices");
++        slicesField.setAccessible(true);
++        List<Entity>[] slices = new List[16];
++        for (int i = 0; i < 16; i++) {
++            slices[i] = new ArrayList<>();
++        }
++        slicesField.set(c, slices);
++
++        for (String fn : new String[]{"itemCounts", "inventoryEntityCounts", "hardCollidableCounts", "itemFrameCounts"}) {
++            Field f = Chunk.class.getDeclaredField(fn);
++            f.setAccessible(true);
++            f.set(c, new int[16]);
++        }
++        map.put(ChunkCoordIntPair.a(0, 0), c);
++
++        TestChunkProviderServer cps = (TestChunkProviderServer) unsafe.allocateInstance(TestChunkProviderServer.class);
++        cps.map = map;
++        world.chunkProvider = cps;
++        return world;
++    }
++
++    private static void setBlock(TestWorld world, int x, int y, int z, IBlockData data) {
++        Chunk c = world.getChunkIfLoaded(x >> 4, z >> 4);
++        c.getSections()[y >> 4].setType(x & 15, y & 15, z & 15, data);
++    }
++
++    private static EntityItemFrame createItemFrame(TestWorld world, int x, int y, int z, EnumDirection facing) throws Exception {
++        EntityItemFrame frame = (EntityItemFrame) unsafe.allocateInstance(EntityItemFrame.class);
++        frame.h(nextEntityId++);
++        frame.world = world;
++        frame.locX = x + 0.5D;
++        frame.locY = y + 0.5D;
++        frame.locZ = z + 0.5D;
++        frame.direction = facing;
++        frame.a(new AxisAlignedBB(x + 0.1D, y + 0.1D, z + 0.1D, x + 0.9D, y + 0.9D, z + 0.9D));
++        Chunk c = world.getChunkIfLoaded(x >> 4, z >> 4);
++        int slice = MathHelper.clamp(y >> 4, 0, 15);
++        c.getEntitySlices()[slice].add(frame);
++        c.itemFrameCounts[slice]++;
++        return frame;
++    }
++
++    @Test
++    public void testRedstoneCliffsAndComponentsParity() throws Exception {
++        TestWorld world = createWorld();
++
++        // 1. BlockActionData hashCode + FIFO ObjectLinkedOpenHashSet dedup
++        ObjectLinkedOpenHashSet<BlockActionData> actionSet = new ObjectLinkedOpenHashSet<>();
++        BlockPosition p1 = new BlockPosition(5, 64, 5);
++        BlockPosition p2 = new BlockPosition(6, 64, 5);
++        Assert.assertTrue(actionSet.add(new BlockActionData(p1, Blocks.PISTON, 0, 1)));
++        Assert.assertTrue(actionSet.add(new BlockActionData(p2, Blocks.PISTON, 0, 2)));
++        Assert.assertFalse(actionSet.add(new BlockActionData(new BlockPosition(5, 64, 5), Blocks.PISTON, 0, 1)));
++        Assert.assertEquals(2, actionSet.size());
++        Iterator<BlockActionData> it = actionSet.iterator();
++        Assert.assertEquals(p1, it.next().a());
++        Assert.assertEquals(p2, it.next().a());
++
++        // 2. BlockDiodeAbstract.isDiode & D
++        Assert.assertTrue(BlockDiodeAbstract.isDiode(Blocks.UNPOWERED_REPEATER.getBlockData()));
++        Assert.assertTrue(BlockDiodeAbstract.isDiode(Blocks.POWERED_REPEATER.getBlockData()));
++        Assert.assertTrue(BlockDiodeAbstract.isDiode(Blocks.UNPOWERED_COMPARATOR.getBlockData()));
++        Assert.assertTrue(BlockDiodeAbstract.isDiode(Blocks.POWERED_COMPARATOR.getBlockData()));
++        Assert.assertFalse(BlockDiodeAbstract.isDiode(Blocks.STONE.getBlockData()));
++        Assert.assertFalse(BlockDiodeAbstract.isDiode(Blocks.REDSTONE_WIRE.getBlockData()));
++        Assert.assertTrue(Blocks.UNPOWERED_REPEATER.D(Blocks.POWERED_REPEATER.getBlockData()));
++        Assert.assertFalse(Blocks.UNPOWERED_REPEATER.D(Blocks.POWERED_COMPARATOR.getBlockData()));
++        Assert.assertTrue(Blocks.UNPOWERED_COMPARATOR.D(Blocks.POWERED_COMPARATOR.getBlockData()));
++
++        // 3. BlockRedstoneTorch 8-toggle burnout + 60-tick expiry
++        BlockRedstoneTorch torch = (BlockRedstoneTorch) Blocks.REDSTONE_TORCH;
++        Method torchBurnout = BlockRedstoneTorch.class.getDeclaredMethod("a", World.class, BlockPosition.class, boolean.class);
++        torchBurnout.setAccessible(true);
++        BlockPosition torchPos = new BlockPosition(8, 65, 8);
++        setBlock(world, 8, 65, 8, torch.getBlockData());
++        world.time = 100L;
++        for (int i = 0; i < 7; i++) {
++            Assert.assertFalse((Boolean) torchBurnout.invoke(torch, world, torchPos, true));
++        }
++        Assert.assertTrue((Boolean) torchBurnout.invoke(torch, world, torchPos, true));
++        world.time = 161L; // > 60 ticks later
++        torch.b(world, torchPos, torch.getBlockData(), new Random(1L));
++        Assert.assertEquals(0, world.redstoneUpdateCounts.get(torchPos.asLong()));
++        Assert.assertFalse((Boolean) torchBurnout.invoke(torch, world, torchPos, true));
++
++        // 4. BlockRedstoneWire.b() across all 6 faces and connection patterns
++        BlockRedstoneWire wire = (BlockRedstoneWire) Blocks.REDSTONE_WIRE;
++        IBlockData wire12 = wire.getBlockData().set(BlockRedstoneWire.POWER, 12);
++        setBlock(world, 10, 65, 10, wire12);
++        // Dot (no neighbors) -> UP=12, DOWN=0, N/E/S/W=12
++        Assert.assertEquals(12, wire.b(wire12, world, new BlockPosition(10, 65, 10), EnumDirection.UP));
++        Assert.assertEquals(0, wire.b(wire12, world, new BlockPosition(10, 65, 10), EnumDirection.DOWN));
++        Assert.assertEquals(12, wire.b(wire12, world, new BlockPosition(10, 65, 10), EnumDirection.NORTH));
++        Assert.assertEquals(12, wire.b(wire12, world, new BlockPosition(10, 65, 10), EnumDirection.EAST));
++        // Straight line N-S: NORTH=12, SOUTH=12, EAST=0, WEST=0
++        setBlock(world, 10, 65, 9, wire12);
++        setBlock(world, 10, 65, 11, wire12);
++        Assert.assertEquals(12, wire.b(wire12, world, new BlockPosition(10, 65, 10), EnumDirection.NORTH));
++        Assert.assertEquals(0, wire.b(wire12, world, new BlockPosition(10, 65, 10), EnumDirection.EAST));
++        // Step-up blocked by opaque block above center
++        setBlock(world, 10, 65, 9, Blocks.STONE.getBlockData());
++        setBlock(world, 10, 66, 9, wire12);
++        setBlock(world, 10, 65, 11, Blocks.AIR.getBlockData());
++        Assert.assertEquals(12, wire.b(wire12, world, new BlockPosition(10, 65, 10), EnumDirection.NORTH));
++        setBlock(world, 10, 66, 10, Blocks.STONE.getBlockData()); // blocks step-up!
++        Assert.assertEquals(12, wire.b(wire12, world, new BlockPosition(10, 65, 10), EnumDirection.EAST)); // back to dot
++
++        // 5. Comparator item frame 0 / 1 / 2 check
++        BlockRedstoneComparator comp = (BlockRedstoneComparator) Blocks.UNPOWERED_COMPARATOR;
++        Method findFrame = BlockRedstoneComparator.class.getDeclaredMethod("a", World.class, EnumDirection.class, int.class, int.class, int.class);
++        findFrame.setAccessible(true);
++        Assert.assertNull(findFrame.invoke(comp, world, EnumDirection.NORTH, 12, 65, 12));
++        EntityItemFrame f1 = createItemFrame(world, 12, 65, 12, EnumDirection.NORTH);
++        Assert.assertSame(f1, findFrame.invoke(comp, world, EnumDirection.NORTH, 12, 65, 12));
++        createItemFrame(world, 12, 65, 12, EnumDirection.NORTH);
++        Assert.assertNull(findFrame.invoke(comp, world, EnumDirection.NORTH, 12, 65, 12));
++
++        // 6. World.z() & isBlockIndirectlyPowered()
++        setBlock(world, 4, 65, 4, Blocks.REDSTONE_BLOCK.getBlockData());
++        Assert.assertEquals(15, world.z(new BlockPosition(5, 65, 4)));
++        Assert.assertTrue(world.isBlockIndirectlyPowered(new BlockPosition(5, 65, 4)));
++        Assert.assertEquals(0, world.z(new BlockPosition(2, 65, 2)));
++        Assert.assertFalse(world.isBlockIndirectlyPowered(new BlockPosition(2, 65, 2)));
++    }
++
++    @Test
++    public void testRedstoneCliffsAndComponentsBenchmark() throws Exception {
++        TestWorld world = createWorld();
++        BlockRedstoneWire wire = (BlockRedstoneWire) Blocks.REDSTONE_WIRE;
++        IBlockData wire10 = wire.getBlockData().set(BlockRedstoneWire.POWER, 10);
++        setBlock(world, 8, 65, 8, wire10);
++        setBlock(world, 8, 65, 7, wire10);
++        setBlock(world, 8, 65, 9, wire10);
++        BlockPosition wirePos = new BlockPosition(8, 65, 8);
++        BlockPosition powerPos = new BlockPosition(5, 65, 5);
++
++        // Pre-populate 500-torch deque/counts
++        ArrayDeque<BlockRedstoneTorch.RedstoneUpdateInfo> deque = new ArrayDeque<>();
++        it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap counts = new it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap();
++        for (int i = 0; i < 500; i++) {
++            BlockPosition bp = new BlockPosition(i & 15, 65, (i >> 4) & 15);
++            deque.add(new BlockRedstoneTorch.RedstoneUpdateInfo(bp, 100L));
++            counts.addTo(bp.asLong(), 1);
++        }
++        BlockPosition probeTorch = new BlockPosition(15, 65, 15);
++
++        ThreadMXBean bean = (ThreadMXBean) ManagementFactory.getThreadMXBean();
++        long tid = Thread.currentThread().getId();
++
++        for (int i = 0; i < 6000; i++) {
++            runVanillaComponentQuery(world, wire, wire10, wirePos, powerPos);
++            runOptComponentQuery(world, wire, wire10, wirePos, powerPos);
++        }
++        bean.getThreadAllocatedBytes(tid);
++
++        // Component query bench (50k)
++        final int compIters = 50000;
++        long cvT0 = System.nanoTime();
++        int sink = 0;
++        for (int i = 0; i < compIters; i++) {
++            sink += runVanillaComponentQuery(world, wire, wire10, wirePos, powerPos);
++        }
++        long cvNs = System.nanoTime() - cvT0;
++
++        long coAlloc0 = bean.getThreadAllocatedBytes(tid);
++        long coT0 = System.nanoTime();
++        for (int i = 0; i < compIters; i++) {
++            sink += runOptComponentQuery(world, wire, wire10, wirePos, powerPos);
++        }
++        long coNs = System.nanoTime() - coT0;
++        long coBytes = bean.getThreadAllocatedBytes(tid) - coAlloc0;
++
++        // Cliff bench: 2000 playBlockAction dedups + 500 torch burnout lookups
++        long cliffVT0 = System.nanoTime();
++        List<BlockActionData> vanillaList = new ArrayList<>(2048);
++        for (int i = 0; i < 2000; i++) {
++            BlockActionData d = new BlockActionData(new BlockPosition(i & 15, 64, i >> 4), Blocks.PISTON, 0, 1);
++            boolean exists = false;
++            for (int j = 0, sz = vanillaList.size(); j < sz; j++) {
++                if (vanillaList.get(j).equals(d)) { exists = true; break; }
++            }
++            if (!exists) vanillaList.add(d);
++        }
++        for (int i = 0; i < 500; i++) {
++            int c = 0;
++            for (BlockRedstoneTorch.RedstoneUpdateInfo info : deque) {
++                if (info.a.equals(probeTorch)) c++;
++            }
++            sink += c;
++        }
++        long cliffVNs = System.nanoTime() - cliffVT0;
++
++        long cliffOT0 = System.nanoTime();
++        ObjectLinkedOpenHashSet<BlockActionData> optSet = new ObjectLinkedOpenHashSet<>(2048);
++        for (int i = 0; i < 2000; i++) {
++            optSet.add(new BlockActionData(new BlockPosition(i & 15, 64, i >> 4), Blocks.PISTON, 0, 1));
++        }
++        long tKey = probeTorch.asLong();
++        for (int i = 0; i < 500; i++) {
++            sink += counts.get(tKey);
++        }
++        long cliffONs = System.nanoTime() - cliffOT0;
++
++        long totalV = cvNs + cliffVNs;
++        long totalO = coNs + cliffONs;
++        double speedup = (double) totalV / (double) Math.max(1L, totalO);
++        System.out.println(String.format(
++                "C3_BENCH vanilla_ns=%d opt_ns=%d speedup=%.2fx comp_opt_bytes=%d cliff_speedup=%.2fx sink=%d",
++                totalV, totalO, speedup, coBytes, (double) cliffVNs / Math.max(1L, cliffONs), sink));
++
++        Assert.assertEquals("Component queries must allocate 0 bytes", 0L, coBytes);
++        Assert.assertTrue("Expected speedup > 2.5x, got " + speedup, speedup > 2.5D);
++    }
++
++    private static int runVanillaComponentQuery(World world, BlockRedstoneWire wire, IBlockData wireData, BlockPosition wirePos, BlockPosition powerPos) {
++        int acc = 0;
++        if (Blocks.UNPOWERED_REPEATER.D(Blocks.POWERED_REPEATER.getBlockData())) acc++;
++        EnumSet<EnumDirection> set = EnumSet.noneOf(EnumDirection.class);
++        Iterator<EnumDirection> it = EnumDirection.EnumDirectionLimit.HORIZONTAL.iterator();
++        while (it.hasNext()) {
++            EnumDirection dir = it.next();
++            if (world.getType(wirePos.shift(dir)).getBlock() == Blocks.REDSTONE_WIRE) {
++                set.add(dir);
++            }
++        }
++        acc += set.size();
++        for (EnumDirection d : EnumDirection.values()) {
++            acc += world.getBlockFacePower(powerPos.shift(d), d);
++        }
++        return acc;
++    }
++
++    private static int runOptComponentQuery(World world, BlockRedstoneWire wire, IBlockData wireData, BlockPosition wirePos, BlockPosition powerPos) {
++        int acc = 0;
++        if (BlockDiodeAbstract.isDiode(Blocks.POWERED_REPEATER.getBlockData())) acc++;
++        acc += wire.b(wireData, world, wirePos, EnumDirection.EAST);
++        acc += world.z(powerPos);
++        return acc;
++    }
++}
