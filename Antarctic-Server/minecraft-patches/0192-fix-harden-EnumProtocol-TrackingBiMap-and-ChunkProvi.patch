@@ -1,0 +1,788 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 21:05:58 +0700
+Subject: [PATCH 192/192] fix: harden EnumProtocol TrackingBiMap and
+ ChunkProviderServer lastChunkByPos invalidation
+
+
+diff --git a/main/java/net/minecraft/server/ChunkProviderServer.java b/main/java/net/minecraft/server/ChunkProviderServer.java
+index d949bb6..fe51d59 100644
+--- a/main/java/net/minecraft/server/ChunkProviderServer.java
++++ b/main/java/net/minecraft/server/ChunkProviderServer.java
+@@ -82,6 +82,299 @@ public class ChunkProviderServer implements IChunkProvider {
+             lastChunkByPos = null;
+             super.clear();
+         }
++
++        @Override
++        @SuppressWarnings("deprecation")
++        public Chunk get(Object key) {
++            return key instanceof Long ? this.get(((Long) key).longValue()) : null;
++        }
++
++        @Override
++        @SuppressWarnings("deprecation")
++        public boolean containsKey(Object key) {
++            return key instanceof Long && this.containsKey(((Long) key).longValue());
++        }
++
++        @Override
++        @SuppressWarnings("deprecation")
++        public Chunk put(Long key, Chunk value) {
++            return this.put(key.longValue(), value);
++        }
++
++        @Override
++        @SuppressWarnings("deprecation")
++        public Chunk remove(Object key) {
++            return key instanceof Long ? this.remove(((Long) key).longValue()) : null;
++        }
++
++        @Override
++        public void putAll(java.util.Map<? extends Long, ? extends Chunk> m) {
++            lastChunkByPos = null;
++            super.putAll(m);
++        }
++
++        @Override
++        public void replaceAll(java.util.function.BiFunction<? super Long, ? super Chunk, ? extends Chunk> function) {
++            lastChunkByPos = null;
++            super.replaceAll(function);
++        }
++
++        @Override
++        public it.unimi.dsi.fastutil.objects.ObjectCollection<Chunk> values() {
++            final it.unimi.dsi.fastutil.objects.ObjectCollection<Chunk> raw = super.values();
++            return new it.unimi.dsi.fastutil.objects.AbstractObjectCollection<Chunk>() {
++                @Override
++                public it.unimi.dsi.fastutil.objects.ObjectIterator<Chunk> iterator() {
++                    final it.unimi.dsi.fastutil.objects.ObjectIterator<Chunk> it = raw.iterator();
++                    return new it.unimi.dsi.fastutil.objects.AbstractObjectIterator<Chunk>() {
++                        @Override
++                        public boolean hasNext() {
++                            return it.hasNext();
++                        }
++
++                        @Override
++                        public Chunk next() {
++                            return it.next();
++                        }
++
++                        @Override
++                        public void remove() {
++                            lastChunkByPos = null;
++                            it.remove();
++                        }
++                    };
++                }
++
++                @Override
++                public int size() {
++                    return raw.size();
++                }
++
++                @Override
++                public boolean contains(Object o) {
++                    return raw.contains(o);
++                }
++
++                @Override
++                public void clear() {
++                    lastChunkByPos = null;
++                    raw.clear();
++                }
++
++                @Override
++                public boolean remove(Object o) {
++                    lastChunkByPos = null;
++                    return raw.remove(o);
++                }
++
++                @Override
++                public boolean removeAll(Collection<?> c) {
++                    lastChunkByPos = null;
++                    return raw.removeAll(c);
++                }
++
++                @Override
++                public boolean retainAll(Collection<?> c) {
++                    lastChunkByPos = null;
++                    return raw.retainAll(c);
++                }
++
++                @Override
++                public boolean removeIf(java.util.function.Predicate<? super Chunk> filter) {
++                    lastChunkByPos = null;
++                    return raw.removeIf(filter);
++                }
++            };
++        }
++
++        @Override
++        public it.unimi.dsi.fastutil.longs.LongSet keySet() {
++            final it.unimi.dsi.fastutil.longs.LongSet raw = super.keySet();
++            return new it.unimi.dsi.fastutil.longs.AbstractLongSet() {
++                @Override
++                public it.unimi.dsi.fastutil.longs.LongIterator iterator() {
++                    final it.unimi.dsi.fastutil.longs.LongIterator it = raw.iterator();
++                    return new it.unimi.dsi.fastutil.longs.AbstractLongIterator() {
++                        @Override
++                        public boolean hasNext() {
++                            return it.hasNext();
++                        }
++
++                        @Override
++                        public long nextLong() {
++                            return it.nextLong();
++                        }
++
++                        @Override
++                        public void remove() {
++                            lastChunkByPos = null;
++                            it.remove();
++                        }
++                    };
++                }
++
++                @Override
++                public int size() {
++                    return raw.size();
++                }
++
++                @Override
++                public boolean contains(long k) {
++                    return containsKey(k);
++                }
++
++                @Override
++                public boolean remove(long k) {
++                    if (lastChunkByPos != null && k == lastChunkByPos.chunkKey) {
++                        lastChunkByPos = null;
++                    }
++                    return raw.remove(k);
++                }
++
++                @Override
++                public void clear() {
++                    lastChunkByPos = null;
++                    raw.clear();
++                }
++
++                @Override
++                public boolean removeAll(Collection<?> c) {
++                    lastChunkByPos = null;
++                    return raw.removeAll(c);
++                }
++
++                @Override
++                public boolean retainAll(Collection<?> c) {
++                    lastChunkByPos = null;
++                    return raw.retainAll(c);
++                }
++
++                @Override
++                public boolean removeIf(java.util.function.Predicate<? super Long> filter) {
++                    lastChunkByPos = null;
++                    return raw.removeIf(filter);
++                }
++            };
++        }
++
++        private it.unimi.dsi.fastutil.objects.ObjectIterator<it.unimi.dsi.fastutil.longs.Long2ObjectMap.Entry<Chunk>> wrapEntryIterator(
++                final it.unimi.dsi.fastutil.objects.ObjectIterator<it.unimi.dsi.fastutil.longs.Long2ObjectMap.Entry<Chunk>> it) {
++            return new it.unimi.dsi.fastutil.objects.AbstractObjectIterator<it.unimi.dsi.fastutil.longs.Long2ObjectMap.Entry<Chunk>>() {
++                @Override
++                public boolean hasNext() {
++                    return it.hasNext();
++                }
++
++                @Override
++                public it.unimi.dsi.fastutil.longs.Long2ObjectMap.Entry<Chunk> next() {
++                    final it.unimi.dsi.fastutil.longs.Long2ObjectMap.Entry<Chunk> entry = it.next();
++                    return new it.unimi.dsi.fastutil.longs.Long2ObjectMap.Entry<Chunk>() {
++                        @Override
++                        public long getLongKey() {
++                            return entry.getLongKey();
++                        }
++
++                        @Override
++                        @SuppressWarnings("deprecation")
++                        public Long getKey() {
++                            return entry.getKey();
++                        }
++
++                        @Override
++                        public Chunk getValue() {
++                            return entry.getValue();
++                        }
++
++                        @Override
++                        public Chunk setValue(Chunk value) {
++                            lastChunkByPos = null;
++                            return entry.setValue(value);
++                        }
++
++                        @Override
++                        public boolean equals(Object o) {
++                            return entry.equals(o);
++                        }
++
++                        @Override
++                        public int hashCode() {
++                            return entry.hashCode();
++                        }
++                    };
++                }
++
++                @Override
++                public void remove() {
++                    lastChunkByPos = null;
++                    it.remove();
++                }
++            };
++        }
++
++        @Override
++        public it.unimi.dsi.fastutil.longs.Long2ObjectMap.FastEntrySet<Chunk> long2ObjectEntrySet() {
++            final it.unimi.dsi.fastutil.longs.Long2ObjectMap.FastEntrySet<Chunk> raw = super.long2ObjectEntrySet();
++            return new AbstractFastEntrySetWrapper(raw);
++        }
++
++        final class AbstractFastEntrySetWrapper extends it.unimi.dsi.fastutil.objects.AbstractObjectSet<it.unimi.dsi.fastutil.longs.Long2ObjectMap.Entry<Chunk>>
++                implements it.unimi.dsi.fastutil.longs.Long2ObjectMap.FastEntrySet<Chunk> {
++            private final it.unimi.dsi.fastutil.longs.Long2ObjectMap.FastEntrySet<Chunk> raw;
++
++            AbstractFastEntrySetWrapper(it.unimi.dsi.fastutil.longs.Long2ObjectMap.FastEntrySet<Chunk> raw) {
++                this.raw = raw;
++            }
++
++            @Override
++            public it.unimi.dsi.fastutil.objects.ObjectIterator<it.unimi.dsi.fastutil.longs.Long2ObjectMap.Entry<Chunk>> iterator() {
++                return wrapEntryIterator(this.raw.iterator());
++            }
++
++            @Override
++            public it.unimi.dsi.fastutil.objects.ObjectIterator<it.unimi.dsi.fastutil.longs.Long2ObjectMap.Entry<Chunk>> fastIterator() {
++                return wrapEntryIterator(this.raw.fastIterator());
++            }
++
++            @Override
++            public int size() {
++                return this.raw.size();
++            }
++
++            @Override
++            public boolean contains(Object o) {
++                return this.raw.contains(o);
++            }
++
++            @Override
++            public void clear() {
++                lastChunkByPos = null;
++                this.raw.clear();
++            }
++
++            @Override
++            public boolean remove(Object o) {
++                lastChunkByPos = null;
++                return this.raw.remove(o);
++            }
++
++            @Override
++            public boolean removeAll(Collection<?> c) {
++                lastChunkByPos = null;
++                return this.raw.removeAll(c);
++            }
++
++            @Override
++            public boolean retainAll(Collection<?> c) {
++                lastChunkByPos = null;
++                return this.raw.retainAll(c);
++            }
++
++            @Override
++            public boolean removeIf(java.util.function.Predicate<? super it.unimi.dsi.fastutil.longs.Long2ObjectMap.Entry<Chunk>> filter) {
++                lastChunkByPos = null;
++                return this.raw.removeIf(filter);
++            }
++        }
+     }; // CraftBukkit
+     // Paper end
+     public final WorldServer world;
+diff --git a/main/java/net/minecraft/server/EnumProtocol.java b/main/java/net/minecraft/server/EnumProtocol.java
+index 8d4486f..f60f1c0 100644
+--- a/main/java/net/minecraft/server/EnumProtocol.java
++++ b/main/java/net/minecraft/server/EnumProtocol.java
+@@ -156,11 +156,12 @@ public enum EnumProtocol {
+     private static final Map<Class<? extends Packet<?>>, EnumProtocol> f = Maps.newHashMap();
+     private final int g;
+     private final Map<EnumProtocolDirection, BiMap<Integer, Class<? extends Packet<?>>>> h;
+-    private final Supplier<? extends Packet<?>>[][] supplierTable;
++    private final java.util.concurrent.atomic.AtomicReferenceArray<Supplier<? extends Packet<?>>[]> supplierTable;
+ 
++    @SuppressWarnings("unchecked")
+     private EnumProtocol(int i) {
+         this.h = Maps.newEnumMap(EnumProtocolDirection.class);
+-        this.supplierTable = new Supplier[EnumProtocolDirection.values().length][];
++        this.supplierTable = new java.util.concurrent.atomic.AtomicReferenceArray<>(EnumProtocolDirection.values().length);
+         this.g = i;
+     }
+ 
+@@ -168,6 +169,7 @@ public enum EnumProtocol {
+         return this.a(enumprotocoldirection, oclass, null);
+     }
+ 
++    @SuppressWarnings("unchecked")
+     protected EnumProtocol a(EnumProtocolDirection enumprotocoldirection, Class<? extends Packet<?>> oclass, @Nullable Supplier<? extends Packet<?>> supplier) {
+         BiMap<Integer, Class<? extends Packet<?>>> bimap = this.h.get(enumprotocoldirection);
+ 
+@@ -186,15 +188,14 @@ public enum EnumProtocol {
+             bimap.put(Integer.valueOf(id), oclass);
+             if (supplier != null) {
+                 int dirOrdinal = enumprotocoldirection.ordinal();
+-                Supplier<? extends Packet<?>>[] row = this.supplierTable[dirOrdinal];
++                Supplier<? extends Packet<?>>[] row = this.supplierTable.get(dirOrdinal);
+                 if (row == null) {
+                     row = new Supplier[Math.max(16, id + 1)];
+-                    this.supplierTable[dirOrdinal] = row;
+                 } else if (id >= row.length) {
+                     row = Arrays.copyOf(row, Math.max(id + 1, row.length * 2));
+-                    this.supplierTable[dirOrdinal] = row;
+                 }
+                 row[id] = supplier;
++                this.supplierTable.set(dirOrdinal, row);
+             }
+             return this;
+         }
+@@ -206,7 +207,7 @@ public enum EnumProtocol {
+ 
+     @Nullable
+     public Packet<?> a(EnumProtocolDirection enumprotocoldirection, int i) throws IllegalAccessException, InstantiationException {
+-        Supplier<? extends Packet<?>>[] row = this.supplierTable[enumprotocoldirection.ordinal()];
++        Supplier<? extends Packet<?>>[] row = this.supplierTable.get(enumprotocoldirection.ordinal());
+         if (row != null && i >= 0 && i < row.length) {
+             Supplier<? extends Packet<?>> supplier = row[i];
+             if (supplier != null) {
+@@ -249,15 +250,175 @@ public enum EnumProtocol {
+         private void invalidateSlot(Object key) {
+             if (key instanceof Integer) {
+                 int id = ((Integer) key).intValue();
+-                Supplier<? extends Packet<?>>[] row = EnumProtocol.this.supplierTable[this.dirOrdinal];
+-                if (row != null && id >= 0 && id < row.length) {
+-                    row[id] = null;
++                Supplier<? extends Packet<?>>[] row = EnumProtocol.this.supplierTable.get(this.dirOrdinal);
++                if (row != null && id >= 0 && id < row.length && row[id] != null) {
++                    Supplier<? extends Packet<?>>[] updated = row.clone();
++                    updated[id] = null;
++                    EnumProtocol.this.supplierTable.set(this.dirOrdinal, updated);
+                 }
+             }
+         }
+ 
+         private void invalidateAll() {
+-            EnumProtocol.this.supplierTable[this.dirOrdinal] = null;
++            EnumProtocol.this.supplierTable.set(this.dirOrdinal, null);
++        }
++
++        private <E> Set<E> wrapInvalidatingSet(Set<E> set) {
++            return new com.google.common.collect.ForwardingSet<E>() {
++                @Override
++                protected Set<E> delegate() {
++                    return set;
++                }
++
++                @Override
++                public boolean remove(Object object) {
++                    boolean changed = super.remove(object);
++                    if (changed) {
++                        TrackingBiMap.this.invalidateAll();
++                    }
++                    return changed;
++                }
++
++                @Override
++                public boolean removeAll(java.util.Collection<?> collection) {
++                    boolean changed = super.removeAll(collection);
++                    if (changed) {
++                        TrackingBiMap.this.invalidateAll();
++                    }
++                    return changed;
++                }
++
++                @Override
++                public boolean retainAll(java.util.Collection<?> collection) {
++                    boolean changed = super.retainAll(collection);
++                    if (changed) {
++                        TrackingBiMap.this.invalidateAll();
++                    }
++                    return changed;
++                }
++
++                @Override
++                public boolean removeIf(java.util.function.Predicate<? super E> filter) {
++                    boolean changed = super.removeIf(filter);
++                    if (changed) {
++                        TrackingBiMap.this.invalidateAll();
++                    }
++                    return changed;
++                }
++
++                @Override
++                public void clear() {
++                    TrackingBiMap.this.invalidateAll();
++                    super.clear();
++                }
++
++                @Override
++                public java.util.Iterator<E> iterator() {
++                    final java.util.Iterator<E> it = super.iterator();
++                    return new java.util.Iterator<E>() {
++                        @Override
++                        public boolean hasNext() {
++                            return it.hasNext();
++                        }
++
++                        @Override
++                        public E next() {
++                            return it.next();
++                        }
++
++                        @Override
++                        public void remove() {
++                            it.remove();
++                            TrackingBiMap.this.invalidateAll();
++                        }
++                    };
++                }
++            };
++        }
++
++        private <K, V> Set<Map.Entry<K, V>> wrapInvalidatingEntrySet(Set<Map.Entry<K, V>> set) {
++            return new com.google.common.collect.ForwardingSet<Map.Entry<K, V>>() {
++                @Override
++                protected Set<Map.Entry<K, V>> delegate() {
++                    return set;
++                }
++
++                @Override
++                public boolean remove(Object object) {
++                    boolean changed = super.remove(object);
++                    if (changed) {
++                        TrackingBiMap.this.invalidateAll();
++                    }
++                    return changed;
++                }
++
++                @Override
++                public boolean removeAll(java.util.Collection<?> collection) {
++                    boolean changed = super.removeAll(collection);
++                    if (changed) {
++                        TrackingBiMap.this.invalidateAll();
++                    }
++                    return changed;
++                }
++
++                @Override
++                public boolean retainAll(java.util.Collection<?> collection) {
++                    boolean changed = super.retainAll(collection);
++                    if (changed) {
++                        TrackingBiMap.this.invalidateAll();
++                    }
++                    return changed;
++                }
++
++                @Override
++                public boolean removeIf(java.util.function.Predicate<? super Map.Entry<K, V>> filter) {
++                    boolean changed = super.removeIf(filter);
++                    if (changed) {
++                        TrackingBiMap.this.invalidateAll();
++                    }
++                    return changed;
++                }
++
++                @Override
++                public void clear() {
++                    TrackingBiMap.this.invalidateAll();
++                    super.clear();
++                }
++
++                @Override
++                public java.util.Iterator<Map.Entry<K, V>> iterator() {
++                    final java.util.Iterator<Map.Entry<K, V>> it = super.iterator();
++                    return new java.util.Iterator<Map.Entry<K, V>>() {
++                        @Override
++                        public boolean hasNext() {
++                            return it.hasNext();
++                        }
++
++                        @Override
++                        public Map.Entry<K, V> next() {
++                            final Map.Entry<K, V> entry = it.next();
++                            return new com.google.common.collect.ForwardingMapEntry<K, V>() {
++                                @Override
++                                protected Map.Entry<K, V> delegate() {
++                                    return entry;
++                                }
++
++                                @Override
++                                public V setValue(V value) {
++                                    TrackingBiMap.this.invalidateAll();
++                                    return super.setValue(value);
++                                }
++                            };
++                        }
++
++                        @Override
++                        public void remove() {
++                            it.remove();
++                            TrackingBiMap.this.invalidateAll();
++                        }
++                    };
++                }
++            };
+         }
+ 
+         @Override
+@@ -268,7 +429,11 @@ public enum EnumProtocol {
+ 
+         @Override
+         public Class<? extends Packet<?>> forcePut(Integer key, Class<? extends Packet<?>> value) {
++            Integer displacedKey = this.delegate.inverse().get(value);
+             this.invalidateSlot(key);
++            if (displacedKey != null) {
++                this.invalidateSlot(displacedKey);
++            }
+             return this.delegate.forcePut(key, value);
+         }
+ 
+@@ -278,6 +443,12 @@ public enum EnumProtocol {
+             super.putAll(map);
+         }
+ 
++        @Override
++        public void replaceAll(java.util.function.BiFunction<? super Integer, ? super Class<? extends Packet<?>>, ? extends Class<? extends Packet<?>>> function) {
++            this.invalidateAll();
++            super.replaceAll(function);
++        }
++
+         @Override
+         public Class<? extends Packet<?>> remove(Object object) {
+             this.invalidateSlot(object);
+@@ -290,9 +461,19 @@ public enum EnumProtocol {
+             super.clear();
+         }
+ 
++        @Override
++        public Set<Integer> keySet() {
++            return this.wrapInvalidatingSet(this.delegate.keySet());
++        }
++
+         @Override
+         public Set<Class<? extends Packet<?>>> values() {
+-            return this.delegate.values();
++            return this.wrapInvalidatingSet(this.delegate.values());
++        }
++
++        @Override
++        public Set<Map.Entry<Integer, Class<? extends Packet<?>>>> entrySet() {
++            return this.wrapInvalidatingEntrySet(this.delegate.entrySet());
+         }
+ 
+         @Override
+@@ -334,6 +515,12 @@ public enum EnumProtocol {
+                 super.putAll(map);
+             }
+ 
++            @Override
++            public void replaceAll(java.util.function.BiFunction<? super Class<? extends Packet<?>>, ? super Integer, ? extends Integer> function) {
++                TrackingBiMap.this.invalidateAll();
++                super.replaceAll(function);
++            }
++
+             @Override
+             public Integer remove(Object object) {
+                 TrackingBiMap.this.invalidateAll();
+@@ -346,9 +533,19 @@ public enum EnumProtocol {
+                 super.clear();
+             }
+ 
++            @Override
++            public Set<Class<? extends Packet<?>>> keySet() {
++                return TrackingBiMap.this.wrapInvalidatingSet(this.inv.keySet());
++            }
++
+             @Override
+             public Set<Integer> values() {
+-                return this.inv.values();
++                return TrackingBiMap.this.wrapInvalidatingSet(this.inv.values());
++            }
++
++            @Override
++            public Set<Map.Entry<Class<? extends Packet<?>>, Integer>> entrySet() {
++                return TrackingBiMap.this.wrapInvalidatingEntrySet(this.inv.entrySet());
+             }
+ 
+             @Override
+diff --git a/test/java/net/minecraft/server/ProtocolAndChunkMapInvalidationTest.java b/test/java/net/minecraft/server/ProtocolAndChunkMapInvalidationTest.java
+new file mode 100644
+index 0000000..95def5a
+--- /dev/null
++++ b/test/java/net/minecraft/server/ProtocolAndChunkMapInvalidationTest.java
+@@ -0,0 +1,157 @@
++package net.minecraft.server;
++
++import com.google.common.collect.BiMap;
++import com.google.common.collect.HashBiMap;
++import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
++import java.lang.reflect.Field;
++import java.util.Collections;
++import java.util.Iterator;
++import java.util.Map;
++import java.util.concurrent.atomic.AtomicReferenceArray;
++import java.util.function.Supplier;
++import org.junit.Assert;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++public class ProtocolAndChunkMapInvalidationTest {
++
++    private static Unsafe unsafe;
++
++    @BeforeClass
++    public static void init() throws Exception {
++        DispenserRegistry.c();
++        org.spigotmc.AsyncCatcher.enabled = false;
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        unsafe = (Unsafe) f.get(null);
++    }
++
++    @Test
++    @SuppressWarnings("unchecked")
++    public void testEnumProtocolTrackingBiMapInvalidatesOnForcePutViewsAndReplaceAll() throws Exception {
++        Field hField = EnumProtocol.class.getDeclaredField("h");
++        hField.setAccessible(true);
++        Field tableField = EnumProtocol.class.getDeclaredField("supplierTable");
++        tableField.setAccessible(true);
++
++        EnumProtocol proto = EnumProtocol.HANDSHAKING;
++        Map<EnumProtocolDirection, BiMap<Integer, Class<? extends Packet<?>>>> h =
++                (Map<EnumProtocolDirection, BiMap<Integer, Class<? extends Packet<?>>>>) hField.get(proto);
++        BiMap<Integer, Class<? extends Packet<?>>> serverbound = h.get(EnumProtocolDirection.SERVERBOUND);
++        AtomicReferenceArray<Supplier<? extends Packet<?>>[]> table =
++                (AtomicReferenceArray<Supplier<? extends Packet<?>>[]>) tableField.get(proto);
++
++        int dirIdx = EnumProtocolDirection.SERVERBOUND.ordinal();
++        BiMap<Integer, Class<? extends Packet<?>>> snapshotMap = HashBiMap.create(serverbound);
++        Supplier<? extends Packet<?>>[] snapshotRow = table.get(dirIdx) != null ? table.get(dirIdx).clone() : null;
++
++        try {
++            // 1) forcePut(99, PacketHandshakingInSetProtocol.class) must invalidate BOTH slot 99 and displaced slot 0
++            Assert.assertNotNull(table.get(dirIdx)[0]);
++            serverbound.forcePut(99, PacketHandshakingInSetProtocol.class);
++            Assert.assertNull("Displaced key slot 0 must be invalidated on forcePut", table.get(dirIdx)[0]);
++            Assert.assertEquals(99, serverbound.inverse().get(PacketHandshakingInSetProtocol.class).intValue());
++
++            // Restore and verify keySet().remove(...)
++            serverbound.forcePut(0, PacketHandshakingInSetProtocol.class);
++            table.set(dirIdx, snapshotRow.clone());
++            serverbound.keySet().remove(0);
++            Assert.assertNull("keySet().remove must invalidate supplierTable", table.get(dirIdx));
++
++            // Restore and verify values().remove(...)
++            serverbound.put(0, PacketHandshakingInSetProtocol.class);
++            table.set(dirIdx, snapshotRow.clone());
++            serverbound.values().remove(PacketHandshakingInSetProtocol.class);
++            Assert.assertNull("values().remove must invalidate supplierTable", table.get(dirIdx));
++
++            // Restore and verify entrySet().iterator().next().setValue(...) and remove()
++            serverbound.put(0, PacketHandshakingInSetProtocol.class);
++            table.set(dirIdx, snapshotRow.clone());
++            Iterator<Map.Entry<Integer, Class<? extends Packet<?>>>> it = serverbound.entrySet().iterator();
++            Map.Entry<Integer, Class<? extends Packet<?>>> entry = it.next();
++            entry.setValue(PacketLoginInStart.class);
++            Assert.assertNull("entrySet().setValue must invalidate supplierTable", table.get(dirIdx));
++
++            table.set(dirIdx, snapshotRow.clone());
++            it.remove();
++            Assert.assertNull("entrySet().iterator().remove must invalidate supplierTable", table.get(dirIdx));
++
++            // Restore and verify replaceAll(...)
++            serverbound.put(0, PacketHandshakingInSetProtocol.class);
++            table.set(dirIdx, snapshotRow.clone());
++            serverbound.replaceAll((k, v) -> v);
++            Assert.assertNull("replaceAll must invalidate supplierTable", table.get(dirIdx));
++
++            // Verify inverse().keySet().remove(...) and inverse().replaceAll(...)
++            table.set(dirIdx, snapshotRow.clone());
++            serverbound.inverse().replaceAll((k, v) -> v);
++            Assert.assertNull("inverse().replaceAll must invalidate supplierTable", table.get(dirIdx));
++
++            table.set(dirIdx, snapshotRow.clone());
++            serverbound.inverse().keySet().remove(PacketHandshakingInSetProtocol.class);
++            Assert.assertNull("inverse().keySet().remove must invalidate supplierTable", table.get(dirIdx));
++        } finally {
++            serverbound.clear();
++            serverbound.putAll(snapshotMap);
++            table.set(dirIdx, snapshotRow);
++        }
++    }
++
++    private static Chunk createStubChunk(int cx, int cz) throws Exception {
++        Chunk c = (Chunk) unsafe.allocateInstance(Chunk.class);
++        unsafe.putLong(c, unsafe.objectFieldOffset(Chunk.class.getDeclaredField("chunkKey")), ChunkCoordIntPair.a(cx, cz));
++        return c;
++    }
++
++    @Test
++    public void testChunkProviderServerChunksCacheInvalidatesOnBoxedAndViewMutators() throws Exception {
++        ChunkProviderServer cps = (ChunkProviderServer) unsafe.allocateInstance(ChunkProviderServer.class);
++        // Construct the anonymous chunks map from ChunkProviderServer field initializer
++        ChunkProviderServer real = new ChunkProviderServer(null, null, null);
++        cps.chunks = real.chunks;
++
++        Chunk c1 = createStubChunk(1, 2);
++        Chunk c2 = createStubChunk(1, 2);
++        long key = ChunkCoordIntPair.a(1, 2);
++
++        // Boxed put(Long, Chunk) updates lastChunkByPos
++        cps.chunks.put(key, c1);
++        Assert.assertSame(c1, cps.chunks.get(key));
++        cps.chunks.put(Long.valueOf(key), c2);
++        Assert.assertSame("Boxed put(Long, Chunk) must update cached lastChunkByPos", c2, cps.chunks.get(key));
++
++        // Boxed remove(Object) invalidates lastChunkByPos
++        cps.chunks.remove(Long.valueOf(key));
++        Assert.assertNull("Boxed remove(Object) must invalidate lastChunkByPos", cps.chunks.get(key));
++        Assert.assertFalse(cps.chunks.containsKey(Long.valueOf(key)));
++
++        // putAll invalidates lastChunkByPos
++        cps.chunks.put(key, c1);
++        Assert.assertSame(c1, cps.chunks.get(key));
++        cps.chunks.putAll(Collections.singletonMap(Long.valueOf(key), c2));
++        Assert.assertSame("putAll must invalidate stale lastChunkByPos", c2, cps.chunks.get(key));
++
++        // values().iterator().remove() invalidates lastChunkByPos
++        Iterator<Chunk> vit = cps.chunks.values().iterator();
++        vit.next();
++        vit.remove();
++        Assert.assertNull("values().iterator().remove must invalidate lastChunkByPos", cps.chunks.get(key));
++
++        // keySet().remove(long) invalidates lastChunkByPos
++        cps.chunks.put(key, c1);
++        Assert.assertSame(c1, cps.chunks.get(key));
++        cps.chunks.keySet().remove(key);
++        Assert.assertNull("keySet().remove(long) must invalidate lastChunkByPos", cps.chunks.get(key));
++
++        // long2ObjectEntrySet().fastIterator() setValue & remove invalidate lastChunkByPos
++        cps.chunks.put(key, c1);
++        Assert.assertSame(c1, cps.chunks.get(key));
++        Iterator<Long2ObjectMap.Entry<Chunk>> eit = cps.chunks.long2ObjectEntrySet().fastIterator();
++        Long2ObjectMap.Entry<Chunk> e = eit.next();
++        e.setValue(c2);
++        Assert.assertSame("Entry.setValue must invalidate lastChunkByPos", c2, cps.chunks.get(key));
++        eit.remove();
++        Assert.assertNull("Entry iterator remove must invalidate lastChunkByPos", cps.chunks.get(key));
++    }
++}

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Sat, 17 Oct 2026 13:19:28 +0700
-Subject: [PATCH 001/191] Add Antarctic branding constants
+Subject: [PATCH 001/192] Add Antarctic branding constants
 
 
 diff --git a/main/java/net/minecraft/server/AntarcticVersion.java b/main/java/net/minecraft/server/AntarcticVersion.java
