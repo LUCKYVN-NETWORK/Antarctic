@@ -1,0 +1,500 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 12:39:07 +0700
+Subject: [PATCH 169/169] perf: back PathfinderGoalSelector with flat array Set
+ to eliminate iterator allocations
+
+
+diff --git a/main/java/net/minecraft/server/PathfinderGoalSelector.java b/main/java/net/minecraft/server/PathfinderGoalSelector.java
+index b180fe4..cfc624d 100644
+--- a/main/java/net/minecraft/server/PathfinderGoalSelector.java
++++ b/main/java/net/minecraft/server/PathfinderGoalSelector.java
+@@ -1,6 +1,7 @@
+ package net.minecraft.server;
+ 
+-import com.google.common.collect.Sets;
++import java.util.AbstractSet;
++import java.util.ArrayList;
+ import java.util.Iterator;
+ import java.util.Set;
+ import javax.annotation.Nullable;
+@@ -10,8 +11,8 @@ import org.apache.logging.log4j.Logger;
+ public class PathfinderGoalSelector {
+ 
+     private static final Logger a = LogManager.getLogger();
+-    private final Set<PathfinderGoalSelector.PathfinderGoalSelectorItem> b = Sets.newLinkedHashSet();
+-    private final Set<PathfinderGoalSelector.PathfinderGoalSelectorItem> c = Sets.newLinkedHashSet();
++    private final FlatGoalSet b = new FlatGoalSet();
++    private final FlatGoalSet c = new FlatGoalSet();
+     private final MethodProfiler d;
+     private int e;
+     private int f = com.destroystokyo.paper.config.toml.modules.optimizations.Pathfinder.goalSelectionDelay; // Papaya via Dionysus
+@@ -26,77 +27,61 @@ public class PathfinderGoalSelector {
+     }
+ 
+     public void a(PathfinderGoal pathfindergoal) {
+-        Iterator iterator = this.b.iterator();
+-
+-        PathfinderGoalSelector.PathfinderGoalSelectorItem pathfindergoalselector_pathfindergoalselectoritem;
+-        PathfinderGoal pathfindergoal1;
+-
+-        do {
+-            if (!iterator.hasNext()) {
++        ArrayList<PathfinderGoalSelectorItem> list = this.b.list;
++        for (int i = 0, len = list.size(); i < len; ++i) {
++            PathfinderGoalSelectorItem item = list.get(i);
++            if (item.a == pathfindergoal) {
++                if (item.c) {
++                    item.c = false;
++                    item.a.d();
++                    this.c.remove(item);
++                }
++                list.remove(i);
+                 return;
+             }
+-
+-            pathfindergoalselector_pathfindergoalselectoritem = (PathfinderGoalSelector.PathfinderGoalSelectorItem) iterator.next();
+-            pathfindergoal1 = pathfindergoalselector_pathfindergoalselectoritem.a;
+-        } while (pathfindergoal1 != pathfindergoal);
+-
+-        if (pathfindergoalselector_pathfindergoalselectoritem.c) {
+-            pathfindergoalselector_pathfindergoalselectoritem.c = false;
+-            pathfindergoalselector_pathfindergoalselectoritem.a.d();
+-            this.c.remove(pathfindergoalselector_pathfindergoalselectoritem);
+         }
+-
+-        iterator.remove();
+     }
+ 
+     public void a() {
+         this.d.a("goalSetup");
+-        Iterator iterator;
+-        PathfinderGoalSelector.PathfinderGoalSelectorItem pathfindergoalselector_pathfindergoalselectoritem;
+ 
+         if (this.e++ % this.f == 0) {
+-            iterator = this.b.iterator();
+-
+-            while (iterator.hasNext()) {
+-                pathfindergoalselector_pathfindergoalselectoritem = (PathfinderGoalSelector.PathfinderGoalSelectorItem) iterator.next();
+-                if (pathfindergoalselector_pathfindergoalselectoritem.c) {
+-                    if (!this.b(pathfindergoalselector_pathfindergoalselectoritem) || !this.a(pathfindergoalselector_pathfindergoalselectoritem)) {
+-                        pathfindergoalselector_pathfindergoalselectoritem.c = false;
+-                        pathfindergoalselector_pathfindergoalselectoritem.a.d();
+-                        this.c.remove(pathfindergoalselector_pathfindergoalselectoritem);
++            ArrayList<PathfinderGoalSelectorItem> all = this.b.list;
++            for (int i = 0; i < all.size(); ++i) {
++                PathfinderGoalSelectorItem item = all.get(i);
++                if (item.c) {
++                    if (!this.b(item) || !this.a(item)) {
++                        item.c = false;
++                        item.a.d();
++                        this.c.remove(item);
+                     }
+-                } else if (this.b(pathfindergoalselector_pathfindergoalselectoritem) && pathfindergoalselector_pathfindergoalselectoritem.a.a()) {
+-                    pathfindergoalselector_pathfindergoalselectoritem.c = true;
+-                    pathfindergoalselector_pathfindergoalselectoritem.a.c();
+-                    this.c.add(pathfindergoalselector_pathfindergoalselectoritem);
++                } else if (this.b(item) && item.a.a()) {
++                    item.c = true;
++                    item.a.c();
++                    this.c.add(item);
+                 }
+             }
+         } else {
+-            iterator = this.c.iterator();
+-
+-            while (iterator.hasNext()) {
+-                pathfindergoalselector_pathfindergoalselectoritem = (PathfinderGoalSelector.PathfinderGoalSelectorItem) iterator.next();
+-                if (!this.a(pathfindergoalselector_pathfindergoalselectoritem)) {
+-                    pathfindergoalselector_pathfindergoalselectoritem.c = false;
+-                    pathfindergoalselector_pathfindergoalselectoritem.a.d();
+-                    iterator.remove();
++            ArrayList<PathfinderGoalSelectorItem> active = this.c.list;
++            for (int i = 0; i < active.size(); ++i) {
++                PathfinderGoalSelectorItem item = active.get(i);
++                if (!this.a(item)) {
++                    item.c = false;
++                    item.a.d();
++                    active.remove(i--);
+                 }
+             }
+         }
+ 
+         this.d.b();
+-        if (!this.c.isEmpty()) {
++        ArrayList<PathfinderGoalSelectorItem> active = this.c.list;
++        if (!active.isEmpty()) {
+             this.d.a("goalTick");
+-            iterator = this.c.iterator();
+-
+-            while (iterator.hasNext()) {
+-                pathfindergoalselector_pathfindergoalselectoritem = (PathfinderGoalSelector.PathfinderGoalSelectorItem) iterator.next();
+-                pathfindergoalselector_pathfindergoalselectoritem.a.e();
++            for (int i = 0; i < active.size(); ++i) {
++                active.get(i).a.e();
+             }
+-
+             this.d.b();
+         }
+-
+     }
+ 
+     private boolean a(PathfinderGoalSelector.PathfinderGoalSelectorItem pathfindergoalselector_pathfindergoalselectoritem) {
+@@ -104,22 +89,22 @@ public class PathfinderGoalSelector {
+     }
+ 
+     private boolean b(PathfinderGoalSelector.PathfinderGoalSelectorItem pathfindergoalselector_pathfindergoalselectoritem) {
+-        if (this.c.isEmpty()) {
++        ArrayList<PathfinderGoalSelectorItem> active = this.c.list;
++        int len = active.size();
++        if (len == 0) {
+             return true;
+         } else if (this.b(pathfindergoalselector_pathfindergoalselectoritem.a.h())) {
+             return false;
+         } else {
+-            Iterator iterator = this.c.iterator();
++            for (int i = 0; i < len; ++i) {
++                PathfinderGoalSelector.PathfinderGoalSelectorItem item1 = active.get(i);
+ 
+-            while (iterator.hasNext()) {
+-                PathfinderGoalSelector.PathfinderGoalSelectorItem pathfindergoalselector_pathfindergoalselectoritem1 = (PathfinderGoalSelector.PathfinderGoalSelectorItem) iterator.next();
+-
+-                if (pathfindergoalselector_pathfindergoalselectoritem1 != pathfindergoalselector_pathfindergoalselectoritem) {
+-                    if (pathfindergoalselector_pathfindergoalselectoritem.b >= pathfindergoalselector_pathfindergoalselectoritem1.b) {
+-                        if (!this.a(pathfindergoalselector_pathfindergoalselectoritem, pathfindergoalselector_pathfindergoalselectoritem1)) {
++                if (item1 != pathfindergoalselector_pathfindergoalselectoritem) {
++                    if (pathfindergoalselector_pathfindergoalselectoritem.b >= item1.b) {
++                        if (!this.a(pathfindergoalselector_pathfindergoalselectoritem, item1)) {
+                             return false;
+                         }
+-                    } else if (!pathfindergoalselector_pathfindergoalselectoritem1.a.g()) {
++                    } else if (!item1.a.g()) {
+                         return false;
+                     }
+                 }
+@@ -154,6 +139,49 @@ public class PathfinderGoalSelector {
+ 
+     }
+ 
++    private static final class FlatGoalSet extends AbstractSet<PathfinderGoalSelectorItem> {
++        final ArrayList<PathfinderGoalSelectorItem> list = new ArrayList<PathfinderGoalSelectorItem>(8);
++
++        @Override
++        public int size() {
++            return this.list.size();
++        }
++
++        @Override
++        public boolean isEmpty() {
++            return this.list.isEmpty();
++        }
++
++        @Override
++        public boolean contains(Object o) {
++            return this.list.contains(o);
++        }
++
++        @Override
++        public boolean add(PathfinderGoalSelectorItem item) {
++            if (this.list.contains(item)) {
++                return false;
++            }
++            this.list.add(item);
++            return true;
++        }
++
++        @Override
++        public boolean remove(Object o) {
++            return this.list.remove(o);
++        }
++
++        @Override
++        public void clear() {
++            this.list.clear();
++        }
++
++        @Override
++        public Iterator<PathfinderGoalSelectorItem> iterator() {
++            return this.list.iterator();
++        }
++    }
++
+     class PathfinderGoalSelectorItem {
+ 
+         public final PathfinderGoal a;
+diff --git a/test/java/net/minecraft/server/PathfinderGoalSelectorPerfTest.java b/test/java/net/minecraft/server/PathfinderGoalSelectorPerfTest.java
+new file mode 100644
+index 0000000..2eb6bbd
+--- /dev/null
++++ b/test/java/net/minecraft/server/PathfinderGoalSelectorPerfTest.java
+@@ -0,0 +1,270 @@
++package net.minecraft.server;
++
++import com.sun.management.ThreadMXBean;
++import org.junit.Test;
++
++import java.lang.management.ManagementFactory;
++import java.lang.reflect.Field;
++import java.util.Iterator;
++import java.util.LinkedHashSet;
++import java.util.Set;
++
++import static org.junit.Assert.*;
++
++public class PathfinderGoalSelectorPerfTest {
++
++    private static final class DummyGoal extends PathfinderGoal {
++        boolean shouldStart;
++        boolean shouldContinue;
++        boolean interruptible = true;
++        int startCount;
++        int stopCount;
++        int tickCount;
++        Runnable onTick;
++
++        DummyGoal(int mutexBits) {
++            this.a(mutexBits);
++        }
++
++        @Override
++        public boolean a() {
++            return this.shouldStart;
++        }
++
++        @Override
++        public boolean b() {
++            return this.shouldContinue;
++        }
++
++        @Override
++        public boolean g() {
++            return this.interruptible;
++        }
++
++        @Override
++        public void c() {
++            ++this.startCount;
++        }
++
++        @Override
++        public void d() {
++            ++this.stopCount;
++        }
++
++        @Override
++        public void e() {
++            ++this.tickCount;
++            if (this.onTick != null) {
++                this.onTick.run();
++            }
++        }
++    }
++
++    private static final class VanillaLinkedGoalSelector {
++        final Set<Entry> b = new LinkedHashSet<Entry>();
++        final Set<Entry> c = new LinkedHashSet<Entry>();
++        int e;
++        int f = 3;
++        int g;
++
++        static final class Entry {
++            final PathfinderGoal a;
++            final int b;
++            boolean c;
++
++            Entry(int p, PathfinderGoal g) {
++                this.b = p;
++                this.a = g;
++            }
++
++            @Override
++            public boolean equals(Object o) {
++                return this == o || (o instanceof Entry && this.a.equals(((Entry) o).a));
++            }
++
++            @Override
++            public int hashCode() {
++                return this.a.hashCode();
++            }
++        }
++
++        void add(int p, PathfinderGoal goal) {
++            this.b.add(new Entry(p, goal));
++        }
++
++        void tick() {
++            if (this.e++ % this.f == 0) {
++                Iterator<Entry> it = this.b.iterator();
++                while (it.hasNext()) {
++                    Entry item = it.next();
++                    if (item.c) {
++                        if (!canUse(item) || !item.a.b()) {
++                            item.c = false;
++                            item.a.d();
++                            this.c.remove(item);
++                        }
++                    } else if (canUse(item) && item.a.a()) {
++                        item.c = true;
++                        item.a.c();
++                        this.c.add(item);
++                    }
++                }
++            } else {
++                Iterator<Entry> it = this.c.iterator();
++                while (it.hasNext()) {
++                    Entry item = it.next();
++                    if (!item.a.b()) {
++                        item.c = false;
++                        item.a.d();
++                        it.remove();
++                    }
++                }
++            }
++            if (!this.c.isEmpty()) {
++                Iterator<Entry> it = this.c.iterator();
++                while (it.hasNext()) {
++                    it.next().a.e();
++                }
++            }
++        }
++
++        private boolean canUse(Entry item) {
++            if (this.c.isEmpty()) {
++                return true;
++            }
++            if ((this.g & item.a.h()) > 0) {
++                return false;
++            }
++            Iterator<Entry> it = this.c.iterator();
++            while (it.hasNext()) {
++                Entry other = it.next();
++                if (other != item) {
++                    if (item.b >= other.b) {
++                        if ((item.a.h() & other.a.h()) != 0) {
++                            return false;
++                        }
++                    } else if (!other.a.g()) {
++                        return false;
++                    }
++                }
++            }
++            return true;
++        }
++    }
++
++    @Test
++    public void testGoalSelectorParityAndReentrancy() throws Exception {
++        MethodProfiler profiler = new MethodProfiler();
++        PathfinderGoalSelector sel = new PathfinderGoalSelector(profiler);
++
++        // Reflection Set compatibility
++        Field bField = PathfinderGoalSelector.class.getDeclaredField("b");
++        Field cField = PathfinderGoalSelector.class.getDeclaredField("c");
++        bField.setAccessible(true);
++        cField.setAccessible(true);
++        assertTrue(bField.get(sel) instanceof Set);
++        assertTrue(cField.get(sel) instanceof Set);
++
++        DummyGoal g1 = new DummyGoal(1);
++        DummyGoal g2 = new DummyGoal(1);
++        DummyGoal g3 = new DummyGoal(2);
++        g1.shouldStart = true;
++        g1.shouldContinue = true;
++        g3.shouldStart = true;
++        g3.shouldContinue = true;
++
++        sel.a(2, g1);
++        sel.a(1, g1); // duplicate ignored
++        sel.a(1, g2);
++        sel.a(3, g3);
++        assertEquals(3, ((Set<?>) bField.get(sel)).size());
++
++        // Tick 0: g1 and g3 start
++        sel.a();
++        assertEquals(1, g1.startCount);
++        assertEquals(0, g2.startCount);
++        assertEquals(1, g3.startCount);
++
++        // Mutex block on g3 bit (2)
++        sel.c(2);
++        g3.shouldContinue = false;
++        sel.a(); // stops g3 on non-setup or setup tick
++        assertEquals(1, g3.stopCount);
++        sel.d(2);
++
++        // Reentrant removal inside e()
++        g1.onTick = () -> sel.a(g1);
++        sel.a();
++        assertEquals(1, g1.stopCount);
++        assertEquals(2, ((Set<?>) bField.get(sel)).size());
++
++        // Non-interruptible higher-priority goal blocks preemption
++        g2.shouldStart = true;
++        g2.shouldContinue = true;
++        g2.interruptible = false;
++        sel.a();
++        sel.a();
++        sel.a(); // ensures setup tick ran
++        assertEquals(1, g2.startCount);
++        DummyGoal g0 = new DummyGoal(1);
++        g0.shouldStart = true;
++        g0.shouldContinue = true;
++        sel.a(0, g0);
++        sel.a();
++        sel.a();
++        sel.a();
++        assertEquals(0, g0.startCount);
++    }
++
++    @Test
++    public void testGoalSelectorTickBenchmark() {
++        MethodProfiler profiler = new MethodProfiler();
++        PathfinderGoalSelector opt = new PathfinderGoalSelector(profiler);
++        VanillaLinkedGoalSelector ref = new VanillaLinkedGoalSelector();
++
++        for (int i = 0; i < 8; ++i) {
++            boolean active = i < 2;
++            DummyGoal gOpt = new DummyGoal(1 << (i % 3));
++            gOpt.shouldStart = active;
++            gOpt.shouldContinue = active;
++            opt.a(i, gOpt);
++
++            DummyGoal gRef = new DummyGoal(1 << (i % 3));
++            gRef.shouldStart = active;
++            gRef.shouldContinue = active;
++            ref.add(i, gRef);
++        }
++
++        for (int w = 0; w < 5000; ++w) {
++            ref.tick();
++            opt.a();
++        }
++
++        ThreadMXBean threadBean = (ThreadMXBean) ManagementFactory.getThreadMXBean();
++        long tid = Thread.currentThread().getId();
++        int ticks = 50000;
++
++        long a0 = threadBean.getThreadAllocatedBytes(tid);
++        long t0 = System.nanoTime();
++        for (int i = 0; i < ticks; ++i) {
++            ref.tick();
++        }
++        long vanillaNs = System.nanoTime() - t0;
++        long vanillaBytes = Math.max(0L, threadBean.getThreadAllocatedBytes(tid) - a0);
++
++        a0 = threadBean.getThreadAllocatedBytes(tid);
++        t0 = System.nanoTime();
++        for (int i = 0; i < ticks; ++i) {
++            opt.a();
++        }
++        long optNs = System.nanoTime() - t0;
++        long optBytes = Math.max(0L, threadBean.getThreadAllocatedBytes(tid) - a0);
++
++        System.out.printf("B5_BENCH goal50k_vanilla_ns=%d goal50k_opt_ns=%d speedup=%.2fx vanilla_bytes=%d opt_bytes=%d%n",
++                vanillaNs, optNs, (double) vanillaNs / Math.max(1L, optNs), vanillaBytes, optBytes);
++
++        assertEquals("PathfinderGoalSelector steady tick must allocate 0 bytes", 0L, optBytes);
++        assertTrue("Expected PathfinderGoalSelector speedup > 1.2x, got " + vanillaNs + " vs " + optNs,
++                optNs * 1.2 < vanillaNs);
++    }
++}

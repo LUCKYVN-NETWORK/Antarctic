@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Tue, 24 Nov 2026 12:27:31 +0700
-Subject: [PATCH 167/168] perf: add zero-alloc Entity.move collision sweep and
+Subject: [PATCH 167/169] perf: add zero-alloc Entity.move collision sweep and
  Chunk hardCollidableCounts
 
 
