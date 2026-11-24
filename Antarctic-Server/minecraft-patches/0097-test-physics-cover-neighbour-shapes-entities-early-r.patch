@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Wed, 18 Nov 2026 14:30:34 +0700
-Subject: [PATCH 097/162] test(physics): cover neighbour shapes, entities,
+Subject: [PATCH 097/163] test(physics): cover neighbour shapes, entities,
  early return and world border in voxel parity
 
 VoxelCollisionContextTest compares World collision results with the voxel fast path on and off for every registered block state in contexts the isolated-block test missed: four neighbour sets (air, stone, fence, glass pane, stairs) on all sides, the boolean early-return query, a real pig and boat (lily pad boat rule), and the world-border placeholder branch with entities inside, outside and absent. A diagnostic sweep reports fast-path timing over vegetation-only, shapes-only and mixed terrain.

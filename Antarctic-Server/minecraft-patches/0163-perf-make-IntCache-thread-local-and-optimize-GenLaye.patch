@@ -1,0 +1,841 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 11:16:01 +0700
+Subject: [PATCH 163/163] perf: make IntCache thread-local and optimize
+ GenLayer and RegistryID
+
+
+diff --git a/main/java/net/minecraft/server/GenLayer.java b/main/java/net/minecraft/server/GenLayer.java
+new file mode 100644
+index 0000000..84b49fd
+--- /dev/null
++++ b/main/java/net/minecraft/server/GenLayer.java
+@@ -0,0 +1,174 @@
++package net.minecraft.server;
++
++public abstract class GenLayer {
++
++    private long c;
++    protected GenLayer a;
++    private long d;
++    protected long b;
++
++    public static GenLayer[] a(long i, WorldType worldtype, CustomWorldSettingsFinal customworldsettingsfinal) {
++        LayerIsland layerisland = new LayerIsland(1L);
++        GenLayerZoomFuzzy genlayerzoomfuzzy = new GenLayerZoomFuzzy(2000L, layerisland);
++        GenLayerIsland genlayerisland = new GenLayerIsland(1L, genlayerzoomfuzzy);
++        GenLayerZoom genlayerzoom = new GenLayerZoom(2001L, genlayerisland);
++
++        genlayerisland = new GenLayerIsland(2L, genlayerzoom);
++        genlayerisland = new GenLayerIsland(50L, genlayerisland);
++        genlayerisland = new GenLayerIsland(70L, genlayerisland);
++        GenLayerIcePlains genlayericeplains = new GenLayerIcePlains(2L, genlayerisland);
++        GenLayerTopSoil genlayertopsoil = new GenLayerTopSoil(2L, genlayericeplains);
++
++        genlayerisland = new GenLayerIsland(3L, genlayertopsoil);
++        GenLayerSpecial genlayerspecial = new GenLayerSpecial(2L, genlayerisland, GenLayerSpecial.EnumGenLayerSpecial.COOL_WARM);
++
++        genlayerspecial = new GenLayerSpecial(2L, genlayerspecial, GenLayerSpecial.EnumGenLayerSpecial.HEAT_ICE);
++        genlayerspecial = new GenLayerSpecial(3L, genlayerspecial, GenLayerSpecial.EnumGenLayerSpecial.SPECIAL);
++        genlayerzoom = new GenLayerZoom(2002L, genlayerspecial);
++        genlayerzoom = new GenLayerZoom(2003L, genlayerzoom);
++        genlayerisland = new GenLayerIsland(4L, genlayerzoom);
++        GenLayerMushroomIsland genlayermushroomisland = new GenLayerMushroomIsland(5L, genlayerisland);
++        GenLayerDeepOcean genlayerdeepocean = new GenLayerDeepOcean(4L, genlayermushroomisland);
++        GenLayer genlayer = GenLayerZoom.b(1000L, genlayerdeepocean, 0);
++        int j = 4;
++        int k = j;
++
++        if (customworldsettingsfinal != null) {
++            j = customworldsettingsfinal.H;
++            k = customworldsettingsfinal.I;
++        }
++
++        if (worldtype == WorldType.LARGE_BIOMES) {
++            j = 6;
++        }
++
++        GenLayer genlayer1 = GenLayerZoom.b(1000L, genlayer, 0);
++        GenLayerCleaner genlayercleaner = new GenLayerCleaner(100L, genlayer1);
++        GenLayerBiome genlayerbiome = new GenLayerBiome(200L, genlayer, worldtype, customworldsettingsfinal);
++        GenLayer genlayer2 = GenLayerZoom.b(1000L, genlayerbiome, 2);
++        GenLayerDesert genlayerdesert = new GenLayerDesert(1000L, genlayer2);
++        GenLayer genlayer3 = GenLayerZoom.b(1000L, genlayercleaner, 2);
++        GenLayerRegionHills genlayerregionhills = new GenLayerRegionHills(1000L, genlayerdesert, genlayer3);
++
++        genlayer1 = GenLayerZoom.b(1000L, genlayercleaner, 2);
++        genlayer1 = GenLayerZoom.b(1000L, genlayer1, k);
++        GenLayerRiver genlayerriver = new GenLayerRiver(1L, genlayer1);
++        GenLayerSmooth genlayersmooth = new GenLayerSmooth(1000L, genlayerriver);
++        Object object = new GenLayerPlains(1001L, genlayerregionhills);
++
++        for (int l = 0; l < j; ++l) {
++            object = new GenLayerZoom((long) (1000 + l), (GenLayer) object);
++            if (l == 0) {
++                object = new GenLayerIsland(3L, (GenLayer) object);
++            }
++
++            if (l == 1 || j == 1) {
++                object = new GenLayerMushroomShore(1000L, (GenLayer) object);
++            }
++        }
++
++        GenLayerSmooth genlayersmooth1 = new GenLayerSmooth(1000L, (GenLayer) object);
++        GenLayerRiverMix genlayerrivermix = new GenLayerRiverMix(100L, genlayersmooth1, genlayersmooth);
++        GenLayerZoomVoronoi genlayerzoomvoronoi = new GenLayerZoomVoronoi(10L, genlayerrivermix);
++
++        genlayerrivermix.a(i);
++        genlayerzoomvoronoi.a(i);
++        return new GenLayer[] { genlayerrivermix, genlayerzoomvoronoi, genlayerrivermix};
++    }
++
++    public GenLayer(long i) {
++        this.b = i;
++        this.b *= this.b * 6364136223846793005L + 1442695040888963407L;
++        this.b += i;
++        this.b *= this.b * 6364136223846793005L + 1442695040888963407L;
++        this.b += i;
++        this.b *= this.b * 6364136223846793005L + 1442695040888963407L;
++        this.b += i;
++    }
++
++    public void a(long i) {
++        this.c = i;
++        if (this.a != null) {
++            this.a.a(i);
++        }
++
++        this.c *= this.c * 6364136223846793005L + 1442695040888963407L;
++        this.c += this.b;
++        this.c *= this.c * 6364136223846793005L + 1442695040888963407L;
++        this.c += this.b;
++        this.c *= this.c * 6364136223846793005L + 1442695040888963407L;
++        this.c += this.b;
++    }
++
++    public void a(long i, long j) {
++        this.d = this.c;
++        this.d *= this.d * 6364136223846793005L + 1442695040888963407L;
++        this.d += i;
++        this.d *= this.d * 6364136223846793005L + 1442695040888963407L;
++        this.d += j;
++        this.d *= this.d * 6364136223846793005L + 1442695040888963407L;
++        this.d += i;
++        this.d *= this.d * 6364136223846793005L + 1442695040888963407L;
++        this.d += j;
++    }
++
++    protected int a(int i) {
++        int j;
++        if ((i & (i - 1)) == 0) {
++            j = (int) (this.d >> 24) & (i - 1);
++        } else {
++            j = (int) ((this.d >> 24) % (long) i);
++            if (j < 0) {
++                j += i;
++            }
++        }
++
++        this.d *= this.d * 6364136223846793005L + 1442695040888963407L;
++        this.d += this.c;
++        return j;
++    }
++
++    public abstract int[] a(int i, int j, int k, int l);
++
++    protected static boolean a(int i, int j) {
++        if (i == j) {
++            return true;
++        } else {
++            BiomeBase biomebase = BiomeBase.getBiome(i);
++            BiomeBase biomebase1 = BiomeBase.getBiome(j);
++
++            return biomebase != null && biomebase1 != null ? (biomebase != Biomes.N && biomebase != Biomes.O ? biomebase == biomebase1 || biomebase.g() == biomebase1.g() : biomebase1 == Biomes.N || biomebase1 == Biomes.O) : false;
++        }
++    }
++
++    protected static boolean b(int i) {
++        BiomeBase biomebase = BiomeBase.getBiome(i);
++
++        return biomebase == Biomes.a || biomebase == Biomes.z || biomebase == Biomes.l;
++    }
++
++    protected int a(int... aint) {
++        return aint[this.a(aint.length)];
++    }
++
++    protected int selectRandom(int a, int b) {
++        return this.a(2) == 0 ? a : b;
++    }
++
++    protected int selectRandom(int a, int b, int c, int d) {
++        switch (this.a(4)) {
++            case 0:
++                return a;
++            case 1:
++                return b;
++            case 2:
++                return c;
++            default:
++                return d;
++        }
++    }
++
++    protected int b(int i, int j, int k, int l) {
++        return j == k && k == l ? j : (i == j && i == k ? i : (i == j && i == l ? i : (i == k && i == l ? i : (i == j && k != l ? i : (i == k && j != l ? i : (i == l && j != k ? i : (j == k && i != l ? j : (j == l && i != k ? j : (k == l && i != j ? k : this.selectRandom(i, j, k, l))))))))));
++    }
++}
+diff --git a/main/java/net/minecraft/server/GenLayerZoom.java b/main/java/net/minecraft/server/GenLayerZoom.java
+new file mode 100644
+index 0000000..20a9c1f
+--- /dev/null
++++ b/main/java/net/minecraft/server/GenLayerZoom.java
+@@ -0,0 +1,59 @@
++package net.minecraft.server;
++
++public class GenLayerZoom extends GenLayer {
++
++    public GenLayerZoom(long i, GenLayer genlayer) {
++        super(i);
++        super.a = genlayer;
++    }
++
++    public int[] a(int i, int j, int k, int l) {
++        int i1 = i >> 1;
++        int j1 = j >> 1;
++        int k1 = (k >> 1) + 2;
++        int l1 = (l >> 1) + 2;
++        int[] aint = this.a.a(i1, j1, k1, l1);
++        int i2 = k1 - 1 << 1;
++        int j2 = l1 - 1 << 1;
++        int[] aint1 = IntCache.a(i2 * j2);
++
++        int k2;
++
++        for (int l2 = 0; l2 < l1 - 1; ++l2) {
++            k2 = (l2 << 1) * i2;
++            int i3 = 0;
++            int j3 = aint[i3 + 0 + (l2 + 0) * k1];
++
++            for (int k3 = aint[i3 + 0 + (l2 + 1) * k1]; i3 < k1 - 1; ++i3) {
++                this.a((long) (i3 + i1 << 1), (long) (l2 + j1 << 1));
++                int l3 = aint[i3 + 1 + (l2 + 0) * k1];
++                int i4 = aint[i3 + 1 + (l2 + 1) * k1];
++
++                aint1[k2] = j3;
++                aint1[k2++ + i2] = this.selectRandom(j3, k3);
++                aint1[k2] = this.selectRandom(j3, l3);
++                aint1[k2++ + i2] = this.b(j3, l3, k3, i4);
++                j3 = l3;
++                k3 = i4;
++            }
++        }
++
++        int[] aint2 = IntCache.a(k * l);
++
++        for (k2 = 0; k2 < l; ++k2) {
++            System.arraycopy(aint1, (k2 + (j & 1)) * i2 + (i & 1), aint2, k2 * k, k);
++        }
++
++        return aint2;
++    }
++
++    public static GenLayer b(long i, GenLayer genlayer, int j) {
++        Object object = genlayer;
++
++        for (int k = 0; k < j; ++k) {
++            object = new GenLayerZoom(i + (long) k, (GenLayer) object);
++        }
++
++        return (GenLayer) object;
++    }
++}
+diff --git a/main/java/net/minecraft/server/GenLayerZoomFuzzy.java b/main/java/net/minecraft/server/GenLayerZoomFuzzy.java
+new file mode 100644
+index 0000000..61a3f6a
+--- /dev/null
++++ b/main/java/net/minecraft/server/GenLayerZoomFuzzy.java
+@@ -0,0 +1,12 @@
++package net.minecraft.server;
++
++public class GenLayerZoomFuzzy extends GenLayerZoom {
++
++    public GenLayerZoomFuzzy(long i, GenLayer genlayer) {
++        super(i, genlayer);
++    }
++
++    protected int b(int i, int j, int k, int l) {
++        return this.selectRandom(i, j, k, l);
++    }
++}
+diff --git a/main/java/net/minecraft/server/IntCache.java b/main/java/net/minecraft/server/IntCache.java
+index c725f71..140f34f 100644
+--- a/main/java/net/minecraft/server/IntCache.java
++++ b/main/java/net/minecraft/server/IntCache.java
+@@ -1,63 +1,71 @@
+ package net.minecraft.server;
+ 
+-import com.google.common.collect.Lists;
+-import java.util.List;
++import java.util.Arrays;
+ 
+ public class IntCache {
+ 
+-    private static int a = 256;
+-    private static final List<int[]> b = Lists.newArrayList();
+-    private static final List<int[]> c = Lists.newArrayList();
+-    private static final List<int[]> d = Lists.newArrayList();
+-    private static final List<int[]> e = Lists.newArrayList();
++    private static final int MAX_FREE = 64;
+ 
+-    public static synchronized int[] a(int i) {
+-        int[] aint;
++    private static final class Pool {
++        int maxSize = 256;
++        final int[][] small = new int[MAX_FREE][];
++        int smallCount;
++        int smallCursor;
++        final int[][] large = new int[MAX_FREE][];
++        int largeCount;
++        int largeCursor;
++    }
++
++    private static final ThreadLocal<Pool> POOL = ThreadLocal.withInitial(Pool::new);
++
++    public static int[] a(int i) {
++        Pool pool = POOL.get();
+ 
+         if (i <= 256) {
+-            if (IntCache.b.isEmpty()) {
+-                aint = new int[256];
+-                if (c.size() < org.spigotmc.SpigotConfig.intCacheLimit) IntCache.c.add(aint);
+-                return aint;
+-            } else {
+-                aint = (int[]) IntCache.b.remove(IntCache.b.size() - 1);
+-                if (c.size() < org.spigotmc.SpigotConfig.intCacheLimit) IntCache.c.add(aint);
+-                return aint;
++            int idx = pool.smallCursor++;
++            if (idx < pool.smallCount) {
++                return pool.small[idx];
++            }
++            int[] aint = new int[256];
++            if (idx < MAX_FREE) {
++                pool.small[idx] = aint;
++                pool.smallCount = idx + 1;
+             }
+-        } else if (i > IntCache.a) {
+-            IntCache.a = i;
+-            IntCache.d.clear();
+-            IntCache.e.clear();
+-            aint = new int[IntCache.a];
+-            if (e.size() < org.spigotmc.SpigotConfig.intCacheLimit) IntCache.e.add(aint);
+-            return aint;
+-        } else if (IntCache.d.isEmpty()) {
+-            aint = new int[IntCache.a];
+-            if (e.size() < org.spigotmc.SpigotConfig.intCacheLimit) IntCache.e.add(aint);
+-            return aint;
+-        } else {
+-            aint = (int[]) IntCache.d.remove(IntCache.d.size() - 1);
+-            if (e.size() < org.spigotmc.SpigotConfig.intCacheLimit) IntCache.e.add(aint);
+             return aint;
+         }
+-    }
+ 
+-    public static synchronized void a() {
+-        if (!IntCache.d.isEmpty()) {
+-            IntCache.d.remove(IntCache.d.size() - 1);
++        if (i > pool.maxSize) {
++            pool.maxSize = i;
++            if (pool.largeCount > 0) {
++                Arrays.fill(pool.large, 0, pool.largeCount, null);
++                pool.largeCount = 0;
++            }
++            pool.largeCursor = 0;
+         }
+ 
+-        if (!IntCache.b.isEmpty()) {
+-            IntCache.b.remove(IntCache.b.size() - 1);
++        int idx = pool.largeCursor++;
++        if (idx < pool.largeCount) {
++            return pool.large[idx];
+         }
++        int[] aint = new int[pool.maxSize];
++        if (idx < MAX_FREE) {
++            pool.large[idx] = aint;
++            pool.largeCount = idx + 1;
++        }
++        return aint;
++    }
+ 
+-        IntCache.d.addAll(IntCache.e);
+-        IntCache.b.addAll(IntCache.c);
+-        IntCache.e.clear();
+-        IntCache.c.clear();
++    public static void a() {
++        Pool pool = POOL.get();
++        pool.smallCursor = 0;
++        pool.largeCursor = 0;
+     }
+ 
+-    public static synchronized String b() {
+-        return "cache: " + IntCache.d.size() + ", tcache: " + IntCache.b.size() + ", allocated: " + IntCache.e.size() + ", tallocated: " + IntCache.c.size();
++    public static String b() {
++        Pool pool = POOL.get();
++        return "cache: " + Math.max(0, pool.largeCount - pool.largeCursor)
++                + ", tcache: " + Math.max(0, pool.smallCount - pool.smallCursor)
++                + ", allocated: " + pool.largeCursor
++                + ", tallocated: " + pool.smallCursor;
+     }
+ }
+diff --git a/main/java/net/minecraft/server/RegistryID.java b/main/java/net/minecraft/server/RegistryID.java
+new file mode 100644
+index 0000000..a5fae50
+--- /dev/null
++++ b/main/java/net/minecraft/server/RegistryID.java
+@@ -0,0 +1,164 @@
++package net.minecraft.server;
++
++import com.google.common.base.Predicates;
++import com.google.common.collect.Iterators;
++import java.util.Iterator;
++import javax.annotation.Nullable;
++
++public class RegistryID<K> implements Registry<K> {
++
++    private static final Object a = null;
++    private K[] b;
++    private int[] c;
++    private K[] d;
++    private int e;
++    private int f;
++    private int mask;
++
++    private static int nextPowerOfTwo(int v) {
++        int n = Math.max(2, v) - 1;
++        n |= n >>> 1;
++        n |= n >>> 2;
++        n |= n >>> 4;
++        n |= n >>> 8;
++        n |= n >>> 16;
++        return n + 1;
++    }
++
++    @SuppressWarnings("unchecked")
++    public RegistryID(int i) {
++        int cap = nextPowerOfTwo((int) ((float) i / 0.8F));
++        this.b = (K[]) new Object[cap];
++        this.c = new int[cap];
++        this.d = (K[]) new Object[cap];
++        this.mask = cap - 1;
++    }
++
++    public int getId(@Nullable K k0) {
++        return this.c(this.b(k0, this.d(k0)));
++    }
++
++    @Nullable
++    public K fromId(int i) {
++        return i >= 0 && i < this.d.length ? this.d[i] : null;
++    }
++
++    private int c(int i) {
++        return i == -1 ? -1 : this.c[i];
++    }
++
++    public int c(K k0) {
++        int i = this.c();
++
++        this.a(k0, i);
++        return i;
++    }
++
++    private int c() {
++        while (this.e < this.d.length && this.d[this.e] != null) {
++            ++this.e;
++        }
++
++        return this.e;
++    }
++
++    @SuppressWarnings("unchecked")
++    private void d(int i) {
++        K[] aobject = this.b;
++        int[] aint = this.c;
++
++        int cap = nextPowerOfTwo(i);
++        this.b = (K[]) new Object[cap];
++        this.c = new int[cap];
++        this.d = (K[]) new Object[cap];
++        this.mask = cap - 1;
++        this.e = 0;
++        this.f = 0;
++
++        for (int j = 0; j < aobject.length; ++j) {
++            if (aobject[j] != null) {
++                this.a(aobject[j], aint[j]);
++            }
++        }
++
++    }
++
++    public void a(K k0, int i) {
++        int j = Math.max(i, this.f + 1);
++        int k;
++
++        if ((float) j >= (float) this.b.length * 0.8F) {
++            for (k = this.b.length << 1; k <= i; k <<= 1) {
++                ;
++            }
++
++            this.d(k);
++        }
++
++        k = this.e(this.d(k0));
++        this.b[k] = k0;
++        this.c[k] = i;
++        this.d[i] = k0;
++        ++this.f;
++        if (i == this.e) {
++            ++this.e;
++        }
++
++    }
++
++    private int d(@Nullable K k0) {
++        return MathHelper.f(System.identityHashCode(k0)) & this.mask;
++    }
++
++    private int b(@Nullable K k0, int i) {
++        int j;
++
++        for (j = i; j < this.b.length; ++j) {
++            if (this.b[j] == k0) {
++                return j;
++            }
++
++            if (this.b[j] == RegistryID.a) {
++                return -1;
++            }
++        }
++
++        for (j = 0; j < i; ++j) {
++            if (this.b[j] == k0) {
++                return j;
++            }
++
++            if (this.b[j] == RegistryID.a) {
++                return -1;
++            }
++        }
++
++        return -1;
++    }
++
++    private int e(int i) {
++        int j;
++
++        for (j = i; j < this.b.length; ++j) {
++            if (this.b[j] == RegistryID.a) {
++                return j;
++            }
++        }
++
++        for (j = 0; j < i; ++j) {
++            if (this.b[j] == RegistryID.a) {
++                return j;
++            }
++        }
++
++        throw new RuntimeException("Overflowed :(");
++    }
++
++    public Iterator<K> iterator() {
++        return Iterators.filter(Iterators.forArray(this.d), Predicates.notNull());
++    }
++
++    public int b() {
++        return this.f;
++    }
++}
+diff --git a/test/java/net/minecraft/server/IntCacheGenLayerRegistryPerfTest.java b/test/java/net/minecraft/server/IntCacheGenLayerRegistryPerfTest.java
+new file mode 100644
+index 0000000..294ea82
+--- /dev/null
++++ b/test/java/net/minecraft/server/IntCacheGenLayerRegistryPerfTest.java
+@@ -0,0 +1,276 @@
++package net.minecraft.server;
++
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.List;
++
++import static org.junit.Assert.*;
++
++public class IntCacheGenLayerRegistryPerfTest {
++
++    @BeforeClass
++    public static void setup() {
++        DispenserRegistry.c();
++    }
++
++    private static final class VanillaGenLayerRng {
++        long d;
++        long c;
++
++        int nextInt(int i) {
++            int j = (int) ((this.d >> 24) % (long) i);
++            if (j < 0) {
++                j += i;
++            }
++            this.d *= this.d * 6364136223846793005L + 1442695040888963407L;
++            this.d += this.c;
++            return j;
++        }
++    }
++
++    private static final class ProbeGenLayer extends GenLayer {
++        ProbeGenLayer(long seed) {
++            super(seed);
++            this.a(seed);
++            this.a(17L, -31L);
++        }
++
++        int nextInt(int i) {
++            return this.a(i);
++        }
++
++        @Override
++        public int[] a(int i, int j, int k, int l) {
++            return new int[0];
++        }
++    }
++
++    private static final class VanillaSyncedIntCache {
++        private static int a = 256;
++        private static final List<int[]> b = new ArrayList<int[]>();
++        private static final List<int[]> c = new ArrayList<int[]>();
++        private static final List<int[]> d = new ArrayList<int[]>();
++        private static final List<int[]> e = new ArrayList<int[]>();
++
++        static synchronized int[] a(int i) {
++            int[] aint;
++            if (i <= 256) {
++                if (b.isEmpty()) {
++                    aint = new int[256];
++                    c.add(aint);
++                    return aint;
++                } else {
++                    aint = b.remove(b.size() - 1);
++                    c.add(aint);
++                    return aint;
++                }
++            } else if (i > a) {
++                a = i;
++                d.clear();
++                e.clear();
++                aint = new int[a];
++                e.add(aint);
++                return aint;
++            } else if (d.isEmpty()) {
++                aint = new int[a];
++                e.add(aint);
++                return aint;
++            } else {
++                aint = d.remove(d.size() - 1);
++                e.add(aint);
++                return aint;
++            }
++        }
++
++        static synchronized void reset() {
++            if (!d.isEmpty()) {
++                d.remove(d.size() - 1);
++            }
++            if (!b.isEmpty()) {
++                b.remove(b.size() - 1);
++            }
++            d.addAll(e);
++            b.addAll(c);
++            e.clear();
++            c.clear();
++        }
++    }
++
++    @Test
++    public void testGenLayerNextIntAndPipelineParity() throws Exception {
++        Field cField = GenLayer.class.getDeclaredField("c");
++        Field dField = GenLayer.class.getDeclaredField("d");
++        cField.setAccessible(true);
++        dField.setAccessible(true);
++
++        int[] bounds = new int[]{1, 2, 4, 8, 16, 256, 3, 5, 7, 10};
++        for (long seed : new long[]{0L, 123456789L, -9876543210123L}) {
++            ProbeGenLayer opt = new ProbeGenLayer(seed);
++            VanillaGenLayerRng ref = new VanillaGenLayerRng();
++            ref.c = cField.getLong(opt);
++            ref.d = dField.getLong(opt);
++            for (int step = 0; step < 10000; ++step) {
++                int bound = bounds[step % bounds.length];
++                int expected = ref.nextInt(bound);
++                int actual = opt.nextInt(bound);
++                assertEquals("GenLayer.a(" + bound + ") mismatch at step " + step, expected, actual);
++            }
++        }
++
++        // Full overworld GenLayer pipeline determinism & IntCache.a() non-aliasing
++        GenLayer[] layers = GenLayer.a(123456789L, WorldType.NORMAL, null);
++        assertNotNull(layers);
++        assertEquals(3, layers.length);
++
++        IntCache.a();
++        int[] r1 = layers[0].a(0, 0, 16, 16);
++        int[] r2 = layers[0].a(32, -16, 16, 16);
++        assertNotSame("Distinct IntCache.a(int) calls before reset must not alias", r1, r2);
++        int[] copy1 = Arrays.copyOf(r1, r1.length);
++        int[] copy2 = Arrays.copyOf(r2, r2.length);
++
++        IntCache.a();
++        int[] r1Again = layers[0].a(0, 0, 16, 16);
++        int[] r2Again = layers[0].a(32, -16, 16, 16);
++        assertArrayEquals("GenLayer overworld determinism check 1", copy1, r1Again);
++        assertArrayEquals("GenLayer overworld determinism check 2", copy2, r2Again);
++        IntCache.a();
++
++        // Beyond MAX_FREE (70 calls before reset) must never alias, and size > maxSize escalation must grow cleanly
++        int[][] manySmall = new int[70][];
++        for (int i = 0; i < manySmall.length; ++i) {
++            manySmall[i] = IntCache.a(256);
++            manySmall[i][0] = i + 1;
++            for (int prev = 0; prev < i; ++prev) {
++                assertNotSame("IntCache small buffers must not alias at " + i, manySmall[prev], manySmall[i]);
++            }
++        }
++        int[] l1 = IntCache.a(512);
++        int[] l2 = IntCache.a(2048);
++        assertTrue(l2.length >= 2048);
++        assertNotSame(l1, l2);
++        IntCache.a();
++    }
++
++    @Test
++    public void testRegistryIDParity() {
++        RegistryID<Object> reg = new RegistryID<Object>(16);
++        Object[] objs = new Object[500];
++        int[] expectedIds = new int[500];
++        for (int i = 0; i < 500; ++i) {
++            objs[i] = new Object();
++            if ((i & 3) == 0) {
++                int sparseId = i * 2 + 17;
++                reg.a(objs[i], sparseId);
++                expectedIds[i] = sparseId;
++            } else {
++                expectedIds[i] = reg.c(objs[i]);
++            }
++        }
++
++        assertEquals(500, reg.b());
++        for (int i = 0; i < 500; ++i) {
++            assertEquals("getId mismatch at " + i, expectedIds[i], reg.getId(objs[i]));
++            assertSame("fromId mismatch at " + i, objs[i], reg.fromId(expectedIds[i]));
++        }
++        assertEquals(-1, reg.getId(new Object()));
++        assertNull(reg.fromId(-1));
++        assertNull(reg.fromId(999999));
++
++        int iterCount = 0;
++        for (Object ignored : reg) {
++            ++iterCount;
++        }
++        assertEquals(500, iterCount);
++    }
++
++    @Test
++    public void testIntCacheAndGenLayerBenchmark() {
++        long blackhole = 0L;
++
++        // Warmup IntCache
++        for (int w = 0; w < 500; ++w) {
++            VanillaSyncedIntCache.reset();
++            for (int i = 0; i < 16; ++i) {
++                blackhole ^= VanillaSyncedIntCache.a(256)[0];
++                blackhole ^= VanillaSyncedIntCache.a(1024)[0];
++            }
++            IntCache.a();
++            for (int i = 0; i < 16; ++i) {
++                blackhole ^= IntCache.a(256)[0];
++                blackhole ^= IntCache.a(1024)[0];
++            }
++        }
++        VanillaSyncedIntCache.reset();
++        IntCache.a();
++
++        int iters = 2000;
++        long t0 = System.nanoTime();
++        for (int c = 0; c < iters; ++c) {
++            VanillaSyncedIntCache.reset();
++            for (int i = 0; i < 24; ++i) {
++                int[] a1 = VanillaSyncedIntCache.a(256);
++                int[] a2 = VanillaSyncedIntCache.a(1024);
++                blackhole += a1.length + a2.length;
++            }
++        }
++        long intCacheVanillaNs = (System.nanoTime() - t0) / iters;
++
++        t0 = System.nanoTime();
++        for (int c = 0; c < iters; ++c) {
++            IntCache.a();
++            for (int i = 0; i < 24; ++i) {
++                int[] a1 = IntCache.a(256);
++                int[] a2 = IntCache.a(1024);
++                blackhole += a1.length + a2.length;
++            }
++        }
++        long intCacheOptNs = (System.nanoTime() - t0) / iters;
++        IntCache.a();
++
++        // RegistryID getId throughput
++        RegistryID<Object> reg = new RegistryID<Object>(256);
++        Object[] keys = new Object[512];
++        for (int i = 0; i < keys.length; ++i) {
++            keys[i] = new Object();
++            reg.c(keys[i]);
++        }
++        for (int w = 0; w < 200; ++w) {
++            for (Object key : keys) {
++                blackhole ^= reg.getId(key);
++            }
++        }
++        t0 = System.nanoTime();
++        for (int r = 0; r < 500; ++r) {
++            for (Object key : keys) {
++                blackhole += reg.getId(key);
++            }
++        }
++        long regLookupNs = (System.nanoTime() - t0) / 500;
++
++        // GenLayer biome pipeline throughput
++        GenLayer[] layers = GenLayer.a(123456789L, WorldType.NORMAL, null);
++        for (int w = 0; w < 50; ++w) {
++            IntCache.a();
++            blackhole ^= layers[0].a(w * 16, w * 16, 16, 16)[0];
++        }
++        t0 = System.nanoTime();
++        for (int c = 0; c < 200; ++c) {
++            IntCache.a();
++            blackhole += layers[0].a(c * 16, -c * 16, 16, 16)[0];
++        }
++        long genLayerNs = (System.nanoTime() - t0) / 200;
++        IntCache.a();
++
++        System.out.printf("A8_BENCH intcache_vanilla_ns=%d intcache_opt_ns=%d intcache_speedup=%.2fx reg512_ns=%d genlayer_ns=%d blackhole=%d%n",
++                intCacheVanillaNs, intCacheOptNs, (double) intCacheVanillaNs / Math.max(1L, intCacheOptNs),
++                regLookupNs, genLayerNs, blackhole);
++
++        assertTrue("Expected IntCache speedup > 1.5x, got " + intCacheVanillaNs + " vs " + intCacheOptNs,
++                intCacheOptNs * 1.5 < intCacheVanillaNs);
++    }
++}

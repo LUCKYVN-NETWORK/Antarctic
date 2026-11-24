@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Tue, 24 Nov 2026 10:28:15 +0700
-Subject: [PATCH 157/162] perf: optimize Chunk initial lighting, recheckGaps
+Subject: [PATCH 157/163] perf: optimize Chunk initial lighting, recheckGaps
  and entity slice maps
 
 
