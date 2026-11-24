@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 21:17:23 +0700
+Subject: [PATCH 193/193] test: update ZeroMovementTest and
+ MobSpawnerOptimizationTest fixtures for Track B hooks
+
+
+diff --git a/test/java/net/minecraft/server/MobSpawnerOptimizationTest.java b/test/java/net/minecraft/server/MobSpawnerOptimizationTest.java
+index 4410476..532eca1 100644
+--- a/test/java/net/minecraft/server/MobSpawnerOptimizationTest.java
++++ b/test/java/net/minecraft/server/MobSpawnerOptimizationTest.java
+@@ -137,6 +137,7 @@ public class MobSpawnerOptimizationTest {
+         setField(Chunk.class, chunk, "entityCounts", new co.aikar.util.Counter<String>());
+         setField(Chunk.class, chunk, "itemCounts", new int[16]);
+         setField(Chunk.class, chunk, "inventoryEntityCounts", new int[16]);
++        setField(Chunk.class, chunk, "hardCollidableCounts", new int[16]);
+         setField(Chunk.class, chunk, "entityCount", new gnu.trove.map.hash.TObjectIntHashMap<Class>());
+         setField(Chunk.class, chunk, "antarcticCreatureCounts", new int[EnumCreatureType.values().length]);
+         world.getChunkProviderServer().chunks.put(key, chunk);
+diff --git a/test/java/net/minecraft/server/ZeroMovementTest.java b/test/java/net/minecraft/server/ZeroMovementTest.java
+index 3c479ee..777e356 100644
+--- a/test/java/net/minecraft/server/ZeroMovementTest.java
++++ b/test/java/net/minecraft/server/ZeroMovementTest.java
+@@ -56,6 +56,17 @@ public class ZeroMovementTest {
+             flammableCheckCalls++;
+             return flammable;
+         }
++
++        @Override
++        boolean resolveEntityMoveCollisions(Entity entity, double d0, double d1, double d2, double[] outDelta) {
++            return false;
++        }
++
++        @Override
++        public boolean e(double minX, double minY, double minZ, double maxX, double maxY, double maxZ) {
++            flammableCheckCalls++;
++            return flammable;
++        }
+     }
+ 
+     private static final class StubEntity extends Entity {
