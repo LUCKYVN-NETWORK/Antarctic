@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 13:08:07 +0700
+Subject: [PATCH 172/172] perf: add primitive World.getType and remove
+ EntityLiving.m_ allocation
+
+
+diff --git a/main/java/net/minecraft/server/EntityLiving.java b/main/java/net/minecraft/server/EntityLiving.java
+index 2a23264..587373d 100644
+--- a/main/java/net/minecraft/server/EntityLiving.java
++++ b/main/java/net/minecraft/server/EntityLiving.java
+@@ -1278,24 +1278,22 @@ public abstract class EntityLiving extends Entity {
+     protected void dropDeathLoot(boolean flag, int i) {}
+ 
+     public boolean m_() {
+-        int i = MathHelper.floor(this.locX);
+-        int j = MathHelper.floor(this.getBoundingBox().b);
+-        int k = MathHelper.floor(this.locZ);
+-
+         if (this instanceof EntityHuman && ((EntityHuman) this).isSpectator()) {
+             return false;
+         } else {
+-            BlockPosition blockposition = new BlockPosition(i, j, k);
+-            IBlockData iblockdata = this.world.getType(blockposition);
++            int i = MathHelper.floor(this.locX);
++            int j = MathHelper.floor(this.getBoundingBox().b);
++            int k = MathHelper.floor(this.locZ);
++            IBlockData iblockdata = this.world.getType(i, j, k);
+             Block block = iblockdata.getBlock();
+ 
+-            return block != Blocks.LADDER && block != Blocks.VINE ? block instanceof BlockTrapdoor && this.a(blockposition, iblockdata) : true;
++            return block != Blocks.LADDER && block != Blocks.VINE ? block instanceof BlockTrapdoor && this.a(i, j, k, iblockdata) : true;
+         }
+     }
+ 
+-    private boolean a(BlockPosition blockposition, IBlockData iblockdata) {
++    private boolean a(int x, int y, int z, IBlockData iblockdata) {
+         if (((Boolean) iblockdata.get(BlockTrapdoor.OPEN)).booleanValue()) {
+-            IBlockData iblockdata1 = this.world.getType(blockposition.down());
++            IBlockData iblockdata1 = this.world.getType(x, y - 1, z);
+ 
+             if (iblockdata1.getBlock() == Blocks.LADDER && iblockdata1.get(BlockLadder.FACING) == iblockdata.get(BlockTrapdoor.FACING)) {
+                 return true;
+@@ -1892,8 +1890,7 @@ public abstract class EntityLiving extends Entity {
+                 BlockPosition.PooledBlockPosition blockposition_pooledblockposition = null;
+ 
+                 if (this.onGround) {
+-                    blockposition_pooledblockposition = BlockPosition.PooledBlockPosition.d(this.locX, this.getBoundingBox().b - 1.0D, this.locZ);
+-                    f9 = this.world.getType(blockposition_pooledblockposition).getBlock().frictionFactor * 0.91F;
++                    f9 = this.world.getType(MathHelper.floor(this.locX), MathHelper.floor(this.getBoundingBox().b - 1.0D), MathHelper.floor(this.locZ)).getBlock().frictionFactor * 0.91F;
+                 }
+ 
+                 f4 = 0.16277136F / (f9 * f9 * f9);
+diff --git a/main/java/net/minecraft/server/World.java b/main/java/net/minecraft/server/World.java
+index 31cec06..028669e 100644
+--- a/main/java/net/minecraft/server/World.java
++++ b/main/java/net/minecraft/server/World.java
+@@ -1007,11 +1007,12 @@ public abstract class World implements IBlockAccess {
+     // Paper end
+ 
+     public IBlockData getType(BlockPosition blockposition) {
++        return this.getType(blockposition.getX(), blockposition.getY(), blockposition.getZ());
++    }
++
++    public IBlockData getType(int x, int y, int z) {
+         // CraftBukkit start - tree generation
+         // Paper start - optimize getType lookup to reduce instructions - getBlockData already enforces valid Y, move tree out
+-        final int x = blockposition.getX();
+-        final int y = blockposition.getY();
+-        final int z = blockposition.getZ();
+         if (captureTreeGeneration) {
+             final IBlockData previous = getCapturedBlockType(x, y, z);
+             if (previous != null) {
+diff --git a/test/java/net/minecraft/server/EntityMicroWastePerfTest.java b/test/java/net/minecraft/server/EntityMicroWastePerfTest.java
+index 74d0b09..d7be4db 100644
+--- a/test/java/net/minecraft/server/EntityMicroWastePerfTest.java
++++ b/test/java/net/minecraft/server/EntityMicroWastePerfTest.java
+@@ -74,12 +74,17 @@ public class EntityMicroWastePerfTest {
+ 
+         @Override
+         public IBlockData getType(BlockPosition pos) {
+-            Chunk c = getChunkIfLoaded(pos.getX() >> 4, pos.getZ() >> 4);
+-            if (c == null || pos.getY() < 0 || pos.getY() >= 256) {
++            return getType(pos.getX(), pos.getY(), pos.getZ());
++        }
++
++        @Override
++        public IBlockData getType(int x, int y, int z) {
++            Chunk c = getChunkIfLoaded(x >> 4, z >> 4);
++            if (c == null || y < 0 || y >= 256) {
+                 return Blocks.AIR.getBlockData();
+             }
+-            ChunkSection sec = c.getSections()[pos.getY() >> 4];
+-            return sec == Chunk.a ? Blocks.AIR.getBlockData() : sec.getType(pos.getX() & 15, pos.getY() & 15, pos.getZ() & 15);
++            ChunkSection sec = c.getSections()[y >> 4];
++            return sec == Chunk.a ? Blocks.AIR.getBlockData() : sec.getType(x & 15, y & 15, z & 15);
+         }
+     }
+ 
+@@ -276,6 +281,18 @@ public class EntityMicroWastePerfTest {
+         move.a(24.0D, 64.0D, 20.0D, 1.5D);
+         move.a();
+         Assert.assertEquals((float) (1.5D * 0.50D), zombie.cy(), 1.0e-5F);
++
++        // 6. EntityLiving.m_() (isOnLadder) parity: air -> false, ladder -> true, closed trapdoor -> false, open trapdoor matching ladder -> true
++        EntityZombie climber = createZombie(world, 22.5D, 66.0D, 22.5D);
++        Assert.assertFalse(climber.m_());
++        Chunk secChunk = world.getChunkIfLoaded(1, 1);
++        secChunk.getSections()[4].setType(6, 2, 6, Blocks.LADDER.getBlockData().set(BlockLadder.FACING, EnumDirection.NORTH));
++        Assert.assertTrue(climber.m_());
++        secChunk.getSections()[4].setType(6, 1, 6, Blocks.LADDER.getBlockData().set(BlockLadder.FACING, EnumDirection.NORTH));
++        secChunk.getSections()[4].setType(6, 2, 6, Blocks.TRAPDOOR.getBlockData().set(BlockTrapdoor.FACING, EnumDirection.NORTH).set(BlockTrapdoor.OPEN, false));
++        Assert.assertFalse(climber.m_());
++        secChunk.getSections()[4].setType(6, 2, 6, Blocks.TRAPDOOR.getBlockData().set(BlockTrapdoor.FACING, EnumDirection.NORTH).set(BlockTrapdoor.OPEN, true));
++        Assert.assertTrue(climber.m_());
+     }
+ 
+     @Test
