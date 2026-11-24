@@ -1,0 +1,907 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 10:28:15 +0700
+Subject: [PATCH 157/157] perf: optimize Chunk initial lighting, recheckGaps
+ and entity slice maps
+
+
+diff --git a/main/java/net/minecraft/server/Chunk.java b/main/java/net/minecraft/server/Chunk.java
+index 848d93c..b3a4e94 100644
+--- a/main/java/net/minecraft/server/Chunk.java
++++ b/main/java/net/minecraft/server/Chunk.java
+@@ -28,6 +28,7 @@ public class Chunk {
+ 
+     private static final Logger e = LogManager.getLogger();
+     public static final ChunkSection a = null; public static final ChunkSection EMPTY_CHUNK_SECTION = Chunk.a; // Paper - OBFHELPER
++    private static final EnumDirection[] HORIZONTAL_DIRECTIONS = EnumDirection.EnumDirectionLimit.HORIZONTAL.a(); // Antarctic - avoid ArrayIterator allocs
+     private final ChunkSection[] sections;
+     private final byte[] g;
+     private final int[] h;
+@@ -306,56 +307,69 @@ public class Chunk {
+     }
+ 
+     public void initLighting() {
+-        int i = this.g();
++        final boolean hasSky = this.world.worldProvider.m();
++        final boolean notifyLight = hasSky && this.world.hasLightAccessListeners();
++        this.computeInitialLighting(hasSky, notifyLight);
++    }
+ 
++    // Antarctic start - single-pass heightmap + skylight fill preserving exact y > 0 skylight boundary
++    final void computeInitialLighting(boolean hasSky, boolean notifyLight) {
++        int i = this.g();
+         this.v = Integer.MAX_VALUE;
++        final int baseX = this.locX << 4;
++        final int baseZ = this.locZ << 4;
++        final int topY = i + 16;
+ 
+         for (int j = 0; j < 16; ++j) {
+-            int k = 0;
+-
+-            while (k < 16) {
++            for (int k = 0; k < 16; ++k) {
+                 this.h[j + (k << 4)] = -999;
+-                int l = i + 16;
+-
+-                while (true) {
+-                    if (l > 0) {
+-                        if (this.d(j, l - 1, k) == 0) {
+-                            --l;
+-                            continue;
+-                        }
+-
+-                        this.heightMap[k << 4 | j] = l;
+-                        if (l < this.v) {
+-                            this.v = l;
++                int l = topY;
++
++                while (l > 0) {
++                    int y = l - 1;
++                    ChunkSection sec = this.sections[y >> 4];
++                    int opacity = sec == Chunk.a ? 0 : sec.getType(j, y & 15, k).c();
++                    if (opacity == 0) {
++                        if (hasSky && sec != Chunk.a && y > 0) {
++                            sec.a(j, y & 15, k, 15);
++                            if (notifyLight) {
++                                this.world.m(new BlockPosition(baseX + j, y, baseZ + k));
++                            }
+                         }
++                        --l;
++                        continue;
+                     }
+ 
+-                    if (this.world.worldProvider.m()) {
+-                        l = 15;
+-                        int i1 = i + 16 - 1;
+-
+-                        do {
+-                            int j1 = this.d(j, i1, k);
++                    this.heightMap[k << 4 | j] = l;
++                    if (l < this.v) {
++                        this.v = l;
++                    }
+ 
+-                            if (j1 == 0 && l != 15) {
++                    if (hasSky && y > 0) {
++                        int sky = 15 - opacity;
++                        if (sky > 0) {
++                            sec.a(j, y & 15, k, sky);
++                            if (notifyLight) {
++                                this.world.m(new BlockPosition(baseX + j, y, baseZ + k));
++                            }
++                        }
++                        int i1 = y - 1;
++                        while (i1 > 0 && sky > 0) {
++                            ChunkSection sec1 = this.sections[i1 >> 4];
++                            int j1 = sec1 == Chunk.a ? 0 : sec1.getType(j, i1 & 15, k).c();
++                            if (j1 == 0) {
+                                 j1 = 1;
+                             }
+-
+-                            l -= j1;
+-                            if (l > 0) {
+-                                ChunkSection chunksection = this.sections[i1 >> 4];
+-
+-                                if (chunksection != Chunk.a) {
+-                                    chunksection.a(j, i1 & 15, k, l);
+-                                    this.world.m(new BlockPosition((this.locX << 4) + j, i1, (this.locZ << 4) + k));
++                            sky -= j1;
++                            if (sky > 0 && sec1 != Chunk.a) {
++                                sec1.a(j, i1 & 15, k, sky);
++                                if (notifyLight) {
++                                    this.world.m(new BlockPosition(baseX + j, i1, baseZ + k));
+                                 }
+                             }
+-
+                             --i1;
+-                        } while (i1 > 0 && l > 0);
++                        }
+                     }
+-
+-                    ++k;
+                     break;
+                 }
+             }
+@@ -363,6 +377,7 @@ public class Chunk {
+ 
+         this.s = true;
+     }
++    // Antarctic end
+ 
+     private void d(int i, int j) {
+         this.i[i + j * 16] = true;
+@@ -379,20 +394,18 @@ public class Chunk {
+                         int k = this.b(i, j);
+                         int l = this.locX * 16 + i;
+                         int i1 = this.locZ * 16 + j;
+-                        int j1 = Integer.MAX_VALUE;
+-
+-                        Iterator iterator;
+-                        EnumDirection enumdirection;
+-
+-                        for (iterator = EnumDirection.EnumDirectionLimit.HORIZONTAL.iterator(); iterator.hasNext(); j1 = Math.min(j1, this.world.d(l + enumdirection.getAdjacentX(), i1 + enumdirection.getAdjacentZ()))) {
+-                            enumdirection = (EnumDirection) iterator.next();
++                        int j1;
++                        if (i > 0 && i < 15 && j > 0 && j < 15 && l > -30000000 && l < 29999999 && i1 > -30000000 && i1 < 29999999) {
++                            j1 = this.v;
++                        } else {
++                            j1 = Integer.MAX_VALUE;
++                            for (EnumDirection enumdirection : HORIZONTAL_DIRECTIONS) {
++                                j1 = Math.min(j1, this.world.d(l + enumdirection.getAdjacentX(), i1 + enumdirection.getAdjacentZ()));
++                            }
+                         }
+ 
+                         this.b(l, i1, j1);
+-                        iterator = EnumDirection.EnumDirectionLimit.HORIZONTAL.iterator();
+-
+-                        while (iterator.hasNext()) {
+-                            enumdirection = (EnumDirection) iterator.next();
++                        for (EnumDirection enumdirection : HORIZONTAL_DIRECTIONS) {
+                             this.b(l + enumdirection.getAdjacentX(), i1 + enumdirection.getAdjacentZ(), k);
+                         }
+ 
+@@ -411,7 +424,7 @@ public class Chunk {
+     }
+ 
+     private void b(int i, int j, int k) {
+-        int l = this.world.getHighestBlockYAt(new BlockPosition(i, 0, j)).getY();
++        int l = this.world.c(i, j); // Antarctic - primitive height lookup without BlockPosition alloc
+ 
+         if (l > k) {
+             this.a(i, j, k, l + 1);
+@@ -454,13 +467,16 @@ public class Chunk {
+ 
+             if (this.world.worldProvider.m()) {
+                 ChunkSection chunksection;
++                final boolean notifyLight = this.world.hasLightAccessListeners();
+ 
+                 if (i1 < l) {
+                     for (l1 = i1; l1 < l; ++l1) {
+                         chunksection = this.sections[l1 >> 4];
+                         if (chunksection != Chunk.a) {
+                             chunksection.a(i, l1 & 15, k, 15);
+-                            this.world.m(new BlockPosition((this.locX << 4) + i, l1, (this.locZ << 4) + k));
++                            if (notifyLight) {
++                                this.world.m(new BlockPosition((this.locX << 4) + i, l1, (this.locZ << 4) + k));
++                            }
+                         }
+                     }
+                 } else {
+@@ -468,7 +484,9 @@ public class Chunk {
+                         chunksection = this.sections[l1 >> 4];
+                         if (chunksection != Chunk.a) {
+                             chunksection.a(i, l1 & 15, k, 0);
+-                            this.world.m(new BlockPosition((this.locX << 4) + i, l1, (this.locZ << 4) + k));
++                            if (notifyLight) {
++                                this.world.m(new BlockPosition((this.locX << 4) + i, l1, (this.locZ << 4) + k));
++                            }
+                         }
+                     }
+                 }
+@@ -509,11 +527,7 @@ public class Chunk {
+             }
+ 
+             if (this.world.worldProvider.m()) {
+-                Iterator iterator = EnumDirection.EnumDirectionLimit.HORIZONTAL.iterator();
+-
+-                while (iterator.hasNext()) {
+-                    EnumDirection enumdirection = (EnumDirection) iterator.next();
+-
++                for (EnumDirection enumdirection : HORIZONTAL_DIRECTIONS) {
+                     this.a(j1 + enumdirection.getAdjacentX(), k1 + enumdirection.getAdjacentZ(), i2, j2);
+                 }
+ 
+@@ -524,6 +538,23 @@ public class Chunk {
+         }
+     }
+ 
++    private void updateLightAfterBlockChange(int i, int j, int k, int i1, BlockPosition blockposition, IBlockData iblockdata, IBlockData iblockdata1) {
++        int j1 = iblockdata.c();
++        int k1 = iblockdata1.c();
++
++        if (j1 > 0) {
++            if (j >= i1) {
++                this.c(i, j + 1, k);
++            }
++        } else if (j == i1 - 1) {
++            this.c(i, j, k);
++        }
++
++        if (j1 != k1 && (j1 < k1 || this.getBrightness(EnumSkyBlock.SKY, blockposition) > 0 || this.getBrightness(EnumSkyBlock.BLOCK, blockposition) > 0)) {
++            this.d(i, k);
++        }
++    }
++
+     public int b(BlockPosition blockposition) {
+         return this.getBlockData(blockposition).c();
+     }
+@@ -641,22 +672,11 @@ public class Chunk {
+                 if (flag) {
+                     this.initLighting();
+                 } else {
+-                    this.runOrQueueLightUpdate(() -> { // Paper - Queue light update
+-                    int j1 = iblockdata.c();
+-                    int k1 = iblockdata1.c();
+-
+-                    if (j1 > 0) {
+-                        if (j >= i1) {
+-                            this.c(i, j + 1, k);
+-                        }
+-                    } else if (j == i1 - 1) {
+-                        this.c(i, j, k);
++                    if (this.world.paperConfig.queueLightUpdates) {
++                        this.runOrQueueLightUpdate(() -> this.updateLightAfterBlockChange(i, j, k, i1, blockposition, iblockdata, iblockdata1)); // Paper - Queue light update
++                    } else {
++                        this.updateLightAfterBlockChange(i, j, k, i1, blockposition, iblockdata, iblockdata1);
+                     }
+-
+-                    if (j1 != k1 && (j1 < k1 || this.getBrightness(EnumSkyBlock.SKY, blockposition) > 0 || this.getBrightness(EnumSkyBlock.BLOCK, blockposition) > 0)) {
+-                        this.d(i, k);
+-                    }
+-                    }); // Paper
+                 }
+ 
+                 TileEntity tileentity;
+@@ -976,13 +996,17 @@ public class Chunk {
+         this.world.b(this.tileEntities.values());
+         List[] aentityslice = this.entitySlices; // Spigot
+         int i = aentityslice.length;
+-        List<Entity> toAdd = new java.util.ArrayList<>(32); // Paper
++        List<Entity> toAdd = null; // Paper / Antarctic - lazy alloc when non-empty
++        final DuplicateUUIDMode mode = world.paperConfig.duplicateUUIDMode;
++        final boolean checkDupes = (mode == DuplicateUUIDMode.WARN || mode == DuplicateUUIDMode.DELETE || mode == DuplicateUUIDMode.SAFE_REGEN);
+ 
+         for (int j = 0; j < i; ++j) {
+             List entityslice = aentityslice[j]; // Spigot
++            if (entityslice.isEmpty()) {
++                continue;
++            }
+             // Paper start
+-            DuplicateUUIDMode mode = world.paperConfig.duplicateUUIDMode;
+-            if (mode == DuplicateUUIDMode.WARN || mode == DuplicateUUIDMode.DELETE || mode == DuplicateUUIDMode.SAFE_REGEN) {
++            if (checkDupes) {
+                 Map<UUID, Entity> thisChunk = new HashMap<>();
+                 for (Iterator<Entity> iterator = ((List<Entity>) entityslice).iterator(); iterator.hasNext(); ) {
+                     Entity entity = iterator.next();
+@@ -1034,8 +1058,12 @@ public class Chunk {
+                 }
+             }
+ 
+-            //this.world.a((Collection) entityslice); // Move down, add all entities at same time
+-            toAdd.addAll(entityslice);
++            if (!entityslice.isEmpty()) {
++                if (toAdd == null) {
++                    toAdd = new java.util.ArrayList<>(32);
++                }
++                toAdd.addAll(entityslice);
++            }
+             // Paper end
+         }
+         // Antarctic start - publish loaded chunk creature counts to world
+@@ -1046,7 +1074,7 @@ public class Chunk {
+             }
+         }
+         // Antarctic end
+-        this.world.addChunkEntities(toAdd); // Paper - add all at same time to avoid entities adding to world modifying slice state
++        this.world.addChunkEntities(toAdd != null ? toAdd : java.util.Collections.emptyList()); // Paper - add all at same time to avoid entities adding to world modifying slice state
+ 
+     }
+ 
+@@ -1076,6 +1104,9 @@ public class Chunk {
+         int i = aentityslice.length;
+ 
+         for (int j = 0; j < i; ++j) {
++            if (aentityslice[j].isEmpty()) {
++                continue;
++            }
+             // CraftBukkit start
+             List<Entity> newList = Lists.newArrayList(aentityslice[j]);
+             java.util.Iterator<Entity> iter = newList.iterator();
+@@ -1714,29 +1745,49 @@ public class Chunk {
+         int k = this.g();
+         boolean flag = false;
+         boolean flag1 = false;
+-        BlockPosition.MutableBlockPosition blockposition_mutableblockposition = new BlockPosition.MutableBlockPosition((this.locX << 4) + i, 0, (this.locZ << 4) + j);
++        final int seaLevel = this.world.getSeaLevel();
++        final int worldX = (this.locX << 4) + i;
++        final int worldZ = (this.locZ << 4) + j;
++        BlockPosition.MutableBlockPosition mutablePos = null;
+ 
+         int l;
++        int lastY = 0;
+ 
+-        for (l = k + 16 - 1; l > this.world.getSeaLevel() || l > 0 && !flag1; --l) {
+-            blockposition_mutableblockposition.c(blockposition_mutableblockposition.getX(), l, blockposition_mutableblockposition.getZ());
+-            int i1 = this.b((BlockPosition) blockposition_mutableblockposition);
++        for (l = k + 16 - 1; l > seaLevel || l > 0 && !flag1; --l) {
++            lastY = l;
++            int i1 = this.d(i, l, j);
+ 
+-            if (i1 == 255 && blockposition_mutableblockposition.getY() < this.world.getSeaLevel()) {
++            if (i1 == 255 && l < seaLevel) {
+                 flag1 = true;
+             }
+ 
+             if (!flag && i1 > 0) {
+                 flag = true;
+-            } else if (flag && i1 == 0 && !this.world.w(blockposition_mutableblockposition)) {
+-                return false;
++            } else if (flag && i1 == 0) {
++                if (mutablePos == null) {
++                    mutablePos = new BlockPosition.MutableBlockPosition(worldX, l, worldZ);
++                } else {
++                    mutablePos.c(worldX, l, worldZ);
++                }
++                if (!this.world.w(mutablePos)) {
++                    return false;
++                }
+             }
+         }
+ 
+-        for (l = blockposition_mutableblockposition.getY(); l > 0; --l) {
+-            blockposition_mutableblockposition.c(blockposition_mutableblockposition.getX(), l, blockposition_mutableblockposition.getZ());
+-            if (this.getBlockData(blockposition_mutableblockposition).d() > 0) {
+-                this.world.w(blockposition_mutableblockposition);
++        for (l = lastY; l > 0; --l) {
++            ChunkSection sec = this.sections[l >> 4];
++            if (sec == Chunk.a || !sec.hasLightSources()) {
++                l = l & ~15;
++                continue;
++            }
++            if (sec.getType(i, l & 15, j).d() > 0) {
++                if (mutablePos == null) {
++                    mutablePos = new BlockPosition.MutableBlockPosition(worldX, l, worldZ);
++                } else {
++                    mutablePos.c(worldX, l, worldZ);
++                }
++                this.world.w(mutablePos);
+             }
+         }
+ 
+diff --git a/main/java/net/minecraft/server/ChunkSection.java b/main/java/net/minecraft/server/ChunkSection.java
+index 53341f8..6a3c9ac 100644
+--- a/main/java/net/minecraft/server/ChunkSection.java
++++ b/main/java/net/minecraft/server/ChunkSection.java
+@@ -7,6 +7,7 @@ public class ChunkSection {
+     private int tickingBlockCount;
+     private int fluidCount; // Antarctic - O(1) section fluid skip for World fluid sweeps
+     private int fireOrLavaCount; // Antarctic - O(1) section fire/lava skip for World.e(AABB)
++    private int lightSourceCount; // Antarctic - O(1) section light-emitter skip for Chunk.e(x, z)
+     final DataPaletteBlock blockIds; // Paper - package
+     private NibbleArray emittedLight;
+     private NibbleArray skyLight;
+@@ -39,11 +40,12 @@ public class ChunkSection {
+         this.blockIds.loadFromAnvil(blocks, dataNibbles, addNibbles, this);
+     }
+ 
+-    void setBlockCounts(int nonEmpty, int ticking, int fluids, int fireOrLava) {
++    void setBlockCounts(int nonEmpty, int ticking, int fluids, int fireOrLava, int lightSources) {
+         this.nonEmptyBlockCount = nonEmpty;
+         this.tickingBlockCount = ticking;
+         this.fluidCount = fluids;
+         this.fireOrLavaCount = fireOrLava;
++        this.lightSourceCount = lightSources;
+     }
+     // Antarctic end
+ 
+@@ -91,6 +93,9 @@ public class ChunkSection {
+             if (block == Blocks.FIRE || block == Blocks.FLOWING_LAVA || block == Blocks.LAVA) {
+                 --this.fireOrLavaCount;
+             }
++            if (iblockdata1.d() > 0) {
++                --this.lightSourceCount;
++            }
+         }
+ 
+         if (block1 != Blocks.AIR) {
+@@ -104,6 +109,9 @@ public class ChunkSection {
+             if (block1 == Blocks.FIRE || block1 == Blocks.FLOWING_LAVA || block1 == Blocks.LAVA) {
+                 ++this.fireOrLavaCount;
+             }
++            if (iblockdata.d() > 0) {
++                ++this.lightSourceCount;
++            }
+         }
+ 
+         this.blockIds.setBlock(i, j, k, iblockdata);
+@@ -116,6 +124,7 @@ public class ChunkSection {
+         int ticking = 0;
+         int fluids = 0;
+         int fireOrLava = 0;
++        int lightSources = 0;
+ 
+         char lastId = 0;
+         IBlockData lastData = null;
+@@ -123,6 +132,7 @@ public class ChunkSection {
+         boolean lastTicking = false;
+         boolean lastLiquid = false;
+         boolean lastFireOrLava = false;
++        boolean lastLightSource = false;
+ 
+         for (int dy = 0; dy < 16; ++dy) {
+             int y = baseY + dy;
+@@ -147,6 +157,7 @@ public class ChunkSection {
+                         lastTicking = lastNotAir && block.isTicking();
+                         lastLiquid = data.getMaterial().isLiquid();
+                         lastFireOrLava = block == Blocks.FIRE || block == Blocks.FLOWING_LAVA || block == Blocks.LAVA;
++                        lastLightSource = lastNotAir && data.d() > 0;
+                     }
+                     wroteAny = true;
+                     if (lastNotAir) {
+@@ -160,6 +171,9 @@ public class ChunkSection {
+                         if (lastFireOrLava) {
+                             ++fireOrLava;
+                         }
++                        if (lastLightSource) {
++                            ++lightSources;
++                        }
+                     }
+                     this.blockIds.setBlockIndex(zyShift | x, lastData);
+                 }
+@@ -170,6 +184,7 @@ public class ChunkSection {
+         this.tickingBlockCount = ticking;
+         this.fluidCount = fluids;
+         this.fireOrLavaCount = fireOrLava;
++        this.lightSourceCount = lightSources;
+         return wroteAny;
+     }
+     // Antarctic end
+@@ -190,6 +205,10 @@ public class ChunkSection {
+     public boolean hasFireOrLava() {
+         return this.fireOrLavaCount > 0;
+     }
++
++    public boolean hasLightSources() {
++        return this.lightSourceCount > 0;
++    }
+     // Antarctic end
+ 
+     public int getYPosition() {
+@@ -217,6 +236,7 @@ public class ChunkSection {
+         this.tickingBlockCount = 0;
+         this.fluidCount = 0;
+         this.fireOrLavaCount = 0;
++        this.lightSourceCount = 0;
+ 
+         for (int i = 0; i < 16; ++i) {
+             for (int j = 0; j < 16; ++j) {
+@@ -235,6 +255,9 @@ public class ChunkSection {
+                         if (block == Blocks.FIRE || block == Blocks.FLOWING_LAVA || block == Blocks.LAVA) {
+                             ++this.fireOrLavaCount;
+                         }
++                        if (data.d() > 0) {
++                            ++this.lightSourceCount;
++                        }
+                     }
+                 }
+             }
+diff --git a/main/java/net/minecraft/server/DataPaletteBlock.java b/main/java/net/minecraft/server/DataPaletteBlock.java
+index 2416569..954c744 100644
+--- a/main/java/net/minecraft/server/DataPaletteBlock.java
++++ b/main/java/net/minecraft/server/DataPaletteBlock.java
+@@ -430,6 +430,7 @@ public class DataPaletteBlock implements DataPaletteExpandable {
+                 int ticking = 0;
+                 int fluids = 0;
+                 int fireOrLava = 0;
++                int lightSources = 0;
+                 for (int u = 0; u < uniqueCount; ++u) {
+                     IBlockData data = uniqueStates[u];
+                     Block block = data.getBlock();
+@@ -445,9 +446,12 @@ public class DataPaletteBlock implements DataPaletteExpandable {
+                         if (block == Blocks.FIRE || block == Blocks.FLOWING_LAVA || block == Blocks.LAVA) {
+                             fireOrLava += count;
+                         }
++                        if (data.d() > 0) {
++                            lightSources += count;
++                        }
+                     }
+                 }
+-                countsTarget.setBlockCounts(nonEmpty, ticking, fluids, fireOrLava);
++                countsTarget.setBlockCounts(nonEmpty, ticking, fluids, fireOrLava, lightSources);
+             }
+ 
+             int neededEntries = (scratch.sawAir ? uniqueCount : uniqueCount + 1) + (this.predefinedBlockData == null ? 0 : this.predefinedBlockData.length);
+@@ -490,10 +494,12 @@ public class DataPaletteBlock implements DataPaletteExpandable {
+         int ticking = 0;
+         int fluids = 0;
+         int fireOrLava = 0;
++        int lightSources = 0;
+         boolean lastNotAir = false;
+         boolean lastTicking = false;
+         boolean lastLiquid = false;
+         boolean lastFireOrLava = false;
++        boolean lastLightSource = false;
+ 
+         for (int i = 0; i < 4096; ++i) {
+             int j1 = nibblearray1.a(i) << 12 | (abyte[i] & 255) << 4 | nibblearray.a(i);
+@@ -506,6 +512,7 @@ public class DataPaletteBlock implements DataPaletteExpandable {
+                     lastTicking = lastNotAir && block.isTicking();
+                     lastLiquid = lastData.getMaterial().isLiquid();
+                     lastFireOrLava = block == Blocks.FIRE || block == Blocks.FLOWING_LAVA || block == Blocks.LAVA;
++                    lastLightSource = lastNotAir && lastData.d() > 0;
+                 }
+             }
+             this.setBlockIndex(i, lastData);
+@@ -514,10 +521,11 @@ public class DataPaletteBlock implements DataPaletteExpandable {
+                 if (lastTicking) ++ticking;
+                 if (lastLiquid) ++fluids;
+                 if (lastFireOrLava) ++fireOrLava;
++                if (lastLightSource) ++lightSources;
+             }
+         }
+         if (countsTarget != null) {
+-            countsTarget.setBlockCounts(nonEmpty, ticking, fluids, fireOrLava);
++            countsTarget.setBlockCounts(nonEmpty, ticking, fluids, fireOrLava, lightSources);
+         }
+     }
+     // Antarctic end
+diff --git a/main/java/net/minecraft/server/World.java b/main/java/net/minecraft/server/World.java
+index ae977c8..33ae2b3 100644
+--- a/main/java/net/minecraft/server/World.java
++++ b/main/java/net/minecraft/server/World.java
+@@ -94,6 +94,7 @@ public abstract class World implements IBlockAccess {
+     public WorldProvider worldProvider;
+     protected NavigationListener t = new NavigationListener();
+     protected List<IWorldAccess> u;
++    private boolean hasCustomLightAccess; // Antarctic - skip no-op light notify BlockPosition allocs
+     protected IChunkProvider chunkProvider;
+     protected final IDataManager dataManager;
+     public WorldData worldData;
+@@ -441,7 +442,11 @@ public abstract class World implements IBlockAccess {
+             } else {
+                 if (iblockdata.c() != iblockdata1.c() || iblockdata.d() != iblockdata1.d()) {
+                     this.methodProfiler.a("checkLight");
+-                    chunk.runOrQueueLightUpdate(() -> this.w(blockposition)); // Paper - Queue light update
++                    if (this.paperConfig.queueLightUpdates) {
++                        chunk.runOrQueueLightUpdate(() -> this.w(blockposition)); // Paper - Queue light update
++                    } else {
++                        this.w(blockposition);
++                    }
+                     this.methodProfiler.b();
+                 }
+ 
+@@ -946,7 +951,26 @@ public abstract class World implements IBlockAccess {
+         }
+     }
+ 
++    // Antarctic start - skip no-op BlockPosition allocations when only vanilla server IWorldAccess listeners exist
++    final boolean hasLightAccessListeners() {
++        if (this.hasCustomLightAccess) {
++            return true;
++        }
++        for (int i = 0, size = this.u.size(); i < size; ++i) {
++            IWorldAccess access = this.u.get(i);
++            if (!(access instanceof WorldManager) && !(access instanceof NavigationListener)) {
++                this.hasCustomLightAccess = true;
++                return true;
++            }
++        }
++        return false;
++    }
++    // Antarctic end
++
+     public void m(BlockPosition blockposition) {
++        if (!this.hasLightAccessListeners()) {
++            return;
++        }
+         for (int i = 0; i < this.u.size(); ++i) {
+             ((IWorldAccess) this.u.get(i)).a(blockposition);
+         }
+@@ -1405,6 +1429,9 @@ public abstract class World implements IBlockAccess {
+ 
+     public void addIWorldAccess(IWorldAccess iworldaccess) {
+         this.u.add(iworldaccess);
++        if (!(iworldaccess instanceof WorldManager) && !(iworldaccess instanceof NavigationListener)) {
++            this.hasCustomLightAccess = true;
++        }
+     }
+ 
+     private boolean a(@Nullable Entity entity, AxisAlignedBB axisalignedbb, boolean flag, @Nullable List<AxisAlignedBB> list) {
+diff --git a/test/java/net/minecraft/server/ChunkInitLightingAndGapsPerfTest.java b/test/java/net/minecraft/server/ChunkInitLightingAndGapsPerfTest.java
+new file mode 100644
+index 0000000..5793a7c
+--- /dev/null
++++ b/test/java/net/minecraft/server/ChunkInitLightingAndGapsPerfTest.java
+@@ -0,0 +1,282 @@
++package net.minecraft.server;
++
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++import java.lang.reflect.Field;
++import java.util.Random;
++
++import static org.junit.Assert.*;
++
++public class ChunkInitLightingAndGapsPerfTest {
++
++    private static Unsafe UNSAFE;
++
++    @BeforeClass
++    public static void setup() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        UNSAFE = (Unsafe) f.get(null);
++    }
++
++    private static Chunk createTestChunk(ChunkSection[] sections) throws Exception {
++        Chunk chunk = (Chunk) UNSAFE.allocateInstance(Chunk.class);
++        setField(chunk, "sections", sections);
++        setField(chunk, "heightMap", new int[256]);
++        setField(chunk, "h", new int[256]);
++        setField(chunk, "locX", 3);
++        setField(chunk, "locZ", -4);
++        return chunk;
++    }
++
++    private static void setField(Object target, String name, Object value) throws Exception {
++        Field f = Chunk.class.getDeclaredField(name);
++        f.setAccessible(true);
++        f.set(target, value);
++    }
++
++    private static int getTopSectionY(ChunkSection[] sections) {
++        for (int i = sections.length - 1; i >= 0; --i) {
++            if (sections[i] != null) {
++                return sections[i].getYPosition();
++            }
++        }
++        return 0;
++    }
++
++    private static int getOpacity(ChunkSection[] sections, int x, int y, int z) {
++        if (y >= 0 && y >> 4 < sections.length) {
++            ChunkSection sec = sections[y >> 4];
++            if (sec != null) {
++                return sec.getType(x, y & 15, z).c();
++            }
++        }
++        return 0;
++    }
++
++    private static int vanillaInitLightingReference(ChunkSection[] sections, int[] heightMap, int[] h, int locX, int locZ, boolean hasSky, boolean notifyLight, ListSink sink) {
++        int i = getTopSectionY(sections);
++        int v = Integer.MAX_VALUE;
++        for (int j = 0; j < 16; ++j) {
++            int k = 0;
++            while (k < 16) {
++                h[j + (k << 4)] = -999;
++                int l = i + 16;
++                while (true) {
++                    if (l > 0) {
++                        if (getOpacity(sections, j, l - 1, k) == 0) {
++                            --l;
++                            continue;
++                        }
++                        heightMap[k << 4 | j] = l;
++                        if (l < v) {
++                            v = l;
++                        }
++                    }
++                    if (hasSky) {
++                        l = 15;
++                        int i1 = i + 16 - 1;
++                        do {
++                            int j1 = getOpacity(sections, j, i1, k);
++                            if (j1 == 0 && l != 15) {
++                                j1 = 1;
++                            }
++                            l -= j1;
++                            if (l > 0) {
++                                ChunkSection sec = sections[i1 >> 4];
++                                if (sec != null) {
++                                    sec.a(j, i1 & 15, k, l);
++                                    if (notifyLight) {
++                                        sink.accept(new BlockPosition((locX << 4) + j, i1, (locZ << 4) + k));
++                                    }
++                                }
++                            }
++                            --i1;
++                        } while (i1 > 0 && l > 0);
++                    }
++                    ++k;
++                    break;
++                }
++            }
++        }
++        return v;
++    }
++
++    private interface ListSink {
++        void accept(BlockPosition pos);
++    }
++
++    private static ChunkSection[] cloneSections(ChunkSection[] src) {
++        ChunkSection[] copy = new ChunkSection[src.length];
++        for (int i = 0; i < src.length; ++i) {
++            if (src[i] != null) {
++                ChunkSection s = new ChunkSection(src[i].getYPosition(), true);
++                for (int y = 0; y < 16; ++y) {
++                    for (int z = 0; z < 16; ++z) {
++                        for (int x = 0; x < 16; ++x) {
++                            IBlockData d = src[i].getType(x, y, z);
++                            if (d.getBlock() != Blocks.AIR) {
++                                s.setType(x, y, z, d);
++                            }
++                        }
++                    }
++                }
++                copy[i] = s;
++            }
++        }
++        return copy;
++    }
++
++    @Test
++    public void testLightSourceCountTracking() {
++        ChunkSection sec = new ChunkSection(0, true);
++        assertFalse(sec.hasLightSources());
++
++        sec.setType(1, 2, 3, Blocks.GLOWSTONE.getBlockData());
++        assertTrue(sec.hasLightSources());
++
++        sec.setType(1, 2, 3, Blocks.STONE.getBlockData());
++        assertFalse(sec.hasLightSources());
++
++        // Snapshot path
++        ChunkSnapshot snap = new ChunkSnapshot();
++        snap.a(4, 5, 6, Blocks.TORCH.getBlockData());
++        ChunkSection fromSnap = new ChunkSection(0, true);
++        assertTrue(fromSnap.fillFromSnapshot(snap.rawBlocks(), 0));
++        assertTrue(fromSnap.hasLightSources());
++
++        // Anvil load path
++        byte[] blocks = new byte[4096];
++        NibbleArray data = new NibbleArray();
++        fromSnap.getBlocks().exportData(blocks, data);
++        ChunkSection fromAnvil = new ChunkSection(0, null, new NibbleArray(), new NibbleArray());
++        fromAnvil.loadFromAnvil(blocks, data, null);
++        assertTrue(fromAnvil.hasLightSources());
++        fromAnvil.recalcBlockCounts();
++        assertTrue(fromAnvil.hasLightSources());
++    }
++
++    @Test
++    public void testSinglePassInitLightingParityIncludingY0Quirk() throws Exception {
++        ChunkSection[] refSections = new ChunkSection[16];
++        for (int s = 0; s < 5; ++s) {
++            refSections[s] = new ChunkSection(s << 4, true);
++        }
++
++        Random rng = new Random(0xA3A3A3A3L);
++        IBlockData stone = Blocks.STONE.getBlockData();
++        IBlockData water = Blocks.WATER.getBlockData();
++        IBlockData leaves = Blocks.LEAVES.getBlockData();
++        IBlockData glass = Blocks.GLASS.getBlockData();
++        IBlockData glowstone = Blocks.GLOWSTONE.getBlockData();
++
++        for (int x = 0; x < 16; ++x) {
++            for (int z = 0; z < 16; ++z) {
++                if (x == 0 && z == 0) {
++                    // Column (0, 0): all-air down to y=0 -> verifies y=0 skylight quirk
++                    continue;
++                }
++                if (x == 1 && z == 0) {
++                    // Column (1, 0): opaque block at y=0 only -> heightMap=1, v=1, y=0 skylight untouched
++                    refSections[0].setType(x, 0, z, stone);
++                    continue;
++                }
++                int top = 40 + rng.nextInt(32);
++                for (int y = 0; y <= top; ++y) {
++                    IBlockData d;
++                    if (y == top && (x + z) % 3 == 0) {
++                        d = leaves;
++                    } else if (y > top - 4 && (x & 1) == 0) {
++                        d = water;
++                    } else if (y == top - 2 && (z & 1) == 1) {
++                        d = glass;
++                    } else if (y == 12 && x == 5) {
++                        d = glowstone;
++                    } else {
++                        d = stone;
++                    }
++                    refSections[y >> 4].setType(x, y & 15, z, d);
++                }
++            }
++        }
++
++        ChunkSection[] optSections = cloneSections(refSections);
++        int[] refHeightMap = new int[256];
++        int[] refH = new int[256];
++        int refV = vanillaInitLightingReference(refSections, refHeightMap, refH, 3, -4, true, false, pos -> {});
++
++        Chunk optChunk = createTestChunk(optSections);
++        optChunk.computeInitialLighting(true, false);
++
++        assertArrayEquals(refHeightMap, optChunk.r());
++        assertEquals(refV, optChunk.w());
++
++        for (int s = 0; s < 5; ++s) {
++            assertArrayEquals("SkyLight mismatch in section " + s,
++                    refSections[s].getSkyLightArray().asBytes(),
++                    optSections[s].getSkyLightArray().asBytes());
++        }
++        // Explicitly verify y=0 skylight nibble on all-air column (0, 0) stayed 0
++        assertEquals(0, optSections[0].b(0, 0, 0));
++        // Explicitly verify y=0 skylight nibble on opaque-at-0 column (1, 0) stayed 0
++        assertEquals(0, optSections[0].b(1, 0, 0));
++    }
++
++    @Test
++    public void testInitLightingBenchmark() throws Exception {
++        ChunkSection[] baseSections = new ChunkSection[16];
++        for (int s = 0; s < 5; ++s) {
++            baseSections[s] = new ChunkSection(s << 4, true);
++        }
++        IBlockData stone = Blocks.STONE.getBlockData();
++        IBlockData water = Blocks.WATER.getBlockData();
++        for (int x = 0; x < 16; ++x) {
++            for (int z = 0; z < 16; ++z) {
++                for (int y = 0; y < 60; ++y) {
++                    baseSections[y >> 4].setType(x, y & 15, z, stone);
++                }
++                for (int y = 60; y < 64; ++y) {
++                    baseSections[y >> 4].setType(x, y & 15, z, water);
++                }
++            }
++        }
++
++        ChunkSection[] refSections = cloneSections(baseSections);
++        ChunkSection[] optSections = cloneSections(baseSections);
++        int[] refHeightMap = new int[256];
++        int[] refH = new int[256];
++        Chunk optChunk = createTestChunk(optSections);
++
++        final int[] sinkSum = new int[1];
++        ListSink sink = pos -> sinkSum[0] ^= pos.getY();
++
++        long blackhole = 0L;
++        for (int i = 0; i < 600; ++i) {
++            vanillaInitLightingReference(refSections, refHeightMap, refH, 3, -4, true, true, sink);
++            optChunk.computeInitialLighting(true, false);
++            blackhole ^= refHeightMap[i & 255] ^ optChunk.r()[i & 255] ^ sinkSum[0];
++        }
++
++        int iters = 1500;
++        long t0 = System.nanoTime();
++        for (int i = 0; i < iters; ++i) {
++            int v = vanillaInitLightingReference(refSections, refHeightMap, refH, 3, -4, true, true, sink);
++            blackhole ^= v ^ refHeightMap[i & 255];
++        }
++        long vanillaNs = (System.nanoTime() - t0) / iters;
++
++        t0 = System.nanoTime();
++        for (int i = 0; i < iters; ++i) {
++            optChunk.computeInitialLighting(true, false);
++            blackhole ^= optChunk.w() ^ optChunk.r()[i & 255];
++        }
++        long optNs = (System.nanoTime() - t0) / iters;
++
++        System.out.printf("A3_BENCH init_lighting_vanilla_ns=%d init_lighting_opt_ns=%d speedup=%.2fx blackhole=%d%n",
++                vanillaNs, optNs, (double) vanillaNs / Math.max(1L, optNs), blackhole);
++
++        assertTrue("Expected initLighting speedup > 1.5x, got " + vanillaNs + " vs " + optNs, optNs * 1.5 < vanillaNs);
++    }
++}
