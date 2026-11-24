@@ -1,0 +1,792 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 10:07:48 +0700
+Subject: [PATCH 155/155] perf: optimize ChunkSnapshot raw access, terrain
+ fast-path and section build
+
+
+diff --git a/main/java/net/minecraft/server/BiomeBase.java b/main/java/net/minecraft/server/BiomeBase.java
+index ab6db74..5cf21f5 100644
+--- a/main/java/net/minecraft/server/BiomeBase.java
++++ b/main/java/net/minecraft/server/BiomeBase.java
+@@ -173,55 +173,103 @@ public abstract class BiomeBase {
+         int i1 = (int) (d0 / 3.0D + 3.0D + random.nextDouble() * 0.25D);
+         int j1 = i & 15;
+         int k1 = j & 15;
+-        BlockPosition.MutableBlockPosition blockposition_mutableblockposition = new BlockPosition.MutableBlockPosition();
++        // Antarctic start - direct raw char[] access, cached block IDs, and lazy MutableBlockPosition
++        final char[] rawBlocks = chunksnapshot.rawBlocks();
++        final int colBase = (k1 << 12) | (j1 << 8);
++        final boolean flatBedrock = world.paperConfig.generateFlatBedrock;
++        final char stoneId = (char) Block.REGISTRY_ID.getId(BiomeBase.a);
++        final char airId = (char) Block.REGISTRY_ID.getId(BiomeBase.b);
++        final char bedrockId = (char) Block.REGISTRY_ID.getId(BiomeBase.c);
++        final char gravelId = (char) Block.REGISTRY_ID.getId(BiomeBase.d);
++        final char redSandstoneId = (char) Block.REGISTRY_ID.getId(BiomeBase.e);
++        final char sandstoneId = (char) Block.REGISTRY_ID.getId(BiomeBase.f);
++        final char iceId = (char) Block.REGISTRY_ID.getId(BiomeBase.g);
++        final char waterId = (char) Block.REGISTRY_ID.getId(BiomeBase.h);
++        char topId = (char) Block.REGISTRY_ID.getId(iblockdata);
++        char fillerId = (char) Block.REGISTRY_ID.getId(iblockdata1);
++        final char baseTopId = topId;
++        final char baseFillerId = fillerId;
++        BlockPosition.MutableBlockPosition blockposition_mutableblockposition = null;
+ 
+         for (int l1 = 255; l1 >= 0; --l1) {
+-            if (l1 <= (world.paperConfig.generateFlatBedrock ? 0 : random.nextInt(5))) { // Paper - Configurable flat bedrock
+-                chunksnapshot.a(k1, l1, j1, BiomeBase.c);
++            if (l1 <= (flatBedrock ? 0 : random.nextInt(5))) { // Paper - Configurable flat bedrock
++                rawBlocks[colBase | l1] = bedrockId;
+             } else {
+-                IBlockData iblockdata2 = chunksnapshot.a(k1, l1, j1);
+-
+-                if (iblockdata2.getMaterial() == Material.AIR) {
++                char raw = rawBlocks[colBase | l1];
++                if (raw == 0) {
+                     l = -1;
+-                } else if (iblockdata2.getBlock() == Blocks.STONE) {
+-                    if (l == -1) {
+-                        if (i1 <= 0) {
+-                            iblockdata = BiomeBase.b;
+-                            iblockdata1 = BiomeBase.a;
+-                        } else if (l1 >= k - 4 && l1 <= k + 1) {
+-                            iblockdata = this.q;
+-                            iblockdata1 = this.r;
++                } else {
++                    boolean isStone;
++                    if (raw == stoneId) {
++                        isStone = true;
++                    } else {
++                        IBlockData iblockdata2 = Block.REGISTRY_ID.fromId(raw);
++                        if (iblockdata2 == null || iblockdata2.getMaterial() == Material.AIR) {
++                            l = -1;
++                            isStone = false;
++                        } else {
++                            isStone = iblockdata2.getBlock() == Blocks.STONE;
+                         }
++                    }
+ 
+-                        if (l1 < k && (iblockdata == null || iblockdata.getMaterial() == Material.AIR)) {
+-                            if (this.a((BlockPosition) blockposition_mutableblockposition.c(i, l1, j)) < 0.15F) {
+-                                iblockdata = BiomeBase.g;
+-                            } else {
+-                                iblockdata = BiomeBase.h;
++                    if (isStone) {
++                        if (l == -1) {
++                            if (i1 <= 0) {
++                                iblockdata = BiomeBase.b;
++                                iblockdata1 = BiomeBase.a;
++                                topId = airId;
++                                fillerId = stoneId;
++                            } else if (l1 >= k - 4 && l1 <= k + 1) {
++                                iblockdata = this.q;
++                                iblockdata1 = this.r;
++                                topId = baseTopId;
++                                fillerId = baseFillerId;
+                             }
+-                        }
+ 
+-                        l = i1;
+-                        if (l1 >= k - 1) {
+-                            chunksnapshot.a(k1, l1, j1, iblockdata);
+-                        } else if (l1 < k - 7 - i1) {
+-                            iblockdata = BiomeBase.b;
+-                            iblockdata1 = BiomeBase.a;
+-                            chunksnapshot.a(k1, l1, j1, BiomeBase.d);
+-                        } else {
+-                            chunksnapshot.a(k1, l1, j1, iblockdata1);
+-                        }
+-                    } else if (l > 0) {
+-                        --l;
+-                        chunksnapshot.a(k1, l1, j1, iblockdata1);
+-                        if (l == 0 && iblockdata1.getBlock() == Blocks.SAND && i1 > 1) {
+-                            l = random.nextInt(4) + Math.max(0, l1 - 63);
+-                            iblockdata1 = iblockdata1.get(BlockSand.VARIANT) == BlockSand.EnumSandVariant.RED_SAND ? BiomeBase.e : BiomeBase.f;
++                            if (l1 < k && (iblockdata == null || iblockdata.getMaterial() == Material.AIR)) {
++                                if (blockposition_mutableblockposition == null) {
++                                    blockposition_mutableblockposition = new BlockPosition.MutableBlockPosition();
++                                }
++                                if (this.a((BlockPosition) blockposition_mutableblockposition.c(i, l1, j)) < 0.15F) {
++                                    iblockdata = BiomeBase.g;
++                                    topId = iceId;
++                                } else {
++                                    iblockdata = BiomeBase.h;
++                                    topId = waterId;
++                                }
++                            }
++
++                            l = i1;
++                            if (l1 >= k - 1) {
++                                rawBlocks[colBase | l1] = topId;
++                            } else if (l1 < k - 7 - i1) {
++                                iblockdata = BiomeBase.b;
++                                iblockdata1 = BiomeBase.a;
++                                topId = airId;
++                                fillerId = stoneId;
++                                rawBlocks[colBase | l1] = gravelId;
++                            } else {
++                                rawBlocks[colBase | l1] = fillerId;
++                            }
++                        } else if (l > 0) {
++                            --l;
++                            rawBlocks[colBase | l1] = fillerId;
++                            if (l == 0 && iblockdata1.getBlock() == Blocks.SAND && i1 > 1) {
++                                l = random.nextInt(4) + Math.max(0, l1 - 63);
++                                if (iblockdata1.get(BlockSand.VARIANT) == BlockSand.EnumSandVariant.RED_SAND) {
++                                    iblockdata1 = BiomeBase.e;
++                                    fillerId = redSandstoneId;
++                                } else {
++                                    iblockdata1 = BiomeBase.f;
++                                    fillerId = sandstoneId;
++                                }
++                            }
+                         }
+                     }
+                 }
+             }
+         }
++        // Antarctic end
+ 
+     }
+ 
+diff --git a/main/java/net/minecraft/server/Chunk.java b/main/java/net/minecraft/server/Chunk.java
+index dc6da26..848d93c 100644
+--- a/main/java/net/minecraft/server/Chunk.java
++++ b/main/java/net/minecraft/server/Chunk.java
+@@ -244,27 +244,32 @@ public class Chunk {
+ 
+     public Chunk(World world, ChunkSnapshot chunksnapshot, int i, int j) {
+         this(world, i, j);
+-        boolean flag = true;
+         boolean flag1 = world.worldProvider.m();
++        char[] raw = chunksnapshot.rawBlocks();
+ 
+-        for (int k = 0; k < 16; ++k) {
+-            for (int l = 0; l < 16; ++l) {
+-                for (int i1 = 0; i1 < 256; ++i1) {
+-                    IBlockData iblockdata = chunksnapshot.a(k, i1, l);
+-
+-                    if (iblockdata.getMaterial() != Material.AIR) {
+-                        int j1 = i1 >> 4;
++        for (int secY = 0; secY < 16; ++secY) {
++            int baseY = secY << 4;
++            if (!hasNonAirInSection(raw, baseY)) {
++                continue;
++            }
++            ChunkSection section = new ChunkSection(baseY, flag1, world.chunkPacketBlockController.getPredefinedBlockData(this, secY)); // Paper - Anti-Xray - Add predefined block data
++            if (section.fillFromSnapshot(raw, baseY)) {
++                this.sections[secY] = section;
++            }
++        }
+ 
+-                        if (this.sections[j1] == Chunk.a) {
+-                            this.sections[j1] = new ChunkSection(j1 << 4, flag1, world.chunkPacketBlockController.getPredefinedBlockData(this, j1)); // Paper - Anti-Xray - Add predefined block data
+-                        }
++    }
+ 
+-                        this.sections[j1].setType(k, i1 & 15, l, iblockdata);
+-                    }
++    private static boolean hasNonAirInSection(char[] raw, int baseY) {
++        for (int col = 0; col < 256; ++col) {
++            int offset = (col << 8) | baseY;
++            for (int dy = 0; dy < 16; ++dy) {
++                if (raw[offset + dy] != 0) {
++                    return true;
+                 }
+             }
+         }
+-
++        return false;
+     }
+ 
+     public boolean a(int i, int j) {
+diff --git a/main/java/net/minecraft/server/ChunkProviderGenerate.java b/main/java/net/minecraft/server/ChunkProviderGenerate.java
+index ee9e00e..0cbf3c7 100644
+--- a/main/java/net/minecraft/server/ChunkProviderGenerate.java
++++ b/main/java/net/minecraft/server/ChunkProviderGenerate.java
+@@ -32,6 +32,7 @@ public class ChunkProviderGenerate implements ChunkGenerator {
+     private final WorldGenMonument B;
+     private final WorldGenWoodlandMansion C;
+     private BiomeBase[] D;
++    private final ChunkSnapshot reusableSnapshot = new ChunkSnapshot(); // Antarctic - reuse 128KB snapshot buffer across chunk gens
+     double[] e;
+     double[] f;
+     double[] g;
+@@ -81,45 +82,75 @@ public class ChunkProviderGenerate implements ChunkGenerator {
+     public void a(int i, int j, ChunkSnapshot chunksnapshot) {
+         this.D = this.n.getWorldChunkManager().getBiomes(this.D, i * 4 - 2, j * 4 - 2, 10, 10);
+         this.a(i * 4, 0, j * 4);
++        final char[] raw = chunksnapshot.rawBlocks();
++        final char stoneId = (char) Block.REGISTRY_ID.getId(ChunkProviderGenerate.a);
++        final char fluidId = (char) Block.REGISTRY_ID.getId(this.t);
++        fillTerrainFromDensity(this.q, raw, stoneId, fluidId, this.s.q);
++    }
+ 
++    // Antarctic start - uniform-sign 4x8x4 sub-cell fast-paths with exact vanilla fallback
++    static void fillTerrainFromDensity(double[] density, char[] raw, char stoneId, char fluidId, int seaLevel) {
+         for (int k = 0; k < 4; ++k) {
+             int l = k * 5;
+             int i1 = (k + 1) * 5;
++            int xBase = k << 2;
+ 
+             for (int j1 = 0; j1 < 4; ++j1) {
+                 int k1 = (l + j1) * 33;
+                 int l1 = (l + j1 + 1) * 33;
+                 int i2 = (i1 + j1) * 33;
+                 int j2 = (i1 + j1 + 1) * 33;
++                int zBase = j1 << 2;
+ 
+                 for (int k2 = 0; k2 < 32; ++k2) {
+-                    double d0 = 0.125D;
+-                    double d1 = this.q[k1 + k2];
+-                    double d2 = this.q[l1 + k2];
+-                    double d3 = this.q[i2 + k2];
+-                    double d4 = this.q[j2 + k2];
+-                    double d5 = (this.q[k1 + k2 + 1] - d1) * 0.125D;
+-                    double d6 = (this.q[l1 + k2 + 1] - d2) * 0.125D;
+-                    double d7 = (this.q[i2 + k2 + 1] - d3) * 0.125D;
+-                    double d8 = (this.q[j2 + k2 + 1] - d4) * 0.125D;
++                    double d1 = density[k1 + k2];
++                    double d2 = density[l1 + k2];
++                    double d3 = density[i2 + k2];
++                    double d4 = density[j2 + k2];
++                    double u1 = density[k1 + k2 + 1];
++                    double u2 = density[l1 + k2 + 1];
++                    double u3 = density[i2 + k2 + 1];
++                    double u4 = density[j2 + k2 + 1];
++
++                    double minC = Math.min(Math.min(Math.min(d1, d2), Math.min(d3, d4)), Math.min(Math.min(u1, u2), Math.min(u3, u4)));
++                    double maxC = Math.max(Math.max(Math.max(d1, d2), Math.max(d3, d4)), Math.max(Math.max(u1, u2), Math.max(u3, u4)));
++                    int yBase = k2 << 3;
++
++                    if (maxC < -1.0D && minC > -1.0E9D) {
++                        if (yBase >= seaLevel) {
++                            continue;
++                        }
++                        if (yBase + 8 <= seaLevel) {
++                            fillSubCell(raw, xBase, yBase, zBase, fluidId);
++                            continue;
++                        }
++                    } else if (minC > 1.0D && maxC < 1.0E9D) {
++                        fillSubCell(raw, xBase, yBase, zBase, stoneId);
++                        continue;
++                    }
++
++                    double d5 = (u1 - d1) * 0.125D;
++                    double d6 = (u2 - d2) * 0.125D;
++                    double d7 = (u3 - d3) * 0.125D;
++                    double d8 = (u4 - d4) * 0.125D;
+ 
+                     for (int l2 = 0; l2 < 8; ++l2) {
+-                        double d9 = 0.25D;
+                         double d10 = d1;
+                         double d11 = d2;
+                         double d12 = (d3 - d1) * 0.25D;
+                         double d13 = (d4 - d2) * 0.25D;
++                        int y = yBase + l2;
+ 
+                         for (int i3 = 0; i3 < 4; ++i3) {
+-                            double d14 = 0.25D;
+                             double d15 = (d11 - d10) * 0.25D;
+                             double d16 = d10 - d15;
++                            int colOffset = ((xBase + i3) << 12) | y;
+ 
+                             for (int j3 = 0; j3 < 4; ++j3) {
+                                 if ((d16 += d15) > 0.0D) {
+-                                    chunksnapshot.a(k * 4 + i3, k2 * 8 + l2, j1 * 4 + j3, ChunkProviderGenerate.a);
+-                                } else if (k2 * 8 + l2 < this.s.q) {
+-                                    chunksnapshot.a(k * 4 + i3, k2 * 8 + l2, j1 * 4 + j3, this.t);
++                                    raw[colOffset | ((zBase + j3) << 8)] = stoneId;
++                                } else if (y < seaLevel) {
++                                    raw[colOffset | ((zBase + j3) << 8)] = fluidId;
+                                 }
+                             }
+ 
+@@ -135,8 +166,25 @@ public class ChunkProviderGenerate implements ChunkGenerator {
+                 }
+             }
+         }
++    }
+ 
++    private static void fillSubCell(char[] raw, int xBase, int yBase, int zBase, char blockId) {
++        for (int ix = 0; ix < 4; ++ix) {
++            int xShift = (xBase + ix) << 12;
++            for (int iz = 0; iz < 4; ++iz) {
++                int base = xShift | ((zBase + iz) << 8) | yBase;
++                raw[base]     = blockId;
++                raw[base + 1] = blockId;
++                raw[base + 2] = blockId;
++                raw[base + 3] = blockId;
++                raw[base + 4] = blockId;
++                raw[base + 5] = blockId;
++                raw[base + 6] = blockId;
++                raw[base + 7] = blockId;
++            }
++        }
+     }
++    // Antarctic end
+ 
+     public void a(int i, int j, ChunkSnapshot chunksnapshot, BiomeBase[] abiomebase) {
+         double d0 = 0.03125D;
+@@ -155,7 +203,8 @@ public class ChunkProviderGenerate implements ChunkGenerator {
+ 
+     public Chunk getOrCreateChunk(int i, int j) {
+         this.i.setSeed((long) i * 341873128712L + (long) j * 132897987541L);
+-        ChunkSnapshot chunksnapshot = new ChunkSnapshot();
++        ChunkSnapshot chunksnapshot = this.reusableSnapshot;
++        chunksnapshot.clear();
+ 
+         this.a(i, j, chunksnapshot);
+         this.D = this.n.getWorldChunkManager().getBiomeBlock(this.D, i * 16, j * 16, 16, 16);
+diff --git a/main/java/net/minecraft/server/ChunkSection.java b/main/java/net/minecraft/server/ChunkSection.java
+index f5194fe..f174abe 100644
+--- a/main/java/net/minecraft/server/ChunkSection.java
++++ b/main/java/net/minecraft/server/ChunkSection.java
+@@ -89,6 +89,71 @@ public class ChunkSection {
+         this.blockIds.setBlock(i, j, k, iblockdata);
+     }
+ 
++    // Antarctic start - single-pass section population from ChunkSnapshot raw char[]
++    boolean fillFromSnapshot(char[] raw, int baseY) {
++        boolean wroteAny = false;
++        int nonEmpty = 0;
++        int ticking = 0;
++        int fluids = 0;
++        int fireOrLava = 0;
++
++        char lastId = 0;
++        IBlockData lastData = null;
++        boolean lastNotAir = false;
++        boolean lastTicking = false;
++        boolean lastLiquid = false;
++        boolean lastFireOrLava = false;
++
++        for (int dy = 0; dy < 16; ++dy) {
++            int y = baseY + dy;
++            int dyShift = dy << 8;
++            for (int z = 0; z < 16; ++z) {
++                int zyShift = dyShift | (z << 4);
++                int zSnap = (z << 8) | y;
++                for (int x = 0; x < 16; ++x) {
++                    char id = raw[(x << 12) | zSnap];
++                    if (id == 0) {
++                        continue;
++                    }
++                    if (id != lastId) {
++                        IBlockData data = Block.REGISTRY_ID.fromId(id);
++                        if (data == null || data.getMaterial() == Material.AIR) {
++                            continue;
++                        }
++                        lastId = id;
++                        lastData = data;
++                        Block block = data.getBlock();
++                        lastNotAir = block != Blocks.AIR;
++                        lastTicking = lastNotAir && block.isTicking();
++                        lastLiquid = data.getMaterial().isLiquid();
++                        lastFireOrLava = block == Blocks.FIRE || block == Blocks.FLOWING_LAVA || block == Blocks.LAVA;
++                    }
++                    wroteAny = true;
++                    if (lastNotAir) {
++                        ++nonEmpty;
++                        if (lastTicking) {
++                            ++ticking;
++                        }
++                        if (lastLiquid) {
++                            ++fluids;
++                        }
++                        if (lastFireOrLava) {
++                            ++fireOrLava;
++                        }
++                    }
++                    this.blockIds.setBlockIndex(zyShift | x, lastData);
++                }
++            }
++        }
++
++        this.nonEmptyBlockCount = nonEmpty;
++        this.tickingBlockCount = ticking;
++        this.fluidCount = fluids;
++        this.fireOrLavaCount = fireOrLava;
++        return wroteAny;
++    }
++    // Antarctic end
++
+     public boolean a() {
+         return false; // CraftBukkit - MC-80966
+     }
+diff --git a/main/java/net/minecraft/server/ChunkSnapshot.java b/main/java/net/minecraft/server/ChunkSnapshot.java
+new file mode 100644
+index 0000000..74a3865
+--- /dev/null
++++ b/main/java/net/minecraft/server/ChunkSnapshot.java
+@@ -0,0 +1,55 @@
++package net.minecraft.server;
++
++public class ChunkSnapshot {
++
++    private static final IBlockData a = Blocks.AIR.getBlockData();
++    private final char[] b = new char[65536];
++
++    public ChunkSnapshot() {}
++
++    public IBlockData a(int i, int j, int k) {
++        IBlockData iblockdata = (IBlockData) Block.REGISTRY_ID.fromId(this.b[b(i, j, k)]);
++
++        return iblockdata == null ? ChunkSnapshot.a : iblockdata;
++    }
++
++    public void a(int i, int j, int k, IBlockData iblockdata) {
++        this.b[b(i, j, k)] = (char) Block.REGISTRY_ID.getId(iblockdata);
++    }
++
++    private static int b(int i, int j, int k) {
++        return i << 12 | k << 8 | j;
++    }
++
++    public int a(int i, int j) {
++        int k = (i << 12 | j << 8) + 256 - 1;
++
++        for (int l = 255; l >= 0; --l) {
++            IBlockData iblockdata = (IBlockData) Block.REGISTRY_ID.fromId(this.b[k + l]);
++
++            if (iblockdata != null && iblockdata != ChunkSnapshot.a) {
++                return l;
++            }
++        }
++
++        return 0;
++    }
++
++    // Antarctic start - raw char[] access and reusable reset for chunk generation
++    char[] rawBlocks() {
++        return this.b;
++    }
++
++    void clear() {
++        java.util.Arrays.fill(this.b, '\0');
++    }
++
++    char getRaw(int i, int j, int k) {
++        return this.b[i << 12 | k << 8 | j];
++    }
++
++    void setRaw(int i, int j, int k, char id) {
++        this.b[i << 12 | k << 8 | j] = id;
++    }
++    // Antarctic end
++}
+diff --git a/test/java/net/minecraft/server/ChunkSnapshotAndGenPerfTest.java b/test/java/net/minecraft/server/ChunkSnapshotAndGenPerfTest.java
+new file mode 100644
+index 0000000..51adecf
+--- /dev/null
++++ b/test/java/net/minecraft/server/ChunkSnapshotAndGenPerfTest.java
+@@ -0,0 +1,309 @@
++package net.minecraft.server;
++
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++import java.util.Arrays;
++import java.util.Random;
++
++import static org.junit.Assert.*;
++
++public class ChunkSnapshotAndGenPerfTest {
++
++    @BeforeClass
++    public static void setup() {
++        DispenserRegistry.c();
++    }
++
++    private static void vanillaTerrainReference(double[] density, ChunkSnapshot snapshot, IBlockData stone, IBlockData fluid, int seaLevel) {
++        for (int k = 0; k < 4; ++k) {
++            int l = k * 5;
++            int i1 = (k + 1) * 5;
++
++            for (int j1 = 0; j1 < 4; ++j1) {
++                int k1 = (l + j1) * 33;
++                int l1 = (l + j1 + 1) * 33;
++                int i2 = (i1 + j1) * 33;
++                int j2 = (i1 + j1 + 1) * 33;
++
++                for (int k2 = 0; k2 < 32; ++k2) {
++                    double d1 = density[k1 + k2];
++                    double d2 = density[l1 + k2];
++                    double d3 = density[i2 + k2];
++                    double d4 = density[j2 + k2];
++                    double d5 = (density[k1 + k2 + 1] - d1) * 0.125D;
++                    double d6 = (density[l1 + k2 + 1] - d2) * 0.125D;
++                    double d7 = (density[i2 + k2 + 1] - d3) * 0.125D;
++                    double d8 = (density[j2 + k2 + 1] - d4) * 0.125D;
++
++                    for (int l2 = 0; l2 < 8; ++l2) {
++                        double d10 = d1;
++                        double d11 = d2;
++                        double d12 = (d3 - d1) * 0.25D;
++                        double d13 = (d4 - d2) * 0.25D;
++
++                        for (int i3 = 0; i3 < 4; ++i3) {
++                            double d15 = (d11 - d10) * 0.25D;
++                            double d16 = d10 - d15;
++
++                            for (int j3 = 0; j3 < 4; ++j3) {
++                                if ((d16 += d15) > 0.0D) {
++                                    snapshot.a(k * 4 + i3, k2 * 8 + l2, j1 * 4 + j3, stone);
++                                } else if (k2 * 8 + l2 < seaLevel) {
++                                    snapshot.a(k * 4 + i3, k2 * 8 + l2, j1 * 4 + j3, fluid);
++                                }
++                            }
++
++                            d10 += d12;
++                            d11 += d13;
++                        }
++
++                        d1 += d5;
++                        d2 += d6;
++                        d3 += d7;
++                        d4 += d8;
++                    }
++                }
++            }
++        }
++    }
++
++    @Test
++    public void testChunkSnapshotRawAndMansionQuirkParity() {
++        ChunkSnapshot snap = new ChunkSnapshot();
++        IBlockData stone = Blocks.STONE.getBlockData();
++        IBlockData water = Blocks.WATER.getBlockData();
++        char stoneId = (char) Block.REGISTRY_ID.getId(stone);
++        char waterId = (char) Block.REGISTRY_ID.getId(water);
++
++        snap.a(7, 65, 7, stone);
++        assertEquals(stoneId, snap.getRaw(7, 65, 7));
++        snap.setRaw(3, 12, 11, waterId);
++        assertEquals(water, snap.a(3, 12, 11));
++
++        // Woodland mansion height helper a(x, z) preserves exact vanilla this.b[k + l] quirk
++        assertEquals(0, snap.a(7, 7));
++        assertEquals(66, snap.a(7, 6));
++        assertEquals(0, snap.a(0, 0));
++
++        snap.clear();
++        for (char c : snap.rawBlocks()) {
++            assertEquals('\0', c);
++        }
++    }
++
++    @Test
++    public void testTerrainDensityParityRealisticAndCancellationEdgeCase() {
++        IBlockData stone = Blocks.STONE.getBlockData();
++        IBlockData water = Blocks.WATER.getBlockData();
++        char stoneId = (char) Block.REGISTRY_ID.getId(stone);
++        char waterId = (char) Block.REGISTRY_ID.getId(water);
++        int seaLevel = 63;
++
++        Random rng = new Random(0xA1A1A1A1L);
++        for (int trial = 0; trial < 12; ++trial) {
++            double[] density = new double[825];
++            for (int xz = 0; xz < 25; ++xz) {
++                for (int y = 0; y < 33; ++y) {
++                    double base = (8.0 - y) * 18.0 + (rng.nextDouble() - 0.5) * 40.0;
++                    density[xz * 33 + y] = base;
++                }
++            }
++
++            ChunkSnapshot expected = new ChunkSnapshot();
++            ChunkSnapshot actual = new ChunkSnapshot();
++            vanillaTerrainReference(density, expected, stone, water, seaLevel);
++            ChunkProviderGenerate.fillTerrainFromDensity(density, actual.rawBlocks(), stoneId, waterId, seaLevel);
++
++            assertArrayEquals("Terrain mismatch on trial " + trial, expected.rawBlocks(), actual.rawBlocks());
++        }
++
++        // IEEE-754 cancellation edge case: small +1e-16 and large +1000.0 (falls back to vanilla via <= 1.0D guard)
++        double[] cancelDensity = new double[825];
++        Arrays.fill(cancelDensity, 1e-16);
++        for (int i = 0; i < cancelDensity.length; i += 3) {
++            cancelDensity[i] = 1000.0;
++        }
++        cancelDensity[33] = -1e-16;
++        cancelDensity[34] = -500.0;
++
++        ChunkSnapshot expectedCancel = new ChunkSnapshot();
++        ChunkSnapshot actualCancel = new ChunkSnapshot();
++        vanillaTerrainReference(cancelDensity, expectedCancel, stone, water, seaLevel);
++        ChunkProviderGenerate.fillTerrainFromDensity(cancelDensity, actualCancel.rawBlocks(), stoneId, waterId, seaLevel);
++        assertArrayEquals("Cancellation edge case mismatch", expectedCancel.rawBlocks(), actualCancel.rawBlocks());
++    }
++
++    @Test
++    public void testChunkSectionFillFromSnapshotParity() {
++        ChunkSnapshot snap = new ChunkSnapshot();
++        IBlockData stone = Blocks.STONE.getBlockData();
++        IBlockData grass = Blocks.GRASS.getBlockData();
++        IBlockData water = Blocks.WATER.getBlockData();
++        IBlockData lava = Blocks.LAVA.getBlockData();
++        IBlockData fire = Blocks.FIRE.getBlockData();
++
++        // Section 0: empty
++        ChunkSection emptySection = new ChunkSection(0, true);
++        assertFalse(emptySection.fillFromSnapshot(snap.rawBlocks(), 0));
++
++        // Section 1 (y = 16..31): mixed blocks including ticking, liquid, fire/lava
++        for (int x = 0; x < 16; ++x) {
++            for (int z = 0; z < 16; ++z) {
++                snap.a(x, 16, z, stone);
++                if (x < 4) {
++                    snap.a(x, 17, z, water);
++                } else if (x < 8) {
++                    snap.a(x, 17, z, grass);
++                } else if (x < 10) {
++                    snap.a(x, 17, z, lava);
++                } else if (x == 12) {
++                    snap.a(x, 17, z, fire);
++                }
++            }
++        }
++
++        IBlockData[] predefined = new IBlockData[] { stone, grass, water, lava };
++        ChunkSection expected = new ChunkSection(16, true, predefined);
++        for (int x = 0; x < 16; ++x) {
++            for (int z = 0; z < 16; ++z) {
++                for (int dy = 0; dy < 16; ++dy) {
++                    IBlockData data = snap.a(x, 16 + dy, z);
++                    if (data.getMaterial() != Material.AIR) {
++                        expected.setType(x, dy, z, data);
++                    }
++                }
++            }
++        }
++
++        ChunkSection actual = new ChunkSection(16, true, predefined);
++        assertTrue(actual.fillFromSnapshot(snap.rawBlocks(), 16));
++
++        for (int x = 0; x < 16; ++x) {
++            for (int z = 0; z < 16; ++z) {
++                for (int dy = 0; dy < 16; ++dy) {
++                    assertEquals("Block mismatch at " + x + "," + dy + "," + z,
++                            expected.getType(x, dy, z), actual.getType(x, dy, z));
++                }
++            }
++        }
++        assertEquals(expected.shouldTick(), actual.shouldTick());
++        assertEquals(expected.hasFluids(), actual.hasFluids());
++        assertEquals(expected.hasFireOrLava(), actual.hasFireOrLava());
++
++        // Verify counters match recalcBlockCounts()
++        boolean beforeTick = actual.shouldTick();
++        boolean beforeFluid = actual.hasFluids();
++        boolean beforeFire = actual.hasFireOrLava();
++        actual.recalcBlockCounts();
++        assertEquals(beforeTick, actual.shouldTick());
++        assertEquals(beforeFluid, actual.hasFluids());
++        assertEquals(beforeFire, actual.hasFireOrLava());
++    }
++
++    @Test
++    public void testChunkGenAndSectionBuildBenchmark() {
++        IBlockData stone = Blocks.STONE.getBlockData();
++        IBlockData water = Blocks.WATER.getBlockData();
++        char stoneId = (char) Block.REGISTRY_ID.getId(stone);
++        char waterId = (char) Block.REGISTRY_ID.getId(water);
++        int seaLevel = 63;
++
++        double[] density = new double[825];
++        for (int xz = 0; xz < 25; ++xz) {
++            for (int y = 0; y < 33; ++y) {
++                density[xz * 33 + y] = (8.0 - y) * 18.0;
++            }
++        }
++
++        ChunkSnapshot snap = new ChunkSnapshot();
++        long blackhole = 0L;
++
++        // Warmup
++        for (int i = 0; i < 400; ++i) {
++            snap.clear();
++            vanillaTerrainReference(density, snap, stone, water, seaLevel);
++            blackhole ^= snap.rawBlocks()[i & 4095];
++
++            snap.clear();
++            ChunkProviderGenerate.fillTerrainFromDensity(density, snap.rawBlocks(), stoneId, waterId, seaLevel);
++            blackhole ^= snap.rawBlocks()[i & 4095];
++        }
++
++        int terrainIters = 1500;
++        long t0 = System.nanoTime();
++        for (int i = 0; i < terrainIters; ++i) {
++            snap.clear();
++            vanillaTerrainReference(density, snap, stone, water, seaLevel);
++            blackhole ^= snap.rawBlocks()[i & 4095];
++        }
++        long vanillaTerrainNs = (System.nanoTime() - t0) / terrainIters;
++
++        t0 = System.nanoTime();
++        for (int i = 0; i < terrainIters; ++i) {
++            snap.clear();
++            ChunkProviderGenerate.fillTerrainFromDensity(density, snap.rawBlocks(), stoneId, waterId, seaLevel);
++            blackhole ^= snap.rawBlocks()[i & 4095];
++        }
++        long optTerrainNs = (System.nanoTime() - t0) / terrainIters;
++
++        // Section build benchmark (4 sections: y=0, 16, 32, 48)
++        int sectionIters = 600;
++        for (int i = 0; i < 150; ++i) {
++            ChunkSection s1 = new ChunkSection(16, true);
++            for (int x = 0; x < 16; ++x) {
++                for (int z = 0; z < 16; ++z) {
++                    for (int dy = 0; dy < 16; ++dy) {
++                        IBlockData d = snap.a(x, 16 + dy, z);
++                        if (d.getMaterial() != Material.AIR) {
++                            s1.setType(x, dy, z, d);
++                        }
++                    }
++                }
++            }
++            ChunkSection s2 = new ChunkSection(16, true);
++            s2.fillFromSnapshot(snap.rawBlocks(), 16);
++            blackhole ^= (s1.shouldTick() ? 1 : 0) ^ (s2.shouldTick() ? 2 : 0);
++        }
++
++        t0 = System.nanoTime();
++        for (int i = 0; i < sectionIters; ++i) {
++            for (int secY = 0; secY < 4; ++secY) {
++                int baseY = secY << 4;
++                ChunkSection s = new ChunkSection(baseY, true);
++                for (int x = 0; x < 16; ++x) {
++                    for (int z = 0; z < 16; ++z) {
++                        for (int dy = 0; dy < 16; ++dy) {
++                            IBlockData d = snap.a(x, baseY + dy, z);
++                            if (d.getMaterial() != Material.AIR) {
++                                s.setType(x, dy, z, d);
++                            }
++                        }
++                    }
++                }
++                blackhole ^= s.hasFluids() ? 1L : 0L;
++            }
++        }
++        long vanillaSectionNs = (System.nanoTime() - t0) / sectionIters;
++
++        t0 = System.nanoTime();
++        for (int i = 0; i < sectionIters; ++i) {
++            for (int secY = 0; secY < 4; ++secY) {
++                int baseY = secY << 4;
++                ChunkSection s = new ChunkSection(baseY, true);
++                s.fillFromSnapshot(snap.rawBlocks(), baseY);
++                blackhole ^= s.hasFluids() ? 1L : 0L;
++            }
++        }
++        long optSectionNs = (System.nanoTime() - t0) / sectionIters;
++
++        System.out.printf("A1_BENCH terrain_vanilla_ns=%d terrain_opt_ns=%d terrain_speedup=%.2fx section4_vanilla_ns=%d section4_opt_ns=%d section_speedup=%.2fx blackhole=%d%n",
++                vanillaTerrainNs, optTerrainNs, (double) vanillaTerrainNs / Math.max(1L, optTerrainNs),
++                vanillaSectionNs, optSectionNs, (double) vanillaSectionNs / Math.max(1L, optSectionNs), blackhole);
++
++        assertTrue("Expected terrain fast-path speedup > 1.2x, got " + vanillaTerrainNs + " vs " + optTerrainNs,
++                optTerrainNs * 1.2 < vanillaTerrainNs);
++        assertTrue("Expected section build speedup > 1.2x, got " + vanillaSectionNs + " vs " + optSectionNs,
++                optSectionNs * 1.2 < vanillaSectionNs);
++    }
++}
