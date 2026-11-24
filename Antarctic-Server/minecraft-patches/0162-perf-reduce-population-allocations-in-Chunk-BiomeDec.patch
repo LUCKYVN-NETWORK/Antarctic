@@ -1,0 +1,736 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 11:08:50 +0700
+Subject: [PATCH 162/162] perf: reduce population allocations in Chunk,
+ BiomeDecorator and WorldGenMinable
+
+
+diff --git a/main/java/net/minecraft/server/BiomeDecorator.java b/main/java/net/minecraft/server/BiomeDecorator.java
+new file mode 100644
+index 0000000..8617200
+--- /dev/null
++++ b/main/java/net/minecraft/server/BiomeDecorator.java
+@@ -0,0 +1,359 @@
++package net.minecraft.server;
++
++import java.util.Random;
++
++public class BiomeDecorator {
++
++    protected boolean a;
++    protected BlockPosition b;
++    protected CustomWorldSettingsFinal c;
++    // Antarctic start - stateless shared worldgen instances and cached generator options
++    private static final WorldGenDeadBush DEAD_BUSH_GEN = new WorldGenDeadBush();
++    private static final WorldGenPumpkin PUMPKIN_GEN = new WorldGenPumpkin();
++    private static final WorldGenLiquids WATER_LIQUID_GEN = new WorldGenLiquids(Blocks.FLOWING_WATER);
++    private static final WorldGenLiquids LAVA_LIQUID_GEN = new WorldGenLiquids(Blocks.FLOWING_LAVA);
++    private String cachedGeneratorOptions;
++    // Antarctic end
++    protected WorldGenerator d = new WorldGenClay(4);
++    protected WorldGenerator e;
++    protected WorldGenerator f;
++    protected WorldGenerator g;
++    protected WorldGenerator h;
++    protected WorldGenerator i;
++    protected WorldGenerator j;
++    protected WorldGenerator k;
++    protected WorldGenerator l;
++    protected WorldGenerator m;
++    protected WorldGenerator n;
++    protected WorldGenerator o;
++    protected WorldGenerator p;
++    protected WorldGenerator q;
++    protected WorldGenFlowers r;
++    protected WorldGenerator s;
++    protected WorldGenerator t;
++    protected WorldGenerator u;
++    protected WorldGenerator v;
++    protected WorldGenerator w;
++    protected WorldGenerator x;
++    protected int y;
++    protected int z;
++    protected float A;
++    protected int B;
++    protected int C;
++    protected int D;
++    protected int E;
++    protected int F;
++    protected int G;
++    protected int H;
++    protected int I;
++    protected int J;
++    protected int K;
++    public boolean L;
++
++    public BiomeDecorator() {
++        this.e = new WorldGenSand(Blocks.SAND, 7);
++        this.f = new WorldGenSand(Blocks.GRAVEL, 6);
++        this.r = new WorldGenFlowers(Blocks.YELLOW_FLOWER, BlockFlowers.EnumFlowerVarient.DANDELION);
++        this.s = new WorldGenMushrooms(Blocks.BROWN_MUSHROOM);
++        this.t = new WorldGenMushrooms(Blocks.RED_MUSHROOM);
++        this.u = new WorldGenHugeMushroom();
++        this.v = new WorldGenReed();
++        this.w = new WorldGenCactus();
++        this.x = new WorldGenWaterLily();
++        this.A = 0.1F;
++        this.B = 2;
++        this.C = 1;
++        this.H = 1;
++        this.I = 3;
++        this.J = 1;
++        this.L = true;
++    }
++
++    public void a(World world, Random random, BiomeBase biomebase, BlockPosition blockposition) {
++        if (this.a) {
++            throw new RuntimeException("Already decorating");
++        } else {
++            String genOptions = world.getWorldData().getGeneratorOptions();
++            if (this.c == null || !java.util.Objects.equals(this.cachedGeneratorOptions, genOptions)) {
++                this.cachedGeneratorOptions = genOptions;
++                this.c = CustomWorldSettingsFinal.CustomWorldSettings.a(genOptions).b();
++                this.g = new WorldGenMinable(Blocks.DIRT.getBlockData(), this.c.J);
++                this.h = new WorldGenMinable(Blocks.GRAVEL.getBlockData(), this.c.N);
++                this.i = new WorldGenMinable(Blocks.STONE.getBlockData().set(BlockStone.VARIANT, BlockStone.EnumStoneVariant.GRANITE), this.c.R);
++                this.j = new WorldGenMinable(Blocks.STONE.getBlockData().set(BlockStone.VARIANT, BlockStone.EnumStoneVariant.DIORITE), this.c.V);
++                this.k = new WorldGenMinable(Blocks.STONE.getBlockData().set(BlockStone.VARIANT, BlockStone.EnumStoneVariant.ANDESITE), this.c.Z);
++                this.l = new WorldGenMinable(Blocks.COAL_ORE.getBlockData(), this.c.ad);
++                this.m = new WorldGenMinable(Blocks.IRON_ORE.getBlockData(), this.c.ah);
++                this.n = new WorldGenMinable(Blocks.GOLD_ORE.getBlockData(), this.c.al);
++                this.o = new WorldGenMinable(Blocks.REDSTONE_ORE.getBlockData(), this.c.ap);
++                this.p = new WorldGenMinable(Blocks.DIAMOND_ORE.getBlockData(), this.c.at);
++                this.q = new WorldGenMinable(Blocks.LAPIS_ORE.getBlockData(), this.c.ax);
++            }
++            this.b = blockposition;
++            this.a(biomebase, world, random);
++            this.a = false;
++        }
++    }
++
++    protected void a(BiomeBase biomebase, World world, Random random) {
++        this.a(world, random);
++
++        int i;
++        int j;
++        int k;
++
++        for (i = 0; i < this.I; ++i) {
++            j = random.nextInt(16) + 8;
++            k = random.nextInt(16) + 8;
++            this.e.generate(world, random, world.q(this.b.a(j, 0, k)));
++        }
++
++        for (i = 0; i < this.J; ++i) {
++            j = random.nextInt(16) + 8;
++            k = random.nextInt(16) + 8;
++            this.d.generate(world, random, world.q(this.b.a(j, 0, k)));
++        }
++
++        for (i = 0; i < this.H; ++i) {
++            j = random.nextInt(16) + 8;
++            k = random.nextInt(16) + 8;
++            this.f.generate(world, random, world.q(this.b.a(j, 0, k)));
++        }
++
++        i = this.z;
++        if (random.nextFloat() < this.A) {
++            ++i;
++        }
++
++        int l;
++        BlockPosition blockposition;
++
++        for (j = 0; j < i; ++j) {
++            k = random.nextInt(16) + 8;
++            l = random.nextInt(16) + 8;
++            WorldGenTreeAbstract worldgentreeabstract = biomebase.a(random);
++
++            worldgentreeabstract.e();
++            blockposition = world.getHighestBlockYAt(this.b.a(k, 0, l));
++            if (worldgentreeabstract.generate(world, random, blockposition)) {
++                worldgentreeabstract.a(world, random, blockposition);
++            }
++        }
++
++        for (j = 0; j < this.K; ++j) {
++            k = random.nextInt(16) + 8;
++            l = random.nextInt(16) + 8;
++            this.u.generate(world, random, world.getHighestBlockYAt(this.b.a(k, 0, l)));
++        }
++
++        BlockPosition blockposition1;
++        int i1;
++        int j1;
++
++        for (j = 0; j < this.B; ++j) {
++            k = random.nextInt(16) + 8;
++            l = random.nextInt(16) + 8;
++            i1 = world.c(this.b.getX() + k, this.b.getZ() + l) + 32;
++            if (i1 > 0) {
++                j1 = random.nextInt(i1);
++                blockposition1 = this.b.a(k, j1, l);
++                BlockFlowers.EnumFlowerVarient blockflowers_enumflowervarient = biomebase.a(random, blockposition1);
++                BlockFlowers blockflowers = blockflowers_enumflowervarient.a().a();
++
++                if (blockflowers.getBlockData().getMaterial() != Material.AIR) {
++                    this.r.a(blockflowers, blockflowers_enumflowervarient);
++                    this.r.generate(world, random, blockposition1);
++                }
++            }
++        }
++
++        for (j = 0; j < this.C; ++j) {
++            k = random.nextInt(16) + 8;
++            l = random.nextInt(16) + 8;
++            i1 = world.c(this.b.getX() + k, this.b.getZ() + l) * 2;
++            if (i1 > 0) {
++                j1 = random.nextInt(i1);
++                biomebase.b(random).generate(world, random, this.b.a(k, j1, l));
++            }
++        }
++
++        for (j = 0; j < this.D; ++j) {
++            k = random.nextInt(16) + 8;
++            l = random.nextInt(16) + 8;
++            i1 = world.c(this.b.getX() + k, this.b.getZ() + l) * 2;
++            if (i1 > 0) {
++                j1 = random.nextInt(i1);
++                DEAD_BUSH_GEN.generate(world, random, this.b.a(k, j1, l));
++            }
++        }
++
++        for (j = 0; j < this.y; ++j) {
++            k = random.nextInt(16) + 8;
++            l = random.nextInt(16) + 8;
++            i1 = world.c(this.b.getX() + k, this.b.getZ() + l) * 2;
++            if (i1 > 0) {
++                j1 = random.nextInt(i1);
++
++                BlockPosition blockposition2;
++
++                for (blockposition1 = this.b.a(k, j1, l); blockposition1.getY() > 0; blockposition1 = blockposition2) {
++                    blockposition2 = blockposition1.down();
++                    if (!world.isEmpty(blockposition2)) {
++                        break;
++                    }
++                }
++
++                this.x.generate(world, random, blockposition1);
++            }
++        }
++
++        for (j = 0; j < this.E; ++j) {
++            if (random.nextInt(4) == 0) {
++                k = random.nextInt(16) + 8;
++                l = random.nextInt(16) + 8;
++                BlockPosition blockposition3 = world.getHighestBlockYAt(this.b.a(k, 0, l));
++
++                this.s.generate(world, random, blockposition3);
++            }
++
++            if (random.nextInt(8) == 0) {
++                k = random.nextInt(16) + 8;
++                l = random.nextInt(16) + 8;
++                i1 = world.c(this.b.getX() + k, this.b.getZ() + l) * 2;
++                if (i1 > 0) {
++                    j1 = random.nextInt(i1);
++                    blockposition1 = this.b.a(k, j1, l);
++                    this.t.generate(world, random, blockposition1);
++                }
++            }
++        }
++
++        if (random.nextInt(4) == 0) {
++            j = random.nextInt(16) + 8;
++            k = random.nextInt(16) + 8;
++            l = world.c(this.b.getX() + j, this.b.getZ() + k) * 2;
++            if (l > 0) {
++                i1 = random.nextInt(l);
++                this.s.generate(world, random, this.b.a(j, i1, k));
++            }
++        }
++
++        if (random.nextInt(8) == 0) {
++            j = random.nextInt(16) + 8;
++            k = random.nextInt(16) + 8;
++            l = world.c(this.b.getX() + j, this.b.getZ() + k) * 2;
++            if (l > 0) {
++                i1 = random.nextInt(l);
++                this.t.generate(world, random, this.b.a(j, i1, k));
++            }
++        }
++
++        for (j = 0; j < this.F; ++j) {
++            k = random.nextInt(16) + 8;
++            l = random.nextInt(16) + 8;
++            i1 = world.c(this.b.getX() + k, this.b.getZ() + l) * 2;
++            if (i1 > 0) {
++                j1 = random.nextInt(i1);
++                this.v.generate(world, random, this.b.a(k, j1, l));
++            }
++        }
++
++        for (j = 0; j < 10; ++j) {
++            k = random.nextInt(16) + 8;
++            l = random.nextInt(16) + 8;
++            i1 = world.c(this.b.getX() + k, this.b.getZ() + l) * 2;
++            if (i1 > 0) {
++                j1 = random.nextInt(i1);
++                this.v.generate(world, random, this.b.a(k, j1, l));
++            }
++        }
++
++        if (random.nextInt(32) == 0) {
++            j = random.nextInt(16) + 8;
++            k = random.nextInt(16) + 8;
++            l = world.c(this.b.getX() + j, this.b.getZ() + k) * 2;
++            if (l > 0) {
++                i1 = random.nextInt(l);
++                PUMPKIN_GEN.generate(world, random, this.b.a(j, i1, k));
++            }
++        }
++
++        for (j = 0; j < this.G; ++j) {
++            k = random.nextInt(16) + 8;
++            l = random.nextInt(16) + 8;
++            i1 = world.c(this.b.getX() + k, this.b.getZ() + l) * 2;
++            if (i1 > 0) {
++                j1 = random.nextInt(i1);
++                this.w.generate(world, random, this.b.a(k, j1, l));
++            }
++        }
++
++        if (this.L) {
++            for (j = 0; j < 50; ++j) {
++                k = random.nextInt(16) + 8;
++                l = random.nextInt(16) + 8;
++                i1 = random.nextInt(248) + 8;
++                if (i1 > 0) {
++                    j1 = random.nextInt(i1);
++                    blockposition1 = this.b.a(k, j1, l);
++                    WATER_LIQUID_GEN.generate(world, random, blockposition1);
++                }
++            }
++
++            for (j = 0; j < 20; ++j) {
++                k = random.nextInt(16) + 8;
++                l = random.nextInt(16) + 8;
++                i1 = random.nextInt(random.nextInt(random.nextInt(240) + 8) + 8);
++                blockposition = this.b.a(k, i1, l);
++                LAVA_LIQUID_GEN.generate(world, random, blockposition);
++            }
++        }
++
++    }
++
++    protected void a(World world, Random random) {
++        this.a(world, random, this.c.K, this.g, this.c.L, this.c.M);
++        this.a(world, random, this.c.O, this.h, this.c.P, this.c.Q);
++        this.a(world, random, this.c.W, this.j, this.c.X, this.c.Y);
++        this.a(world, random, this.c.S, this.i, this.c.T, this.c.U);
++        this.a(world, random, this.c.aa, this.k, this.c.ab, this.c.ac);
++        this.a(world, random, this.c.ae, this.l, this.c.af, this.c.ag);
++        this.a(world, random, this.c.ai, this.m, this.c.aj, this.c.ak);
++        this.a(world, random, this.c.am, this.n, this.c.an, this.c.ao);
++        this.a(world, random, this.c.aq, this.o, this.c.ar, this.c.as);
++        this.a(world, random, this.c.au, this.p, this.c.av, this.c.aw);
++        this.b(world, random, this.c.ay, this.q, this.c.az, this.c.aA);
++    }
++
++    protected void a(World world, Random random, int i, WorldGenerator worldgenerator, int j, int k) {
++        int l;
++
++        if (k < j) {
++            l = j;
++            j = k;
++            k = l;
++        } else if (k == j) {
++            if (j < 255) {
++                ++k;
++            } else {
++                --j;
++            }
++        }
++
++        for (l = 0; l < i; ++l) {
++            BlockPosition blockposition = this.b.a(random.nextInt(16), random.nextInt(k - j) + j, random.nextInt(16));
++
++            worldgenerator.generate(world, random, blockposition);
++        }
++
++    }
++
++    protected void b(World world, Random random, int i, WorldGenerator worldgenerator, int j, int k) {
++        for (int l = 0; l < i; ++l) {
++            BlockPosition blockposition = this.b.a(random.nextInt(16), random.nextInt(k) + random.nextInt(k) + j - k, random.nextInt(16));
++
++            worldgenerator.generate(world, random, blockposition);
++        }
++
++    }
++}
+diff --git a/main/java/net/minecraft/server/Chunk.java b/main/java/net/minecraft/server/Chunk.java
+index b3a4e94..1ed7574 100644
+--- a/main/java/net/minecraft/server/Chunk.java
++++ b/main/java/net/minecraft/server/Chunk.java
+@@ -1486,32 +1486,41 @@ public class Chunk {
+     }
+ 
+     public BlockPosition f(BlockPosition blockposition) {
+-        int i = blockposition.getX() & 15;
+-        int j = blockposition.getZ() & 15;
++        int x = blockposition.getX();
++        int z = blockposition.getZ();
++        int i = x & 15;
++        int j = z & 15;
+         int k = i | j << 4;
+-        BlockPosition blockposition1 = new BlockPosition(blockposition.getX(), this.h[k], blockposition.getZ());
+-
+-        if (blockposition1.getY() == -999) {
+-            int l = this.g() + 15;
+-
+-            blockposition1 = new BlockPosition(blockposition.getX(), l, blockposition.getZ());
+-            int i1 = -1;
++        int cachedY = this.h[k];
+ 
+-            while (blockposition1.getY() > 0 && i1 == -1) {
+-                IBlockData iblockdata = this.getBlockData(blockposition1);
+-                Material material = iblockdata.getMaterial();
++        if (cachedY == -999) {
++            int found = -1;
++            int topSec = this.g() >> 4;
++            if (topSec >= this.sections.length) {
++                topSec = this.sections.length - 1;
++            }
+ 
+-                if (!material.isSolid() && !material.isLiquid()) {
+-                    blockposition1 = blockposition1.down();
+-                } else {
+-                    i1 = blockposition1.getY() + 1;
++            outer:
++            for (int secIdx = topSec; secIdx >= 0; --secIdx) {
++                ChunkSection sec = this.sections[secIdx];
++                if (sec == Chunk.a || sec.a()) {
++                    continue;
++                }
++                int minLy = secIdx == 0 ? 1 : 0;
++                for (int ly = 15; ly >= minLy; --ly) {
++                    Material material = sec.getType(i, ly, j).getMaterial();
++                    if (material.isSolid() || material.isLiquid()) {
++                        found = (secIdx << 4) + ly + 1;
++                        break outer;
++                    }
+                 }
+             }
+ 
+-            this.h[k] = i1;
++            cachedY = found;
++            this.h[k] = cachedY;
+         }
+ 
+-        return new BlockPosition(blockposition.getX(), this.h[k], blockposition.getZ());
++        return new BlockPosition(x, cachedY, z);
+     }
+ 
+     public void b(boolean flag) {
+diff --git a/main/java/net/minecraft/server/WorldGenMinable.java b/main/java/net/minecraft/server/WorldGenMinable.java
+new file mode 100644
+index 0000000..73a034d
+--- /dev/null
++++ b/main/java/net/minecraft/server/WorldGenMinable.java
+@@ -0,0 +1,101 @@
++package net.minecraft.server;
++
++import com.google.common.base.Predicate;
++import java.util.Random;
++
++public class WorldGenMinable extends WorldGenerator {
++
++    private static final Predicate<IBlockData> DEFAULT_PREDICATE = new WorldGenMinable.a(null); // Antarctic - shared stone predicate
++    private final IBlockData a;
++    private final int b;
++    private final Predicate<IBlockData> c;
++
++    public WorldGenMinable(IBlockData iblockdata, int i) {
++        this(iblockdata, i, DEFAULT_PREDICATE);
++    }
++
++    public WorldGenMinable(IBlockData iblockdata, int i, Predicate<IBlockData> predicate) {
++        this.a = iblockdata;
++        this.b = i;
++        this.c = predicate;
++    }
++
++    public boolean generate(World world, Random random, BlockPosition blockposition) {
++        float f = random.nextFloat() * 3.1415927F;
++        double d0 = (double) ((float) (blockposition.getX() + 8) + MathHelper.sin(f) * (float) this.b / 8.0F);
++        double d1 = (double) ((float) (blockposition.getX() + 8) - MathHelper.sin(f) * (float) this.b / 8.0F);
++        double d2 = (double) ((float) (blockposition.getZ() + 8) + MathHelper.cos(f) * (float) this.b / 8.0F);
++        double d3 = (double) ((float) (blockposition.getZ() + 8) - MathHelper.cos(f) * (float) this.b / 8.0F);
++        double d4 = (double) (blockposition.getY() + random.nextInt(3) - 2);
++        double d5 = (double) (blockposition.getY() + random.nextInt(3) - 2);
++        BlockPosition.MutableBlockPosition probe = new BlockPosition.MutableBlockPosition(); // Antarctic - reuse probe
++
++        for (int i = 0; i < this.b; ++i) {
++            float f1 = (float) i / (float) this.b;
++            double d6 = d0 + (d1 - d0) * (double) f1;
++            double d7 = d4 + (d5 - d4) * (double) f1;
++            double d8 = d2 + (d3 - d2) * (double) f1;
++            double d9 = random.nextDouble() * (double) this.b / 16.0D;
++            double d10 = (double) (MathHelper.sin(3.1415927F * f1) + 1.0F) * d9 + 1.0D;
++            double d11 = (double) (MathHelper.sin(3.1415927F * f1) + 1.0F) * d9 + 1.0D;
++            double halfD10 = d10 / 2.0D;
++            double halfD11 = d11 / 2.0D;
++            int j = MathHelper.floor(d6 - halfD10);
++            int k = MathHelper.floor(d7 - halfD11);
++            int l = MathHelper.floor(d8 - halfD10);
++            int i1 = MathHelper.floor(d6 + halfD10);
++            int j1 = MathHelper.floor(d7 + halfD11);
++            int k1 = MathHelper.floor(d8 + halfD10);
++
++            for (int l1 = j; l1 <= i1; ++l1) {
++                double d12 = ((double) l1 + 0.5D - d6) / halfD10;
++                double d12Sq = d12 * d12;
++
++                if (d12Sq < 1.0D) {
++                    for (int i2 = k; i2 <= j1; ++i2) {
++                        double d13 = ((double) i2 + 0.5D - d7) / halfD11;
++                        double d1213 = d12Sq + d13 * d13;
++
++                        if (d1213 < 1.0D) {
++                            for (int j2 = l; j2 <= k1; ++j2) {
++                                double d14 = ((double) j2 + 0.5D - d8) / halfD10;
++
++                                if (d1213 + d14 * d14 < 1.0D) {
++                                    probe.c(l1, i2, j2);
++                                    if (this.c.apply(world.getType(probe))) {
++                                        world.setTypeAndData(new BlockPosition(l1, i2, j2), this.a, 2);
++                                    }
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++        }
++
++        return true;
++    }
++
++    static class a implements Predicate<IBlockData> {
++
++        private a() {}
++
++        public boolean a(IBlockData iblockdata) {
++            if (iblockdata != null && iblockdata.getBlock() == Blocks.STONE) {
++                BlockStone.EnumStoneVariant blockstone_enumstonevariant = (BlockStone.EnumStoneVariant) iblockdata.get(BlockStone.VARIANT);
++
++                return blockstone_enumstonevariant.e();
++            } else {
++                return false;
++            }
++        }
++
++        public boolean apply(IBlockData object) {
++            return this.a(object);
++        }
++
++        a(Object object) {
++            this();
++        }
++    }
++}
+diff --git a/test/java/net/minecraft/server/PopulationAllocPerfTest.java b/test/java/net/minecraft/server/PopulationAllocPerfTest.java
+new file mode 100644
+index 0000000..209921e
+--- /dev/null
++++ b/test/java/net/minecraft/server/PopulationAllocPerfTest.java
+@@ -0,0 +1,187 @@
++package net.minecraft.server;
++
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++import java.lang.reflect.Field;
++import java.util.Arrays;
++
++import static org.junit.Assert.*;
++
++public class PopulationAllocPerfTest {
++
++    private static Unsafe UNSAFE;
++
++    @BeforeClass
++    public static void setup() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        UNSAFE = (Unsafe) f.get(null);
++    }
++
++    private static Chunk createTestChunk(ChunkSection[] sections) throws Exception {
++        Chunk chunk = (Chunk) UNSAFE.allocateInstance(Chunk.class);
++        setField("sections", chunk, sections);
++        int[] h = new int[256];
++        Arrays.fill(h, -999);
++        setField("h", chunk, h);
++        setField("heightMap", chunk, new int[256]);
++        return chunk;
++    }
++
++    private static void setField(String name, Object target, Object value) throws Exception {
++        Field f = Chunk.class.getDeclaredField(name);
++        f.setAccessible(true);
++        f.set(target, value);
++    }
++
++    private static BlockPosition vanillaChunkFReference(Chunk chunk, int[] h, BlockPosition blockposition) {
++        int i = blockposition.getX() & 15;
++        int j = blockposition.getZ() & 15;
++        int k = i | j << 4;
++        BlockPosition blockposition1 = new BlockPosition(blockposition.getX(), h[k], blockposition.getZ());
++        if (blockposition1.getY() == -999) {
++            int l = chunk.g() + 15;
++            blockposition1 = new BlockPosition(blockposition.getX(), l, blockposition.getZ());
++            int i1 = -1;
++            while (blockposition1.getY() > 0 && i1 == -1) {
++                IBlockData iblockdata = chunk.getBlockData(blockposition1);
++                Material material = iblockdata.getMaterial();
++                if (!material.isSolid() && !material.isLiquid()) {
++                    blockposition1 = blockposition1.down();
++                } else {
++                    i1 = blockposition1.getY() + 1;
++                }
++            }
++            h[k] = i1;
++        }
++        return new BlockPosition(blockposition.getX(), h[k], blockposition.getZ());
++    }
++
++    @Test
++    public void testChunkFAndMinablePredicateParity() throws Exception {
++        ChunkSection[] sections = new ChunkSection[16];
++        for (int s = 0; s < 5; ++s) {
++            sections[s] = new ChunkSection(s << 4, true);
++        }
++        IBlockData stone = Blocks.STONE.getBlockData();
++        IBlockData water = Blocks.WATER.getBlockData();
++        IBlockData tallgrass = Blocks.TALLGRASS.getBlockData();
++
++        // Column (0,0): stone up to 50, tallgrass at 51 -> top solid/liquid = 51
++        for (int y = 0; y <= 50; ++y) sections[y >> 4].setType(0, y & 15, 0, stone);
++        sections[51 >> 4].setType(0, 51 & 15, 0, tallgrass);
++
++        // Column (1,0): stone up to 40, water up to 62 -> top = 63
++        for (int y = 0; y <= 40; ++y) sections[y >> 4].setType(1, y & 15, 0, stone);
++        for (int y = 41; y <= 62; ++y) sections[y >> 4].setType(1, y & 15, 0, water);
++
++        // Column (2,0): all air -> -1
++        // Column (3,0): solid at y=0 only -> -1 (while y > 0 stops at 0)
++        sections[0].setType(3, 0, 0, stone);
++        // Column (4,0): glass (opacity 0, solid) at y=60 -> 61
++        sections[60 >> 4].setType(4, 60 & 15, 0, Blocks.GLASS.getBlockData());
++
++        Chunk optChunk = createTestChunk(sections);
++        int[] refH = new int[256];
++        Arrays.fill(refH, -999);
++
++        for (int x = 0; x < 5; ++x) {
++            BlockPosition query = new BlockPosition(32 + x, 0, -16);
++            BlockPosition expected = vanillaChunkFReference(optChunk, refH, query);
++            BlockPosition actual = optChunk.f(query);
++            assertEquals("Chunk.f mismatch for x=" + x, expected, actual);
++            // Repeat cached query
++            assertEquals(expected, optChunk.f(query));
++        }
++
++        // Null middle section: sections[3] = null, sections[4] has stone at (0,0) y=68, sections[2] has stone at (5,0) y=35
++        ChunkSection[] sparseSections = new ChunkSection[16];
++        sparseSections[2] = new ChunkSection(32, true);
++        sparseSections[2].setType(5, 3, 0, stone);
++        sparseSections[4] = new ChunkSection(64, true);
++        sparseSections[4].setType(0, 4, 0, stone);
++        Chunk sparseChunk = createTestChunk(sparseSections);
++        int[] sparseRefH = new int[256];
++        Arrays.fill(sparseRefH, -999);
++        for (int x : new int[]{0, 5}) {
++            BlockPosition query = new BlockPosition(x, 0, 0);
++            assertEquals("Sparse Chunk.f mismatch for x=" + x,
++                    vanillaChunkFReference(sparseChunk, sparseRefH, query),
++                    sparseChunk.f(query));
++        }
++
++        // WorldGenMinable predicate parity
++        WorldGenMinable.a pred = new WorldGenMinable.a(null);
++        assertTrue(pred.a(Blocks.STONE.getBlockData()));
++        assertTrue(pred.a(Blocks.STONE.getBlockData().set(BlockStone.VARIANT, BlockStone.EnumStoneVariant.GRANITE)));
++        assertTrue(pred.a(Blocks.STONE.getBlockData().set(BlockStone.VARIANT, BlockStone.EnumStoneVariant.DIORITE)));
++        assertTrue(pred.a(Blocks.STONE.getBlockData().set(BlockStone.VARIANT, BlockStone.EnumStoneVariant.ANDESITE)));
++        assertFalse(pred.a(Blocks.DIRT.getBlockData()));
++        assertFalse(pred.a(Blocks.AIR.getBlockData()));
++        assertFalse(pred.a(Blocks.STONE.getBlockData().set(BlockStone.VARIANT, BlockStone.EnumStoneVariant.GRANITE_SMOOTH)));
++    }
++
++    @Test
++    public void testChunkFBenchmark() throws Exception {
++        ChunkSection[] sections = new ChunkSection[16];
++        for (int s = 0; s < 5; ++s) {
++            sections[s] = new ChunkSection(s << 4, true);
++        }
++        IBlockData stone = Blocks.STONE.getBlockData();
++        for (int x = 0; x < 16; ++x) {
++            for (int z = 0; z < 16; ++z) {
++                for (int y = 0; y < 56; ++y) {
++                    sections[y >> 4].setType(x, y & 15, z, stone);
++                }
++            }
++        }
++
++        Chunk chunk = createTestChunk(sections);
++        Field hField = Chunk.class.getDeclaredField("h");
++        hField.setAccessible(true);
++        int[] chunkH = (int[]) hField.get(chunk);
++        int[] refH = new int[256];
++
++        BlockPosition[] queries = new BlockPosition[256];
++        for (int i = 0; i < 256; ++i) {
++            queries[i] = new BlockPosition(i & 15, 0, i >> 4);
++        }
++
++        long blackhole = 0L;
++        for (int w = 0; w < 300; ++w) {
++            Arrays.fill(refH, -999);
++            Arrays.fill(chunkH, -999);
++            for (int i = 0; i < 256; ++i) {
++                blackhole ^= vanillaChunkFReference(chunk, refH, queries[i]).getY();
++                blackhole ^= chunk.f(queries[i]).getY();
++            }
++        }
++
++        int chunks = 600;
++        long t0 = System.nanoTime();
++        for (int c = 0; c < chunks; ++c) {
++            Arrays.fill(refH, -999);
++            for (int i = 0; i < 256; ++i) {
++                blackhole += vanillaChunkFReference(chunk, refH, queries[i]).getY();
++            }
++        }
++        long vanillaNs = (System.nanoTime() - t0) / chunks;
++
++        t0 = System.nanoTime();
++        for (int c = 0; c < chunks; ++c) {
++            Arrays.fill(chunkH, -999);
++            for (int i = 0; i < 256; ++i) {
++                blackhole += chunk.f(queries[i]).getY();
++            }
++        }
++        long optNs = (System.nanoTime() - t0) / chunks;
++
++        System.out.printf("A7_BENCH chunkF256_vanilla_ns=%d chunkF256_opt_ns=%d speedup=%.2fx blackhole=%d%n",
++                vanillaNs, optNs, (double) vanillaNs / Math.max(1L, optNs), blackhole);
++
++        assertTrue("Expected Chunk.f speedup > 1.2x, got " + vanillaNs + " vs " + optNs, optNs * 1.2 < vanillaNs);
++    }
++}
