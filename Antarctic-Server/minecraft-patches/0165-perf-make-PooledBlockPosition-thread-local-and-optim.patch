@@ -1,0 +1,501 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 12:11:55 +0700
+Subject: [PATCH 165/165] perf: make PooledBlockPosition thread-local and
+ optimize Entity.checkBlockCollisions
+
+
+diff --git a/main/java/net/minecraft/server/BlockDataAbstract.java b/main/java/net/minecraft/server/BlockDataAbstract.java
+index 562ca56..f460c2e 100644
+--- a/main/java/net/minecraft/server/BlockDataAbstract.java
++++ b/main/java/net/minecraft/server/BlockDataAbstract.java
+@@ -34,8 +34,25 @@ public abstract class BlockDataAbstract implements IBlockData {
+         }
+     };
+ 
+-    // Antarctic start - per-state cached collision shape for FastVoxelCache
++    // Antarctic start - per-state cached collision shape and entity-collision callback flag
++    private static final ClassValue<Boolean> HAS_ENTITY_COLLIDE_CALLBACK = new ClassValue<Boolean>() {
++        @Override
++        protected Boolean computeValue(Class<?> type) {
++            Class<?> cur = type;
++            while (cur != null && cur != Block.class && cur != Object.class) {
++                try {
++                    cur.getDeclaredMethod("a", World.class, BlockPosition.class, IBlockData.class, Entity.class);
++                    return Boolean.TRUE;
++                } catch (NoSuchMethodException ignored) {
++                    cur = cur.getSuperclass();
++                }
++            }
++            return Boolean.FALSE;
++        }
++    };
++
+     private me.stella.antarctic.spatial.FastVoxelCache.ShapeType antarcticShape;
++    private byte antarcticEntityCollideFlag;
+ 
+     public final me.stella.antarctic.spatial.FastVoxelCache.ShapeType antarcticShapeType() {
+         me.stella.antarctic.spatial.FastVoxelCache.ShapeType shape = this.antarcticShape;
+@@ -45,6 +62,15 @@ public abstract class BlockDataAbstract implements IBlockData {
+         }
+         return shape;
+     }
++
++    public final boolean antarcticHasEntityCollisionCallback() {
++        byte flag = this.antarcticEntityCollideFlag;
++        if (flag == 0) {
++            flag = HAS_ENTITY_COLLIDE_CALLBACK.get(this.getBlock().getClass()) ? (byte) 2 : (byte) 1;
++            this.antarcticEntityCollideFlag = flag;
++        }
++        return flag == 2;
++    }
+     // Antarctic end
+ 
+     public BlockDataAbstract() {}
+diff --git a/main/java/net/minecraft/server/BlockPosition.java b/main/java/net/minecraft/server/BlockPosition.java
+index 4849fcb..d04236b 100644
+--- a/main/java/net/minecraft/server/BlockPosition.java
++++ b/main/java/net/minecraft/server/BlockPosition.java
+@@ -284,7 +284,9 @@ public class BlockPosition extends BaseBlockPosition {
+     public static final class PooledBlockPosition extends BlockPosition.MutableBlockPosition {
+ 
+         private boolean f;
+-        private static final List<BlockPosition.PooledBlockPosition> g = Lists.newArrayList();
++        private static final int POOL_LIMIT = 100;
++        private static final ThreadLocal<java.util.ArrayList<BlockPosition.PooledBlockPosition>> POOL =
++                ThreadLocal.withInitial(() -> new java.util.ArrayList<BlockPosition.PooledBlockPosition>(16));
+ 
+         private PooledBlockPosition(int i, int j, int k) {
+             super(i, j, k);
+@@ -300,17 +302,14 @@ public class BlockPosition extends BaseBlockPosition {
+         }
+ 
+         public static BlockPosition.PooledBlockPosition e(int i, int j, int k) {
+-            List list = BlockPosition.PooledBlockPosition.g;
+-
+-            synchronized (BlockPosition.PooledBlockPosition.g) {
+-                if (!BlockPosition.PooledBlockPosition.g.isEmpty()) {
+-                    BlockPosition.PooledBlockPosition blockposition_pooledblockposition = (BlockPosition.PooledBlockPosition) BlockPosition.PooledBlockPosition.g.remove(BlockPosition.PooledBlockPosition.g.size() - 1);
+-
+-                    if (blockposition_pooledblockposition != null && blockposition_pooledblockposition.f) {
+-                        blockposition_pooledblockposition.f = false;
+-                        blockposition_pooledblockposition.f(i, j, k);
+-                        return blockposition_pooledblockposition;
+-                    }
++            java.util.ArrayList<BlockPosition.PooledBlockPosition> pool = POOL.get();
++            int size = pool.size();
++            if (size > 0) {
++                BlockPosition.PooledBlockPosition blockposition_pooledblockposition = pool.remove(size - 1);
++                if (blockposition_pooledblockposition != null && blockposition_pooledblockposition.f) {
++                    blockposition_pooledblockposition.f = false;
++                    blockposition_pooledblockposition.f(i, j, k);
++                    return blockposition_pooledblockposition;
+                 }
+             }
+ 
+@@ -319,14 +318,10 @@ public class BlockPosition extends BaseBlockPosition {
+ 
+         public void free() { t(); } // Paper - OBFHELPER
+         public void t() {
+-            List list = BlockPosition.PooledBlockPosition.g;
+-
+-            synchronized (BlockPosition.PooledBlockPosition.g) {
+-                if (BlockPosition.PooledBlockPosition.g.size() < 100) {
+-                    BlockPosition.PooledBlockPosition.g.add(this);
+-                }
+-
+-                this.f = true;
++            this.f = true;
++            java.util.ArrayList<BlockPosition.PooledBlockPosition> pool = POOL.get();
++            if (pool.size() < POOL_LIMIT) {
++                pool.add(this);
+             }
+         }
+ 
+diff --git a/main/java/net/minecraft/server/Entity.java b/main/java/net/minecraft/server/Entity.java
+index 555a88d..339a332 100644
+--- a/main/java/net/minecraft/server/Entity.java
++++ b/main/java/net/minecraft/server/Entity.java
+@@ -1004,37 +1004,107 @@ public abstract class Entity implements ICommandListener, KeyedObject { // Paper
+         return SoundEffects.bZ;
+     }
+ 
++    private static final ClassValue<Boolean> HAS_BLOCK_ENTER_CALLBACK = new ClassValue<Boolean>() {
++        @Override
++        protected Boolean computeValue(Class<?> type) {
++            Class<?> cur = type;
++            while (cur != null && cur != Entity.class && cur != Object.class) {
++                try {
++                    cur.getDeclaredMethod("a", IBlockData.class);
++                    return Boolean.TRUE;
++                } catch (NoSuchMethodException ignored) {
++                    cur = cur.getSuperclass();
++                }
++            }
++            return Boolean.FALSE;
++        }
++    };
++
+     protected void checkBlockCollisions() {
+         AxisAlignedBB axisalignedbb = this.getBoundingBox();
+-        BlockPosition.PooledBlockPosition blockposition_pooledblockposition = BlockPosition.PooledBlockPosition.d(axisalignedbb.a + 0.001D, axisalignedbb.b + 0.001D, axisalignedbb.c + 0.001D);
+-        BlockPosition.PooledBlockPosition blockposition_pooledblockposition1 = BlockPosition.PooledBlockPosition.d(axisalignedbb.d - 0.001D, axisalignedbb.e - 0.001D, axisalignedbb.f - 0.001D);
+-        BlockPosition.PooledBlockPosition blockposition_pooledblockposition2 = BlockPosition.PooledBlockPosition.s();
+-
+-        if (this.world.areChunksLoadedBetween(blockposition_pooledblockposition, blockposition_pooledblockposition1)) {
+-            for (int i = blockposition_pooledblockposition.getX(); i <= blockposition_pooledblockposition1.getX(); ++i) {
+-                for (int j = blockposition_pooledblockposition.getY(); j <= blockposition_pooledblockposition1.getY(); ++j) {
+-                    for (int k = blockposition_pooledblockposition.getZ(); k <= blockposition_pooledblockposition1.getZ(); ++k) {
+-                        blockposition_pooledblockposition2.f(i, j, k);
+-                        IBlockData iblockdata = this.world.getType(blockposition_pooledblockposition2);
+-
+-                        try {
+-                            iblockdata.getBlock().a(this.world, (BlockPosition) blockposition_pooledblockposition2, iblockdata, this);
+-                            this.a(iblockdata);
+-                        } catch (Throwable throwable) {
+-                            CrashReport crashreport = CrashReport.a(throwable, "Colliding entity with block");
+-                            CrashReportSystemDetails crashreportsystemdetails = crashreport.a("Block being collided with");
++        int minX = MathHelper.floor(axisalignedbb.a + 0.001D);
++        int minY = MathHelper.floor(axisalignedbb.b + 0.001D);
++        int minZ = MathHelper.floor(axisalignedbb.c + 0.001D);
++        int maxX = MathHelper.floor(axisalignedbb.d - 0.001D);
++        int maxY = MathHelper.floor(axisalignedbb.e - 0.001D);
++        int maxZ = MathHelper.floor(axisalignedbb.f - 0.001D);
++
++        if (!this.world.areChunksLoadedBetween(minX, minY, minZ, maxX, maxY, maxZ)) {
++            return;
++        }
++
++        boolean hasEnterCallback = HAS_BLOCK_ENTER_CALLBACK.get(this.getClass());
++        int loopMinY = hasEnterCallback ? minY : Math.max(0, minY);
++        int loopMaxY = hasEnterCallback ? maxY : Math.min(255, maxY);
++        if (loopMinY > loopMaxY) {
++            return;
++        }
++
++        BlockPosition.MutableBlockPosition pos = null;
++        int cachedChunkX = Integer.MIN_VALUE;
++        int cachedChunkZ = Integer.MIN_VALUE;
++        Chunk cachedChunk = null;
++        ChunkSection[] sections = null;
++        IBlockData air = Blocks.AIR.getBlockData();
++
++        for (int i = minX; i <= maxX; ++i) {
++            int cx = i >> 4;
++            for (int k = minZ; k <= maxZ; ++k) {
++                int cz = k >> 4;
++                if (cx != cachedChunkX || cz != cachedChunkZ) {
++                    cachedChunkX = cx;
++                    cachedChunkZ = cz;
++                    cachedChunk = this.world.getChunkIfLoaded(cx, cz);
++                    sections = cachedChunk != null ? cachedChunk.getSections() : null;
++                }
++                if (sections == null) {
++                    continue;
++                }
++
++                int localX = i & 15;
++                int localZ = k & 15;
++                for (int j = loopMinY; j <= loopMaxY; ++j) {
++                    IBlockData iblockdata;
++                    if (j >= 0 && j < 256) {
++                        ChunkSection sec = sections[j >> 4];
++                        if (sec == Chunk.a || sec.a()) {
++                            if (!hasEnterCallback) {
++                                j = j | 15;
++                            }
++                            continue;
++                        }
++                        iblockdata = sec.getType(localX, j & 15, localZ);
++                    } else {
++                        iblockdata = air;
++                    }
++
++                    boolean hasBlockCb = !(iblockdata instanceof BlockDataAbstract) || ((BlockDataAbstract) iblockdata).antarcticHasEntityCollisionCallback();
++                    if (!hasBlockCb && !hasEnterCallback) {
++                        continue;
++                    }
++
++                    if (pos == null) {
++                        pos = new BlockPosition.MutableBlockPosition();
++                    }
++                    pos.c(i, j, k);
+ 
+-                            CrashReportSystemDetails.a(crashreportsystemdetails, blockposition_pooledblockposition2, iblockdata);
+-                            throw new ReportedException(crashreport);
++                    try {
++                        if (hasBlockCb) {
++                            iblockdata.getBlock().a(this.world, (BlockPosition) pos, iblockdata, this);
+                         }
++                        if (hasEnterCallback) {
++                            this.a(iblockdata);
++                        }
++                    } catch (Throwable throwable) {
++                        CrashReport crashreport = CrashReport.a(throwable, "Colliding entity with block");
++                        CrashReportSystemDetails crashreportsystemdetails = crashreport.a("Block being collided with");
++
++                        CrashReportSystemDetails.a(crashreportsystemdetails, pos, iblockdata);
++                        throw new ReportedException(crashreport);
+                     }
+                 }
+             }
+         }
+-
+-        blockposition_pooledblockposition.t();
+-        blockposition_pooledblockposition1.t();
+-        blockposition_pooledblockposition2.t();
+     }
+ 
+     protected void a(IBlockData iblockdata) {}
+diff --git a/main/java/net/minecraft/server/World.java b/main/java/net/minecraft/server/World.java
+index 33ae2b3..14f9c78 100644
+--- a/main/java/net/minecraft/server/World.java
++++ b/main/java/net/minecraft/server/World.java
+@@ -344,6 +344,10 @@ public abstract class World implements IBlockAccess {
+         return this.areChunksLoadedBetween(blockposition, blockposition1, true);
+     }
+ 
++    public boolean areChunksLoadedBetween(int minX, int minY, int minZ, int maxX, int maxY, int maxZ) {
++        return this.isAreaLoaded(minX, minY, minZ, maxX, maxY, maxZ, true);
++    }
++
+     public boolean areChunksLoadedBetween(BlockPosition blockposition, BlockPosition blockposition1, boolean flag) {
+         return this.isAreaLoaded(blockposition.getX(), blockposition.getY(), blockposition.getZ(), blockposition1.getX(), blockposition1.getY(), blockposition1.getZ(), flag);
+     }
+diff --git a/test/java/net/minecraft/server/EntityBlockCollisionAndPoolPerfTest.java b/test/java/net/minecraft/server/EntityBlockCollisionAndPoolPerfTest.java
+new file mode 100644
+index 0000000..f23b6aa
+--- /dev/null
++++ b/test/java/net/minecraft/server/EntityBlockCollisionAndPoolPerfTest.java
+@@ -0,0 +1,231 @@
++package net.minecraft.server;
++
++import com.sun.management.ThreadMXBean;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++import java.lang.management.ManagementFactory;
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.concurrent.Callable;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.Future;
++
++import static org.junit.Assert.*;
++
++public class EntityBlockCollisionAndPoolPerfTest {
++
++    private static Unsafe UNSAFE;
++
++    @BeforeClass
++    public static void setup() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        UNSAFE = (Unsafe) f.get(null);
++    }
++
++    private static final class SyncedPooledPos {
++        private boolean released;
++        int x, y, z;
++        private static final List<SyncedPooledPos> POOL = new ArrayList<SyncedPooledPos>();
++
++        static SyncedPooledPos acquire(int x, int y, int z) {
++            synchronized (POOL) {
++                if (!POOL.isEmpty()) {
++                    SyncedPooledPos p = POOL.remove(POOL.size() - 1);
++                    if (p != null && p.released) {
++                        p.released = false;
++                        p.x = x;
++                        p.y = y;
++                        p.z = z;
++                        return p;
++                    }
++                }
++            }
++            SyncedPooledPos p = new SyncedPooledPos();
++            p.x = x;
++            p.y = y;
++            p.z = z;
++            return p;
++        }
++
++        void free() {
++            synchronized (POOL) {
++                if (POOL.size() < 100) {
++                    POOL.add(this);
++                }
++                this.released = true;
++            }
++        }
++    }
++
++    @Test
++    public void testBlockCollisionCallbackDetectionAndPoolParity() throws Exception {
++        assertFalse(((BlockDataAbstract) Blocks.AIR.getBlockData()).antarcticHasEntityCollisionCallback());
++        assertFalse(((BlockDataAbstract) Blocks.STONE.getBlockData()).antarcticHasEntityCollisionCallback());
++        assertFalse(((BlockDataAbstract) Blocks.DIRT.getBlockData()).antarcticHasEntityCollisionCallback());
++        assertFalse(((BlockDataAbstract) Blocks.GRASS.getBlockData()).antarcticHasEntityCollisionCallback());
++        assertFalse(((BlockDataAbstract) Blocks.SAND.getBlockData()).antarcticHasEntityCollisionCallback());
++        assertFalse(((BlockDataAbstract) Blocks.FIRE.getBlockData()).antarcticHasEntityCollisionCallback());
++        assertFalse(((BlockDataAbstract) Blocks.HOPPER.getBlockData()).antarcticHasEntityCollisionCallback());
++
++        assertTrue(((BlockDataAbstract) Blocks.CACTUS.getBlockData()).antarcticHasEntityCollisionCallback());
++        assertTrue(((BlockDataAbstract) Blocks.WEB.getBlockData()).antarcticHasEntityCollisionCallback());
++        assertTrue(((BlockDataAbstract) Blocks.SOUL_SAND.getBlockData()).antarcticHasEntityCollisionCallback());
++        assertTrue(((BlockDataAbstract) Blocks.PORTAL.getBlockData()).antarcticHasEntityCollisionCallback());
++        assertTrue(((BlockDataAbstract) Blocks.WOODEN_PRESSURE_PLATE.getBlockData()).antarcticHasEntityCollisionCallback());
++        assertTrue(((BlockDataAbstract) Blocks.TRIPWIRE.getBlockData()).antarcticHasEntityCollisionCallback());
++        assertTrue(((BlockDataAbstract) Blocks.cauldron.getBlockData()).antarcticHasEntityCollisionCallback());
++
++        // Pool reuse & non-aliasing
++        BlockPosition.PooledBlockPosition p1 = BlockPosition.PooledBlockPosition.e(1, 2, 3);
++        BlockPosition.PooledBlockPosition p2 = BlockPosition.PooledBlockPosition.e(4, 5, 6);
++        assertNotSame(p1, p2);
++        assertEquals(1, p1.getX());
++        assertEquals(5, p2.getY());
++        p2.t();
++        p1.t();
++
++        BlockPosition.PooledBlockPosition p3 = BlockPosition.PooledBlockPosition.e(7, 8, 9);
++        assertSame(p1, p3);
++        assertEquals(7, p3.getX());
++        assertEquals(8, p3.getY());
++        assertEquals(9, p3.getZ());
++        p3.t();
++
++        // 2-thread isolation check
++        ExecutorService exec = Executors.newFixedThreadPool(2);
++        try {
++            Callable<Boolean> task = () -> {
++                for (int i = 0; i < 5000; ++i) {
++                    BlockPosition.PooledBlockPosition a = BlockPosition.PooledBlockPosition.e(i, i + 1, i + 2);
++                    BlockPosition.PooledBlockPosition b = BlockPosition.PooledBlockPosition.e(i + 3, i + 4, i + 5);
++                    if (a == b || a.getX() != i || b.getZ() != i + 5) {
++                        return false;
++                    }
++                    b.t();
++                    a.t();
++                }
++                return true;
++            };
++            Future<Boolean> f1 = exec.submit(task);
++            Future<Boolean> f2 = exec.submit(task);
++            assertTrue(f1.get());
++            assertTrue(f2.get());
++        } finally {
++            exec.shutdownNow();
++        }
++    }
++
++    @Test
++    public void testPooledBlockPositionAndCheckBlockCollisionsBenchmark() throws Exception {
++        ThreadMXBean threadBean = (ThreadMXBean) ManagementFactory.getThreadMXBean();
++        long tid = Thread.currentThread().getId();
++
++        // Warmup PooledBlockPosition on main thread
++        for (int w = 0; w < 5000; ++w) {
++            BlockPosition.PooledBlockPosition a = BlockPosition.PooledBlockPosition.e(1, 2, 3);
++            BlockPosition.PooledBlockPosition b = BlockPosition.PooledBlockPosition.e(4, 5, 6);
++            BlockPosition.PooledBlockPosition c = BlockPosition.PooledBlockPosition.s();
++            c.t();
++            b.t();
++            a.t();
++        }
++
++        long allocBefore = threadBean.getThreadAllocatedBytes(tid);
++        long sink = 0L;
++        for (int i = 0; i < 10000; ++i) {
++            BlockPosition.PooledBlockPosition a = BlockPosition.PooledBlockPosition.e(i, 64, i);
++            BlockPosition.PooledBlockPosition b = BlockPosition.PooledBlockPosition.e(i + 1, 65, i + 1);
++            BlockPosition.PooledBlockPosition c = BlockPosition.PooledBlockPosition.s();
++            c.f(i, 64, i);
++            sink += a.getX() + b.getY() + c.getZ();
++            c.t();
++            b.t();
++            a.t();
++        }
++        long allocBytes = Math.max(0L, threadBean.getThreadAllocatedBytes(tid) - allocBefore);
++        assertEquals("Steady-state PooledBlockPosition acquire/free must allocate 0 bytes", 0L, allocBytes);
++
++        // 2-thread contention benchmark: SyncedPooledPos vs ThreadLocal PooledBlockPosition
++        ExecutorService exec = Executors.newFixedThreadPool(2);
++        try {
++            final java.util.concurrent.CyclicBarrier barrier = new java.util.concurrent.CyclicBarrier(2);
++            Callable<Long> syncWork = () -> {
++                long s = 0L;
++                for (int i = 0; i < 100000; ++i) {
++                    SyncedPooledPos a = SyncedPooledPos.acquire(i, 64, i);
++                    SyncedPooledPos b = SyncedPooledPos.acquire(i + 1, 65, i + 1);
++                    SyncedPooledPos c = SyncedPooledPos.acquire(0, 0, 0);
++                    c.x = i;
++                    s += a.x + b.y + c.z;
++                    c.free();
++                    b.free();
++                    a.free();
++                }
++                barrier.await();
++                for (int i = 0; i < 500000; ++i) {
++                    SyncedPooledPos a = SyncedPooledPos.acquire(i, 64, i);
++                    SyncedPooledPos b = SyncedPooledPos.acquire(i + 1, 65, i + 1);
++                    SyncedPooledPos c = SyncedPooledPos.acquire(0, 0, 0);
++                    c.x = i;
++                    s += a.x + b.y + c.z;
++                    c.free();
++                    b.free();
++                    a.free();
++                }
++                return s;
++            };
++            Callable<Long> tlWork = () -> {
++                long s = 0L;
++                for (int i = 0; i < 100000; ++i) {
++                    BlockPosition.PooledBlockPosition a = BlockPosition.PooledBlockPosition.e(i, 64, i);
++                    BlockPosition.PooledBlockPosition b = BlockPosition.PooledBlockPosition.e(i + 1, 65, i + 1);
++                    BlockPosition.PooledBlockPosition c = BlockPosition.PooledBlockPosition.s();
++                    c.f(i, 64, i);
++                    s += a.getX() + b.getY() + c.getZ();
++                    c.t();
++                    b.t();
++                    a.t();
++                }
++                barrier.await();
++                for (int i = 0; i < 500000; ++i) {
++                    BlockPosition.PooledBlockPosition a = BlockPosition.PooledBlockPosition.e(i, 64, i);
++                    BlockPosition.PooledBlockPosition b = BlockPosition.PooledBlockPosition.e(i + 1, 65, i + 1);
++                    BlockPosition.PooledBlockPosition c = BlockPosition.PooledBlockPosition.s();
++                    c.f(i, 64, i);
++                    s += a.getX() + b.getY() + c.getZ();
++                    c.t();
++                    b.t();
++                    a.t();
++                }
++                return s;
++            };
++
++            long t0 = System.nanoTime();
++            Future<Long> s1 = exec.submit(syncWork);
++            Future<Long> s2 = exec.submit(syncWork);
++            sink += s1.get() + s2.get();
++            long syncNs = System.nanoTime() - t0;
++
++            t0 = System.nanoTime();
++            Future<Long> o1 = exec.submit(tlWork);
++            Future<Long> o2 = exec.submit(tlWork);
++            sink += o1.get() + o2.get();
++            long optNs = System.nanoTime() - t0;
++
++            double speedup = (double) syncNs / Math.max(1L, optNs);
++            System.out.printf("B1_BENCH pool2t_sync_ns=%d pool2t_opt_ns=%d speedup=%.2fx steady_alloc=%d blackhole=%d%n",
++                    syncNs, optNs, speedup, allocBytes, sink);
++
++            assertTrue("Expected PooledBlockPosition 2-thread speedup > 1.5x, got " + syncNs + " vs " + optNs,
++                    optNs * 1.5 < syncNs);
++        } finally {
++            exec.shutdownNow();
++        }
++    }
++}
