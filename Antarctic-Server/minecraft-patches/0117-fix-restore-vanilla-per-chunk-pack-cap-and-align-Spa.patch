@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Mon, 23 Nov 2026 13:45:14 +0700
-Subject: [PATCH 117/173] fix: restore vanilla per-chunk pack cap and align
+Subject: [PATCH 117/174] fix: restore vanilla per-chunk pack cap and align
  SpawnerCreature cap divisor
 
 

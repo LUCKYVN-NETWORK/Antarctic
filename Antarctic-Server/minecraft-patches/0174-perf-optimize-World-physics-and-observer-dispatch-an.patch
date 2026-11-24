@@ -1,0 +1,518 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 15:42:09 +0700
+Subject: [PATCH 174/174] perf: optimize World physics and observer dispatch
+ and cache EnumDirection arrays
+
+
+diff --git a/main/java/net/minecraft/server/Block.java b/main/java/net/minecraft/server/Block.java
+index 3e2f526..d77863c 100644
+--- a/main/java/net/minecraft/server/Block.java
++++ b/main/java/net/minecraft/server/Block.java
+@@ -153,7 +153,20 @@ public class Block {
+         return iblockdata;
+     }
+ 
++    private static final ClassValue<Boolean> NEIGHBOR_PHYSICS_CACHE = new ClassValue<Boolean>() {
++        @Override
++        protected Boolean computeValue(Class<?> type) {
++            try {
++                return type.getMethod("a", IBlockData.class, World.class, BlockPosition.class, Block.class, BlockPosition.class).getDeclaringClass() != Block.class;
++            } catch (Throwable ignored) {
++                return Boolean.TRUE;
++            }
++        }
++    };
++    final boolean hasNeighborPhysics;
++
+     public Block(Material material, MaterialMapColor materialmapcolor) {
++        this.hasNeighborPhysics = NEIGHBOR_PHYSICS_CACHE.get(this.getClass()).booleanValue();
+         this.s = true;
+         this.stepSound = SoundEffectType.d;
+         this.w = 1.0F;
+diff --git a/main/java/net/minecraft/server/EnumDirection.java b/main/java/net/minecraft/server/EnumDirection.java
+index 0abe44a..a83f0ff 100644
+--- a/main/java/net/minecraft/server/EnumDirection.java
++++ b/main/java/net/minecraft/server/EnumDirection.java
+@@ -175,6 +175,10 @@ public enum EnumDirection implements INamable {
+         return entityliving.getDirection().opposite();
+     }
+ 
++    static final EnumDirection[] VALUES = values();
++    static final EnumDirection[] HORIZONTAL = {NORTH, EAST, SOUTH, WEST};
++    static final EnumDirection[] VERTICAL = {UP, DOWN};
++
+     static {
+         EnumDirection[] aenumdirection = values();
+         int i = aenumdirection.length;
+diff --git a/main/java/net/minecraft/server/World.java b/main/java/net/minecraft/server/World.java
+index ca1cadd..8e28f43 100644
+--- a/main/java/net/minecraft/server/World.java
++++ b/main/java/net/minecraft/server/World.java
+@@ -488,12 +488,12 @@ public abstract class World implements IBlockAccess {
+         }
+ 
+         if (!this.isClientSide && (i & 1) != 0) {
+-            this.update(blockposition, oldBlock.getBlock(), true);
++            this.update(blockposition, oldBlock.getBlock(), true, chunk);
+             if (newBlock.n()) {
+                 this.updateAdjacentComparators(blockposition, newBlock.getBlock());
+             }
+         } else if (!this.isClientSide && (i & 16) == 0) {
+-            this.c(blockposition, newBlock.getBlock());
++            this.c(blockposition, newBlock.getBlock(), chunk);
+         }
+     }
+     // CraftBukkit end
+@@ -530,13 +530,17 @@ public abstract class World implements IBlockAccess {
+     }
+ 
+     public void update(BlockPosition blockposition, Block block, boolean flag) {
++        this.update(blockposition, block, flag, null);
++    }
++
++    private void update(BlockPosition blockposition, Block block, boolean flag, @Nullable Chunk chunk) {
+         if (this.worldData.getType() != WorldType.DEBUG_ALL_BLOCK_STATES) {
+             // CraftBukkit start
+             if (populating) {
+                 return;
+             }
+             // CraftBukkit end
+-            this.applyPhysics(blockposition, block, flag);
++            this.applyPhysics(blockposition, block, flag, chunk);
+         }
+ 
+     }
+@@ -570,55 +574,165 @@ public abstract class World implements IBlockAccess {
+ 
+     }
+ 
+-    public void c(BlockPosition blockposition, Block block) {
+-        this.b(blockposition.west(), block, blockposition);
+-        this.b(blockposition.east(), block, blockposition);
+-        this.b(blockposition.down(), block, blockposition);
+-        this.b(blockposition.up(), block, blockposition);
+-        this.b(blockposition.north(), block, blockposition);
+-        this.b(blockposition.south(), block, blockposition);
++    private IBlockData getTypeCached(@Nullable Chunk chunk, int x, int y, int z) {
++        if (chunk != null && !this.captureTreeGeneration && (x >> 4) == chunk.locX && (z >> 4) == chunk.locZ) {
++            return chunk.getBlockData(x, y, z);
++        }
++        return this.getType(x, y, z);
+     }
+ 
+-    public void applyPhysics(BlockPosition blockposition, Block block, boolean flag) {
+-        if (captureBlockStates) { return; } // Paper - Cancel all physics during placement
+-        this.a(blockposition.west(), block, blockposition);
+-        this.a(blockposition.east(), block, blockposition);
+-        this.a(blockposition.down(), block, blockposition);
+-        this.a(blockposition.up(), block, blockposition);
+-        this.a(blockposition.north(), block, blockposition);
+-        this.a(blockposition.south(), block, blockposition);
+-        if (flag) {
+-            this.c(blockposition, block);
++    private boolean shouldFirePhysicsEvent() {
++        if (this.isClientSide || !(this instanceof WorldServer)) {
++            return false;
+         }
++        WorldServer ws = (WorldServer) this;
++        return ws.getWorld() != null && !ws.stopPhysicsEvent && BlockPhysicsEvent.getHandlerList().getRegisteredListeners().length != 0;
++    }
+ 
+-        this.chunkPacketBlockController.updateNearbyBlocks(this, blockposition); // Paper - Anti-Xray
++    public void c(BlockPosition blockposition, Block block) {
++        this.c(blockposition, block, null);
+     }
+ 
+-    public void a(BlockPosition blockposition, Block block, EnumDirection enumdirection) {
+-        if (enumdirection != EnumDirection.WEST) {
+-            this.a(blockposition.west(), block, blockposition);
++    private void c(BlockPosition blockposition, Block block, @Nullable Chunk chunk) {
++        if (this.isClientSide) {
++            return;
+         }
++        int x = blockposition.getX();
++        int y = blockposition.getY();
++        int z = blockposition.getZ();
++        this.notifyObserver(chunk, x - 1, y, z, block, blockposition);
++        this.notifyObserver(chunk, x + 1, y, z, block, blockposition);
++        this.notifyObserver(chunk, x, y - 1, z, block, blockposition);
++        this.notifyObserver(chunk, x, y + 1, z, block, blockposition);
++        this.notifyObserver(chunk, x, y, z - 1, block, blockposition);
++        this.notifyObserver(chunk, x, y, z + 1, block, blockposition);
++    }
+ 
+-        if (enumdirection != EnumDirection.EAST) {
+-            this.a(blockposition.east(), block, blockposition);
++    private void notifyObserver(@Nullable Chunk chunk, int nx, int ny, int nz, final Block block, BlockPosition sourcePos) {
++        IBlockData iblockdata = this.getTypeCached(chunk, nx, ny, nz);
++        if (iblockdata.getBlock() != Blocks.dk) {
++            return;
+         }
++        BlockPosition blockposition = new BlockPosition(nx, ny, nz);
++        try {
++            ((BlockObserver) iblockdata.getBlock()).b(iblockdata, this, blockposition, block, sourcePos);
++        } catch (Throwable throwable) {
++            CrashReport crashreport = CrashReport.a(throwable, "Exception while updating neighbours");
++            CrashReportSystemDetails crashreportsystemdetails = crashreport.a("Block being updated");
++
++            crashreportsystemdetails.a("Source block type", new CrashReportCallable() {
++                public String a() throws Exception {
++                    try {
++                        return String.format("ID #%d (%s // %s)", new Object[] { Integer.valueOf(Block.getId(block)), block.a(), block.getClass().getCanonicalName()});
++                    } catch (Throwable throwable) {
++                        return "ID #" + Block.getId(block);
++                    }
++                }
+ 
+-        if (enumdirection != EnumDirection.DOWN) {
+-            this.a(blockposition.down(), block, blockposition);
++                public Object call() throws Exception {
++                    return this.a();
++                }
++            });
++            CrashReportSystemDetails.a(crashreportsystemdetails, blockposition, iblockdata);
++            throw new ReportedException(crashreport);
+         }
++    }
+ 
+-        if (enumdirection != EnumDirection.UP) {
+-            this.a(blockposition.up(), block, blockposition);
++    public void applyPhysics(BlockPosition blockposition, Block block, boolean flag) {
++        this.applyPhysics(blockposition, block, flag, null);
++    }
++
++    private void applyPhysics(BlockPosition blockposition, Block block, boolean flag, @Nullable Chunk chunk) {
++        if (captureBlockStates) { return; } // Paper - Cancel all physics during placement
++        if (!this.isClientSide) {
++            boolean firePhysicsEvent = this.shouldFirePhysicsEvent();
++            int x = blockposition.getX();
++            int y = blockposition.getY();
++            int z = blockposition.getZ();
++            this.notifyNeighbor(chunk, x - 1, y, z, block, blockposition, firePhysicsEvent);
++            this.notifyNeighbor(chunk, x + 1, y, z, block, blockposition, firePhysicsEvent);
++            this.notifyNeighbor(chunk, x, y - 1, z, block, blockposition, firePhysicsEvent);
++            this.notifyNeighbor(chunk, x, y + 1, z, block, blockposition, firePhysicsEvent);
++            this.notifyNeighbor(chunk, x, y, z - 1, block, blockposition, firePhysicsEvent);
++            this.notifyNeighbor(chunk, x, y, z + 1, block, blockposition, firePhysicsEvent);
++            if (flag) {
++                this.c(blockposition, block, chunk);
++            }
+         }
+ 
+-        if (enumdirection != EnumDirection.NORTH) {
+-            this.a(blockposition.north(), block, blockposition);
++        this.chunkPacketBlockController.updateNearbyBlocks(this, blockposition); // Paper - Anti-Xray
++    }
++
++    public void a(BlockPosition blockposition, Block block, EnumDirection enumdirection) {
++        if (!this.isClientSide) {
++            boolean firePhysicsEvent = this.shouldFirePhysicsEvent();
++            int x = blockposition.getX();
++            int y = blockposition.getY();
++            int z = blockposition.getZ();
++            if (enumdirection != EnumDirection.WEST) {
++                this.notifyNeighbor(null, x - 1, y, z, block, blockposition, firePhysicsEvent);
++            }
++            if (enumdirection != EnumDirection.EAST) {
++                this.notifyNeighbor(null, x + 1, y, z, block, blockposition, firePhysicsEvent);
++            }
++            if (enumdirection != EnumDirection.DOWN) {
++                this.notifyNeighbor(null, x, y - 1, z, block, blockposition, firePhysicsEvent);
++            }
++            if (enumdirection != EnumDirection.UP) {
++                this.notifyNeighbor(null, x, y + 1, z, block, blockposition, firePhysicsEvent);
++            }
++            if (enumdirection != EnumDirection.NORTH) {
++                this.notifyNeighbor(null, x, y, z - 1, block, blockposition, firePhysicsEvent);
++            }
++            if (enumdirection != EnumDirection.SOUTH) {
++                this.notifyNeighbor(null, x, y, z + 1, block, blockposition, firePhysicsEvent);
++            }
+         }
++    }
+ 
+-        if (enumdirection != EnumDirection.SOUTH) {
+-            this.a(blockposition.south(), block, blockposition);
++    private void notifyNeighbor(@Nullable Chunk chunk, int nx, int ny, int nz, final Block block, BlockPosition sourcePos, boolean firePhysicsEvent) {
++        IBlockData iblockdata = this.getTypeCached(chunk, nx, ny, nz);
++        if (!firePhysicsEvent && !iblockdata.getBlock().hasNeighborPhysics) {
++            return;
+         }
++        BlockPosition blockposition = new BlockPosition(nx, ny, nz);
++        try {
++            // CraftBukkit start
++            if (firePhysicsEvent) {
++                CraftWorld world = ((WorldServer) this).getWorld();
++                BlockPhysicsEvent event = new BlockPhysicsEvent(world.getBlockAt(nx, ny, nz), CraftMagicNumbers.getId(block), sourcePos.getX(), sourcePos.getY(), sourcePos.getZ()); // Paper - add source block
++                this.getServer().getPluginManager().callEvent(event);
++
++                if (event.isCancelled()) {
++                    return;
++                }
++            }
++            // CraftBukkit end
++            iblockdata.doPhysics(this, blockposition, block, sourcePos);
++        } catch (StackOverflowError stackoverflowerror) { // Spigot Start
++            haveWeSilencedAPhysicsCrash = true;
++            blockLocation = nx + ", " + ny + ", " + nz;
++            // Spigot End
++        } catch (Throwable throwable) {
++            CrashReport crashreport = CrashReport.a(throwable, "Exception while updating neighbours");
++            CrashReportSystemDetails crashreportsystemdetails = crashreport.a("Block being updated");
+ 
++            crashreportsystemdetails.a("Source block type", new CrashReportCallable() {
++                public String a() throws Exception {
++                    try {
++                        return String.format("ID #%d (%s // %s)", new Object[] { Integer.valueOf(Block.getId(block)), block.a(), block.getClass().getCanonicalName()});
++                    } catch (Throwable throwable) {
++                        return "ID #" + Block.getId(block);
++                    }
++                }
++
++                public Object call() throws Exception {
++                    return this.a();
++                }
++            });
++            CrashReportSystemDetails.a(crashreportsystemdetails, blockposition, iblockdata);
++            throw new ReportedException(crashreport);
++        }
+     }
+ 
+     public void neighborChanged(BlockPosition pos, Block blockIn, BlockPosition fromPos) { a(pos, blockIn, fromPos); } // Paper - OBFHELPER
+diff --git a/test/java/net/minecraft/server/WorldPhysicsDispatchPerfTest.java b/test/java/net/minecraft/server/WorldPhysicsDispatchPerfTest.java
+new file mode 100644
+index 0000000..ce974b8
+--- /dev/null
++++ b/test/java/net/minecraft/server/WorldPhysicsDispatchPerfTest.java
+@@ -0,0 +1,230 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.antixray.ChunkPacketBlockController;
++import com.sun.management.ThreadMXBean;
++import java.lang.management.ManagementFactory;
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.List;
++import org.junit.Assert;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
++import org.spigotmc.SpigotWorldConfig;
++import sun.misc.Unsafe;
++
++public class WorldPhysicsDispatchPerfTest {
++
++    private static Unsafe unsafe;
++
++    @BeforeClass
++    public static void init() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        unsafe = (Unsafe) f.get(null);
++    }
++
++    private static final class TestWorld extends World {
++        Chunk chunk;
++        final List<String> trace = new ArrayList<>();
++
++        TestWorld() {
++            super(null, null, null, null, false, null, null);
++        }
++
++        @Override
++        protected IChunkProvider n() {
++            return null;
++        }
++
++        @Override
++        public Chunk getChunkIfLoaded(int x, int z) {
++            return (x == 0 && z == 0) ? chunk : null;
++        }
++
++        @Override
++        public Chunk getChunkAt(int x, int z) {
++            return chunk;
++        }
++
++        @Override
++        public boolean isChunkLoaded(int x, int z, boolean allowEmpty) {
++            return x == 0 && z == 0;
++        }
++    }
++
++    private static final class TestChunkProviderServer extends ChunkProviderServer {
++        final Long2ObjectOpenHashMap<Chunk> map = new Long2ObjectOpenHashMap<>();
++
++        TestChunkProviderServer() {
++            super(null, null, null);
++        }
++
++        @Override
++        public Chunk getChunkIfLoaded(int x, int z) {
++            return map.get(ChunkCoordIntPair.a(x, z));
++        }
++
++        @Override
++        public Chunk getChunkAt(int x, int z) {
++            return map.get(ChunkCoordIntPair.a(x, z));
++        }
++    }
++
++    private static TestWorld createWorld() throws Exception {
++        TestWorld world = (TestWorld) unsafe.allocateInstance(TestWorld.class);
++        Field traceField = TestWorld.class.getDeclaredField("trace");
++        traceField.setAccessible(true);
++        traceField.set(world, new ArrayList<String>());
++
++        Field cpcField = World.class.getDeclaredField("chunkPacketBlockController");
++        cpcField.setAccessible(true);
++        cpcField.set(world, new ChunkPacketBlockController() {});
++
++        world.worldData = new WorldData();
++        world.u = new ArrayList<>();
++        Field spigotField = World.class.getDeclaredField("spigotConfig");
++        spigotField.setAccessible(true);
++        spigotField.set(world, unsafe.allocateInstance(SpigotWorldConfig.class));
++
++        Chunk c = (Chunk) unsafe.allocateInstance(Chunk.class);
++        Field worldField = Chunk.class.getDeclaredField("world");
++        worldField.setAccessible(true);
++        worldField.set(c, world);
++        Field secField = Chunk.class.getDeclaredField("sections");
++        secField.setAccessible(true);
++        ChunkSection[] sections = new ChunkSection[16];
++        for (int i = 0; i < 16; i++) {
++            sections[i] = Chunk.a;
++        }
++        sections[4] = new ChunkSection(64, true);
++        secField.set(c, sections);
++        world.chunk = c;
++
++        TestChunkProviderServer cps = (TestChunkProviderServer) unsafe.allocateInstance(TestChunkProviderServer.class);
++        Field mapField = TestChunkProviderServer.class.getDeclaredField("map");
++        mapField.setAccessible(true);
++        Long2ObjectOpenHashMap<Chunk> map = new Long2ObjectOpenHashMap<>();
++        map.put(ChunkCoordIntPair.a(0, 0), c);
++        mapField.set(cps, map);
++        world.chunkProvider = cps;
++        return world;
++    }
++
++    @Test
++    public void testPhysicsAndObserverParity() throws Exception {
++        Assert.assertArrayEquals(EnumDirection.values(), EnumDirection.VALUES);
++        Assert.assertArrayEquals(EnumDirection.EnumDirectionLimit.HORIZONTAL.a(), EnumDirection.HORIZONTAL);
++        Assert.assertArrayEquals(EnumDirection.EnumDirectionLimit.VERTICAL.a(), EnumDirection.VERTICAL);
++
++        Assert.assertFalse(Blocks.AIR.hasNeighborPhysics);
++        Assert.assertFalse(Blocks.STONE.hasNeighborPhysics);
++        Assert.assertFalse(Blocks.DIRT.hasNeighborPhysics);
++        Assert.assertFalse(Blocks.GLASS.hasNeighborPhysics);
++
++        Assert.assertTrue(Blocks.REDSTONE_WIRE.hasNeighborPhysics);
++        Assert.assertTrue(Blocks.FLOWING_WATER.hasNeighborPhysics);
++        Assert.assertTrue(Blocks.SAND.hasNeighborPhysics);
++        Assert.assertTrue(Blocks.PISTON.hasNeighborPhysics);
++        Assert.assertTrue(Blocks.REDSTONE_TORCH.hasNeighborPhysics);
++        Assert.assertTrue(Blocks.dk.hasNeighborPhysics); // Blocks.OBSERVER
++
++        // Verify exact W, E, D, U, N, S order using a custom Block subclass overriding a(...)
++        TestWorld world = createWorld();
++        Block recordingBlock = new Block(Material.STONE) {
++            @Override
++            public void a(IBlockData iblockdata, World w, BlockPosition pos, Block sourceBlock, BlockPosition fromPos) {
++                ((TestWorld) w).trace.add(pos.getX() + "," + pos.getY() + "," + pos.getZ());
++            }
++        };
++        Assert.assertTrue(recordingBlock.hasNeighborPhysics);
++        IBlockData recData = recordingBlock.getBlockData();
++        ChunkSection sec = world.chunk.getSections()[4];
++        sec.setType(7, 0, 8, recData); // W
++        sec.setType(9, 0, 8, recData); // E
++        sec.setType(8, 1, 8, recData); // U
++        sec.setType(8, 0, 7, recData); // N
++        sec.setType(8, 0, 9, recData); // S
++        ChunkSection secBelow = new ChunkSection(48, true);
++        world.chunk.getSections()[3] = secBelow;
++        secBelow.setType(8, 15, 8, recData); // D (y=63)
++
++        world.applyPhysics(new BlockPosition(8, 64, 8), Blocks.STONE, false);
++        Assert.assertEquals(
++                Arrays.asList("7,64,8", "9,64,8", "8,63,8", "8,65,8", "8,64,7", "8,64,9"),
++                world.trace);
++
++        // Verify notifyAndUpdatePhysics also passes chunk cleanly and fires observer without error
++        sec.setType(8, 0, 8, Blocks.STONE.getBlockData());
++        sec.setType(7, 0, 8, Blocks.STONE.getBlockData());
++        sec.setType(9, 0, 8, Blocks.STONE.getBlockData());
++        secBelow.setType(8, 15, 8, Blocks.AIR.getBlockData());
++        world.notifyAndUpdatePhysics(new BlockPosition(8, 64, 8), world.chunk, Blocks.AIR.getBlockData(), Blocks.STONE.getBlockData(), 3);
++    }
++
++    @Test
++    public void testPhysicsDispatchBenchmark() throws Exception {
++        TestWorld world = createWorld();
++        ChunkSection sec = world.chunk.getSections()[4];
++        for (int dx = -1; dx <= 1; dx++) {
++            for (int dz = -1; dz <= 1; dz++) {
++                sec.setType(8 + dx, 1, 8 + dz, Blocks.STONE.getBlockData());
++            }
++        }
++        BlockPosition center = new BlockPosition(8, 65, 8);
++
++        ThreadMXBean bean = (ThreadMXBean) ManagementFactory.getThreadMXBean();
++        long tid = Thread.currentThread().getId();
++
++        for (int i = 0; i < 5000; i++) {
++            runVanillaApplyPhysicsAndC(world, center, Blocks.STONE);
++            world.notifyAndUpdatePhysics(center, world.chunk, Blocks.AIR.getBlockData(), Blocks.STONE.getBlockData(), 1);
++        }
++
++        final int iters = 50000;
++        long vAlloc0 = bean.getThreadAllocatedBytes(tid);
++        long vT0 = System.nanoTime();
++        int sink = 0;
++        for (int i = 0; i < iters; i++) {
++            sink += runVanillaApplyPhysicsAndC(world, center, Blocks.STONE);
++        }
++        long vNs = System.nanoTime() - vT0;
++        long vBytes = bean.getThreadAllocatedBytes(tid) - vAlloc0;
++
++        long oAlloc0 = bean.getThreadAllocatedBytes(tid);
++        long oT0 = System.nanoTime();
++        for (int i = 0; i < iters; i++) {
++            world.notifyAndUpdatePhysics(center, world.chunk, Blocks.AIR.getBlockData(), Blocks.STONE.getBlockData(), 1);
++        }
++        long oNs = System.nanoTime() - oT0;
++        long oBytes = bean.getThreadAllocatedBytes(tid) - oAlloc0;
++
++        double speedup = (double) vNs / (double) Math.max(1L, oNs);
++        System.out.println(String.format(
++                "C1_BENCH vanilla_ns=%d opt_ns=%d speedup=%.2fx vanilla_bytes=%d opt_bytes=%d sink=%d",
++                vNs, oNs, speedup, vBytes, oBytes, sink));
++
++        Assert.assertEquals("Optimized applyPhysics+c on stone/air should allocate 0 bytes", 0L, oBytes);
++        Assert.assertTrue("Expected speedup > 1.5x, got " + speedup, speedup > 1.5D);
++    }
++
++    private static int runVanillaApplyPhysicsAndC(World world, BlockPosition pos, Block block) {
++        int acc = 0;
++        BlockPosition w = pos.west(); IBlockData dw = world.getType(w); dw.doPhysics(world, w, block, pos); acc += Block.getId(dw.getBlock());
++        BlockPosition e = pos.east(); IBlockData de = world.getType(e); de.doPhysics(world, e, block, pos); acc += Block.getId(de.getBlock());
++        BlockPosition d = pos.down(); IBlockData dd = world.getType(d); dd.doPhysics(world, d, block, pos); acc += Block.getId(dd.getBlock());
++        BlockPosition u = pos.up(); IBlockData du = world.getType(u); du.doPhysics(world, u, block, pos); acc += Block.getId(du.getBlock());
++        BlockPosition n = pos.north(); IBlockData dn = world.getType(n); dn.doPhysics(world, n, block, pos); acc += Block.getId(dn.getBlock());
++        BlockPosition s = pos.south(); IBlockData ds = world.getType(s); ds.doPhysics(world, s, block, pos); acc += Block.getId(ds.getBlock());
++
++        BlockPosition w2 = pos.west(); if (world.getType(w2).getBlock() == Blocks.dk) acc++;
++        BlockPosition e2 = pos.east(); if (world.getType(e2).getBlock() == Blocks.dk) acc++;
++        BlockPosition d2 = pos.down(); if (world.getType(d2).getBlock() == Blocks.dk) acc++;
++        BlockPosition u2 = pos.up(); if (world.getType(u2).getBlock() == Blocks.dk) acc++;
++        BlockPosition n2 = pos.north(); if (world.getType(n2).getBlock() == Blocks.dk) acc++;
++        BlockPosition s2 = pos.south(); if (world.getType(s2).getBlock() == Blocks.dk) acc++;
++        return acc;
++    }
++}
