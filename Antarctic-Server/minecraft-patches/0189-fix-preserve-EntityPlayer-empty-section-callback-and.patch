@@ -1,0 +1,285 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 20:22:01 +0700
+Subject: [PATCH 189/189] fix: preserve EntityPlayer empty-section callback and
+ pushable chunk bounds
+
+
+diff --git a/main/java/net/minecraft/server/Entity.java b/main/java/net/minecraft/server/Entity.java
+index 4946b6d..4542d3f 100644
+--- a/main/java/net/minecraft/server/Entity.java
++++ b/main/java/net/minecraft/server/Entity.java
+@@ -1128,10 +1128,12 @@ public abstract class Entity implements ICommandListener, KeyedObject { // Paper
+                         if (sec == Chunk.a || sec.a()) {
+                             if (!hasEnterCallback) {
+                                 j = j | 15;
++                                continue;
+                             }
+-                            continue;
++                            iblockdata = air;
++                        } else {
++                            iblockdata = sec.getType(localX, j & 15, localZ);
+                         }
+-                        iblockdata = sec.getType(localX, j & 15, localZ);
+                     } else {
+                         iblockdata = air;
+                     }
+diff --git a/main/java/net/minecraft/server/World.java b/main/java/net/minecraft/server/World.java
+index e3f115d..afa3745 100644
+--- a/main/java/net/minecraft/server/World.java
++++ b/main/java/net/minecraft/server/World.java
+@@ -3605,7 +3605,7 @@ public abstract class World implements IBlockAccess {
+         double dy = ey - sy;
+         double dz = ez - sz;
+ 
+-        if (dx * dx >= 1.0E-7D) {
++        if (dx * dx >= 1.0000000116860974E-7D) {
+             double t = (0.0D - sx) / dx;
+             if (t >= 0.0D && t <= 1.0D) {
+                 double y = sy + dy * t;
+@@ -3623,7 +3623,7 @@ public abstract class World implements IBlockAccess {
+                 }
+             }
+         }
+-        if (dy * dy >= 1.0E-7D) {
++        if (dy * dy >= 1.0000000116860974E-7D) {
+             double t = (0.0D - sy) / dy;
+             if (t >= 0.0D && t <= 1.0D) {
+                 double x = sx + dx * t;
+@@ -3641,7 +3641,7 @@ public abstract class World implements IBlockAccess {
+                 }
+             }
+         }
+-        if (dz * dz >= 1.0E-7D) {
++        if (dz * dz >= 1.0000000116860974E-7D) {
+             double t = (0.0D - sz) / dz;
+             if (t >= 0.0D && t <= 1.0D) {
+                 double x = sx + dx * t;
+@@ -4307,12 +4307,12 @@ public abstract class World implements IBlockAccess {
+ 
+     void collectPushableEntities(EntityLiving self, AxisAlignedBB axisalignedbb, @Nullable ScoreboardTeamBase selfTeam, ScoreboardTeamBase.EnumTeamPush selfPush, List<Entity> out) {
+         int i = MathHelper.floor((axisalignedbb.a - 2.0D) / 16.0D);
+-        int j = MathHelper.f((axisalignedbb.d + 2.0D) / 16.0D);
++        int j = MathHelper.floor((axisalignedbb.d + 2.0D) / 16.0D);
+         int k = MathHelper.floor((axisalignedbb.c - 2.0D) / 16.0D);
+-        int l = MathHelper.f((axisalignedbb.f + 2.0D) / 16.0D);
++        int l = MathHelper.floor((axisalignedbb.f + 2.0D) / 16.0D);
+ 
+-        for (int i1 = i; i1 < j; ++i1) {
+-            for (int j1 = k; j1 < l; ++j1) {
++        for (int i1 = i; i1 <= j; ++i1) {
++            for (int j1 = k; j1 <= l; ++j1) {
+                 Chunk chunk = this.getChunkIfLoaded(i1, j1);
+                 if (chunk != null) {
+                     chunk.collectPushableEntities(self, axisalignedbb, selfTeam, selfPush, this.isClientSide, out);
+diff --git a/test/java/net/minecraft/server/CollisionBoundsAndEnterBlockParityTest.java b/test/java/net/minecraft/server/CollisionBoundsAndEnterBlockParityTest.java
+new file mode 100644
+index 0000000..69d11a4
+--- /dev/null
++++ b/test/java/net/minecraft/server/CollisionBoundsAndEnterBlockParityTest.java
+@@ -0,0 +1,205 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.PaperWorldConfig;
++import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
++import java.lang.reflect.Field;
++import java.lang.reflect.Method;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Random;
++import org.junit.Assert;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import org.spigotmc.SpigotWorldConfig;
++import sun.misc.Unsafe;
++
++public class CollisionBoundsAndEnterBlockParityTest {
++
++    private static Unsafe unsafe;
++
++    @BeforeClass
++    public static void init() throws Exception {
++        DispenserRegistry.c();
++        org.spigotmc.AsyncCatcher.enabled = false;
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        unsafe = (Unsafe) f.get(null);
++    }
++
++    private static final class TestWorld extends WorldServer {
++        final Long2ObjectOpenHashMap<Chunk> map = new Long2ObjectOpenHashMap<>();
++
++        TestWorld() {
++            super(null, null, null, 0, null, null, null);
++        }
++
++        @Override
++        public Chunk getChunkIfLoaded(int x, int z) {
++            return map.get(ChunkCoordIntPair.a(x, z));
++        }
++
++        @Override
++        public Chunk getChunkAt(int x, int z) {
++            return map.get(ChunkCoordIntPair.a(x, z));
++        }
++
++        @Override
++        public boolean isChunkLoaded(int x, int z, boolean allowEmpty) {
++            return map.containsKey(ChunkCoordIntPair.a(x, z));
++        }
++    }
++
++    private static TestWorld createWorld() throws Exception {
++        TestWorld world = (TestWorld) unsafe.allocateInstance(TestWorld.class);
++        unsafe.putObject(world, unsafe.objectFieldOffset(TestWorld.class.getDeclaredField("map")), new Long2ObjectOpenHashMap<>());
++        world.worldData = new WorldData();
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("spigotConfig")), unsafe.allocateInstance(SpigotWorldConfig.class));
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("paperConfig")), unsafe.allocateInstance(PaperWorldConfig.class));
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("random")), new Random(1L));
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("methodProfiler")), new MethodProfiler());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("P")), new WorldBorder());
++        world.worldProvider = new WorldProviderNormal();
++        world.worldProvider.a(world);
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("chunkProvider")), new IChunkProvider() {
++            @Override
++            public Chunk getLoadedChunkAt(int x, int z) {
++                return world.getChunkIfLoaded(x, z);
++            }
++
++            @Override
++            public Chunk getChunkAt(int x, int z) {
++                return world.getChunkAt(x, z);
++            }
++
++            @Override
++            public boolean unloadChunks() {
++                return false;
++            }
++
++            @Override
++            public String getName() {
++                return "test";
++            }
++
++            @Override
++            public boolean e(int x, int z) {
++                return world.isChunkLoaded(x, z, true);
++            }
++        });
++        return world;
++    }
++
++    @SuppressWarnings("unchecked")
++    private static Chunk createChunk(World world, int cx, int cz) throws Exception {
++        Chunk c = (Chunk) unsafe.allocateInstance(Chunk.class);
++        unsafe.putObject(c, unsafe.objectFieldOffset(Chunk.class.getDeclaredField("world")), world);
++        unsafe.putInt(c, unsafe.objectFieldOffset(Chunk.class.getDeclaredField("locX")), cx);
++        unsafe.putInt(c, unsafe.objectFieldOffset(Chunk.class.getDeclaredField("locZ")), cz);
++        ChunkSection[] secs = new ChunkSection[16];
++        for (int i = 0; i < 16; i++) {
++            secs[i] = Chunk.a;
++        }
++        unsafe.putObject(c, unsafe.objectFieldOffset(Chunk.class.getDeclaredField("sections")), secs);
++        List<Entity>[] slices = new List[16];
++        for (int i = 0; i < 16; i++) {
++            slices[i] = new ArrayList<>();
++        }
++        unsafe.putObject(c, unsafe.objectFieldOffset(Chunk.class.getDeclaredField("entitySlices")), slices);
++        unsafe.putObject(c, unsafe.objectFieldOffset(Chunk.class.getDeclaredField("entityCounts")), new co.aikar.util.Counter<>());
++        return c;
++    }
++
++    private static final class EnterCallbackEntity extends Entity {
++        final List<IBlockData> entered = new ArrayList<>();
++
++        EnterCallbackEntity(World world) {
++            super(world);
++            this.setSize(0.6F, 1.8F);
++        }
++
++        @Override
++        protected void i() {}
++
++        @Override
++        protected void a(NBTTagCompound nbttagcompound) {}
++
++        @Override
++        protected void b(NBTTagCompound nbttagcompound) {}
++
++        @Override
++        protected void a(IBlockData iblockdata) {
++            entered.add(iblockdata);
++        }
++    }
++
++    private static final class PlainEntity extends Entity {
++        PlainEntity(World world) {
++            super(world);
++            this.setSize(0.6F, 1.8F);
++        }
++
++        @Override
++        protected void i() {}
++
++        @Override
++        protected void a(NBTTagCompound nbttagcompound) {}
++
++        @Override
++        protected void b(NBTTagCompound nbttagcompound) {}
++    }
++
++    @Test
++    public void testEmptySectionTriggersEnterBlockCallbackWhenOverridden() throws Exception {
++        TestWorld world = createWorld();
++        Chunk c = createChunk(world, 0, 0);
++        // Set section 4 to a non-null empty ChunkSection (sec.a() == true) and section 5 remains Chunk.a
++        c.getSections()[4] = new ChunkSection(64, true);
++        world.map.put(ChunkCoordIntPair.a(0, 0), c);
++
++        EnterCallbackEntity callbackEntity = new EnterCallbackEntity(world);
++        callbackEntity.a(new AxisAlignedBB(4.0D, 79.5D, 4.0D, 4.6D, 81.3D, 4.6D));
++        callbackEntity.checkBlockCollisions();
++        Assert.assertFalse("Entity overriding a(IBlockData) must receive air callbacks in empty sections", callbackEntity.entered.isEmpty());
++        for (IBlockData data : callbackEntity.entered) {
++            Assert.assertEquals(Blocks.AIR.getBlockData(), data);
++        }
++
++        PlainEntity plain = new PlainEntity(world);
++        plain.a(new AxisAlignedBB(4.0D, 79.5D, 4.0D, 4.6D, 81.3D, 4.6D));
++        plain.checkBlockCollisions();
++    }
++
++    @Test
++    public void testCollectPushableEntitiesIncludesExactMultipleOf16ChunkBoundary() throws Exception {
++        TestWorld world = createWorld();
++        Chunk c0 = createChunk(world, 0, 0);
++        Chunk c1 = createChunk(world, 1, 0);
++        world.map.put(ChunkCoordIntPair.a(0, 0), c0);
++        world.map.put(ChunkCoordIntPair.a(1, 0), c1);
++
++        EntityZombie self = new EntityZombie(world);
++        self.setPosition(13.5D, 64.0D, 8.0D);
++
++        // Pushable target in chunk (1, 0) whose wide AABB reaches into queryBox (x=13.8..16.3)
++        EntityZombie target = new EntityZombie(world);
++        target.setPosition(16.05D, 64.0D, 8.0D);
++        target.a(new AxisAlignedBB(13.8D, 64.0D, 7.7D, 16.3D, 65.8D, 8.3D));
++        c1.getEntitySlices()[4].add(target);
++
++        // Query AABB where d + 2.0D == 16.0D exactly -> (16.0 / 16.0) == 1.0 -> floor == 1
++        AxisAlignedBB queryBox = new AxisAlignedBB(13.5D, 64.0D, 7.5D, 14.0D, 65.8D, 8.5D);
++        List<Entity> out = new ArrayList<>();
++        world.collectPushableEntities(self, queryBox, null, ScoreboardTeamBase.EnumTeamPush.ALWAYS, out);
++        Assert.assertTrue("Target in chunk (1,0) must be found at exact (max+2)%16==0 boundary", out.contains(target));
++    }
++
++    @Test
++    public void testRayHitsUnitCubeUsesVanillaFloatWidenedThreshold() throws Exception {
++        Method m = World.class.getDeclaredMethod("rayHitsUnitCube", double.class, double.class, double.class, double.class, double.class, double.class);
++        m.setAccessible(true);
++        // dx = Math.sqrt(1.000000005E-7D) -> dx*dx is >= 1.0E-7D but < 1.0000000116860974E-7D
++        double dx = Math.sqrt(1.000000005E-7D);
++        boolean hit = (Boolean) m.invoke(null, -0.5D * dx, 0.5D, 0.5D, 0.5D * dx, 0.5D, 0.5D);
++        Assert.assertFalse("Expected vanilla 1.0000000116860974E-7D threshold to reject sub-threshold dx^2", hit);
++    }
++}
