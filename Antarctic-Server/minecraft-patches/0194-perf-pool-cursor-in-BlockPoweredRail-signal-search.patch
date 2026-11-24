@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 23:09:38 +0700
+Subject: [PATCH 194/194] perf: pool cursor in BlockPoweredRail signal search
+
+
+diff --git a/main/java/net/minecraft/server/BlockPoweredRail.java b/main/java/net/minecraft/server/BlockPoweredRail.java
+index 0f53f8e..907f0b8 100644
+--- a/main/java/net/minecraft/server/BlockPoweredRail.java
++++ b/main/java/net/minecraft/server/BlockPoweredRail.java
+@@ -201,7 +201,8 @@ public class BlockPoweredRail extends BlockMinecartTrackAbstract {
+         Chunk cachedChunk = null;
+         int cachedChunkX = Integer.MIN_VALUE;
+         int cachedChunkZ = Integer.MIN_VALUE;
+-        BlockPosition.MutableBlockPosition cursor = new BlockPosition.MutableBlockPosition(cx, cy, cz);
++        BlockPosition.PooledBlockPosition cursor = BlockPosition.PooledBlockPosition.e(cx, cy, cz);
++        try {
+         int primaryMask = 0;
+         int dropPacked = 0;
+         for (int dist = 0; dist < 8; ++dist) {
+@@ -309,6 +310,9 @@ public class BlockPoweredRail extends BlockMinecartTrackAbstract {
+             }
+         }
+         return false;
++        } finally {
++            cursor.t();
++        }
+     }
+     // Leaf end
+ 
