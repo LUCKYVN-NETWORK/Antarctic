@@ -1,0 +1,478 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 17:02:11 +0700
+Subject: [PATCH 183/183] perf: optimize EntityTracker chunk queries, idle
+ EntityTrackerEntry, and EntityPlayer.removeQueue
+
+
+diff --git a/main/java/net/minecraft/server/EntityPlayer.java b/main/java/net/minecraft/server/EntityPlayer.java
+index c2c0fe1..fe6da1e 100644
+--- a/main/java/net/minecraft/server/EntityPlayer.java
++++ b/main/java/net/minecraft/server/EntityPlayer.java
+@@ -314,7 +314,6 @@ public class EntityPlayer extends EntityHuman implements ICrafting {
+         while (!this.removeQueue.isEmpty()) {
+             int i = Math.min(this.removeQueue.size(), Integer.MAX_VALUE);
+             int[] aint = new int[i];
+-            Iterator iterator = this.removeQueue.iterator();
+             int j = 0;
+ 
+             // Paper start
+diff --git a/main/java/net/minecraft/server/EntityTracker.java b/main/java/net/minecraft/server/EntityTracker.java
+index a60f946..4ae10df 100644
+--- a/main/java/net/minecraft/server/EntityTracker.java
++++ b/main/java/net/minecraft/server/EntityTracker.java
+@@ -4,6 +4,7 @@ import com.google.common.collect.Lists;
+ import com.google.common.collect.Sets;
+ import java.util.ArrayList;
+ import java.util.Iterator;
++import java.util.List;
+ import java.util.Set;
+ import org.apache.logging.log4j.LogManager;
+ import org.apache.logging.log4j.Logger;
+@@ -168,6 +169,7 @@ public class EntityTracker {
+         if (entitytrackerentry1 != null) {
+             this.c.remove(entitytrackerentry1);
+             entitytrackerentry1.a();
++            entity.tracker = null; // Antarctic - clear dangling tracker reference
+         }
+ 
+     }
+@@ -252,46 +254,68 @@ public class EntityTracker {
+     }
+ 
+     public void a(EntityPlayer entityplayer, Chunk chunk) {
+-        ArrayList arraylist = Lists.newArrayList();
+-        ArrayList arraylist1 = Lists.newArrayList();
+-        Iterator iterator = this.c.iterator();
+-
+-        while (iterator.hasNext()) {
+-            EntityTrackerEntry entitytrackerentry = (EntityTrackerEntry) iterator.next();
+-            Entity entity = entitytrackerentry.b();
+-
+-            if (entity != entityplayer && entity.ab == chunk.locX && entity.ad == chunk.locZ) {
+-                entitytrackerentry.updatePlayer(entityplayer);
+-                if (entity instanceof EntityInsentient && ((EntityInsentient) entity).getLeashHolder() != null) {
+-                    arraylist.add(entity);
++        // Antarctic start - query chunk.entitySlices + world.players instead of scanning all tracked entities O(E)
++        ArrayList<Entity> leashList = null;
++        ArrayList<Entity> mountList = null;
++
++        final List<Entity>[] slices = chunk.getEntitySlices();
++        for (int s = 0; s < slices.length; ++s) {
++            final List<Entity> slice = slices[s];
++            for (int i = 0, len = slice.size(); i < len; ++i) {
++                Entity entity = slice.get(i);
++                if (entity instanceof EntityPlayer) {
++                    continue;
+                 }
+-
+-                if (!entity.bF().isEmpty()) {
+-                    arraylist1.add(entity);
++                EntityTrackerEntry entry = entity.tracker;
++                if (entry != null && this.trackedEntities.get(entity.getId()) == entry && entity.ab == chunk.locX && entity.ad == chunk.locZ) {
++                    entry.updatePlayer(entityplayer);
++                    if (entity instanceof EntityInsentient && ((EntityInsentient) entity).getLeashHolder() != null) {
++                        if (leashList == null) {
++                            leashList = Lists.newArrayList();
++                        }
++                        leashList.add(entity);
++                    }
++                    if (!entity.bF().isEmpty()) {
++                        if (mountList == null) {
++                            mountList = Lists.newArrayList();
++                        }
++                        mountList.add(entity);
++                    }
+                 }
+             }
+         }
+ 
+-        Entity entity1;
+-
+-        if (!arraylist.isEmpty()) {
+-            iterator = arraylist.iterator();
++        final List<EntityHuman> players = this.world.players;
++        for (int i = 0, len = players.size(); i < len; ++i) {
++            EntityHuman human = players.get(i);
++            if (human != entityplayer && human.ab == chunk.locX && human.ad == chunk.locZ) {
++                EntityTrackerEntry entry = (EntityTrackerEntry) this.trackedEntities.get(human.getId());
++                if (entry != null) {
++                    entry.updatePlayer(entityplayer);
++                    if (!human.bF().isEmpty()) {
++                        if (mountList == null) {
++                            mountList = Lists.newArrayList();
++                        }
++                        mountList.add(human);
++                    }
++                }
++            }
++        }
+ 
+-            while (iterator.hasNext()) {
+-                entity1 = (Entity) iterator.next();
++        if (leashList != null) {
++            for (int i = 0, len = leashList.size(); i < len; ++i) {
++                Entity entity1 = leashList.get(i);
+                 entityplayer.playerConnection.sendPacket(new PacketPlayOutAttachEntity(entity1, ((EntityInsentient) entity1).getLeashHolder()));
+             }
+         }
+ 
+-        if (!arraylist1.isEmpty()) {
+-            iterator = arraylist1.iterator();
+-
+-            while (iterator.hasNext()) {
+-                entity1 = (Entity) iterator.next();
++        if (mountList != null) {
++            for (int i = 0, len = mountList.size(); i < len; ++i) {
++                Entity entity1 = mountList.get(i);
+                 entityplayer.playerConnection.sendPacket(new PacketPlayOutMount(entity1));
+             }
+         }
+-
++        // Antarctic end
+     }
+ 
+     public void a(int i) {
+diff --git a/main/java/net/minecraft/server/EntityTrackerEntry.java b/main/java/net/minecraft/server/EntityTrackerEntry.java
+index 951b3a1..e8f9b74 100644
+--- a/main/java/net/minecraft/server/EntityTrackerEntry.java
++++ b/main/java/net/minecraft/server/EntityTrackerEntry.java
+@@ -85,6 +85,29 @@ public class EntityTrackerEntry {
+             this.scanPlayers(list);
+         }
+ 
++        // Antarctic start - idle fast path when no players are tracking a non-player entity
++        if (this.trackedPlayers.isEmpty() && !(this.tracker instanceof EntityPlayer)) {
++            this.tracker.impulse = false;
++            this.tracker.velocityChanged = false;
++            DataWatcher dw = this.tracker.getDataWatcher();
++            if (dw.a()) {
++                dw.e();
++            }
++            if (this.tracker instanceof EntityLiving) {
++                java.util.Set<AttributeInstance> dirtyAttrs = ((AttributeMapServer) ((EntityLiving) this.tracker).getAttributeMap()).getAttributes();
++                if (!dirtyAttrs.isEmpty()) {
++                    dirtyAttrs.clear();
++                }
++            }
++            if (this.a % this.g == 0 && ++this.v > 400) {
++                this.v = 0;
++                this.c();
++            }
++            ++this.a;
++            return;
++        }
++        // Antarctic end
++
+         List list1 = this.tracker.bF();
+ 
+         if (!list1.equals(this.w)) {
+@@ -426,6 +449,17 @@ public class EntityTrackerEntry {
+                         }
+                     }
+ 
++                    if (wasUntracked) {
++                        this.xLoc = EntityTracker.a(this.tracker.locX);
++                        this.yLoc = EntityTracker.a(this.tracker.locY);
++                        this.zLoc = EntityTracker.a(this.tracker.locZ);
++                        this.yRot = MathHelper.d(this.tracker.yaw * 256.0F / 360.0F);
++                        this.xRot = MathHelper.d(this.tracker.pitch * 256.0F / 360.0F);
++                        this.y = this.tracker.onGround;
++                        this.v = 0;
++                        this.x = this.tracker.isPassenger();
++                        this.w = this.tracker.bF();
++                    }
+                     this.n = this.tracker.motX;
+                     this.o = this.tracker.motY;
+                     this.p = this.tracker.motZ;
+diff --git a/test/java/net/minecraft/server/EntityTrackerPerfTest.java b/test/java/net/minecraft/server/EntityTrackerPerfTest.java
+new file mode 100644
+index 0000000..58f7644
+--- /dev/null
++++ b/test/java/net/minecraft/server/EntityTrackerPerfTest.java
+@@ -0,0 +1,285 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.PaperWorldConfig;
++import com.destroystokyo.paper.antixray.ChunkPacketBlockController;
++import com.sun.management.ThreadMXBean;
++import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
++import java.lang.management.ManagementFactory;
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Random;
++import org.junit.Assert;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import org.spigotmc.SpigotWorldConfig;
++import sun.misc.Unsafe;
++
++public class EntityTrackerPerfTest {
++
++    private static Unsafe unsafe;
++
++    @BeforeClass
++    public static void init() throws Exception {
++        DispenserRegistry.c();
++        org.spigotmc.AsyncCatcher.enabled = false;
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        unsafe = (Unsafe) f.get(null);
++    }
++
++    private static final class TestWorld extends WorldServer {
++        final Long2ObjectOpenHashMap<Chunk> map = new Long2ObjectOpenHashMap<>();
++
++        TestWorld() {
++            super(null, null, null, 0, null, null, null);
++        }
++
++        @Override
++        public Chunk getChunkIfLoaded(int x, int z) {
++            return map.get(ChunkCoordIntPair.a(x, z));
++        }
++
++        @Override
++        public Chunk getChunkAt(int x, int z) {
++            return map.get(ChunkCoordIntPair.a(x, z));
++        }
++
++        @Override
++        public boolean isChunkLoaded(int x, int z, boolean allowEmpty) {
++            return map.containsKey(ChunkCoordIntPair.a(x, z));
++        }
++    }
++
++    @SuppressWarnings("unchecked")
++    private static TestWorld createWorld() throws Exception {
++        TestWorld world = (TestWorld) unsafe.allocateInstance(TestWorld.class);
++        Field mapField = TestWorld.class.getDeclaredField("map");
++        mapField.setAccessible(true);
++        Long2ObjectOpenHashMap<Chunk> map = new Long2ObjectOpenHashMap<>();
++        mapField.set(world, map);
++
++        world.worldData = new WorldData();
++        world.u = new ArrayList<>();
++        world.J = new int[32768];
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("players")), new ArrayList<>());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("j")), new ArrayList<>());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("f")), new HashSet<>());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("entityList")), new ArrayList<>());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("tileEntityListTick")), new World.TickableTileEntityList());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("b")), new ArrayList<>());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("tileEntityListUnload")), new HashSet<>());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("random")), new Random(42L));
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("spigotConfig")), unsafe.allocateInstance(SpigotWorldConfig.class));
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("paperConfig")), unsafe.allocateInstance(PaperWorldConfig.class));
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("chunkPacketBlockController")), new ChunkPacketBlockController() {});
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("pendingLight")), new me.stella.antarctic.collection.PendingLightRegistry(256));
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("methodProfiler")), new MethodProfiler());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("P")), new WorldBorder());
++        world.worldProvider = new WorldProviderNormal();
++        world.worldProvider.a(world);
++
++        Chunk c = (Chunk) unsafe.allocateInstance(Chunk.class);
++        Field wf = Chunk.class.getDeclaredField("world");
++        wf.setAccessible(true);
++        wf.set(c, world);
++        Field lx = Chunk.class.getDeclaredField("locX");
++        lx.setAccessible(true);
++        lx.setInt(c, 0);
++        Field lz = Chunk.class.getDeclaredField("locZ");
++        lz.setAccessible(true);
++        lz.setInt(c, 0);
++        Field sf = Chunk.class.getDeclaredField("sections");
++        sf.setAccessible(true);
++        ChunkSection[] secs = new ChunkSection[16];
++        for (int i = 0; i < 16; i++) {
++            secs[i] = Chunk.a;
++        }
++        sf.set(c, secs);
++        Field slicesField = Chunk.class.getDeclaredField("entitySlices");
++        slicesField.setAccessible(true);
++        List<Entity>[] slices = new List[16];
++        for (int i = 0; i < 16; i++) {
++            slices[i] = new ArrayList<>();
++        }
++        slicesField.set(c, slices);
++        for (String fn : new String[]{"itemCounts", "inventoryEntityCounts", "hardCollidableCounts", "itemFrameCounts"}) {
++            Field f = Chunk.class.getDeclaredField(fn);
++            f.setAccessible(true);
++            f.set(c, new int[16]);
++        }
++        Field hm = Chunk.class.getDeclaredField("heightMap");
++        hm.setAccessible(true);
++        hm.set(c, new int[256]);
++        Field ch = Chunk.class.getDeclaredField("h");
++        ch.setAccessible(true);
++        ch.set(c, new int[256]);
++        Field ci = Chunk.class.getDeclaredField("i");
++        ci.setAccessible(true);
++        ci.set(c, new boolean[256]);
++        Field cte = Chunk.class.getDeclaredField("tileEntities");
++        cte.setAccessible(true);
++        cte.set(c, new HashMap<>());
++        map.put(ChunkCoordIntPair.a(0, 0), c);
++
++        return world;
++    }
++
++    @Test
++    @SuppressWarnings("unchecked")
++    public void testEntityTrackerChunkQueryAndIdleEntryParity() throws Exception {
++        TestWorld world = createWorld();
++        EntityTracker tracker = (EntityTracker) unsafe.allocateInstance(EntityTracker.class);
++        unsafe.putObject(tracker, unsafe.objectFieldOffset(EntityTracker.class.getDeclaredField("world")), world);
++        unsafe.putObject(tracker, unsafe.objectFieldOffset(EntityTracker.class.getDeclaredField("c")), new HashSet<>());
++        IntHashMap<EntityTrackerEntry> trackedMap = new IntHashMap<>();
++        unsafe.putObject(tracker, unsafe.objectFieldOffset(EntityTracker.class.getDeclaredField("trackedEntities")), trackedMap);
++        unsafe.putInt(tracker, unsafe.objectFieldOffset(EntityTracker.class.getDeclaredField("e")), 64);
++
++        Chunk chunk = world.getChunkIfLoaded(0, 0);
++        List<EntityTrackerEntry> seenUpdates = new ArrayList<>();
++
++        // Create 5 tracked entities in chunk (0,0) and 1 untracked (dangling tracker)
++        for (int i = 0; i < 5; i++) {
++            EntityZombie zombie = new EntityZombie(world);
++            zombie.setPosition(8.0D, 64.0D, 8.0D);
++            zombie.ab = 0;
++            zombie.ad = 0;
++            chunk.getEntitySlices()[4].add(zombie);
++            EntityTrackerEntry entry = new EntityTrackerEntry(zombie, 80, 80, 3, true) {
++                @Override
++                public void updatePlayer(EntityPlayer p) {
++                    seenUpdates.add(this);
++                }
++            };
++            zombie.tracker = entry;
++            trackedMap.a(zombie.getId(), entry);
++        }
++
++        // Dangling entity.tracker that was untracked must be ignored
++        EntityZombie untracked = new EntityZombie(world);
++        untracked.ab = 0;
++        untracked.ad = 0;
++        chunk.getEntitySlices()[4].add(untracked);
++        EntityTrackerEntry staleEntry = new EntityTrackerEntry(untracked, 80, 80, 3, true) {
++            @Override
++            public void updatePlayer(EntityPlayer p) {
++                seenUpdates.add(this);
++            }
++        };
++        untracked.tracker = staleEntry;
++        trackedMap.a(untracked.getId(), staleEntry);
++        // Untrack must clear dangling reference
++        tracker.untrackEntity(untracked);
++        Assert.assertNull(untracked.tracker);
++
++        EntityPlayer viewer = (EntityPlayer) unsafe.allocateInstance(EntityPlayer.class);
++        tracker.a(viewer, chunk);
++        Assert.assertEquals(5, seenUpdates.size());
++
++        // Idle EntityTrackerEntry.track() clears DataWatcher dirty flag and increments a
++        EntityZombie idleMob = new EntityZombie(world);
++        idleMob.setPosition(10.0D, 64.0D, 10.0D);
++        idleMob.setCustomName("IdleMob");
++        Assert.assertTrue(idleMob.getDataWatcher().a());
++        EntityTrackerEntry idleEntry = new EntityTrackerEntry(idleMob, 80, 80, 3, true);
++        idleEntry.track(Collections.emptyList());
++        Assert.assertFalse("Idle track() must clear DataWatcher dirty flag", idleMob.getDataWatcher().a());
++        Assert.assertEquals(1, idleEntry.a);
++    }
++
++    @Test
++    @SuppressWarnings("unchecked")
++    public void testEntityTrackerPerf() throws Exception {
++        TestWorld world = createWorld();
++        EntityTracker tracker = (EntityTracker) unsafe.allocateInstance(EntityTracker.class);
++        unsafe.putObject(tracker, unsafe.objectFieldOffset(EntityTracker.class.getDeclaredField("world")), world);
++        HashSet<EntityTrackerEntry> entrySet = new HashSet<>();
++        unsafe.putObject(tracker, unsafe.objectFieldOffset(EntityTracker.class.getDeclaredField("c")), entrySet);
++        IntHashMap<EntityTrackerEntry> trackedMap = new IntHashMap<>();
++        unsafe.putObject(tracker, unsafe.objectFieldOffset(EntityTracker.class.getDeclaredField("trackedEntities")), trackedMap);
++        unsafe.putInt(tracker, unsafe.objectFieldOffset(EntityTracker.class.getDeclaredField("e")), 64);
++
++        Chunk chunk = world.getChunkIfLoaded(0, 0);
++        // Populate 2,000 tracked entities across distant chunks, 10 in chunk (0,0)
++        for (int i = 0; i < 2000; i++) {
++            EntityZombie z = new EntityZombie(world);
++            int cx = (i < 10) ? 0 : (i / 10);
++            z.ab = cx;
++            z.ad = 0;
++            if (cx == 0) {
++                chunk.getEntitySlices()[4].add(z);
++            }
++            EntityTrackerEntry entry = new EntityTrackerEntry(z, 80, 80, 3, true) {
++                @Override
++                public void updatePlayer(EntityPlayer p) {
++                    // no-op for benchmark
++                }
++            };
++            z.tracker = entry;
++            entrySet.add(entry);
++            trackedMap.a(z.getId(), entry);
++        }
++
++        EntityPlayer viewer = (EntityPlayer) unsafe.allocateInstance(EntityPlayer.class);
++        EntityZombie idleMob = new EntityZombie(world);
++        EntityTrackerEntry idleEntry = new EntityTrackerEntry(idleMob, 80, 80, 3, true);
++
++        final int warmup = 2000;
++        final int iters = 1000;
++        long sink = 0L;
++
++        for (int i = 0; i < warmup; i++) {
++            for (EntityTrackerEntry e : entrySet) {
++                Entity ent = e.b();
++                if (ent != viewer && ent.ab == chunk.locX && ent.ad == chunk.locZ) {
++                    sink++;
++                }
++            }
++            tracker.a(viewer, chunk);
++            idleEntry.track(Collections.emptyList());
++            sink += idleEntry.a;
++        }
++
++        ThreadMXBean bean = (ThreadMXBean) ManagementFactory.getThreadMXBean();
++        long tid = Thread.currentThread().getId();
++        bean.getThreadAllocatedBytes(tid);
++
++        long vanBytes0 = bean.getThreadAllocatedBytes(tid);
++        long vanT0 = System.nanoTime();
++        for (int i = 0; i < iters; i++) {
++            ArrayList<Entity> l1 = new ArrayList<>();
++            ArrayList<Entity> l2 = new ArrayList<>();
++            for (EntityTrackerEntry e : entrySet) {
++                Entity ent = e.b();
++                if (ent != viewer && ent.ab == chunk.locX && ent.ad == chunk.locZ) {
++                    sink++;
++                }
++            }
++            sink += l1.size() + l2.size();
++        }
++        long vanNs = System.nanoTime() - vanT0;
++        long vanBytes = bean.getThreadAllocatedBytes(tid) - vanBytes0;
++
++        long optBytes0 = bean.getThreadAllocatedBytes(tid);
++        long optT0 = System.nanoTime();
++        for (int i = 0; i < iters; i++) {
++            tracker.a(viewer, chunk);
++            idleEntry.track(Collections.emptyList());
++            sink += idleEntry.a;
++        }
++        long optNs = System.nanoTime() - optT0;
++        long optBytes = bean.getThreadAllocatedBytes(tid) - optBytes0;
++
++        double speedup = (double) vanNs / Math.max(1L, optNs);
++        System.out.println("C10_BENCH vanilla_ns=" + vanNs + " opt_ns=" + optNs
++            + " speedup=" + String.format("%.2fx", speedup)
++            + " vanilla_bytes=" + vanBytes + " opt_bytes=" + optBytes + " sink=" + sink);
++
++        Assert.assertEquals("Optimized path should allocate 0 bytes", 0L, optBytes);
++        Assert.assertTrue("Expected >= 5.0x speedup, got " + speedup, speedup > 5.0D);
++    }
++}

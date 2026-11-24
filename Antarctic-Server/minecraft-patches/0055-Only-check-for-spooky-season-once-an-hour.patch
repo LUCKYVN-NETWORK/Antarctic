@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: AlexProgrammerDE <40795980+AlexProgrammerDE@users.noreply.github.com>
 Date: Sat, 18 Jun 2022 13:22:32 +0200
-Subject: [PATCH 055/182] Only check for spooky season once an hour
+Subject: [PATCH 055/183] Only check for spooky season once an hour
 
 - Backport Dionysus server/0055-Only-check-for-spooky-season-once-an-hour.patch
 - Source: https://github.com/nopjmp/Dionysus at b5c71b62f6f1f555b22bd52f5751e33be4690b6e
