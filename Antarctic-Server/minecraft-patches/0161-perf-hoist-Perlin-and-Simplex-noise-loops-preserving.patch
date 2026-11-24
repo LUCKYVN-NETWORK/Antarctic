@@ -1,0 +1,895 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 10:59:36 +0700
+Subject: [PATCH 161/161] perf: hoist Perlin and Simplex noise loops preserving
+ vanilla quirks
+
+
+diff --git a/main/java/net/minecraft/server/NoiseGenerator3.java b/main/java/net/minecraft/server/NoiseGenerator3.java
+new file mode 100644
+index 0000000..b702d4f
+--- /dev/null
++++ b/main/java/net/minecraft/server/NoiseGenerator3.java
+@@ -0,0 +1,54 @@
++package net.minecraft.server;
++
++import java.util.Random;
++
++public class NoiseGenerator3 extends NoiseGenerator {
++
++    private final NoiseGenerator3Handler[] a;
++    private final int b;
++
++    public NoiseGenerator3(Random random, int i) {
++        this.b = i;
++        this.a = new NoiseGenerator3Handler[i];
++
++        for (int j = 0; j < i; ++j) {
++            this.a[j] = new NoiseGenerator3Handler(random);
++        }
++
++    }
++
++    public double a(double d0, double d1) {
++        double d2 = 0.0D;
++        double d3 = 1.0D;
++
++        for (int i = 0; i < this.b; ++i) {
++            d2 += this.a[i].a(d0 * d3, d1 * d3) / d3;
++            d3 /= 2.0D;
++        }
++
++        return d2;
++    }
++
++    public double[] a(double[] adouble, double d0, double d1, int i, int j, double d2, double d3, double d4) {
++        return this.a(adouble, d0, d1, i, j, d2, d3, d4, 0.5D);
++    }
++
++    public double[] a(double[] adouble, double d0, double d1, int i, int j, double d2, double d3, double d4, double d5) {
++        if (adouble != null && adouble.length >= i * j) {
++            java.util.Arrays.fill(adouble, 0.0D);
++        } else {
++            adouble = new double[i * j];
++        }
++
++        double d6 = 1.0D;
++        double d7 = 1.0D;
++
++        for (int l = 0; l < this.b; ++l) {
++            this.a[l].a(adouble, d0, d1, i, j, d2 * d7 * d6, d3 * d7 * d6, 0.55D / d6);
++            d7 *= d4;
++            d6 *= d5;
++        }
++
++        return adouble;
++    }
++}
+diff --git a/main/java/net/minecraft/server/NoiseGenerator3Handler.java b/main/java/net/minecraft/server/NoiseGenerator3Handler.java
+new file mode 100644
+index 0000000..71b69cb
+--- /dev/null
++++ b/main/java/net/minecraft/server/NoiseGenerator3Handler.java
+@@ -0,0 +1,201 @@
++package net.minecraft.server;
++
++import java.util.Random;
++
++public class NoiseGenerator3Handler {
++
++    private static final int[][] e = new int[][] { { 1, 1, 0}, { -1, 1, 0}, { 1, -1, 0}, { -1, -1, 0}, { 1, 0, 1}, { -1, 0, 1}, { 1, 0, -1}, { -1, 0, -1}, { 0, 1, 1}, { 0, -1, 1}, { 0, 1, -1}, { 0, -1, -1}};
++    private static final double[] GRAD_X = new double[] { 1.0D, -1.0D, 1.0D, -1.0D, 1.0D, -1.0D, 1.0D, -1.0D, 0.0D, 0.0D, 0.0D, 0.0D };
++    private static final double[] GRAD_Y = new double[] { 1.0D, 1.0D, -1.0D, -1.0D, 0.0D, 0.0D, 0.0D, 0.0D, 1.0D, -1.0D, 1.0D, -1.0D };
++    public static final double a = Math.sqrt(3.0D);
++    private final int[] f;
++    private final int[] fMod12; // Antarctic - precomputed modulo-12 permutation table
++    public double b;
++    public double c;
++    public double d;
++    private static final double g = 0.5D * (NoiseGenerator3Handler.a - 1.0D);
++    private static final double h = (3.0D - NoiseGenerator3Handler.a) / 6.0D;
++
++    public NoiseGenerator3Handler() {
++        this(new Random());
++    }
++
++    public NoiseGenerator3Handler(Random random) {
++        this.f = new int[512];
++        this.fMod12 = new int[512];
++        this.b = random.nextDouble() * 256.0D;
++        this.c = random.nextDouble() * 256.0D;
++        this.d = random.nextDouble() * 256.0D;
++
++        int i;
++
++        for (i = 0; i < 256; this.f[i] = i++) {
++            ;
++        }
++
++        for (i = 0; i < 256; ++i) {
++            int j = random.nextInt(256 - i) + i;
++            int k = this.f[i];
++
++            this.f[i] = this.f[j];
++            this.f[j] = k;
++            this.f[i + 256] = this.f[i];
++        }
++
++        for (i = 0; i < 512; ++i) {
++            this.fMod12[i] = this.f[i] % 12;
++        }
++
++    }
++
++    private static int a(double d0) {
++        return d0 > 0.0D ? (int) d0 : (int) d0 - 1;
++    }
++
++    private static double a(int[] aint, double d0, double d1) {
++        return (double) aint[0] * d0 + (double) aint[1] * d1;
++    }
++
++    public double a(double d0, double d1) {
++        double d2 = 0.5D * (NoiseGenerator3Handler.a - 1.0D);
++        double d3 = (d0 + d1) * d2;
++        int i = a(d0 + d3);
++        int j = a(d1 + d3);
++        double d4 = (3.0D - NoiseGenerator3Handler.a) / 6.0D;
++        double d5 = (double) (i + j) * d4;
++        double d6 = (double) i - d5;
++        double d7 = (double) j - d5;
++        double d8 = d0 - d6;
++        double d9 = d1 - d7;
++        byte b0;
++        byte b1;
++
++        if (d8 > d9) {
++            b0 = 1;
++            b1 = 0;
++        } else {
++            b0 = 0;
++            b1 = 1;
++        }
++
++        double d10 = d8 - (double) b0 + d4;
++        double d11 = d9 - (double) b1 + d4;
++        double d12 = d8 - 1.0D + 2.0D * d4;
++        double d13 = d9 - 1.0D + 2.0D * d4;
++        int k = i & 255;
++        int l = j & 255;
++        final int[] perm = this.f;
++        final int[] perm12 = this.fMod12;
++        int i1 = perm12[k + perm[l]];
++        int j1 = perm12[k + b0 + perm[l + b1]];
++        int k1 = perm12[k + 1 + perm[l + 1]];
++        double d14 = 0.5D - d8 * d8 - d9 * d9;
++        double d15;
++
++        if (d14 < 0.0D) {
++            d15 = 0.0D;
++        } else {
++            d14 *= d14;
++            d15 = d14 * d14 * (GRAD_X[i1] * d8 + GRAD_Y[i1] * d9);
++        }
++
++        double d16 = 0.5D - d10 * d10 - d11 * d11;
++        double d17;
++
++        if (d16 < 0.0D) {
++            d17 = 0.0D;
++        } else {
++            d16 *= d16;
++            d17 = d16 * d16 * (GRAD_X[j1] * d10 + GRAD_Y[j1] * d11);
++        }
++
++        double d18 = 0.5D - d12 * d12 - d13 * d13;
++        double d19;
++
++        if (d18 < 0.0D) {
++            d19 = 0.0D;
++        } else {
++            d18 *= d18;
++            d19 = d18 * d18 * (GRAD_X[k1] * d12 + GRAD_Y[k1] * d13);
++        }
++
++        return 70.0D * (d15 + d17 + d19);
++    }
++
++    public void a(double[] adouble, double d0, double d1, int i, int j, double d2, double d3, double d4) {
++        int k = 0;
++        final int[] perm = this.f;
++        final int[] perm12 = this.fMod12;
++        final double gConst = NoiseGenerator3Handler.g;
++        final double hConst = NoiseGenerator3Handler.h;
++        final double twoH = 2.0D * hConst;
++
++        for (int l = 0; l < j; ++l) {
++            double d5 = (d1 + (double) l) * d3 + this.c;
++
++            for (int i1 = 0; i1 < i; ++i1) {
++                double d6 = (d0 + (double) i1) * d2 + this.b;
++                double d7 = (d6 + d5) * gConst;
++                int j1 = a(d6 + d7);
++                int k1 = a(d5 + d7);
++                double d8 = (double) (j1 + k1) * hConst;
++                double d9 = (double) j1 - d8;
++                double d10 = (double) k1 - d8;
++                double d11 = d6 - d9;
++                double d12 = d5 - d10;
++                byte b0;
++                byte b1;
++
++                if (d11 > d12) {
++                    b0 = 1;
++                    b1 = 0;
++                } else {
++                    b0 = 0;
++                    b1 = 1;
++                }
++
++                double d13 = d11 - (double) b0 + hConst;
++                double d14 = d12 - (double) b1 + hConst;
++                double d15 = d11 - 1.0D + twoH;
++                double d16 = d12 - 1.0D + twoH;
++                int l1 = j1 & 255;
++                int i2 = k1 & 255;
++                int j2 = perm12[l1 + perm[i2]];
++                int k2 = perm12[l1 + b0 + perm[i2 + b1]];
++                int l2 = perm12[l1 + 1 + perm[i2 + 1]];
++                double d17 = 0.5D - d11 * d11 - d12 * d12;
++                double d18;
++
++                if (d17 < 0.0D) {
++                    d18 = 0.0D;
++                } else {
++                    d17 *= d17;
++                    d18 = d17 * d17 * (GRAD_X[j2] * d11 + GRAD_Y[j2] * d12);
++                }
++
++                double d19 = 0.5D - d13 * d13 - d14 * d14;
++                double d20;
++
++                if (d19 < 0.0D) {
++                    d20 = 0.0D;
++                } else {
++                    d19 *= d19;
++                    d20 = d19 * d19 * (GRAD_X[k2] * d13 + GRAD_Y[k2] * d14);
++                }
++
++                double d21 = 0.5D - d15 * d15 - d16 * d16;
++                double d22;
++
++                if (d21 < 0.0D) {
++                    d22 = 0.0D;
++                } else {
++                    d21 *= d21;
++                    d22 = d21 * d21 * (GRAD_X[l2] * d15 + GRAD_Y[l2] * d16);
++                }
++
++                adouble[k++] += 70.0D * (d18 + d20 + d22) * d4;
++            }
++        }
++
++    }
++}
+diff --git a/main/java/net/minecraft/server/NoiseGeneratorOctaves.java b/main/java/net/minecraft/server/NoiseGeneratorOctaves.java
+new file mode 100644
+index 0000000..e1d3120
+--- /dev/null
++++ b/main/java/net/minecraft/server/NoiseGeneratorOctaves.java
+@@ -0,0 +1,52 @@
++package net.minecraft.server;
++
++import java.util.Random;
++
++public class NoiseGeneratorOctaves extends NoiseGenerator {
++
++    private final NoiseGeneratorPerlin[] a;
++    private final int b;
++
++    public NoiseGeneratorOctaves(Random random, int i) {
++        this.b = i;
++        this.a = new NoiseGeneratorPerlin[i];
++
++        for (int j = 0; j < i; ++j) {
++            this.a[j] = new NoiseGeneratorPerlin(random);
++        }
++
++    }
++
++    public double[] a(double[] adouble, int i, int j, int k, int l, int i1, int j1, double d0, double d1, double d2) {
++        if (adouble == null) {
++            adouble = new double[l * i1 * j1];
++        } else {
++            java.util.Arrays.fill(adouble, 0.0D);
++        }
++
++        double d3 = 1.0D;
++
++        for (int l1 = 0; l1 < this.b; ++l1) {
++            double d4 = (double) i * d3 * d0;
++            double d5 = (double) j * d3 * d1;
++            double d6 = (double) k * d3 * d2;
++            long i2 = MathHelper.d(d4);
++            long j2 = MathHelper.d(d6);
++
++            d4 -= (double) i2;
++            d6 -= (double) j2;
++            i2 %= 16777216L;
++            j2 %= 16777216L;
++            d4 += (double) i2;
++            d6 += (double) j2;
++            this.a[l1].a(adouble, d4, d5, d6, l, i1, j1, d0 * d3, d1 * d3, d2 * d3, d3);
++            d3 /= 2.0D;
++        }
++
++        return adouble;
++    }
++
++    public double[] a(double[] adouble, int i, int j, int k, int l, double d0, double d1, double d2) {
++        return this.a(adouble, i, 10, j, k, 1, l, d0, 1.0D, d1);
++    }
++}
+diff --git a/main/java/net/minecraft/server/NoiseGeneratorPerlin.java b/main/java/net/minecraft/server/NoiseGeneratorPerlin.java
+new file mode 100644
+index 0000000..571bfce
+--- /dev/null
++++ b/main/java/net/minecraft/server/NoiseGeneratorPerlin.java
+@@ -0,0 +1,197 @@
++package net.minecraft.server;
++
++import java.util.Random;
++
++public class NoiseGeneratorPerlin extends NoiseGenerator {
++
++    private final int[] d;
++    public double a;
++    public double b;
++    public double c;
++    // Antarctic start - reusable Y/Z axis scratch buffers to avoid redundant floor/fade recomputation
++    private int[] yIdx = new int[33];
++    private double[] yFrac = new double[33];
++    private double[] yFade = new double[33];
++    private int[] zIdx = new int[16];
++    private double[] zFrac = new double[16];
++    private double[] zFade = new double[16];
++    // Antarctic end
++    private static final double[] e = new double[] { 1.0D, -1.0D, 1.0D, -1.0D, 1.0D, -1.0D, 1.0D, -1.0D, 0.0D, 0.0D, 0.0D, 0.0D, 1.0D, 0.0D, -1.0D, 0.0D};
++    private static final double[] f = new double[] { 1.0D, 1.0D, -1.0D, -1.0D, 0.0D, 0.0D, 0.0D, 0.0D, 1.0D, -1.0D, 1.0D, -1.0D, 1.0D, -1.0D, 1.0D, -1.0D};
++    private static final double[] g = new double[] { 0.0D, 0.0D, 0.0D, 0.0D, 1.0D, 1.0D, -1.0D, -1.0D, 1.0D, 1.0D, -1.0D, -1.0D, 0.0D, 1.0D, 0.0D, -1.0D};
++    private static final double[] h = new double[] { 1.0D, -1.0D, 1.0D, -1.0D, 1.0D, -1.0D, 1.0D, -1.0D, 0.0D, 0.0D, 0.0D, 0.0D, 1.0D, 0.0D, -1.0D, 0.0D};
++    private static final double[] i = new double[] { 0.0D, 0.0D, 0.0D, 0.0D, 1.0D, 1.0D, -1.0D, -1.0D, 1.0D, 1.0D, -1.0D, -1.0D, 0.0D, 1.0D, 0.0D, -1.0D};
++
++    public NoiseGeneratorPerlin() {
++        this(new Random());
++    }
++
++    public NoiseGeneratorPerlin(Random random) {
++        this.d = new int[512];
++        this.a = random.nextDouble() * 256.0D;
++        this.b = random.nextDouble() * 256.0D;
++        this.c = random.nextDouble() * 256.0D;
++
++        int i;
++
++        for (i = 0; i < 256; this.d[i] = i++) {
++            ;
++        }
++
++        for (i = 0; i < 256; ++i) {
++            int j = random.nextInt(256 - i) + i;
++            int k = this.d[i];
++
++            this.d[i] = this.d[j];
++            this.d[j] = k;
++            this.d[i + 256] = this.d[i];
++        }
++
++    }
++
++    public final double b(double d0, double d1, double d2) {
++        return d1 + d0 * (d2 - d1);
++    }
++
++    public final double a(int i, double d0, double d1) {
++        int j = i & 15;
++
++        return NoiseGeneratorPerlin.h[j] * d0 + NoiseGeneratorPerlin.i[j] * d1;
++    }
++
++    public final double a(int i, double d0, double d1, double d2) {
++        int j = i & 15;
++
++        return NoiseGeneratorPerlin.e[j] * d0 + NoiseGeneratorPerlin.f[j] * d1 + NoiseGeneratorPerlin.g[j] * d2;
++    }
++
++    public void a(double[] adouble, double d0, double d1, double d2, int i, int j, int k, double d3, double d4, double d5, double d6) {
++        if (this.zIdx.length < k) {
++            this.zIdx = new int[k];
++            this.zFrac = new double[k];
++            this.zFade = new double[k];
++        }
++        final int[] zIdx = this.zIdx;
++        final double[] zFrac = this.zFrac;
++        final double[] zFade = this.zFade;
++        for (int m = 0; m < k; ++m) {
++            double v = d2 + (double) m * d5 + this.c;
++            int fl = (int) v;
++            if (v < (double) fl) {
++                --fl;
++            }
++            zIdx[m] = fl & 255;
++            double frac = v - (double) fl;
++            zFrac[m] = frac;
++            zFade[m] = frac * frac * frac * (frac * (frac * 6.0D - 15.0D) + 10.0D);
++        }
++
++        if (j == 1) {
++            this.sample2D(adouble, d0, k, d3, 1.0D / d6, i, zIdx, zFrac, zFade);
++        } else {
++            this.sample3D(adouble, d0, d1, i, j, k, d3, d4, 1.0D / d6, zIdx, zFrac, zFade);
++        }
++    }
++
++    private void sample2D(double[] adouble, double d0, int k, double d3, double invD6, int i, int[] zIdx, double[] zFrac, double[] zFade) {
++        final int[] perm = this.d;
++        int outIdx = 0;
++        for (int k2 = 0; k2 < i; ++k2) {
++            double d7 = d0 + (double) k2 * d3 + this.a;
++            int l2 = (int) d7;
++            if (d7 < (double) l2) {
++                --l2;
++            }
++            int i3 = l2 & 255;
++            d7 -= (double) l2;
++            double d8 = d7 * d7 * d7 * (d7 * (d7 * 6.0D - 15.0D) + 10.0D);
++            int l = perm[i3];
++            int k3 = perm[i3 + 1];
++
++            for (int j1 = 0; j1 < k; ++j1) {
++                int l1 = zIdx[j1];
++                double d9 = zFrac[j1];
++                double d10 = zFade[j1];
++                int j3 = perm[l] + l1;
++                int i1 = perm[k3] + l1;
++                double d11 = this.b(d8, this.a(perm[j3], d7, d9), this.a(perm[i1], d7 - 1.0D, 0.0D, d9));
++                double d12 = this.b(d8, this.a(perm[j3 + 1], d7, 0.0D, d9 - 1.0D), this.a(perm[i1 + 1], d7 - 1.0D, 0.0D, d9 - 1.0D));
++                adouble[outIdx++] += this.b(d10, d11, d12) * invD6;
++            }
++        }
++    }
++
++    private void sample3D(double[] adouble, double d0, double d1, int i, int j, int k, double d3, double d4, double invD6, int[] zIdx, double[] zFrac, double[] zFade) {
++        if (this.yIdx.length < j) {
++            this.yIdx = new int[j];
++            this.yFrac = new double[j];
++            this.yFade = new double[j];
++        }
++        final int[] yIdx = this.yIdx;
++        final double[] yFrac = this.yFrac;
++        final double[] yFade = this.yFade;
++        for (int m = 0; m < j; ++m) {
++            double v = d1 + (double) m * d4 + this.b;
++            int fl = (int) v;
++            if (v < (double) fl) {
++                --fl;
++            }
++            yIdx[m] = fl & 255;
++            double frac = v - (double) fl;
++            yFrac[m] = frac;
++            yFade[m] = frac * frac * frac * (frac * (frac * 6.0D - 15.0D) + 10.0D);
++        }
++
++        final int[] perm = this.d;
++        int outIdx = 0;
++        int i1 = -1; // preserve exact vanilla i1 caching across j1/l3/k4
++        double d16 = 0.0D;
++        double d7 = 0.0D;
++        double d17 = 0.0D;
++        double d8 = 0.0D;
++
++        for (int j1 = 0; j1 < i; ++j1) {
++            double d9 = d0 + (double) j1 * d3 + this.a;
++            int k1 = (int) d9;
++            if (d9 < (double) k1) {
++                --k1;
++            }
++            int l1 = k1 & 255;
++            d9 -= (double) k1;
++            double d10 = d9 * d9 * d9 * (d9 * (d9 * 6.0D - 15.0D) + 10.0D);
++            int pX0 = perm[l1];
++            int pX1 = perm[l1 + 1];
++
++            for (int l3 = 0; l3 < k; ++l3) {
++                int j4 = zIdx[l3];
++                double d18 = zFrac[l3];
++                double d19 = zFade[l3];
++
++                for (int k4 = 0; k4 < j; ++k4) {
++                    int i5 = yIdx[k4];
++                    double d20 = yFrac[k4];
++                    double d21 = yFade[k4];
++
++                    if (k4 == 0 || i5 != i1) {
++                        i1 = i5;
++                        int j5 = pX0 + i5;
++                        int k5 = perm[j5] + j4;
++                        int l5 = perm[j5 + 1] + j4;
++                        int i6 = pX1 + i5;
++                        int i2 = perm[i6] + j4;
++                        int j6 = perm[i6 + 1] + j4;
++
++                        d16 = this.b(d10, this.a(perm[k5], d9, d20, d18), this.a(perm[i2], d9 - 1.0D, d20, d18));
++                        d7 = this.b(d10, this.a(perm[l5], d9, d20 - 1.0D, d18), this.a(perm[j6], d9 - 1.0D, d20 - 1.0D, d18));
++                        d17 = this.b(d10, this.a(perm[k5 + 1], d9, d20, d18 - 1.0D), this.a(perm[i2 + 1], d9 - 1.0D, d20, d18 - 1.0D));
++                        d8 = this.b(d10, this.a(perm[l5 + 1], d9, d20 - 1.0D, d18 - 1.0D), this.a(perm[j6 + 1], d9 - 1.0D, d20 - 1.0D, d18 - 1.0D));
++                    }
++
++                    double d22 = this.b(d21, d16, d7);
++                    double d23 = this.b(d21, d17, d8);
++                    adouble[outIdx++] += this.b(d19, d22, d23) * invD6;
++                }
++            }
++        }
++    }
++}
+diff --git a/test/java/net/minecraft/server/NoiseGeneratorPerfTest.java b/test/java/net/minecraft/server/NoiseGeneratorPerfTest.java
+new file mode 100644
+index 0000000..41f8d0d
+--- /dev/null
++++ b/test/java/net/minecraft/server/NoiseGeneratorPerfTest.java
+@@ -0,0 +1,354 @@
++package net.minecraft.server;
++
++import org.junit.Test;
++
++import java.util.Arrays;
++import java.util.Random;
++
++import static org.junit.Assert.*;
++
++public class NoiseGeneratorPerfTest {
++
++    private static final double[] PERLIN_E = { 1.0D, -1.0D, 1.0D, -1.0D, 1.0D, -1.0D, 1.0D, -1.0D, 0.0D, 0.0D, 0.0D, 0.0D, 1.0D, 0.0D, -1.0D, 0.0D };
++    private static final double[] PERLIN_F = { 1.0D, 1.0D, -1.0D, -1.0D, 0.0D, 0.0D, 0.0D, 0.0D, 1.0D, -1.0D, 1.0D, -1.0D, 1.0D, -1.0D, 1.0D, -1.0D };
++    private static final double[] PERLIN_G = { 0.0D, 0.0D, 0.0D, 0.0D, 1.0D, 1.0D, -1.0D, -1.0D, 1.0D, 1.0D, -1.0D, -1.0D, 0.0D, 1.0D, 0.0D, -1.0D };
++    private static final double[] PERLIN_H = { 1.0D, -1.0D, 1.0D, -1.0D, 1.0D, -1.0D, 1.0D, -1.0D, 0.0D, 0.0D, 0.0D, 0.0D, 1.0D, 0.0D, -1.0D, 0.0D };
++    private static final double[] PERLIN_I = { 0.0D, 0.0D, 0.0D, 0.0D, 1.0D, 1.0D, -1.0D, -1.0D, 1.0D, 1.0D, -1.0D, -1.0D, 0.0D, 1.0D, 0.0D, -1.0D };
++
++    private static final class VanillaPerlin {
++        final int[] d = new int[512];
++        final double a, b, c;
++
++        VanillaPerlin(Random random) {
++            this.a = random.nextDouble() * 256.0D;
++            this.b = random.nextDouble() * 256.0D;
++            this.c = random.nextDouble() * 256.0D;
++            for (int i = 0; i < 256; this.d[i] = i++) {}
++            for (int i = 0; i < 256; ++i) {
++                int j = random.nextInt(256 - i) + i;
++                int k = this.d[i];
++                this.d[i] = this.d[j];
++                this.d[j] = k;
++                this.d[i + 256] = this.d[i];
++            }
++        }
++
++        double lerp(double t, double a, double b) { return a + t * (b - a); }
++        double grad2(int i, double d0, double d1) { int j = i & 15; return PERLIN_H[j] * d0 + PERLIN_I[j] * d1; }
++        double grad3(int i, double d0, double d1, double d2) { int j = i & 15; return PERLIN_E[j] * d0 + PERLIN_F[j] * d1 + PERLIN_G[j] * d2; }
++
++        void sample(double[] adouble, double d0, double d1, double d2, int i, int j, int k, double d3, double d4, double d5, double d6) {
++            if (j == 1) {
++                int i2 = 0;
++                double d13 = 1.0D / d6;
++                for (int k2 = 0; k2 < i; ++k2) {
++                    double d7 = d0 + (double) k2 * d3 + this.a;
++                    int l2 = (int) d7;
++                    if (d7 < (double) l2) --l2;
++                    int i3 = l2 & 255;
++                    d7 -= (double) l2;
++                    double d8 = d7 * d7 * d7 * (d7 * (d7 * 6.0D - 15.0D) + 10.0D);
++                    for (int j1 = 0; j1 < k; ++j1) {
++                        double d9 = d2 + (double) j1 * d5 + this.c;
++                        int k1 = (int) d9;
++                        if (d9 < (double) k1) --k1;
++                        int l1 = k1 & 255;
++                        d9 -= (double) k1;
++                        double d10 = d9 * d9 * d9 * (d9 * (d9 * 6.0D - 15.0D) + 10.0D);
++                        int l = this.d[i3];
++                        int j3 = this.d[l] + l1;
++                        int k3 = this.d[i3 + 1];
++                        int i1 = this.d[k3] + l1;
++                        double d11 = lerp(d8, grad2(this.d[j3], d7, d9), grad3(this.d[i1], d7 - 1.0D, 0.0D, d9));
++                        double d12 = lerp(d8, grad3(this.d[j3 + 1], d7, 0.0D, d9 - 1.0D), grad3(this.d[i1 + 1], d7 - 1.0D, 0.0D, d9 - 1.0D));
++                        adouble[i2++] += lerp(d10, d11, d12) * d13;
++                    }
++                }
++            } else {
++                int l = 0;
++                double d15 = 1.0D / d6;
++                int i1 = -1;
++                double d16 = 0.0D, d7 = 0.0D, d17 = 0.0D, d8 = 0.0D;
++                for (int j1 = 0; j1 < i; ++j1) {
++                    double d9 = d0 + (double) j1 * d3 + this.a;
++                    int k1 = (int) d9;
++                    if (d9 < (double) k1) --k1;
++                    int l1 = k1 & 255;
++                    d9 -= (double) k1;
++                    double d10 = d9 * d9 * d9 * (d9 * (d9 * 6.0D - 15.0D) + 10.0D);
++                    for (int l3 = 0; l3 < k; ++l3) {
++                        double d18 = d2 + (double) l3 * d5 + this.c;
++                        int i4 = (int) d18;
++                        if (d18 < (double) i4) --i4;
++                        int j4 = i4 & 255;
++                        d18 -= (double) i4;
++                        double d19 = d18 * d18 * d18 * (d18 * (d18 * 6.0D - 15.0D) + 10.0D);
++                        for (int k4 = 0; k4 < j; ++k4) {
++                            double d20 = d1 + (double) k4 * d4 + this.b;
++                            int l4 = (int) d20;
++                            if (d20 < (double) l4) --l4;
++                            int i5 = l4 & 255;
++                            d20 -= (double) l4;
++                            double d21 = d20 * d20 * d20 * (d20 * (d20 * 6.0D - 15.0D) + 10.0D);
++                            if (k4 == 0 || i5 != i1) {
++                                i1 = i5;
++                                int j5 = this.d[l1] + i5;
++                                int k5 = this.d[j5] + j4;
++                                int l5 = this.d[j5 + 1] + j4;
++                                int i6 = this.d[l1 + 1] + i5;
++                                int i2 = this.d[i6] + j4;
++                                int j6 = this.d[i6 + 1] + j4;
++                                d16 = lerp(d10, grad3(this.d[k5], d9, d20, d18), grad3(this.d[i2], d9 - 1.0D, d20, d18));
++                                d7 = lerp(d10, grad3(this.d[l5], d9, d20 - 1.0D, d18), grad3(this.d[j6], d9 - 1.0D, d20 - 1.0D, d18));
++                                d17 = lerp(d10, grad3(this.d[k5 + 1], d9, d20, d18 - 1.0D), grad3(this.d[i2 + 1], d9 - 1.0D, d20, d18 - 1.0D));
++                                d8 = lerp(d10, grad3(this.d[l5 + 1], d9, d20 - 1.0D, d18 - 1.0D), grad3(this.d[j6 + 1], d9 - 1.0D, d20 - 1.0D, d18 - 1.0D));
++                            }
++                            double d22 = lerp(d21, d16, d7);
++                            double d23 = lerp(d21, d17, d8);
++                            adouble[l++] += lerp(d19, d22, d23) * d15;
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    private static final class VanillaOctaves {
++        final VanillaPerlin[] a;
++        final int b;
++
++        VanillaOctaves(Random r, int octaves) {
++            this.b = octaves;
++            this.a = new VanillaPerlin[octaves];
++            for (int j = 0; j < octaves; ++j) {
++                this.a[j] = new VanillaPerlin(r);
++            }
++        }
++
++        double[] sample(double[] adouble, int i, int j, int k, int l, int i1, int j1, double d0, double d1, double d2) {
++            if (adouble == null) adouble = new double[l * i1 * j1];
++            else Arrays.fill(adouble, 0.0D);
++            double d3 = 1.0D;
++            for (int l1 = 0; l1 < this.b; ++l1) {
++                double d4 = (double) i * d3 * d0;
++                double d5 = (double) j * d3 * d1;
++                double d6 = (double) k * d3 * d2;
++                long i2 = MathHelper.d(d4);
++                long j2 = MathHelper.d(d6);
++                d4 -= (double) i2;
++                d6 -= (double) j2;
++                i2 %= 16777216L;
++                j2 %= 16777216L;
++                d4 += (double) i2;
++                d6 += (double) j2;
++                this.a[l1].sample(adouble, d4, d5, d6, l, i1, j1, d0 * d3, d1 * d3, d2 * d3, d3);
++                d3 /= 2.0D;
++            }
++            return adouble;
++        }
++    }
++
++    private static final class VanillaSimplexHandler {
++        private static final int[][] E = { { 1, 1, 0}, { -1, 1, 0}, { 1, -1, 0}, { -1, -1, 0}, { 1, 0, 1}, { -1, 0, 1}, { 1, 0, -1}, { -1, 0, -1}, { 0, 1, 1}, { 0, -1, 1}, { 0, 1, -1}, { 0, -1, -1}};
++        private static final double A = Math.sqrt(3.0D);
++        private static final double G = 0.5D * (A - 1.0D);
++        private static final double H = (3.0D - A) / 6.0D;
++        final int[] f = new int[512];
++        final double b, c, d;
++
++        VanillaSimplexHandler(Random r) {
++            this.b = r.nextDouble() * 256.0D;
++            this.c = r.nextDouble() * 256.0D;
++            this.d = r.nextDouble() * 256.0D;
++            for (int i = 0; i < 256; this.f[i] = i++) {}
++            for (int i = 0; i < 256; ++i) {
++                int j = r.nextInt(256 - i) + i;
++                int k = this.f[i];
++                this.f[i] = this.f[j];
++                this.f[j] = k;
++                this.f[i + 256] = this.f[i];
++            }
++        }
++
++        private static int floor(double d0) { return d0 > 0.0D ? (int) d0 : (int) d0 - 1; }
++        private static double dot(int[] g, double x, double y) { return (double) g[0] * x + (double) g[1] * y; }
++
++        void sample(double[] adouble, double d0, double d1, int i, int j, double d2, double d3, double d4) {
++            int k = 0;
++            for (int l = 0; l < j; ++l) {
++                double d5 = (d1 + (double) l) * d3 + this.c;
++                for (int i1 = 0; i1 < i; ++i1) {
++                    double d6 = (d0 + (double) i1) * d2 + this.b;
++                    double d7 = (d6 + d5) * G;
++                    int j1 = floor(d6 + d7);
++                    int k1 = floor(d5 + d7);
++                    double d8 = (double) (j1 + k1) * H;
++                    double d11 = d6 - ((double) j1 - d8);
++                    double d12 = d5 - ((double) k1 - d8);
++                    byte b0 = (byte) (d11 > d12 ? 1 : 0);
++                    byte b1 = (byte) (d11 > d12 ? 0 : 1);
++                    double d13 = d11 - (double) b0 + H;
++                    double d14 = d12 - (double) b1 + H;
++                    double d15 = d11 - 1.0D + 2.0D * H;
++                    double d16 = d12 - 1.0D + 2.0D * H;
++                    int l1 = j1 & 255;
++                    int i2 = k1 & 255;
++                    int j2 = this.f[l1 + this.f[i2]] % 12;
++                    int k2 = this.f[l1 + b0 + this.f[i2 + b1]] % 12;
++                    int l2 = this.f[l1 + 1 + this.f[i2 + 1]] % 12;
++                    double d17 = 0.5D - d11 * d11 - d12 * d12;
++                    double d18 = d17 < 0.0D ? 0.0D : (d17 * d17) * (d17 * d17) * dot(E[j2], d11, d12);
++                    double d19 = 0.5D - d13 * d13 - d14 * d14;
++                    double d20 = d19 < 0.0D ? 0.0D : (d19 * d19) * (d19 * d19) * dot(E[k2], d13, d14);
++                    double d21 = 0.5D - d15 * d15 - d16 * d16;
++                    double d22 = d21 < 0.0D ? 0.0D : (d21 * d21) * (d21 * d21) * dot(E[l2], d15, d16);
++                    adouble[k++] += 70.0D * (d18 + d20 + d22) * d4;
++                }
++            }
++        }
++    }
++
++    private static final class VanillaSimplex {
++        final VanillaSimplexHandler[] a;
++        final int b;
++
++        VanillaSimplex(Random r, int octaves) {
++            this.b = octaves;
++            this.a = new VanillaSimplexHandler[octaves];
++            for (int j = 0; j < octaves; ++j) {
++                this.a[j] = new VanillaSimplexHandler(r);
++            }
++        }
++
++        double[] sample(double[] adouble, double d0, double d1, int i, int j, double d2, double d3, double d4) {
++            if (adouble != null && adouble.length >= i * j) Arrays.fill(adouble, 0.0D);
++            else adouble = new double[i * j];
++            double d6 = 1.0D, d7 = 1.0D;
++            for (int l = 0; l < this.b; ++l) {
++                this.a[l].sample(adouble, d0, d1, i, j, d2 * d7 * d6, d3 * d7 * d6, 0.55D / d6);
++                d7 *= d4;
++                d6 *= 0.5D;
++            }
++            return adouble;
++        }
++    }
++
++    @Test
++    public void testPerlinGradParity() {
++        NoiseGeneratorPerlin perlin = new NoiseGeneratorPerlin(new Random(1L));
++        double[] xs = { -1.25D, 0.0D, 0.37D };
++        double[] ys = { -0.75D, 0.0D, 0.91D };
++        double[] zs = { -0.5D, 0.0D, 0.63D };
++        for (int h = 0; h < 32; ++h) {
++            int j = h & 15;
++            for (double x : xs) {
++                for (double y : ys) {
++                    assertEquals(Double.doubleToLongBits(PERLIN_H[j] * x + PERLIN_I[j] * y),
++                            Double.doubleToLongBits(perlin.a(h, x, y)));
++                    for (double z : zs) {
++                        assertEquals(Double.doubleToLongBits(PERLIN_E[j] * x + PERLIN_F[j] * y + PERLIN_G[j] * z),
++                                Double.doubleToLongBits(perlin.a(h, x, y, z)));
++                    }
++                }
++            }
++        }
++    }
++
++    @Test
++    public void testOctavesAndSimplexBitExactParity() {
++        long[] seeds = { 12345L, -987654321L, 0L };
++        int[][] coords = { { 0, 0 }, { 12, -7 }, { -45, 33 }, { 100, 100 }, { -1, -1 } };
++
++        for (long seed : seeds) {
++            NoiseGeneratorOctaves opt16 = new NoiseGeneratorOctaves(new Random(seed), 16);
++            VanillaOctaves ref16 = new VanillaOctaves(new Random(seed), 16);
++
++            NoiseGeneratorOctaves opt2d = new NoiseGeneratorOctaves(new Random(seed + 1), 16);
++            VanillaOctaves ref2d = new VanillaOctaves(new Random(seed + 1), 16);
++
++            NoiseGenerator3 optSimplex = new NoiseGenerator3(new Random(seed + 2), 4);
++            VanillaSimplex refSimplex = new VanillaSimplex(new Random(seed + 2), 4);
++
++            double[] outOpt3d = null, outRef3d = null;
++            double[] outOpt2d = null, outRef2d = null;
++            double[] outOptS = null, outRefS = null;
++
++            for (int[] c : coords) {
++                int cx = c[0], cz = c[1];
++                outOpt3d = opt16.a(outOpt3d, cx * 4, 0, cz * 4, 5, 33, 5, 684.412D, 684.412D, 684.412D);
++                outRef3d = ref16.sample(outRef3d, cx * 4, 0, cz * 4, 5, 33, 5, 684.412D, 684.412D, 684.412D);
++                assertArrayEquals("Perlin 3D mismatch", outRef3d, outOpt3d, 0.0D);
++
++                outOpt2d = opt2d.a(outOpt2d, cx * 4, cz * 4, 5, 5, 200.0D, 200.0D, 0.5D);
++                outRef2d = ref2d.sample(outRef2d, cx * 4, 10, cz * 4, 5, 1, 5, 200.0D, 1.0D, 200.0D);
++                assertArrayEquals("Perlin 2D mismatch", outRef2d, outOpt2d, 0.0D);
++
++                outOptS = optSimplex.a(outOptS, cx * 16, cz * 16, 16, 16, 0.0625D, 0.0625D, 1.0D);
++                outRefS = refSimplex.sample(outRefS, cx * 16, cz * 16, 16, 16, 0.0625D, 0.0625D, 1.0D);
++                assertArrayEquals("Simplex mismatch", outRefS, outOptS, 0.0D);
++            }
++        }
++    }
++
++    @Test
++    public void testPerlinAndSimplexBenchmarks() {
++        NoiseGeneratorOctaves optPerlin = new NoiseGeneratorOctaves(new Random(42L), 16);
++        VanillaOctaves refPerlin = new VanillaOctaves(new Random(42L), 16);
++        NoiseGenerator3 optSimplex = new NoiseGenerator3(new Random(43L), 4);
++        VanillaSimplex refSimplex = new VanillaSimplex(new Random(43L), 4);
++
++        double[] bufPerlin = new double[825];
++        double[] bufSimplex = new double[256];
++        long blackhole = 0L;
++
++        for (int i = 0; i < 1500; ++i) {
++            refPerlin.sample(bufPerlin, i * 4, 0, i * 4, 5, 33, 5, 684.412D, 684.412D, 684.412D);
++            blackhole ^= Double.doubleToRawLongBits(bufPerlin[i & 511]);
++            optPerlin.a(bufPerlin, i * 4, 0, i * 4, 5, 33, 5, 684.412D, 684.412D, 684.412D);
++            blackhole ^= Double.doubleToRawLongBits(bufPerlin[i & 511]);
++
++            refSimplex.sample(bufSimplex, i * 16, i * 16, 16, 16, 0.0625D, 0.0625D, 1.0D);
++            blackhole ^= Double.doubleToRawLongBits(bufSimplex[i & 255]);
++            optSimplex.a(bufSimplex, i * 16, i * 16, 16, 16, 0.0625D, 0.0625D, 1.0D);
++            blackhole ^= Double.doubleToRawLongBits(bufSimplex[i & 255]);
++        }
++
++        int iters = 2000;
++        long t0 = System.nanoTime();
++        for (int i = 0; i < iters; ++i) {
++            refPerlin.sample(bufPerlin, i * 4, 0, i * 4, 5, 33, 5, 684.412D, 684.412D, 684.412D);
++            blackhole ^= Double.doubleToRawLongBits(bufPerlin[400]);
++        }
++        long vanillaPerlinNs = (System.nanoTime() - t0) / iters;
++
++        t0 = System.nanoTime();
++        for (int i = 0; i < iters; ++i) {
++            optPerlin.a(bufPerlin, i * 4, 0, i * 4, 5, 33, 5, 684.412D, 684.412D, 684.412D);
++            blackhole ^= Double.doubleToRawLongBits(bufPerlin[400]);
++        }
++        long optPerlinNs = (System.nanoTime() - t0) / iters;
++
++        int simplexIters = 4000;
++        t0 = System.nanoTime();
++        for (int i = 0; i < simplexIters; ++i) {
++            refSimplex.sample(bufSimplex, i * 16, i * 16, 16, 16, 0.0625D, 0.0625D, 1.0D);
++            blackhole ^= Double.doubleToRawLongBits(bufSimplex[100]);
++        }
++        long vanillaSimplexNs = (System.nanoTime() - t0) / simplexIters;
++
++        t0 = System.nanoTime();
++        for (int i = 0; i < simplexIters; ++i) {
++            optSimplex.a(bufSimplex, i * 16, i * 16, 16, 16, 0.0625D, 0.0625D, 1.0D);
++            blackhole ^= Double.doubleToRawLongBits(bufSimplex[100]);
++        }
++        long optSimplexNs = (System.nanoTime() - t0) / simplexIters;
++
++        System.out.printf("A6_BENCH perlin_vanilla_ns=%d perlin_opt_ns=%d perlin_speedup=%.2fx simplex_vanilla_ns=%d simplex_opt_ns=%d simplex_speedup=%.2fx blackhole=%d%n",
++                vanillaPerlinNs, optPerlinNs, (double) vanillaPerlinNs / Math.max(1L, optPerlinNs),
++                vanillaSimplexNs, optSimplexNs, (double) vanillaSimplexNs / Math.max(1L, optSimplexNs),
++                blackhole);
++
++        assertTrue("Expected Perlin speedup > 1.15x", optPerlinNs * 1.15 < vanillaPerlinNs);
++        assertTrue("Expected Simplex speedup > 1.15x", optSimplexNs * 1.15 < vanillaSimplexNs);
++    }
++}
