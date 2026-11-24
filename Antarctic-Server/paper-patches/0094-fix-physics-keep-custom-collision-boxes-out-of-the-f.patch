@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Wed, 18 Nov 2026 13:02:07 +0700
-Subject: [PATCH 094/183] fix(physics): keep custom collision boxes out of the
+Subject: [PATCH 094/184] fix(physics): keep custom collision boxes out of the
  full-cube fast path
 
 Occluding and full-cube flags do not prove a unit collision box: soul sand is an opaque cube whose collision box is 0.875 tall, so the voxel fast path emitted a 1.0 box and entities stood 0.125 too high. FULL_CUBE now also requires that the block class declares none of the collision box, bounding box or addCollisionBoxToList hooks (cached per class); other blocks use canonical dispatch.

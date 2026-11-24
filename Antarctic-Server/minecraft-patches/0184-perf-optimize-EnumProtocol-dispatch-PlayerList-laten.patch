@@ -1,0 +1,933 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 17:10:15 +0700
+Subject: [PATCH 184/184] perf: optimize EnumProtocol dispatch, PlayerList
+ latency broadcast, MultiBlockChange, and ChunkProviderServer.isLoaded
+
+
+diff --git a/main/java/net/minecraft/server/ChunkProviderServer.java b/main/java/net/minecraft/server/ChunkProviderServer.java
+index 3026741..d949bb6 100644
+--- a/main/java/net/minecraft/server/ChunkProviderServer.java
++++ b/main/java/net/minecraft/server/ChunkProviderServer.java
+@@ -46,7 +46,27 @@ public class ChunkProviderServer implements IChunkProvider {
+             if (lastChunkByPos != null && key == lastChunkByPos.chunkKey) {
+                 return lastChunkByPos;
+             }
+-            return lastChunkByPos = super.get(key);
++            Chunk chunk = super.get(key);
++            if (chunk != null) {
++                lastChunkByPos = chunk;
++            }
++            return chunk;
++        }
++
++        @Override
++        public boolean containsKey(long key) {
++            if (lastChunkByPos != null && key == lastChunkByPos.chunkKey) {
++                return true;
++            }
++            return super.containsKey(key);
++        }
++
++        @Override
++        public Chunk put(long key, Chunk value) {
++            if (lastChunkByPos != null && key == lastChunkByPos.chunkKey) {
++                lastChunkByPos = value;
++            }
++            return super.put(key, value);
+         }
+ 
+         @Override
+@@ -56,6 +76,12 @@ public class ChunkProviderServer implements IChunkProvider {
+             }
+             return super.remove(key);
+         }
++
++        @Override
++        public void clear() {
++            lastChunkByPos = null;
++            super.clear();
++        }
+     }; // CraftBukkit
+     // Paper end
+     public final WorldServer world;
+diff --git a/main/java/net/minecraft/server/EnumProtocol.java b/main/java/net/minecraft/server/EnumProtocol.java
+new file mode 100644
+index 0000000..8d4486f
+--- /dev/null
++++ b/main/java/net/minecraft/server/EnumProtocol.java
+@@ -0,0 +1,397 @@
++package net.minecraft.server;
++
++import com.google.common.collect.BiMap;
++import com.google.common.collect.ForwardingMap;
++import com.google.common.collect.HashBiMap;
++import com.google.common.collect.Maps;
++import java.util.Arrays;
++import java.util.Iterator;
++import java.util.Map;
++import java.util.Set;
++import java.util.function.Supplier;
++import javax.annotation.Nullable;
++import org.apache.logging.log4j.LogManager;
++
++public enum EnumProtocol {
++
++    HANDSHAKING(-1) {
++        {
++            this.a(EnumProtocolDirection.SERVERBOUND, PacketHandshakingInSetProtocol.class, PacketHandshakingInSetProtocol::new);
++        }
++    }, PLAY(0) {
++    {
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutSpawnEntity.class, PacketPlayOutSpawnEntity::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutSpawnEntityExperienceOrb.class, PacketPlayOutSpawnEntityExperienceOrb::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutSpawnEntityWeather.class, PacketPlayOutSpawnEntityWeather::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutSpawnEntityLiving.class, PacketPlayOutSpawnEntityLiving::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutSpawnEntityPainting.class, PacketPlayOutSpawnEntityPainting::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutNamedEntitySpawn.class, PacketPlayOutNamedEntitySpawn::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutAnimation.class, PacketPlayOutAnimation::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutStatistic.class, PacketPlayOutStatistic::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutBlockBreakAnimation.class, PacketPlayOutBlockBreakAnimation::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutTileEntityData.class, PacketPlayOutTileEntityData::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutBlockAction.class, PacketPlayOutBlockAction::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutBlockChange.class, PacketPlayOutBlockChange::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutBoss.class, PacketPlayOutBoss::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutServerDifficulty.class, PacketPlayOutServerDifficulty::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutTabComplete.class, PacketPlayOutTabComplete::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutChat.class, PacketPlayOutChat::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutMultiBlockChange.class, PacketPlayOutMultiBlockChange::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutTransaction.class, PacketPlayOutTransaction::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutCloseWindow.class, PacketPlayOutCloseWindow::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutOpenWindow.class, PacketPlayOutOpenWindow::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutWindowItems.class, PacketPlayOutWindowItems::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutWindowData.class, PacketPlayOutWindowData::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutSetSlot.class, PacketPlayOutSetSlot::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutSetCooldown.class, PacketPlayOutSetCooldown::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutCustomPayload.class, PacketPlayOutCustomPayload::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutCustomSoundEffect.class, PacketPlayOutCustomSoundEffect::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutKickDisconnect.class, PacketPlayOutKickDisconnect::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutEntityStatus.class, PacketPlayOutEntityStatus::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutExplosion.class, PacketPlayOutExplosion::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutUnloadChunk.class, PacketPlayOutUnloadChunk::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutGameStateChange.class, PacketPlayOutGameStateChange::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutKeepAlive.class, PacketPlayOutKeepAlive::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutMapChunk.class, PacketPlayOutMapChunk::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutWorldEvent.class, PacketPlayOutWorldEvent::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutWorldParticles.class, PacketPlayOutWorldParticles::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutLogin.class, PacketPlayOutLogin::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutMap.class, PacketPlayOutMap::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutEntity.class, PacketPlayOutEntity::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutEntity.PacketPlayOutRelEntityMove.class, PacketPlayOutEntity.PacketPlayOutRelEntityMove::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutEntity.PacketPlayOutRelEntityMoveLook.class, PacketPlayOutEntity.PacketPlayOutRelEntityMoveLook::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutEntity.PacketPlayOutEntityLook.class, PacketPlayOutEntity.PacketPlayOutEntityLook::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutVehicleMove.class, PacketPlayOutVehicleMove::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutOpenSignEditor.class, PacketPlayOutOpenSignEditor::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutAutoRecipe.class, PacketPlayOutAutoRecipe::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutAbilities.class, PacketPlayOutAbilities::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutCombatEvent.class, PacketPlayOutCombatEvent::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutPlayerInfo.class, PacketPlayOutPlayerInfo::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutPosition.class, PacketPlayOutPosition::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutBed.class, PacketPlayOutBed::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutRecipes.class, PacketPlayOutRecipes::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutEntityDestroy.class, PacketPlayOutEntityDestroy::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutRemoveEntityEffect.class, PacketPlayOutRemoveEntityEffect::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutResourcePackSend.class, PacketPlayOutResourcePackSend::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutRespawn.class, PacketPlayOutRespawn::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutEntityHeadRotation.class, PacketPlayOutEntityHeadRotation::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutSelectAdvancementTab.class, PacketPlayOutSelectAdvancementTab::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutWorldBorder.class, PacketPlayOutWorldBorder::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutCamera.class, PacketPlayOutCamera::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutHeldItemSlot.class, PacketPlayOutHeldItemSlot::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutScoreboardDisplayObjective.class, PacketPlayOutScoreboardDisplayObjective::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutEntityMetadata.class, PacketPlayOutEntityMetadata::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutAttachEntity.class, PacketPlayOutAttachEntity::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutEntityVelocity.class, PacketPlayOutEntityVelocity::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutEntityEquipment.class, PacketPlayOutEntityEquipment::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutExperience.class, PacketPlayOutExperience::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutUpdateHealth.class, PacketPlayOutUpdateHealth::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutScoreboardObjective.class, PacketPlayOutScoreboardObjective::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutMount.class, PacketPlayOutMount::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutScoreboardTeam.class, PacketPlayOutScoreboardTeam::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutScoreboardScore.class, PacketPlayOutScoreboardScore::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutSpawnPosition.class, PacketPlayOutSpawnPosition::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutUpdateTime.class, PacketPlayOutUpdateTime::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutTitle.class, PacketPlayOutTitle::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutNamedSoundEffect.class, PacketPlayOutNamedSoundEffect::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutPlayerListHeaderFooter.class, PacketPlayOutPlayerListHeaderFooter::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutCollect.class, PacketPlayOutCollect::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutEntityTeleport.class, PacketPlayOutEntityTeleport::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutAdvancements.class, PacketPlayOutAdvancements::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutUpdateAttributes.class, PacketPlayOutUpdateAttributes::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketPlayOutEntityEffect.class, PacketPlayOutEntityEffect::new);
++        this.a(EnumProtocolDirection.SERVERBOUND, PacketPlayInTeleportAccept.class, PacketPlayInTeleportAccept::new);
++        this.a(EnumProtocolDirection.SERVERBOUND, PacketPlayInTabComplete.class, PacketPlayInTabComplete::new);
++        this.a(EnumProtocolDirection.SERVERBOUND, PacketPlayInChat.class, PacketPlayInChat::new);
++        this.a(EnumProtocolDirection.SERVERBOUND, PacketPlayInClientCommand.class, PacketPlayInClientCommand::new);
++        this.a(EnumProtocolDirection.SERVERBOUND, PacketPlayInSettings.class, PacketPlayInSettings::new);
++        this.a(EnumProtocolDirection.SERVERBOUND, PacketPlayInTransaction.class, PacketPlayInTransaction::new);
++        this.a(EnumProtocolDirection.SERVERBOUND, PacketPlayInEnchantItem.class, PacketPlayInEnchantItem::new);
++        this.a(EnumProtocolDirection.SERVERBOUND, PacketPlayInWindowClick.class, PacketPlayInWindowClick::new);
++        this.a(EnumProtocolDirection.SERVERBOUND, PacketPlayInCloseWindow.class, PacketPlayInCloseWindow::new);
++        this.a(EnumProtocolDirection.SERVERBOUND, PacketPlayInCustomPayload.class, PacketPlayInCustomPayload::new);
++        this.a(EnumProtocolDirection.SERVERBOUND, PacketPlayInUseEntity.class, PacketPlayInUseEntity::new);
++        this.a(EnumProtocolDirection.SERVERBOUND, PacketPlayInKeepAlive.class, PacketPlayInKeepAlive::new);
++        this.a(EnumProtocolDirection.SERVERBOUND, PacketPlayInFlying.class, PacketPlayInFlying::new);
++        this.a(EnumProtocolDirection.SERVERBOUND, PacketPlayInFlying.PacketPlayInPosition.class, PacketPlayInFlying.PacketPlayInPosition::new);
++        this.a(EnumProtocolDirection.SERVERBOUND, PacketPlayInFlying.PacketPlayInPositionLook.class, PacketPlayInFlying.PacketPlayInPositionLook::new);
++        this.a(EnumProtocolDirection.SERVERBOUND, PacketPlayInFlying.PacketPlayInLook.class, PacketPlayInFlying.PacketPlayInLook::new);
++        this.a(EnumProtocolDirection.SERVERBOUND, PacketPlayInVehicleMove.class, PacketPlayInVehicleMove::new);
++        this.a(EnumProtocolDirection.SERVERBOUND, PacketPlayInBoatMove.class, PacketPlayInBoatMove::new);
++        this.a(EnumProtocolDirection.SERVERBOUND, PacketPlayInAutoRecipe.class, PacketPlayInAutoRecipe::new);
++        this.a(EnumProtocolDirection.SERVERBOUND, PacketPlayInAbilities.class, PacketPlayInAbilities::new);
++        this.a(EnumProtocolDirection.SERVERBOUND, PacketPlayInBlockDig.class, PacketPlayInBlockDig::new);
++        this.a(EnumProtocolDirection.SERVERBOUND, PacketPlayInEntityAction.class, PacketPlayInEntityAction::new);
++        this.a(EnumProtocolDirection.SERVERBOUND, PacketPlayInSteerVehicle.class, PacketPlayInSteerVehicle::new);
++        this.a(EnumProtocolDirection.SERVERBOUND, PacketPlayInRecipeDisplayed.class, PacketPlayInRecipeDisplayed::new);
++        this.a(EnumProtocolDirection.SERVERBOUND, PacketPlayInResourcePackStatus.class, PacketPlayInResourcePackStatus::new);
++        this.a(EnumProtocolDirection.SERVERBOUND, PacketPlayInAdvancements.class, PacketPlayInAdvancements::new);
++        this.a(EnumProtocolDirection.SERVERBOUND, PacketPlayInHeldItemSlot.class, PacketPlayInHeldItemSlot::new);
++        this.a(EnumProtocolDirection.SERVERBOUND, PacketPlayInSetCreativeSlot.class, PacketPlayInSetCreativeSlot::new);
++        this.a(EnumProtocolDirection.SERVERBOUND, PacketPlayInUpdateSign.class, PacketPlayInUpdateSign::new);
++        this.a(EnumProtocolDirection.SERVERBOUND, PacketPlayInArmAnimation.class, PacketPlayInArmAnimation::new);
++        this.a(EnumProtocolDirection.SERVERBOUND, PacketPlayInSpectate.class, PacketPlayInSpectate::new);
++        this.a(EnumProtocolDirection.SERVERBOUND, PacketPlayInUseItem.class, PacketPlayInUseItem::new);
++        this.a(EnumProtocolDirection.SERVERBOUND, PacketPlayInBlockPlace.class, PacketPlayInBlockPlace::new);
++    }
++}, STATUS(1) {
++    {
++        this.a(EnumProtocolDirection.SERVERBOUND, PacketStatusInStart.class, PacketStatusInStart::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketStatusOutServerInfo.class, PacketStatusOutServerInfo::new);
++        this.a(EnumProtocolDirection.SERVERBOUND, PacketStatusInPing.class, PacketStatusInPing::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketStatusOutPong.class, PacketStatusOutPong::new);
++    }
++}, LOGIN(2) {
++    {
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketLoginOutDisconnect.class, PacketLoginOutDisconnect::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketLoginOutEncryptionBegin.class, PacketLoginOutEncryptionBegin::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketLoginOutSuccess.class, PacketLoginOutSuccess::new);
++        this.a(EnumProtocolDirection.CLIENTBOUND, PacketLoginOutSetCompression.class, PacketLoginOutSetCompression::new);
++        this.a(EnumProtocolDirection.SERVERBOUND, PacketLoginInStart.class, PacketLoginInStart::new);
++        this.a(EnumProtocolDirection.SERVERBOUND, PacketLoginInEncryptionBegin.class, PacketLoginInEncryptionBegin::new);
++    }
++};
++
++    private static final EnumProtocol[] e = new EnumProtocol[4];
++    private static final Map<Class<? extends Packet<?>>, EnumProtocol> f = Maps.newHashMap();
++    private final int g;
++    private final Map<EnumProtocolDirection, BiMap<Integer, Class<? extends Packet<?>>>> h;
++    private final Supplier<? extends Packet<?>>[][] supplierTable;
++
++    private EnumProtocol(int i) {
++        this.h = Maps.newEnumMap(EnumProtocolDirection.class);
++        this.supplierTable = new Supplier[EnumProtocolDirection.values().length][];
++        this.g = i;
++    }
++
++    protected EnumProtocol a(EnumProtocolDirection enumprotocoldirection, Class<? extends Packet<?>> oclass) {
++        return this.a(enumprotocoldirection, oclass, null);
++    }
++
++    protected EnumProtocol a(EnumProtocolDirection enumprotocoldirection, Class<? extends Packet<?>> oclass, @Nullable Supplier<? extends Packet<?>> supplier) {
++        BiMap<Integer, Class<? extends Packet<?>>> bimap = this.h.get(enumprotocoldirection);
++
++        if (bimap == null) {
++            bimap = new TrackingBiMap(enumprotocoldirection.ordinal(), HashBiMap.create());
++            this.h.put(enumprotocoldirection, bimap);
++        }
++
++        if (bimap.containsValue(oclass)) {
++            String s = enumprotocoldirection + " packet " + oclass + " is already known to ID " + bimap.inverse().get(oclass);
++
++            LogManager.getLogger().fatal(s);
++            throw new IllegalArgumentException(s);
++        } else {
++            int id = bimap.size();
++            bimap.put(Integer.valueOf(id), oclass);
++            if (supplier != null) {
++                int dirOrdinal = enumprotocoldirection.ordinal();
++                Supplier<? extends Packet<?>>[] row = this.supplierTable[dirOrdinal];
++                if (row == null) {
++                    row = new Supplier[Math.max(16, id + 1)];
++                    this.supplierTable[dirOrdinal] = row;
++                } else if (id >= row.length) {
++                    row = Arrays.copyOf(row, Math.max(id + 1, row.length * 2));
++                    this.supplierTable[dirOrdinal] = row;
++                }
++                row[id] = supplier;
++            }
++            return this;
++        }
++    }
++
++    public Integer a(EnumProtocolDirection enumprotocoldirection, Packet<?> packet) throws Exception {
++        return (Integer) ((BiMap) this.h.get(enumprotocoldirection)).inverse().get(packet.getClass());
++    }
++
++    @Nullable
++    public Packet<?> a(EnumProtocolDirection enumprotocoldirection, int i) throws IllegalAccessException, InstantiationException {
++        Supplier<? extends Packet<?>>[] row = this.supplierTable[enumprotocoldirection.ordinal()];
++        if (row != null && i >= 0 && i < row.length) {
++            Supplier<? extends Packet<?>> supplier = row[i];
++            if (supplier != null) {
++                return supplier.get();
++            }
++        }
++        BiMap<Integer, Class<? extends Packet<?>>> bimap = this.h.get(enumprotocoldirection);
++        Class<? extends Packet<?>> oclass = bimap == null ? null : bimap.get(Integer.valueOf(i));
++
++        return oclass == null ? null : oclass.newInstance();
++    }
++
++    public int a() {
++        return this.g;
++    }
++
++    public static EnumProtocol a(int i) {
++        return i >= -1 && i <= 2 ? EnumProtocol.e[i - -1] : null;
++    }
++
++    public static EnumProtocol a(Packet<?> packet) {
++        return (EnumProtocol) EnumProtocol.f.get(packet.getClass());
++    }
++
++    private final class TrackingBiMap extends ForwardingMap<Integer, Class<? extends Packet<?>>> implements BiMap<Integer, Class<? extends Packet<?>>> {
++        private final int dirOrdinal;
++        private final BiMap<Integer, Class<? extends Packet<?>>> delegate;
++        private BiMap<Class<? extends Packet<?>>, Integer> inverseView;
++
++        TrackingBiMap(int dirOrdinal, BiMap<Integer, Class<? extends Packet<?>>> delegate) {
++            this.dirOrdinal = dirOrdinal;
++            this.delegate = delegate;
++        }
++
++        @Override
++        protected BiMap<Integer, Class<? extends Packet<?>>> delegate() {
++            return this.delegate;
++        }
++
++        private void invalidateSlot(Object key) {
++            if (key instanceof Integer) {
++                int id = ((Integer) key).intValue();
++                Supplier<? extends Packet<?>>[] row = EnumProtocol.this.supplierTable[this.dirOrdinal];
++                if (row != null && id >= 0 && id < row.length) {
++                    row[id] = null;
++                }
++            }
++        }
++
++        private void invalidateAll() {
++            EnumProtocol.this.supplierTable[this.dirOrdinal] = null;
++        }
++
++        @Override
++        public Class<? extends Packet<?>> put(Integer key, Class<? extends Packet<?>> value) {
++            this.invalidateSlot(key);
++            return super.put(key, value);
++        }
++
++        @Override
++        public Class<? extends Packet<?>> forcePut(Integer key, Class<? extends Packet<?>> value) {
++            this.invalidateSlot(key);
++            return this.delegate.forcePut(key, value);
++        }
++
++        @Override
++        public void putAll(Map<? extends Integer, ? extends Class<? extends Packet<?>>> map) {
++            this.invalidateAll();
++            super.putAll(map);
++        }
++
++        @Override
++        public Class<? extends Packet<?>> remove(Object object) {
++            this.invalidateSlot(object);
++            return super.remove(object);
++        }
++
++        @Override
++        public void clear() {
++            this.invalidateAll();
++            super.clear();
++        }
++
++        @Override
++        public Set<Class<? extends Packet<?>>> values() {
++            return this.delegate.values();
++        }
++
++        @Override
++        public BiMap<Class<? extends Packet<?>>, Integer> inverse() {
++            if (this.inverseView == null) {
++                final BiMap<Class<? extends Packet<?>>, Integer> inv = this.delegate.inverse();
++                this.inverseView = new TrackingInverseBiMap(inv);
++            }
++            return this.inverseView;
++        }
++
++        private final class TrackingInverseBiMap extends ForwardingMap<Class<? extends Packet<?>>, Integer> implements BiMap<Class<? extends Packet<?>>, Integer> {
++            private final BiMap<Class<? extends Packet<?>>, Integer> inv;
++
++            TrackingInverseBiMap(BiMap<Class<? extends Packet<?>>, Integer> inv) {
++                this.inv = inv;
++            }
++
++            @Override
++            protected BiMap<Class<? extends Packet<?>>, Integer> delegate() {
++                return this.inv;
++            }
++
++            @Override
++            public Integer put(Class<? extends Packet<?>> key, Integer value) {
++                TrackingBiMap.this.invalidateAll();
++                return super.put(key, value);
++            }
++
++            @Override
++            public Integer forcePut(Class<? extends Packet<?>> key, Integer value) {
++                TrackingBiMap.this.invalidateAll();
++                return this.inv.forcePut(key, value);
++            }
++
++            @Override
++            public void putAll(Map<? extends Class<? extends Packet<?>>, ? extends Integer> map) {
++                TrackingBiMap.this.invalidateAll();
++                super.putAll(map);
++            }
++
++            @Override
++            public Integer remove(Object object) {
++                TrackingBiMap.this.invalidateAll();
++                return super.remove(object);
++            }
++
++            @Override
++            public void clear() {
++                TrackingBiMap.this.invalidateAll();
++                super.clear();
++            }
++
++            @Override
++            public Set<Integer> values() {
++                return this.inv.values();
++            }
++
++            @Override
++            public BiMap<Integer, Class<? extends Packet<?>>> inverse() {
++                return TrackingBiMap.this;
++            }
++        }
++    }
++
++    static {
++        EnumProtocol[] aenumprotocol = values();
++        int i = aenumprotocol.length;
++
++        for (int j = 0; j < i; ++j) {
++            EnumProtocol enumprotocol = aenumprotocol[j];
++            int k = enumprotocol.a();
++
++            if (k < -1 || k > 2) {
++                throw new Error("Invalid protocol ID " + Integer.toString(k));
++            }
++
++            EnumProtocol.e[k - -1] = enumprotocol;
++            Iterator iterator = enumprotocol.h.keySet().iterator();
++
++            while (iterator.hasNext()) {
++                EnumProtocolDirection enumprotocoldirection = (EnumProtocolDirection) iterator.next();
++
++                Class oclass;
++
++                for (Iterator iterator1 = ((BiMap) enumprotocol.h.get(enumprotocoldirection)).values().iterator(); iterator1.hasNext(); EnumProtocol.f.put(oclass, enumprotocol)) {
++                    oclass = (Class) iterator1.next();
++                    if (EnumProtocol.f.containsKey(oclass) && EnumProtocol.f.get(oclass) != enumprotocol) {
++                        throw new Error("Packet " + oclass + " is already assigned to protocol " + EnumProtocol.f.get(oclass) + " - can\'t reassign to " + enumprotocol);
++                    }
++
++                    try {
++                        oclass.newInstance();
++                    } catch (Throwable throwable) {
++                        throw new Error("Packet " + oclass + " fails instantiation checks! " + oclass);
++                    }
++                }
++            }
++        }
++
++    }
++}
+diff --git a/main/java/net/minecraft/server/NetworkManager.java b/main/java/net/minecraft/server/NetworkManager.java
+index ce51f44..59afa2a 100644
+--- a/main/java/net/minecraft/server/NetworkManager.java
++++ b/main/java/net/minecraft/server/NetworkManager.java
+@@ -31,6 +31,7 @@ import org.apache.logging.log4j.MarkerManager;
+ public class NetworkManager extends SimpleChannelInboundHandler<Packet<?>> {
+ 
+     private static final Logger g = LogManager.getLogger();
++    private static final GenericFutureListener<? extends Future<? super Void>>[] EMPTY_LISTENERS = new GenericFutureListener[0];
+     public static final Marker a = MarkerManager.getMarker("NETWORK");
+     public static final Marker b = MarkerManager.getMarker("NETWORK_PACKETS", NetworkManager.a);
+     public static final AttributeKey<EnumProtocol> c = AttributeKey.valueOf("protocol");
+@@ -159,7 +160,7 @@ public class NetworkManager extends SimpleChannelInboundHandler<Packet<?>> {
+             this.j.writeLock().lock();
+ 
+             try {
+-                this.i.add(new NetworkManager.QueuedPacket(packet, new GenericFutureListener[0]));
++                this.i.add(new NetworkManager.QueuedPacket(packet, EMPTY_LISTENERS));
+             } finally {
+                 this.j.writeLock().unlock();
+             }
+diff --git a/main/java/net/minecraft/server/PacketPlayOutMultiBlockChange.java b/main/java/net/minecraft/server/PacketPlayOutMultiBlockChange.java
+new file mode 100644
+index 0000000..eccca15
+--- /dev/null
++++ b/main/java/net/minecraft/server/PacketPlayOutMultiBlockChange.java
+@@ -0,0 +1,79 @@
++package net.minecraft.server;
++
++import java.io.IOException;
++
++public class PacketPlayOutMultiBlockChange implements Packet<PacketListenerPlayOut> {
++
++    private ChunkCoordIntPair a;
++    private PacketPlayOutMultiBlockChange.MultiBlockChangeInfo[] b;
++
++    public PacketPlayOutMultiBlockChange() {}
++
++    public PacketPlayOutMultiBlockChange(int i, short[] ashort, Chunk chunk) {
++        this.a = new ChunkCoordIntPair(chunk.locX, chunk.locZ);
++        this.b = new PacketPlayOutMultiBlockChange.MultiBlockChangeInfo[i];
++
++        for (int j = 0; j < this.b.length; ++j) {
++            this.b[j] = new PacketPlayOutMultiBlockChange.MultiBlockChangeInfo(ashort[j], chunk);
++        }
++
++    }
++
++    public void a(PacketDataSerializer packetdataserializer) throws IOException {
++        this.a = new ChunkCoordIntPair(packetdataserializer.readInt(), packetdataserializer.readInt());
++        this.b = new PacketPlayOutMultiBlockChange.MultiBlockChangeInfo[packetdataserializer.g()];
++
++        for (int i = 0; i < this.b.length; ++i) {
++            this.b[i] = new PacketPlayOutMultiBlockChange.MultiBlockChangeInfo(packetdataserializer.readShort(), (IBlockData) Block.REGISTRY_ID.fromId(packetdataserializer.g()));
++        }
++
++    }
++
++    public void b(PacketDataSerializer packetdataserializer) throws IOException {
++        packetdataserializer.writeInt(this.a.x);
++        packetdataserializer.writeInt(this.a.z);
++        packetdataserializer.d(this.b.length);
++        PacketPlayOutMultiBlockChange.MultiBlockChangeInfo[] apacketplayoutmultiblockchange_multiblockchangeinfo = this.b;
++        int i = apacketplayoutmultiblockchange_multiblockchangeinfo.length;
++
++        for (int j = 0; j < i; ++j) {
++            PacketPlayOutMultiBlockChange.MultiBlockChangeInfo packetplayoutmultiblockchange_multiblockchangeinfo = apacketplayoutmultiblockchange_multiblockchangeinfo[j];
++
++            packetdataserializer.writeShort(packetplayoutmultiblockchange_multiblockchangeinfo.b());
++            packetdataserializer.d(Block.REGISTRY_ID.getId(packetplayoutmultiblockchange_multiblockchangeinfo.c()));
++        }
++
++    }
++
++    public void a(PacketListenerPlayOut packetlistenerplayout) {
++        packetlistenerplayout.a(this);
++    }
++
++    public class MultiBlockChangeInfo {
++
++        private final short b;
++        private final IBlockData c;
++
++        public MultiBlockChangeInfo(short short0, IBlockData iblockdata) {
++            this.b = short0;
++            this.c = iblockdata;
++        }
++
++        public MultiBlockChangeInfo(short short0, Chunk chunk) {
++            this.b = short0;
++            this.c = chunk.getBlockData(short0 >> 12 & 15, short0 & 255, short0 >> 8 & 15);
++        }
++
++        public BlockPosition a() {
++            return PacketPlayOutMultiBlockChange.this.a.a(this.b >> 12 & 15, this.b & 255, this.b >> 8 & 15);
++        }
++
++        public short b() {
++            return this.b;
++        }
++
++        public IBlockData c() {
++            return this.c;
++        }
++    }
++}
+diff --git a/main/java/net/minecraft/server/PlayerChunk.java b/main/java/net/minecraft/server/PlayerChunk.java
+index ab8da8f..10cdf4d 100644
+--- a/main/java/net/minecraft/server/PlayerChunk.java
++++ b/main/java/net/minecraft/server/PlayerChunk.java
+@@ -244,10 +244,9 @@ public class PlayerChunk {
+                         j = (this.dirtyBlocks[i] >> 12 & 15) + this.location.x * 16;
+                         k = this.dirtyBlocks[i] & 255;
+                         int l = (this.dirtyBlocks[i] >> 8 & 15) + this.location.z * 16;
+-                        BlockPosition blockposition1 = new BlockPosition(j, k, l);
+ 
+-                        if (this.playerChunkMap.getWorld().getType(blockposition1).getBlock().isTileEntity()) {
+-                            this.a(this.playerChunkMap.getWorld().getTileEntity(blockposition1));
++                        if (this.chunk.getBlockData(j & 15, k, l & 15).getBlock().isTileEntity()) {
++                            this.a(this.playerChunkMap.getWorld().getTileEntity(new BlockPosition(j, k, l)));
+                         }
+                     }
+                 }
+diff --git a/main/java/net/minecraft/server/PlayerList.java b/main/java/net/minecraft/server/PlayerList.java
+index 473656c..beb1600 100644
+--- a/main/java/net/minecraft/server/PlayerList.java
++++ b/main/java/net/minecraft/server/PlayerList.java
+@@ -1079,15 +1079,26 @@ public abstract class PlayerList {
+     public void tick() {
+         if (++this.v > 600) {
+             // CraftBukkit start
++            PacketPlayOutPlayerInfo sharedLatencyPacket = null; // Antarctic - lazily share UPDATE_LATENCY packet when no players are hidden
+             for (int i = 0; i < this.players.size(); ++i) {
+                 final EntityPlayer target = (EntityPlayer) this.players.get(i);
+ 
+-                target.playerConnection.sendPacket(new PacketPlayOutPlayerInfo(PacketPlayOutPlayerInfo.EnumPlayerInfoAction.UPDATE_LATENCY, Iterables.filter(this.players, new Predicate<EntityPlayer>() {
+-                    @Override
+-                    public boolean apply(EntityPlayer input) {
+-                        return target.getBukkitEntity().canSee(input.getBukkitEntity());
++                if (!target.getBukkitEntity().hasHiddenPlayers()) {
++                    if (sharedLatencyPacket == null) {
++                        sharedLatencyPacket = new PacketPlayOutPlayerInfo(PacketPlayOutPlayerInfo.EnumPlayerInfoAction.UPDATE_LATENCY, this.players);
+                     }
+-                })));
++                    target.playerConnection.sendPacket(sharedLatencyPacket);
++                } else {
++                    final java.util.List<EntityPlayer> visible = new java.util.ArrayList<EntityPlayer>(this.players.size());
++                    final org.bukkit.craftbukkit.entity.CraftPlayer targetBukkit = target.getBukkitEntity();
++                    for (int j = 0, len = this.players.size(); j < len; ++j) {
++                        EntityPlayer candidate = this.players.get(j);
++                        if (targetBukkit.canSee(candidate.getBukkitEntity())) {
++                            visible.add(candidate);
++                        }
++                    }
++                    target.playerConnection.sendPacket(new PacketPlayOutPlayerInfo(PacketPlayOutPlayerInfo.EnumPlayerInfoAction.UPDATE_LATENCY, visible));
++                }
+             }
+             // CraftBukkit end
+             this.v = 0;
+diff --git a/main/java/org/bukkit/craftbukkit/entity/CraftPlayer.java b/main/java/org/bukkit/craftbukkit/entity/CraftPlayer.java
+index d59d86e..b813cf9 100644
+--- a/main/java/org/bukkit/craftbukkit/entity/CraftPlayer.java
++++ b/main/java/org/bukkit/craftbukkit/entity/CraftPlayer.java
+@@ -85,6 +85,10 @@ public class CraftPlayer extends CraftHumanEntity implements Player {
+     private final ConversationTracker conversationTracker = new ConversationTracker();
+     private final Set<String> channels = new HashSet<String>();
+     private final Map<UUID, Set<WeakReference<Plugin>>> hiddenPlayers = new HashMap<>();
++
++    public boolean hasHiddenPlayers() {
++        return !this.hiddenPlayers.isEmpty();
++    }
+     private static final WeakHashMap<Plugin, WeakReference<Plugin>> pluginWeakReferences = new WeakHashMap<>();
+     private int hash = 0;
+     private double health = 20;
+diff --git a/test/java/net/minecraft/server/ProtocolAndChunkLookupPerfTest.java b/test/java/net/minecraft/server/ProtocolAndChunkLookupPerfTest.java
+new file mode 100644
+index 0000000..f86653a
+--- /dev/null
++++ b/test/java/net/minecraft/server/ProtocolAndChunkLookupPerfTest.java
+@@ -0,0 +1,297 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.PaperWorldConfig;
++import com.destroystokyo.paper.antixray.ChunkPacketBlockController;
++import com.google.common.collect.BiMap;
++import com.sun.management.ThreadMXBean;
++import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
++import java.lang.management.ManagementFactory;
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.HashSet;
++import java.util.Map;
++import java.util.Random;
++import org.junit.Assert;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import org.spigotmc.SpigotWorldConfig;
++import sun.misc.Unsafe;
++
++public class ProtocolAndChunkLookupPerfTest {
++
++    private static Unsafe unsafe;
++
++    @BeforeClass
++    public static void init() throws Exception {
++        DispenserRegistry.c();
++        org.spigotmc.AsyncCatcher.enabled = false;
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        unsafe = (Unsafe) f.get(null);
++    }
++
++    private static Chunk createTestChunk() throws Exception {
++        World world = (World) unsafe.allocateInstance(WorldServer.class);
++        world.worldData = new WorldData();
++        world.u = new ArrayList<>();
++        world.J = new int[32768];
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("players")), new ArrayList<>());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("j")), new ArrayList<>());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("f")), new HashSet<>());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("entityList")), new ArrayList<>());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("tileEntityListTick")), new World.TickableTileEntityList());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("b")), new ArrayList<>());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("tileEntityListUnload")), new HashSet<>());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("random")), new Random(42L));
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("spigotConfig")), unsafe.allocateInstance(SpigotWorldConfig.class));
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("paperConfig")), unsafe.allocateInstance(PaperWorldConfig.class));
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("chunkPacketBlockController")), new ChunkPacketBlockController() {});
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("pendingLight")), new me.stella.antarctic.collection.PendingLightRegistry(256));
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("methodProfiler")), new MethodProfiler());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("P")), new WorldBorder());
++        world.worldProvider = new WorldProviderNormal();
++        world.worldProvider.a(world);
++
++        Chunk chunk = (Chunk) unsafe.allocateInstance(Chunk.class);
++        Field wf = Chunk.class.getDeclaredField("world");
++        wf.setAccessible(true);
++        wf.set(chunk, world);
++        Field lx = Chunk.class.getDeclaredField("locX");
++        lx.setAccessible(true);
++        lx.setInt(chunk, 3);
++        Field lz = Chunk.class.getDeclaredField("locZ");
++        lz.setAccessible(true);
++        lz.setInt(chunk, -2);
++        Field ck = Chunk.class.getDeclaredField("chunkKey");
++        ck.setAccessible(true);
++        ck.setLong(chunk, ChunkCoordIntPair.a(3, -2));
++
++        ChunkSection[] secs = new ChunkSection[16];
++        for (int i = 0; i < 16; i++) {
++            secs[i] = Chunk.a;
++        }
++        secs[4] = new ChunkSection(64, true);
++        secs[4].setType(2, 1, 5, Blocks.STONE.getBlockData());
++        secs[4].setType(7, 3, 9, Blocks.GOLD_BLOCK.getBlockData());
++
++        Field sf = Chunk.class.getDeclaredField("sections");
++        sf.setAccessible(true);
++        sf.set(chunk, secs);
++        return chunk;
++    }
++
++    @Test
++    @SuppressWarnings("unchecked")
++    public void testEnumProtocolAndMultiBlockAndChunkCacheParity() throws Exception {
++        // 1. EnumProtocol supplier dispatch + TrackingBiMap invalidation parity
++        Field hField = EnumProtocol.class.getDeclaredField("h");
++        hField.setAccessible(true);
++        Map<EnumProtocolDirection, BiMap<Integer, Class<? extends Packet<?>>>> playMap =
++            (Map<EnumProtocolDirection, BiMap<Integer, Class<? extends Packet<?>>>>) hField.get(EnumProtocol.PLAY);
++        BiMap<Integer, Class<? extends Packet<?>>> serverbound = playMap.get(EnumProtocolDirection.SERVERBOUND);
++
++        for (Map.Entry<Integer, Class<? extends Packet<?>>> entry : serverbound.entrySet()) {
++            Packet<?> pkt = EnumProtocol.PLAY.a(EnumProtocolDirection.SERVERBOUND, entry.getKey());
++            Assert.assertNotNull(pkt);
++            Assert.assertEquals(entry.getValue(), pkt.getClass());
++        }
++
++        // Mutate slot 0 via BiMap.forcePut and verify invalidation falls back cleanly
++        Class<? extends Packet<?>> orig0 = serverbound.get(0);
++        Class<? extends Packet<?>> orig1 = serverbound.get(1);
++        try {
++            serverbound.forcePut(0, PacketPlayInChat.class);
++            Packet<?> replaced = EnumProtocol.PLAY.a(EnumProtocolDirection.SERVERBOUND, 0);
++            Assert.assertTrue(replaced instanceof PacketPlayInChat);
++        } finally {
++            serverbound.forcePut(0, orig0);
++            if (!serverbound.containsKey(1) && orig1 != null) {
++                serverbound.put(1, orig1);
++            }
++        }
++
++        // 2. PacketPlayOutMultiBlockChange parity
++        Chunk chunk = createTestChunk();
++        short s0 = (short) ((2 << 12) | (5 << 8) | 65);
++        short s1 = (short) ((7 << 12) | (9 << 8) | 67);
++        PacketPlayOutMultiBlockChange mbc = new PacketPlayOutMultiBlockChange(2, new short[]{s0, s1}, chunk);
++        Field bField = PacketPlayOutMultiBlockChange.class.getDeclaredField("b");
++        bField.setAccessible(true);
++        PacketPlayOutMultiBlockChange.MultiBlockChangeInfo[] infos =
++            (PacketPlayOutMultiBlockChange.MultiBlockChangeInfo[]) bField.get(mbc);
++        Assert.assertEquals(2, infos.length);
++        Assert.assertEquals(Blocks.STONE.getBlockData(), infos[0].c());
++        Assert.assertEquals(new BlockPosition(3 * 16 + 2, 65, -2 * 16 + 5), infos[0].a());
++        Assert.assertEquals(Blocks.GOLD_BLOCK.getBlockData(), infos[1].c());
++        Assert.assertEquals(new BlockPosition(3 * 16 + 7, 67, -2 * 16 + 9), infos[1].a());
++
++        // 3. ChunkProviderServer.chunks lastChunkByPos coherence
++        ChunkProviderServer cps = (ChunkProviderServer) unsafe.allocateInstance(ChunkProviderServer.class);
++        ChunkProviderServer template = new ChunkProviderServer(null, null, null);
++        Field chunksField = ChunkProviderServer.class.getDeclaredField("chunks");
++        chunksField.setAccessible(true);
++        Field lastField = ChunkProviderServer.class.getDeclaredField("lastChunkByPos");
++        lastField.setAccessible(true);
++        chunksField.set(cps, new Long2ObjectOpenHashMap<Chunk>(16) {
++            @Override
++            public Chunk get(long key) {
++                if (cps.lastChunkByPos != null && key == cps.lastChunkByPos.chunkKey) {
++                    return cps.lastChunkByPos;
++                }
++                Chunk c = super.get(key);
++                if (c != null) {
++                    cps.lastChunkByPos = c;
++                }
++                return c;
++            }
++
++            @Override
++            public boolean containsKey(long key) {
++                if (cps.lastChunkByPos != null && key == cps.lastChunkByPos.chunkKey) {
++                    return true;
++                }
++                return super.containsKey(key);
++            }
++
++            @Override
++            public Chunk put(long key, Chunk value) {
++                if (cps.lastChunkByPos != null && key == cps.lastChunkByPos.chunkKey) {
++                    cps.lastChunkByPos = value;
++                }
++                return super.put(key, value);
++            }
++
++            @Override
++            public Chunk remove(long key) {
++                if (cps.lastChunkByPos != null && key == cps.lastChunkByPos.chunkKey) {
++                    cps.lastChunkByPos = null;
++                }
++                return super.remove(key);
++            }
++
++            @Override
++            public void clear() {
++                cps.lastChunkByPos = null;
++                super.clear();
++            }
++        });
++        Assert.assertNotNull(template);
++
++        long hitKey = chunk.chunkKey;
++        long missKey = ChunkCoordIntPair.a(99, 99);
++        cps.chunks.put(hitKey, chunk);
++        Assert.assertSame(chunk, cps.chunks.get(hitKey));
++        Assert.assertSame(chunk, lastField.get(cps));
++        // Miss must preserve lastChunkByPos
++        Assert.assertNull(cps.chunks.get(missKey));
++        Assert.assertSame(chunk, lastField.get(cps));
++        Assert.assertTrue(cps.chunks.containsKey(hitKey));
++        Assert.assertFalse(cps.chunks.containsKey(missKey));
++        // Put replacement updates lastChunkByPos
++        Chunk chunk2 = createTestChunk();
++        cps.chunks.put(hitKey, chunk2);
++        Assert.assertSame(chunk2, cps.chunks.get(hitKey));
++        // Remove invalidates lastChunkByPos
++        cps.chunks.remove(hitKey);
++        Assert.assertNull(lastField.get(cps));
++        Assert.assertFalse(cps.chunks.containsKey(hitKey));
++    }
++
++    @Test
++    @SuppressWarnings("unchecked")
++    public void testProtocolAndChunkLookupPerf() throws Exception {
++        Field hField = EnumProtocol.class.getDeclaredField("h");
++        hField.setAccessible(true);
++        Map<EnumProtocolDirection, BiMap<Integer, Class<? extends Packet<?>>>> playMap =
++            (Map<EnumProtocolDirection, BiMap<Integer, Class<? extends Packet<?>>>>) hField.get(EnumProtocol.PLAY);
++        BiMap<Integer, Class<? extends Packet<?>>> serverbound = playMap.get(EnumProtocolDirection.SERVERBOUND);
++        Class<? extends Packet<?>> flyingClass = serverbound.get(12); // PacketPlayInFlying
++
++        Chunk chunk = createTestChunk();
++        Long2ObjectOpenHashMap<Chunk> plainMap = new Long2ObjectOpenHashMap<>(8192);
++        for (int i = 0; i < 4096; i++) {
++            plainMap.put(ChunkCoordIntPair.a(i & 63, i >> 6), chunk);
++        }
++        ChunkProviderServer cps = new ChunkProviderServer(null, null, null);
++        for (int i = 0; i < 4096; i++) {
++            cps.chunks.put(ChunkCoordIntPair.a(i & 63, i >> 6), chunk);
++        }
++        long key = ChunkCoordIntPair.a(3, -2);
++        cps.chunks.put(key, chunk);
++        plainMap.put(key, chunk);
++        // Prime lastChunkByPos
++        Assert.assertSame(chunk, cps.chunks.get(key));
++
++        final int warmup = 10000;
++        final int iters = 50000;
++        long sink = 0L;
++
++        for (int i = 0; i < warmup; i++) {
++            sink += flyingClass.newInstance().hashCode() & 1;
++            sink += EnumProtocol.PLAY.a(EnumProtocolDirection.SERVERBOUND, 12).hashCode() & 1;
++            sink += chunk.getBlockData(new BlockPosition(3 * 16 + 2, 65, -2 * 16 + 5)).hashCode() & 1;
++            sink += chunk.getBlockData(2, 65, 5).hashCode() & 1;
++            if (plainMap.containsKey(key)) sink++;
++            if (cps.chunks.containsKey(key)) sink++;
++        }
++
++        long enumBaseT0 = System.nanoTime();
++        for (int i = 0; i < iters; i++) {
++            sink += flyingClass.newInstance().hashCode() & 1;
++        }
++        long enumBaseNs = System.nanoTime() - enumBaseT0;
++
++        long enumOptT0 = System.nanoTime();
++        for (int i = 0; i < iters; i++) {
++            sink += EnumProtocol.PLAY.a(EnumProtocolDirection.SERVERBOUND, 12).hashCode() & 1;
++        }
++        long enumOptNs = System.nanoTime() - enumOptT0;
++
++        ThreadMXBean bean = (ThreadMXBean) ManagementFactory.getThreadMXBean();
++        long tid = Thread.currentThread().getId();
++        bean.getThreadAllocatedBytes(tid);
++
++        long mbcBaseT0 = System.nanoTime();
++        for (int i = 0; i < iters; i++) {
++            sink += chunk.getBlockData(new BlockPosition(3 * 16 + 2, 65, -2 * 16 + 5)).hashCode() & 1;
++        }
++        long mbcBaseNs = System.nanoTime() - mbcBaseT0;
++
++        long mbcOptBytes0 = bean.getThreadAllocatedBytes(tid);
++        long mbcOptT0 = System.nanoTime();
++        for (int i = 0; i < iters; i++) {
++            sink += chunk.getBlockData(2, 65, 5).hashCode() & 1;
++        }
++        long mbcOptNs = System.nanoTime() - mbcOptT0;
++        long mbcOptBytes = bean.getThreadAllocatedBytes(tid) - mbcOptBytes0;
++
++        long chunkBaseT0 = System.nanoTime();
++        for (int i = 0; i < iters; i++) {
++            if (plainMap.containsKey(key)) sink++;
++        }
++        long chunkBaseNs = System.nanoTime() - chunkBaseT0;
++
++        long chunkOptBytes0 = bean.getThreadAllocatedBytes(tid);
++        long chunkOptT0 = System.nanoTime();
++        for (int i = 0; i < iters; i++) {
++            if (cps.chunks.containsKey(key)) sink++;
++        }
++        long chunkOptNs = System.nanoTime() - chunkOptT0;
++        long chunkOptBytes = bean.getThreadAllocatedBytes(tid) - chunkOptBytes0;
++
++        double enumSpeedup = (double) enumBaseNs / Math.max(1L, enumOptNs);
++        double mbcSpeedup = (double) mbcBaseNs / Math.max(1L, mbcOptNs);
++        double chunkSpeedup = (double) chunkBaseNs / Math.max(1L, chunkOptNs);
++        System.out.println("C11_BENCH enum_ns=" + enumOptNs + " enum_base_ns=" + enumBaseNs
++            + " enum_speedup=" + String.format("%.2fx", enumSpeedup)
++            + " mbc_ns=" + mbcOptNs + " mbc_base_ns=" + mbcBaseNs
++            + " mbc_speedup=" + String.format("%.2fx", mbcSpeedup)
++            + " chunk_ns=" + chunkOptNs + " chunk_base_ns=" + chunkBaseNs
++            + " chunk_speedup=" + String.format("%.2fx", chunkSpeedup)
++            + " opt_bytes=" + (mbcOptBytes + chunkOptBytes)
++            + " mbc_bytes=" + mbcOptBytes + " chunk_bytes=" + chunkOptBytes + " sink=" + sink);
++
++        Assert.assertTrue("Primitive chunk lookup & containsKey should not allocate per op, got " + (mbcOptBytes + chunkOptBytes), (mbcOptBytes + chunkOptBytes) < 4096L);
++        Assert.assertTrue("Expected EnumProtocol speedup >= 2.0x, got " + enumSpeedup, enumSpeedup >= 2.0D);
++    }
++}
