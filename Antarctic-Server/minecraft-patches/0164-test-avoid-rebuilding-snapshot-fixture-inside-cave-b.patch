@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 11:17:26 +0700
+Subject: [PATCH 164/164] test: avoid rebuilding snapshot fixture inside cave
+ benchmark loop
+
+
+diff --git a/test/java/net/minecraft/server/FastRandomAndCarverPerfTest.java b/test/java/net/minecraft/server/FastRandomAndCarverPerfTest.java
+index ec66315..13391bb 100644
+--- a/test/java/net/minecraft/server/FastRandomAndCarverPerfTest.java
++++ b/test/java/net/minecraft/server/FastRandomAndCarverPerfTest.java
+@@ -248,29 +248,32 @@ public class FastRandomAndCarverPerfTest {
+         // WorldGenCaves carver benchmark
+         WorldGenCaves caves = new WorldGenCaves();
+         ChunkSnapshot caveSnap = buildCarverTestSnapshot();
++        ChunkSnapshot workSnap = new ChunkSnapshot();
++        char[] templateRaw = caveSnap.rawBlocks();
++        char[] workRaw = workSnap.rawBlocks();
+         for (int w = 0; w < 200; ++w) {
+-            ChunkSnapshot s1 = buildCarverTestSnapshot();
+-            vanillaCaveReference(101L + w, 0, 0, s1, 8.0D, 30.0D, 8.0D, 3.0F, 0.4F, 0.1F, 0, 0, 1.0D);
+-            ChunkSnapshot s2 = buildCarverTestSnapshot();
+-            caves.a(101L + w, 0, 0, s2, 8.0D, 30.0D, 8.0D, 3.0F, 0.4F, 0.1F, 0, 0, 1.0D);
+-            blackhole ^= s1.rawBlocks()[0] ^ s2.rawBlocks()[0];
++            System.arraycopy(templateRaw, 0, workRaw, 0, templateRaw.length);
++            vanillaCaveReference(101L + w, 0, 0, workSnap, 8.0D, 30.0D, 8.0D, 3.0F, 0.4F, 0.1F, 0, 0, 1.0D);
++            blackhole ^= workRaw[0];
++            System.arraycopy(templateRaw, 0, workRaw, 0, templateRaw.length);
++            caves.a(101L + w, 0, 0, workSnap, 8.0D, 30.0D, 8.0D, 3.0F, 0.4F, 0.1F, 0, 0, 1.0D);
++            blackhole ^= workRaw[0];
+         }
+ 
+         int caveIters = 200;
+         t0 = System.nanoTime();
+         for (int c = 0; c < caveIters; ++c) {
+-            System.arraycopy(caveSnap.rawBlocks(), 0, caveSnap.rawBlocks(), 0, 0);
+-            ChunkSnapshot s = buildCarverTestSnapshot();
+-            vanillaCaveReference(101L, 0, 0, s, 8.0D, 30.0D, 8.0D, 3.0F, 0.4F, 0.1F, 0, 0, 1.0D);
+-            blackhole ^= s.rawBlocks()[8 << 12 | 8 << 8 | 25];
++            System.arraycopy(templateRaw, 0, workRaw, 0, templateRaw.length);
++            vanillaCaveReference(101L, 0, 0, workSnap, 8.0D, 30.0D, 8.0D, 3.0F, 0.4F, 0.1F, 0, 0, 1.0D);
++            blackhole ^= workRaw[8 << 12 | 8 << 8 | 25];
+         }
+         long carverVanillaNs = (System.nanoTime() - t0) / caveIters;
+ 
+         t0 = System.nanoTime();
+         for (int c = 0; c < caveIters; ++c) {
+-            ChunkSnapshot s = buildCarverTestSnapshot();
+-            caves.a(101L, 0, 0, s, 8.0D, 30.0D, 8.0D, 3.0F, 0.4F, 0.1F, 0, 0, 1.0D);
+-            blackhole ^= s.rawBlocks()[8 << 12 | 8 << 8 | 25];
++            System.arraycopy(templateRaw, 0, workRaw, 0, templateRaw.length);
++            caves.a(101L, 0, 0, workSnap, 8.0D, 30.0D, 8.0D, 3.0F, 0.4F, 0.1F, 0, 0, 1.0D);
++            blackhole ^= workRaw[8 << 12 | 8 << 8 | 25];
+         }
+         long carverOptNs = (System.nanoTime() - t0) / caveIters;
+ 

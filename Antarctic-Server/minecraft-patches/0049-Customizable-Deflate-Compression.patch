@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: nopjmp <kthompson@hey.com>
 Date: Thu, 11 Feb 2021 01:02:59 -0600
-Subject: [PATCH 049/163] Customizable Deflate Compression
+Subject: [PATCH 049/164] Customizable Deflate Compression
 
 - Backport Dionysus server/0026-Customizable-Deflate-Compression.patch
 - Source: https://github.com/nopjmp/Dionysus at b5c71b62f6f1f555b22bd52f5751e33be4690b6e
