@@ -1,0 +1,994 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 12:52:03 +0700
+Subject: [PATCH 170/170] perf: clean up per-tick entity, item, HopperPusher
+ and ControllerMove allocations
+
+
+diff --git a/main/java/com/destroystokyo/paper/HopperPusher.java b/main/java/com/destroystokyo/paper/HopperPusher.java
+index 52457e3..81cb288 100644
+--- a/main/java/com/destroystokyo/paper/HopperPusher.java
++++ b/main/java/com/destroystokyo/paper/HopperPusher.java
+@@ -9,35 +9,40 @@ import net.minecraft.server.World;
+ public interface HopperPusher {
+ 
+     default TileEntityHopper findHopper() {
+-        BlockPosition pos = new BlockPosition(getX(), getY(), getZ());
+-        int startX = pos.getX() - 1;
+-        int endX = pos.getX() + 1;
+-        int startY = Math.max(0, pos.getY() - 1);
+-        int endY = Math.min(255, pos.getY() + 1);
+-        int startZ = pos.getZ() - 1;
+-        int endZ = pos.getZ() + 1;
++        int cx = net.minecraft.server.MathHelper.floor(getX());
++        int cy = net.minecraft.server.MathHelper.floor(getY());
++        int cz = net.minecraft.server.MathHelper.floor(getZ());
++        int startX = cx - 1;
++        int endX = cx + 1;
++        int startY = Math.max(0, cy - 1);
++        int endY = Math.min(255, cy + 1);
++        int startZ = cz - 1;
++        int endZ = cz + 1;
+         BlockPosition.PooledBlockPosition adjacentPos = BlockPosition.PooledBlockPosition.aquire();
+-        for (int x = startX; x <= endX; x++) {
+-            for (int y = startY; y <= endY; y++) {
+-                for (int z = startZ; z <= endZ; z++) {
+-                    adjacentPos.setValues(x, y, z);
+-                    TileEntityHopper hopper = MCUtil.getHopper(getWorld(), adjacentPos);
+-                    if (hopper == null) continue; // Avoid playing with the bounding boxes, if at all possible
+-                    AxisAlignedBB hopperBoundingBox = hopper.getHopperLookupBoundingBox();
+-                    /*
+-                     * Check if the entity's bounding box intersects with the hopper's lookup box.
+-                     * This operation doesn't work both ways!
+-                     * Make sure you check if the entity's box intersects the hopper's box, not vice versa!
+-                     */
+-                    AxisAlignedBB boundingBox = this.getBoundingBox().shrink(0.1); // Imitate vanilla behavior
+-                    if (boundingBox.intersects(hopperBoundingBox)) {
+-                        return hopper;
++        try {
++            for (int x = startX; x <= endX; x++) {
++                for (int y = startY; y <= endY; y++) {
++                    for (int z = startZ; z <= endZ; z++) {
++                        adjacentPos.setValues(x, y, z);
++                        TileEntityHopper hopper = MCUtil.getHopper(getWorld(), adjacentPos);
++                        if (hopper == null) continue; // Avoid playing with the bounding boxes, if at all possible
++                        AxisAlignedBB hopperBoundingBox = hopper.getHopperLookupBoundingBox();
++                        /*
++                         * Check if the entity's bounding box intersects with the hopper's lookup box.
++                         * This operation doesn't work both ways!
++                         * Make sure you check if the entity's box intersects the hopper's box, not vice versa!
++                         */
++                        AxisAlignedBB boundingBox = this.getBoundingBox().shrink(0.1); // Imitate vanilla behavior
++                        if (boundingBox.intersects(hopperBoundingBox)) {
++                            return hopper;
++                        }
+                     }
+                 }
+             }
++            return null;
++        } finally {
++            adjacentPos.free();
+         }
+-        adjacentPos.free();
+-        return null;
+     }
+ 
+     boolean acceptItem(TileEntityHopper hopper);
+diff --git a/main/java/net/minecraft/server/Chunk.java b/main/java/net/minecraft/server/Chunk.java
+index 83f3fe0..dd3ba07 100644
+--- a/main/java/net/minecraft/server/Chunk.java
++++ b/main/java/net/minecraft/server/Chunk.java
+@@ -1295,6 +1295,33 @@ public class Chunk {
+         }
+     }
+ 
++    void mergeNearbyItems(EntityItem self, double minX, double minY, double minZ, double maxX, double maxY, double maxZ, @Nullable Chunk selfChunk, int selfSlice) {
++        int i = MathHelper.floor((minY - 2.0D) / 16.0D);
++        int j = MathHelper.floor((maxY + 2.0D) / 16.0D);
++
++        i = MathHelper.clamp(i, 0, this.entitySlices.length - 1);
++        j = MathHelper.clamp(j, 0, this.entitySlices.length - 1);
++
++        for (int k = i; k <= j; ++k) {
++            if (this.itemCounts[k] <= (this == selfChunk && k == selfSlice ? 1 : 0)) {
++                continue;
++            }
++            List<Entity> slice = this.entitySlices[k];
++            for (int idx = 0, len = slice.size(); idx < len; ++idx) {
++                Entity entity = slice.get(idx);
++                if (entity instanceof EntityItem && entity != self) {
++                    AxisAlignedBB entityBB = entity.getBoundingBox();
++                    if (entityBB.d > minX && entityBB.a < maxX && entityBB.e > minY && entityBB.b < maxY && entityBB.f > minZ && entityBB.c < maxZ) {
++                        self.tryMergeWith((EntityItem) entity);
++                        if (!self.isAlive()) {
++                            return;
++                        }
++                    }
++                }
++            }
++        }
++    }
++
+     public <T extends Entity> void a(Class<? extends T> oclass, AxisAlignedBB axisalignedbb, List<T> list, Predicate<? super T> predicate) {
+         int i = MathHelper.floor((axisalignedbb.b - 2.0D) / 16.0D);
+         int j = MathHelper.floor((axisalignedbb.e + 2.0D) / 16.0D);
+diff --git a/main/java/net/minecraft/server/ControllerMove.java b/main/java/net/minecraft/server/ControllerMove.java
+new file mode 100644
+index 0000000..bb02cb7
+--- /dev/null
++++ b/main/java/net/minecraft/server/ControllerMove.java
+@@ -0,0 +1,170 @@
++package net.minecraft.server;
++
++public class ControllerMove {
++
++    protected final EntityInsentient a;
++    protected double b;
++    protected double c;
++    protected double d;
++    protected double e;
++    protected float f;
++    protected float g;
++    public ControllerMove.Operation h;
++    private AttributeInstance movementSpeedAttr;
++
++    public ControllerMove(EntityInsentient entityinsentient) {
++        this.h = ControllerMove.Operation.WAIT;
++        this.a = entityinsentient;
++    }
++
++    private double getMovementSpeed() {
++        AttributeInstance attr = this.movementSpeedAttr;
++        if (attr == null) {
++            attr = this.a.getAttributeInstance(GenericAttributes.MOVEMENT_SPEED);
++            this.movementSpeedAttr = attr;
++        }
++        return attr.getValue();
++    }
++
++    public boolean b() {
++        return this.h == ControllerMove.Operation.MOVE_TO;
++    }
++
++    public double c() {
++        return this.e;
++    }
++
++    public void a(double d0, double d1, double d2, double d3) {
++        this.b = d0;
++        this.c = d1;
++        this.d = d2;
++        this.e = d3;
++        this.h = ControllerMove.Operation.MOVE_TO;
++    }
++
++    public void a(float f, float f1) {
++        this.h = ControllerMove.Operation.STRAFE;
++        this.f = f;
++        this.g = f1;
++        this.e = 0.25D;
++    }
++
++    public void a(ControllerMove controllermove) {
++        this.h = controllermove.h;
++        this.b = controllermove.b;
++        this.c = controllermove.c;
++        this.d = controllermove.d;
++        this.e = Math.max(controllermove.e, 1.0D);
++        this.f = controllermove.f;
++        this.g = controllermove.g;
++    }
++
++    public void a() {
++        float f;
++
++        if (this.h == ControllerMove.Operation.STRAFE) {
++            float f1 = (float) this.getMovementSpeed();
++            float f2 = (float) this.e * f1;
++            float f3 = this.f;
++            float f4 = this.g;
++            float f5 = MathHelper.c(f3 * f3 + f4 * f4);
++
++            if (f5 < 1.0F) {
++                f5 = 1.0F;
++            }
++
++            f5 = f2 / f5;
++            f3 *= f5;
++            f4 *= f5;
++            float f6 = MathHelper.sin(this.a.yaw * 0.017453292F);
++            float f7 = MathHelper.cos(this.a.yaw * 0.017453292F);
++            float f8 = f3 * f7 - f4 * f6;
++
++            f = f4 * f7 + f3 * f6;
++            NavigationAbstract navigationabstract = this.a.getNavigation();
++
++            if (navigationabstract != null) {
++                PathfinderAbstract pathfinderabstract = navigationabstract.r();
++
++                if (pathfinderabstract != null && pathfinderabstract.a(this.a.world, MathHelper.floor(this.a.locX + (double) f8), MathHelper.floor(this.a.locY), MathHelper.floor(this.a.locZ + (double) f)) != PathType.WALKABLE) {
++                    this.f = 1.0F;
++                    this.g = 0.0F;
++                    f2 = f1;
++                }
++            }
++
++            this.a.k(f2);
++            this.a.n(this.f);
++            this.a.p(this.g);
++            this.h = ControllerMove.Operation.WAIT;
++        } else if (this.h == ControllerMove.Operation.MOVE_TO) {
++            this.h = ControllerMove.Operation.WAIT;
++            double d0 = this.b - this.a.locX;
++            double d1 = this.d - this.a.locZ;
++            double d2 = this.c - this.a.locY;
++            double d3 = d0 * d0 + d2 * d2 + d1 * d1;
++
++            if (d3 < 2.500000277905201E-7D) {
++                this.a.n(0.0F);
++                return;
++            }
++
++            f = (float) (MathHelper.c(d1, d0) * 57.2957763671875D) - 90.0F;
++            this.a.yaw = this.a(this.a.yaw, f, 90.0F);
++            this.a.k((float) (this.e * this.getMovementSpeed()));
++            if (d2 > (double) this.a.P && d0 * d0 + d1 * d1 < (double) Math.max(1.0F, this.a.width)) {
++                this.a.getControllerJump().a();
++                this.h = ControllerMove.Operation.JUMPING;
++            }
++        } else if (this.h == ControllerMove.Operation.JUMPING) {
++            this.a.k((float) (this.e * this.getMovementSpeed()));
++            if (this.a.onGround) {
++                this.h = ControllerMove.Operation.WAIT;
++            }
++        } else {
++            this.a.n(0.0F);
++        }
++
++    }
++
++    protected float a(float f, float f1, float f2) {
++        float f3 = MathHelper.g(f1 - f);
++
++        if (f3 > f2) {
++            f3 = f2;
++        }
++
++        if (f3 < -f2) {
++            f3 = -f2;
++        }
++
++        float f4 = f + f3;
++
++        if (f4 < 0.0F) {
++            f4 += 360.0F;
++        } else if (f4 > 360.0F) {
++            f4 -= 360.0F;
++        }
++
++        return f4;
++    }
++
++    public double d() {
++        return this.b;
++    }
++
++    public double e() {
++        return this.c;
++    }
++
++    public double f() {
++        return this.d;
++    }
++
++    public static enum Operation {
++
++        WAIT, MOVE_TO, STRAFE, JUMPING;
++
++        private Operation() {}
++    }
++}
+diff --git a/main/java/net/minecraft/server/Entity.java b/main/java/net/minecraft/server/Entity.java
+index de1b9d3..2db82b2 100644
+--- a/main/java/net/minecraft/server/Entity.java
++++ b/main/java/net/minecraft/server/Entity.java
+@@ -1013,7 +1013,8 @@ public abstract class Entity implements ICommandListener, KeyedObject { // Paper
+ 
+             boolean flag1 = this.an();
+ 
+-            if (this.world.e(this.getBoundingBox().shrink(0.001D))) {
++            AxisAlignedBB fireCheckBB = this.getBoundingBox();
++            if (this.world.e(fireCheckBB.a + 0.001D, fireCheckBB.b + 0.001D, fireCheckBB.c + 0.001D, fireCheckBB.d - 0.001D, fireCheckBB.e - 0.001D, fireCheckBB.f - 0.001D)) {
+                 this.burn(1);
+                 if (!flag1) {
+                     ++this.fireTicks;
+@@ -1255,6 +1256,8 @@ public abstract class Entity implements ICommandListener, KeyedObject { // Paper
+     public boolean an() {
+         if (this.inWater) {
+             return true;
++        } else if (!this.world.isRaining()) {
++            return false;
+         } else {
+             BlockPosition.PooledBlockPosition blockposition_pooledblockposition = BlockPosition.PooledBlockPosition.d(this.locX, this.locY, this.locZ);
+ 
+@@ -1273,7 +1276,8 @@ public abstract class Entity implements ICommandListener, KeyedObject { // Paper
+     }
+ 
+     public boolean ap() {
+-        return this.world.a(this.getBoundingBox().grow(0.0D, -20.0D, 0.0D).shrink(0.001D), Material.WATER, this);
++        AxisAlignedBB bb = this.getBoundingBox();
++        return this.world.a(bb.a + 0.001D, bb.b + 20.0D + 0.001D, bb.c + 0.001D, bb.d - 0.001D, bb.e - 20.0D - 0.001D, bb.f - 0.001D, Material.WATER, this);
+     }
+ 
+     public boolean aq() {
+@@ -1284,16 +1288,19 @@ public abstract class Entity implements ICommandListener, KeyedObject { // Paper
+         // Paper end
+         if (this.bJ() instanceof EntityBoat) {
+             this.inWater = false;
+-        } else if (this.world.a(this.getBoundingBox().grow(0.0D, -0.4000000059604645D, 0.0D).shrink(0.001D), Material.WATER, this)) {
+-            if (!this.inWater && !this.justCreated) {
+-                this.ar();
+-            }
+-
+-            this.fallDistance = 0.0F;
+-            this.inWater = true;
+-            this.extinguish();
+         } else {
+-            this.inWater = false;
++            AxisAlignedBB bb = this.getBoundingBox();
++            if (this.world.a(bb.a + 0.001D, bb.b + 0.4000000059604645D + 0.001D, bb.c + 0.001D, bb.d - 0.001D, bb.e - 0.4000000059604645D - 0.001D, bb.f - 0.001D, Material.WATER, this)) {
++                if (!this.inWater && !this.justCreated) {
++                    this.ar();
++                }
++
++                this.fallDistance = 0.0F;
++                this.inWater = true;
++                this.extinguish();
++            } else {
++                this.inWater = false;
++            }
+         }
+ 
+         return this.inWater;
+@@ -1370,7 +1377,8 @@ public abstract class Entity implements ICommandListener, KeyedObject { // Paper
+     }
+ 
+     public boolean au() {
+-        return this.world.a(this.getBoundingBox().grow(-0.10000000149011612D, -0.4000000059604645D, -0.10000000149011612D), Material.LAVA);
++        AxisAlignedBB bb = this.getBoundingBox();
++        return this.world.a(bb.a + 0.10000000149011612D, bb.b + 0.4000000059604645D, bb.c + 0.10000000149011612D, bb.d - 0.10000000149011612D, bb.e - 0.4000000059604645D, bb.f - 0.10000000149011612D, Material.LAVA);
+     }
+ 
+     public void b(float f, float f1, float f2, float f3) {
+diff --git a/main/java/net/minecraft/server/EntityItem.java b/main/java/net/minecraft/server/EntityItem.java
+index 4fafb49..7a19508 100644
+--- a/main/java/net/minecraft/server/EntityItem.java
++++ b/main/java/net/minecraft/server/EntityItem.java
+@@ -184,17 +184,11 @@ public class EntityItem extends Entity implements HopperPusher {
+         if (stack.getCount() >= stack.getMaxStackSize()) return;
+         // Paper end
+ 
+-        // Spigot start
+-        double radius = world.spigotConfig.itemMerge;
+-        Iterator iterator = this.world.a(EntityItem.class, this.getBoundingBox().grow(radius, radius, radius)).iterator();
+-        // Spigot end
+-
+-        while (iterator.hasNext()) {
+-            EntityItem entityitem = (EntityItem) iterator.next();
+-
+-            this.a(entityitem);
+-        }
++        this.world.mergeNearbyItems(this, world.spigotConfig.itemMerge);
++    }
+ 
++    boolean tryMergeWith(EntityItem other) {
++        return this.a(other);
+     }
+ 
+     private boolean a(EntityItem entityitem) {
+diff --git a/main/java/net/minecraft/server/EntityLiving.java b/main/java/net/minecraft/server/EntityLiving.java
+index e554974..2a23264 100644
+--- a/main/java/net/minecraft/server/EntityLiving.java
++++ b/main/java/net/minecraft/server/EntityLiving.java
+@@ -36,6 +36,7 @@ import co.aikar.timings.MinecraftTimings; // Paper
+ 
+ public abstract class EntityLiving extends Entity {
+ 
++    private static final EnumItemSlot[] ITEM_SLOTS = EnumItemSlot.values();
+     private static final Logger a = LogManager.getLogger();
+     private static final UUID b = UUID.fromString("662A6B8D-DA3E-4C1C-8813-96EA6097278D");
+     private static final AttributeModifier c = (new AttributeModifier(EntityLiving.b, "Sprinting speed boost", 0.30000001192092896D, 2)).a(false);
+@@ -232,7 +233,7 @@ public abstract class EntityLiving extends Entity {
+             }
+         }
+ 
+-        if (this.isFireProof() || this.world.isClientSide) {
++        if (this.fireTicks > 0 && (this.isFireProof() || this.world.isClientSide)) {
+             this.extinguish();
+         }
+ 
+@@ -269,16 +270,18 @@ public abstract class EntityLiving extends Entity {
+             }
+ 
+             if (!this.world.isClientSide) {
+-                BlockPosition blockposition = new BlockPosition(this);
++                int bx = MathHelper.floor(this.locX);
++                int by = MathHelper.floor(this.locY);
++                int bz = MathHelper.floor(this.locZ);
+ 
+-                if (!Objects.equal(this.bF, blockposition)) {
+-                    this.bF = blockposition;
+-                    this.b(blockposition);
++                if (this.bF == null || this.bF.getX() != bx || this.bF.getY() != by || this.bF.getZ() != bz) {
++                    this.bF = new BlockPosition(bx, by, bz);
++                    this.b(this.bF);
+                 }
+             }
+         }
+ 
+-        if (this.isAlive() && this.an()) {
++        if (this.fireTicks > 0 && this.isAlive() && this.an()) {
+             this.extinguish();
+         }
+ 
+@@ -464,7 +467,7 @@ public abstract class EntityLiving extends Entity {
+         nbttagcompound.setInt("HurtByTimestamp", this.hurtTimestamp);
+         nbttagcompound.setShort("DeathTime", (short) this.deathTicks);
+         nbttagcompound.setFloat("AbsorptionAmount", this.getAbsorptionHearts());
+-        EnumItemSlot[] aenumitemslot = EnumItemSlot.values();
++        EnumItemSlot[] aenumitemslot = ITEM_SLOTS;
+         int i = aenumitemslot.length;
+ 
+         int j;
+@@ -480,7 +483,7 @@ public abstract class EntityLiving extends Entity {
+         }
+ 
+         nbttagcompound.set("Attributes", GenericAttributes.a(this.getAttributeMap()));
+-        aenumitemslot = EnumItemSlot.values();
++        aenumitemslot = ITEM_SLOTS;
+         i = aenumitemslot.length;
+ 
+         for (j = 0; j < i; ++j) {
+@@ -1886,9 +1889,10 @@ public abstract class EntityLiving extends Entity {
+                 }
+             } else {
+                 float f9 = 0.91F;
+-                BlockPosition.PooledBlockPosition blockposition_pooledblockposition = BlockPosition.PooledBlockPosition.d(this.locX, this.getBoundingBox().b - 1.0D, this.locZ);
++                BlockPosition.PooledBlockPosition blockposition_pooledblockposition = null;
+ 
+                 if (this.onGround) {
++                    blockposition_pooledblockposition = BlockPosition.PooledBlockPosition.d(this.locX, this.getBoundingBox().b - 1.0D, this.locZ);
+                     f9 = this.world.getType(blockposition_pooledblockposition).getBlock().frictionFactor * 0.91F;
+                 }
+ 
+@@ -1900,10 +1904,7 @@ public abstract class EntityLiving extends Entity {
+                 }
+ 
+                 this.b(f, f1, f2, f3);
+-                f9 = 0.91F;
+-                if (this.onGround) {
+-                    f9 = this.world.getType(blockposition_pooledblockposition.e(this.locX, this.getBoundingBox().b - 1.0D, this.locZ)).getBlock().frictionFactor * 0.91F;
+-                }
++                // f9 already holds the ground friction factor from above since moveRelative does not change position
+ 
+                 if (this.m_()) {
+                     f5 = 0.15F;
+@@ -1929,7 +1930,13 @@ public abstract class EntityLiving extends Entity {
+                 if (this.hasEffect(MobEffects.LEVITATION)) {
+                     this.motY += (0.05D * (double) (this.getEffect(MobEffects.LEVITATION).getAmplifier() + 1) - this.motY) * 0.2D;
+                 } else {
+-                    blockposition_pooledblockposition.e(this.locX, 0.0D, this.locZ);
++                    if (this.world.isClientSide) {
++                        if (blockposition_pooledblockposition == null) {
++                            blockposition_pooledblockposition = BlockPosition.PooledBlockPosition.d(this.locX, 0.0D, this.locZ);
++                        } else {
++                            blockposition_pooledblockposition.e(this.locX, 0.0D, this.locZ);
++                        }
++                    }
+                     if (this.world.isClientSide && (!this.world.isLoaded(blockposition_pooledblockposition) || !this.world.getChunkAtWorldCoords(blockposition_pooledblockposition).p())) {
+                         if (this.locY > 0.0D) {
+                             this.motY = -0.1D;
+@@ -1944,7 +1951,9 @@ public abstract class EntityLiving extends Entity {
+                 this.motY *= 0.9800000190734863D;
+                 this.motX *= (double) f9;
+                 this.motZ *= (double) f9;
+-                blockposition_pooledblockposition.t();
++                if (blockposition_pooledblockposition != null) {
++                    blockposition_pooledblockposition.t();
++                }
+             }
+         }
+ 
+@@ -1996,7 +2005,7 @@ public abstract class EntityLiving extends Entity {
+                 }
+             }
+ 
+-            EnumItemSlot[] aenumitemslot = EnumItemSlot.values();
++            EnumItemSlot[] aenumitemslot = ITEM_SLOTS;
+             int j = aenumitemslot.length;
+ 
+             for (int k = 0; k < j; ++k) {
+diff --git a/main/java/net/minecraft/server/World.java b/main/java/net/minecraft/server/World.java
+index fb54236..2b9f617 100644
+--- a/main/java/net/minecraft/server/World.java
++++ b/main/java/net/minecraft/server/World.java
+@@ -2677,13 +2677,17 @@ public abstract class World implements IBlockAccess {
+     }
+ 
+     public boolean e(AxisAlignedBB axisalignedbb) {
++        return this.e(axisalignedbb.a, axisalignedbb.b, axisalignedbb.c, axisalignedbb.d, axisalignedbb.e, axisalignedbb.f);
++    }
++
++    public boolean e(double minX, double minYBounds, double minZ, double maxX, double maxYBounds, double maxZ) {
+         // Antarctic start - chunk/section-cached lock-free fire/lava sweep with O(1) section skip
+-        int i = MathHelper.floor(axisalignedbb.a);
+-        int j = MathHelper.f(axisalignedbb.d);
+-        int k = MathHelper.floor(axisalignedbb.b);
+-        int l = MathHelper.f(axisalignedbb.e);
+-        int i1 = MathHelper.floor(axisalignedbb.c);
+-        int j1 = MathHelper.f(axisalignedbb.f);
++        int i = MathHelper.floor(minX);
++        int j = MathHelper.f(maxX);
++        int k = MathHelper.floor(minYBounds);
++        int l = MathHelper.f(maxYBounds);
++        int i1 = MathHelper.floor(minZ);
++        int j1 = MathHelper.f(maxZ);
+ 
+         if (this.isAreaLoaded(i, k, i1, j, l, j1, true)) {
+             int minY = Math.max(0, k);
+@@ -2733,13 +2737,17 @@ public abstract class World implements IBlockAccess {
+     }
+ 
+     public boolean a(AxisAlignedBB axisalignedbb, Material material, Entity entity) {
++        return this.a(axisalignedbb.a, axisalignedbb.b, axisalignedbb.c, axisalignedbb.d, axisalignedbb.e, axisalignedbb.f, material, entity);
++    }
++
++    public boolean a(double minX, double minYBounds, double minZ, double maxX, double maxYBounds, double maxZ, Material material, Entity entity) {
+         // Antarctic start - chunk/section-cached lock-free handleMaterialAcceleration with exact vanilla loop order
+-        int i = MathHelper.floor(axisalignedbb.a);
+-        int j = MathHelper.f(axisalignedbb.d);
+-        int k = MathHelper.floor(axisalignedbb.b);
+-        int l = MathHelper.f(axisalignedbb.e);
+-        int i1 = MathHelper.floor(axisalignedbb.c);
+-        int j1 = MathHelper.f(axisalignedbb.f);
++        int i = MathHelper.floor(minX);
++        int j = MathHelper.f(maxX);
++        int k = MathHelper.floor(minYBounds);
++        int l = MathHelper.f(maxYBounds);
++        int i1 = MathHelper.floor(minZ);
++        int j1 = MathHelper.f(maxZ);
+ 
+         if (!this.isAreaLoaded(i, k, i1, j, l, j1, true)) {
+             return false;
+@@ -2836,13 +2844,17 @@ public abstract class World implements IBlockAccess {
+     }
+ 
+     public boolean a(AxisAlignedBB axisalignedbb, Material material) {
++        return this.a(axisalignedbb.a, axisalignedbb.b, axisalignedbb.c, axisalignedbb.d, axisalignedbb.e, axisalignedbb.f, material);
++    }
++
++    public boolean a(double minX, double minYBounds, double minZ, double maxX, double maxYBounds, double maxZ, Material material) {
+         // Antarctic start - chunk/section-cached lock-free isMaterialInBB with O(1) fluid section skip
+-        int i = MathHelper.floor(axisalignedbb.a);
+-        int j = MathHelper.f(axisalignedbb.d);
+-        int k = MathHelper.floor(axisalignedbb.b);
+-        int l = MathHelper.f(axisalignedbb.e);
+-        int i1 = MathHelper.floor(axisalignedbb.c);
+-        int j1 = MathHelper.f(axisalignedbb.f);
++        int i = MathHelper.floor(minX);
++        int j = MathHelper.f(maxX);
++        int k = MathHelper.floor(minYBounds);
++        int l = MathHelper.f(maxYBounds);
++        int i1 = MathHelper.floor(minZ);
++        int j1 = MathHelper.f(maxZ);
+ 
+         if (material.isLiquid()) {
+             int minY = Math.max(0, k);
+@@ -2900,6 +2912,36 @@ public abstract class World implements IBlockAccess {
+         // Antarctic end
+     }
+ 
++    void mergeNearbyItems(EntityItem self, double radius) {
++        if (!self.isAlive()) {
++            return;
++        }
++        AxisAlignedBB bb = self.getBoundingBox();
++        double minX = bb.a - radius;
++        double minY = bb.b - radius;
++        double minZ = bb.c - radius;
++        double maxX = bb.d + radius;
++        double maxY = bb.e + radius;
++        double maxZ = bb.f + radius;
++
++        int i = MathHelper.floor((minX - 2.0D) / 16.0D);
++        int j = MathHelper.f((maxX + 2.0D) / 16.0D);
++        int k = MathHelper.floor((minZ - 2.0D) / 16.0D);
++        int l = MathHelper.f((maxZ + 2.0D) / 16.0D);
++
++        Chunk selfChunk = self.aa ? this.getChunkIfLoaded(self.ab, self.ad) : null;
++        int selfSlice = selfChunk != null ? self.ac : -1;
++
++        for (int i1 = i; i1 < j; ++i1) {
++            for (int j1 = k; j1 < l; ++j1) {
++                Chunk chunk = this.getChunkIfLoaded(i1, j1);
++                if (chunk != null) {
++                    chunk.mergeNearbyItems(self, minX, minY, minZ, maxX, maxY, maxZ, selfChunk, selfSlice);
++                }
++            }
++        }
++    }
++
+     public Explosion explode(@Nullable Entity entity, double d0, double d1, double d2, float f, boolean flag) {
+         return this.createExplosion(entity, d0, d1, d2, f, false, flag);
+     }
+diff --git a/test/java/net/minecraft/server/EntityMicroWastePerfTest.java b/test/java/net/minecraft/server/EntityMicroWastePerfTest.java
+new file mode 100644
+index 0000000..74d0b09
+--- /dev/null
++++ b/test/java/net/minecraft/server/EntityMicroWastePerfTest.java
+@@ -0,0 +1,365 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.HopperPusher;
++import com.sun.management.ThreadMXBean;
++import java.lang.management.ManagementFactory;
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.List;
++import org.spigotmc.SpigotWorldConfig;
++import org.junit.Assert;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++public class EntityMicroWastePerfTest {
++
++    private static Unsafe unsafe;
++    private static int nextEntityId = 10000;
++
++    @BeforeClass
++    public static void init() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        unsafe = (Unsafe) f.get(null);
++    }
++
++    private static final class TestWorld extends World {
++        Chunk[][] grid = new Chunk[4][4];
++        boolean raining;
++
++        TestWorld() {
++            super(null, null, null, null, false, null, null);
++        }
++
++        @Override
++        protected IChunkProvider n() {
++            return null;
++        }
++
++        protected boolean a(int i, int j, boolean flag) {
++            return i >= 0 && i < 4 && j >= 0 && j < 4 && grid[i][j] != null;
++        }
++
++        @Override
++        public boolean isRaining() {
++            return raining;
++        }
++
++        @Override
++        public boolean isRainingAt(BlockPosition pos) {
++            return raining;
++        }
++
++        @Override
++        public Chunk getChunkIfLoaded(int x, int z) {
++            return (x >= 0 && x < 4 && z >= 0 && z < 4) ? grid[x][z] : null;
++        }
++
++        @Override
++        public Chunk getChunkAt(int x, int z) {
++            return getChunkIfLoaded(x, z);
++        }
++
++        @Override
++        public boolean isChunkLoaded(int x, int z, boolean allowEmpty) {
++            return x >= 0 && x < 4 && z >= 0 && z < 4 && grid[x][z] != null;
++        }
++
++        @Override
++        public TileEntity getTileEntity(BlockPosition pos) {
++            return null;
++        }
++
++        @Override
++        public IBlockData getType(BlockPosition pos) {
++            Chunk c = getChunkIfLoaded(pos.getX() >> 4, pos.getZ() >> 4);
++            if (c == null || pos.getY() < 0 || pos.getY() >= 256) {
++                return Blocks.AIR.getBlockData();
++            }
++            ChunkSection sec = c.getSections()[pos.getY() >> 4];
++            return sec == Chunk.a ? Blocks.AIR.getBlockData() : sec.getType(pos.getX() & 15, pos.getY() & 15, pos.getZ() & 15);
++        }
++    }
++
++    private static TestWorld createWorld() throws Exception {
++        TestWorld world = (TestWorld) unsafe.allocateInstance(TestWorld.class);
++        world.grid = new Chunk[4][4];
++        SpigotWorldConfig spigotCfg = (SpigotWorldConfig) unsafe.allocateInstance(SpigotWorldConfig.class);
++        spigotCfg.itemMerge = 2.5D;
++        Field spigotField = World.class.getDeclaredField("spigotConfig");
++        spigotField.setAccessible(true);
++        spigotField.set(world, spigotCfg);
++        for (int cx = 0; cx < 4; cx++) {
++            for (int cz = 0; cz < 4; cz++) {
++                Chunk c = (Chunk) unsafe.allocateInstance(Chunk.class);
++                initChunk(c, world, cx, cz);
++                world.grid[cx][cz] = c;
++            }
++        }
++        return world;
++    }
++
++    @SuppressWarnings("unchecked")
++    private static void initChunk(Chunk c, World world, int cx, int cz) throws Exception {
++        Field worldField = Chunk.class.getDeclaredField("world");
++        worldField.setAccessible(true);
++        worldField.set(c, world);
++
++        Field locXField = Chunk.class.getDeclaredField("locX");
++        locXField.setAccessible(true);
++        locXField.setInt(c, cx);
++
++        Field locZField = Chunk.class.getDeclaredField("locZ");
++        locZField.setAccessible(true);
++        locZField.setInt(c, cz);
++
++        ChunkSection[] sections = new ChunkSection[16];
++        for (int i = 0; i < 16; i++) {
++            sections[i] = Chunk.a;
++        }
++        Field secField = Chunk.class.getDeclaredField("sections");
++        secField.setAccessible(true);
++        secField.set(c, sections);
++
++        List<Entity>[] slices = new List[16];
++        for (int i = 0; i < 16; i++) {
++            slices[i] = new ArrayList<>();
++        }
++        Field slicesField = Chunk.class.getDeclaredField("entitySlices");
++        slicesField.setAccessible(true);
++        slicesField.set(c, slices);
++
++        Field itemCountsField = Chunk.class.getDeclaredField("itemCounts");
++        itemCountsField.setAccessible(true);
++        itemCountsField.set(c, new int[16]);
++
++        Field invCountsField = Chunk.class.getDeclaredField("inventoryEntityCounts");
++        invCountsField.setAccessible(true);
++        invCountsField.set(c, new int[16]);
++    }
++
++    private static EntityZombie createZombie(World world, double x, double y, double z) throws Exception {
++        EntityZombie zombie = (EntityZombie) unsafe.allocateInstance(EntityZombie.class);
++        zombie.h(nextEntityId++);
++        zombie.world = world;
++        zombie.locX = x;
++        zombie.locY = y;
++        zombie.locZ = z;
++        zombie.a(new AxisAlignedBB(x - 0.3D, y, z - 0.3D, x + 0.3D, y + 1.95D, z + 0.3D));
++        zombie.collides = true;
++        return zombie;
++    }
++
++    private static final class RecordingEntityItem extends EntityItem {
++        final List<EntityItem> seen = new ArrayList<>();
++
++        RecordingEntityItem(World world) {
++            super(world);
++        }
++
++        @Override
++        boolean tryMergeWith(EntityItem other) {
++            seen.add(other);
++            return false;
++        }
++    }
++
++    private static EntityItem createItem(World world, double x, double y, double z, Item item, int count) throws Exception {
++        return initItem((EntityItem) unsafe.allocateInstance(EntityItem.class), world, x, y, z, item, count);
++    }
++
++    private static <T extends EntityItem> T initItem(T entity, World world, double x, double y, double z, Item item, int count) throws Exception {
++        entity.h(nextEntityId++);
++        entity.world = world;
++        entity.locX = x;
++        entity.locY = y;
++        entity.locZ = z;
++        entity.a(new AxisAlignedBB(x - 0.125D, y, z - 0.125D, x + 0.125D, y + 0.25D, z + 0.125D));
++        DataWatcher dw = new DataWatcher(entity);
++        Field itemKeyField = EntityItem.class.getDeclaredField("c");
++        itemKeyField.setAccessible(true);
++        @SuppressWarnings("unchecked")
++        DataWatcherObject<ItemStack> itemKey = (DataWatcherObject<ItemStack>) itemKeyField.get(null);
++        dw.register(itemKey, new ItemStack(item, count));
++        Field dwField = Entity.class.getDeclaredField("datawatcher");
++        dwField.setAccessible(true);
++        dwField.set(entity, dw);
++        entity.aa = true;
++        entity.ab = MathHelper.floor(x) >> 4;
++        entity.ac = MathHelper.clamp(MathHelper.floor(y / 16.0D), 0, 15);
++        entity.ad = MathHelper.floor(z) >> 4;
++        Chunk c = world.getChunkIfLoaded(entity.ab, entity.ad);
++        if (c != null) {
++            c.getEntitySlices()[entity.ac].add(entity);
++            Field itemCountsField = Chunk.class.getDeclaredField("itemCounts");
++            itemCountsField.setAccessible(true);
++            ((int[]) itemCountsField.get(c))[entity.ac]++;
++        }
++        return entity;
++    }
++
++    @Test
++    public void testMicroWasteParity() throws Exception {
++        TestWorld world = createWorld();
++        EntityZombie zombie = createZombie(world, 16.5D, 64.0D, 16.5D);
++
++        // 1. Entity.an() dry vs inWater vs raining
++        world.raining = false;
++        zombie.inWater = false;
++        Assert.assertFalse(zombie.an());
++        zombie.inWater = true;
++        Assert.assertTrue(zombie.an());
++        zombie.inWater = false;
++        world.raining = true;
++        Assert.assertTrue(zombie.an());
++        world.raining = false;
++
++        // 2. World.e(AABB) vs primitive World.e(...) and World.a(AABB, Material, Entity) vs primitive
++        AxisAlignedBB bb = zombie.getBoundingBox();
++        Assert.assertEquals(
++                world.e(bb.shrink(0.001D)),
++                world.e(bb.a + 0.001D, bb.b + 0.001D, bb.c + 0.001D, bb.d - 0.001D, bb.e - 0.001D, bb.f - 0.001D));
++        Assert.assertEquals(
++                world.a(bb.grow(0.0D, -0.4000000059604645D, 0.0D).shrink(0.001D), Material.WATER, zombie),
++                world.a(bb.a + 0.001D, bb.b + 0.4000000059604645D + 0.001D, bb.c + 0.001D, bb.d - 0.001D, bb.e - 0.4000000059604645D - 0.001D, bb.f - 0.001D, Material.WATER, zombie));
++
++        // Place fire block and verify both return true
++        Chunk chunk = world.getChunkIfLoaded(1, 1);
++        chunk.getSections()[4] = new ChunkSection(64, true);
++        chunk.getSections()[4].setType(0, 0, 0, Blocks.FIRE.getBlockData());
++        Assert.assertTrue(world.e(bb.shrink(0.001D)));
++        Assert.assertTrue(world.e(bb.a + 0.001D, bb.b + 0.001D, bb.c + 0.001D, bb.d - 0.001D, bb.e - 0.001D, bb.f - 0.001D));
++
++        // 3. World.mergeNearbyItems (verify horizontal + Spigot Y-radius parity + self-exclusion)
++        RecordingEntityItem item1 = (RecordingEntityItem) unsafe.allocateInstance(RecordingEntityItem.class);
++        Field seenField = RecordingEntityItem.class.getDeclaredField("seen");
++        seenField.setAccessible(true);
++        seenField.set(item1, new ArrayList<>());
++        initItem(item1, world, 20.0D, 64.0D, 20.0D, Items.APPLE, 4);
++        EntityItem item2 = createItem(world, 21.0D, 64.0D, 20.0D, Items.APPLE, 5);
++        EntityItem itemAbove = createItem(world, 20.0D, 65.5D, 20.0D, Items.APPLE, 2);
++        EntityItem itemFar = createItem(world, 30.0D, 64.0D, 20.0D, Items.APPLE, 3);
++        world.mergeNearbyItems(item1, 2.5D);
++        Assert.assertTrue("Expected horizontal in-range item2 to be visited", item1.seen.contains(item2));
++        Assert.assertTrue("Expected vertical in-range itemAbove to be visited (Spigot Y-radius parity)", item1.seen.contains(itemAbove));
++        Assert.assertFalse("Expected out-of-range itemFar not to be visited", item1.seen.contains(itemFar));
++        Assert.assertFalse("Expected self item1 not to be visited", item1.seen.contains(item1));
++
++        // 4. HopperPusher non-leak
++        HopperPusher pusher = new HopperPusher() {
++            @Override public World getWorld() { return world; }
++            @Override public double getX() { return 20.5D; }
++            @Override public double getY() { return 65.5D; }
++            @Override public double getZ() { return 20.5D; }
++            @Override public AxisAlignedBB getBoundingBox() { return itemFar.getBoundingBox(); }
++            @Override public boolean acceptItem(TileEntityHopper hopper) { return false; }
++        };
++        for (int i = 0; i < 50; i++) {
++            Assert.assertNull(pusher.findHopper());
++        }
++
++        // 5. ControllerMove live attribute cache
++        AttributeMapBase attrMap = new AttributeMapServer();
++        AttributeInstance speedAttr = attrMap.b(GenericAttributes.MOVEMENT_SPEED);
++        speedAttr.setValue(0.25D);
++        Field attrField = EntityLiving.class.getDeclaredField("attributeMap");
++        attrField.setAccessible(true);
++        attrField.set(zombie, attrMap);
++
++        ControllerMove move = new ControllerMove(zombie);
++        move.a(22.0D, 64.0D, 20.0D, 1.5D);
++        move.a();
++        Assert.assertEquals((float) (1.5D * 0.25D), zombie.cy(), 1.0e-5F);
++        speedAttr.setValue(0.50D);
++        move.a(24.0D, 64.0D, 20.0D, 1.5D);
++        move.a();
++        Assert.assertEquals((float) (1.5D * 0.50D), zombie.cy(), 1.0e-5F);
++    }
++
++    @Test
++    public void testMicroWasteBenchmark() throws Exception {
++        TestWorld world = createWorld();
++        EntityZombie zombie = createZombie(world, 16.5D, 64.0D, 16.5D);
++        EntityItem soloItem = createItem(world, 20.0D, 64.0D, 20.0D, Items.APPLE, 1);
++        HopperPusher pusher = new HopperPusher() {
++            @Override public World getWorld() { return world; }
++            @Override public double getX() { return 20.5D; }
++            @Override public double getY() { return 65.5D; }
++            @Override public double getZ() { return 20.5D; }
++            @Override public AxisAlignedBB getBoundingBox() { return soloItem.getBoundingBox(); }
++            @Override public boolean acceptItem(TileEntityHopper hopper) { return false; }
++        };
++
++        ThreadMXBean bean = (ThreadMXBean) ManagementFactory.getThreadMXBean();
++        long tid = Thread.currentThread().getId();
++
++        // Warmup
++        for (int i = 0; i < 5000; i++) {
++            runVanillaLoop(world, zombie, soloItem, pusher);
++            runOptLoop(world, zombie, soloItem, pusher);
++        }
++
++        final int iters = 50000;
++        long vAlloc0 = bean.getThreadAllocatedBytes(tid);
++        long vT0 = System.nanoTime();
++        int vSink = 0;
++        for (int i = 0; i < iters; i++) {
++            vSink ^= runVanillaLoop(world, zombie, soloItem, pusher);
++        }
++        long vNs = System.nanoTime() - vT0;
++        long vBytes = bean.getThreadAllocatedBytes(tid) - vAlloc0;
++
++        long oAlloc0 = bean.getThreadAllocatedBytes(tid);
++        long oT0 = System.nanoTime();
++        int oSink = 0;
++        for (int i = 0; i < iters; i++) {
++            oSink ^= runOptLoop(world, zombie, soloItem, pusher);
++        }
++        long oNs = System.nanoTime() - oT0;
++        long oBytes = bean.getThreadAllocatedBytes(tid) - oAlloc0;
++
++        double speedup = (double) vNs / (double) Math.max(1L, oNs);
++        System.out.println(String.format(
++                "B6_BENCH vanilla_ns=%d opt_ns=%d speedup=%.2fx vanilla_bytes=%d opt_bytes=%d sink=%d",
++                vNs, oNs, speedup, vBytes, oBytes, (vSink ^ oSink)));
++
++        Assert.assertEquals("Optimized micro-waste path should allocate 0 bytes", 0L, oBytes);
++        Assert.assertTrue("Expected speedup > 1.2x, got " + speedup, speedup > 1.2D);
++    }
++
++    private static int runVanillaLoop(World world, EntityZombie zombie, EntityItem item, HopperPusher pusher) {
++        int acc = 0;
++        AxisAlignedBB bb = zombie.getBoundingBox();
++        if (world.e(bb.shrink(0.001D))) acc++;
++        if (world.a(bb.grow(0.0D, -0.4000000059604645D, 0.0D).shrink(0.001D), Material.WATER, zombie)) acc += 2;
++        if (world.a(bb.grow(-0.10000000149011612D, -0.4000000059604645D, -0.10000000149011612D), Material.LAVA)) acc += 4;
++        List<EntityItem> list = world.a(EntityItem.class, item.getBoundingBox().grow(2.5D, 0.0D, 2.5D));
++        acc += list.size();
++        for (EnumItemSlot slot : EnumItemSlot.values()) {
++            acc += slot.ordinal();
++        }
++        BlockPosition bp = new BlockPosition(zombie);
++        acc += bp.getX();
++        if (pusher.findHopper() != null) acc += 8;
++        return acc;
++    }
++
++    private static final EnumItemSlot[] CACHED_SLOTS = EnumItemSlot.values();
++
++    private static int runOptLoop(World world, EntityZombie zombie, EntityItem item, HopperPusher pusher) {
++        int acc = 0;
++        AxisAlignedBB bb = zombie.getBoundingBox();
++        if (world.e(bb.a + 0.001D, bb.b + 0.001D, bb.c + 0.001D, bb.d - 0.001D, bb.e - 0.001D, bb.f - 0.001D)) acc++;
++        if (world.a(bb.a + 0.001D, bb.b + 0.4000000059604645D + 0.001D, bb.c + 0.001D, bb.d - 0.001D, bb.e - 0.4000000059604645D - 0.001D, bb.f - 0.001D, Material.WATER, zombie)) acc += 2;
++        if (world.a(bb.a + 0.10000000149011612D, bb.b + 0.4000000059604645D, bb.c + 0.10000000149011612D, bb.d - 0.10000000149011612D, bb.e - 0.4000000059604645D, bb.f - 0.10000000149011612D, Material.LAVA)) acc += 4;
++        world.mergeNearbyItems(item, 2.5D);
++        for (EnumItemSlot slot : CACHED_SLOTS) {
++            acc += slot.ordinal();
++        }
++        if (zombie.an()) acc += 16;
++        if (pusher.findHopper() != null) acc += 8;
++        return acc;
++    }
++}
