@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Tue, 24 Nov 2026 02:01:39 +0700
-Subject: [PATCH 152/179] fix: guard expired IP ban null lookup in PlayerList
+Subject: [PATCH 152/180] fix: guard expired IP ban null lookup in PlayerList
 
 
 diff --git a/main/java/net/minecraft/server/PlayerList.java b/main/java/net/minecraft/server/PlayerList.java

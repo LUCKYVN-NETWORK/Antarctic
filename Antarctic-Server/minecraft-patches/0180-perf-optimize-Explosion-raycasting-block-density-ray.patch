@@ -1,0 +1,1018 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 16:43:37 +0700
+Subject: [PATCH 180/180] perf: optimize Explosion raycasting, block density
+ ray hits, and PacketPlayOutExplosion
+
+
+diff --git a/main/java/net/minecraft/server/BlockPosition.java b/main/java/net/minecraft/server/BlockPosition.java
+index d04236b..f2baa72 100644
+--- a/main/java/net/minecraft/server/BlockPosition.java
++++ b/main/java/net/minecraft/server/BlockPosition.java
+@@ -174,7 +174,11 @@ public class BlockPosition extends BaseBlockPosition {
+     }
+ 
+     public long asLong() {
+-        return ((long) this.getX() & BlockPosition.i) << BlockPosition.h | ((long) this.getY() & BlockPosition.j) << BlockPosition.g | ((long) this.getZ() & BlockPosition.k) << 0;
++        return asLong(this.getX(), this.getY(), this.getZ());
++    }
++
++    public static long asLong(int x, int y, int z) {
++        return ((long) x & BlockPosition.i) << BlockPosition.h | ((long) y & BlockPosition.j) << BlockPosition.g | ((long) z & BlockPosition.k);
+     }
+ 
+     public static BlockPosition fromLong(long i) {
+diff --git a/main/java/net/minecraft/server/Explosion.java b/main/java/net/minecraft/server/Explosion.java
+index eaeb5e9..c09af7f 100644
+--- a/main/java/net/minecraft/server/Explosion.java
++++ b/main/java/net/minecraft/server/Explosion.java
+@@ -2,8 +2,8 @@ package net.minecraft.server;
+ 
+ import com.google.common.collect.Lists;
+ import com.google.common.collect.Maps;
+-import com.google.common.collect.Sets;
+-import java.util.HashSet;
++import it.unimi.dsi.fastutil.longs.LongIterator;
++import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
+ import java.util.Iterator;
+ import java.util.List;
+ import java.util.Map;
+@@ -19,6 +19,37 @@ import org.bukkit.event.block.BlockExplodeEvent;
+ 
+ public class Explosion {
+ 
++    // Antarctic start - precompute 1352 normalized ray directions and static entity filter
++    private static final int RAY_COUNT = 1352;
++    private static final double[] RAY_DIRECTIONS = new double[RAY_COUNT * 3];
++    private static final com.google.common.base.Predicate<Entity> ALIVE_DAMAGEABLE = new com.google.common.base.Predicate<Entity>() {
++        @Override
++        public boolean apply(Entity entity) {
++            return IEntitySelector.d.apply(entity) && !entity.dead;
++        }
++    };
++
++    static {
++        int idx = 0;
++        for (int k = 0; k < 16; ++k) {
++            for (int i = 0; i < 16; ++i) {
++                for (int j = 0; j < 16; ++j) {
++                    if (k == 0 || k == 15 || i == 0 || i == 15 || j == 0 || j == 15) {
++                        double d0 = (double) ((float) k / 15.0F * 2.0F - 1.0F);
++                        double d1 = (double) ((float) i / 15.0F * 2.0F - 1.0F);
++                        double d2 = (double) ((float) j / 15.0F * 2.0F - 1.0F);
++                        double d3 = Math.sqrt(d0 * d0 + d1 * d1 + d2 * d2);
++
++                        RAY_DIRECTIONS[idx++] = d0 / d3;
++                        RAY_DIRECTIONS[idx++] = d1 / d3;
++                        RAY_DIRECTIONS[idx++] = d2 / d3;
++                    }
++                }
++            }
++        }
++    }
++    // Antarctic end
++
+     private final boolean a;
+     private final boolean b;
+     private final Random c = new Random();
+@@ -49,68 +80,90 @@ public class Explosion {
+             return;
+         }
+         // CraftBukkit end
+-        HashSet hashset = Sets.newHashSet();
+-        boolean flag = true;
+-
+-        int i;
+-        int j;
+-
+-        for (int k = 0; k < 16; ++k) {
+-            for (i = 0; i < 16; ++i) {
+-                for (j = 0; j < 16; ++j) {
+-                    if (k == 0 || k == 15 || i == 0 || i == 15 || j == 0 || j == 15) {
+-                        double d0 = (double) ((float) k / 15.0F * 2.0F - 1.0F);
+-                        double d1 = (double) ((float) i / 15.0F * 2.0F - 1.0F);
+-                        double d2 = (double) ((float) j / 15.0F * 2.0F - 1.0F);
+-                        double d3 = Math.sqrt(d0 * d0 + d1 * d1 + d2 * d2);
+-
+-                        d0 /= d3;
+-                        d1 /= d3;
+-                        d2 /= d3;
+-                        float f = this.size * (0.7F + this.world.random.nextFloat() * 0.6F);
+-                        double d4 = this.posX;
+-                        double d5 = this.posY;
+-                        double d6 = this.posZ;
+-
+-                        for (float f1 = 0.3F; f > 0.0F; f -= 0.22500001F) {
+-                            BlockPosition blockposition = new BlockPosition(d4, d5, d6);
+-                            IBlockData iblockdata = this.world.getType(blockposition);
+-
+-                            if (iblockdata.getMaterial() != Material.AIR) {
+-                                float f2 = this.source != null ? this.source.a(this, this.world, blockposition, iblockdata) : iblockdata.getBlock().a((Entity) null);
++        // Antarctic start - precomputed rays, LongOpenHashSet deduplication, and chunk-cached lookups
++        final LongOpenHashSet affected = new LongOpenHashSet(256);
++        final boolean customSource = this.source != null && (this.source instanceof EntityMinecartTNT || this.source instanceof EntityWitherSkull || this.source.getClass().getPackage() != Entity.class.getPackage());
++        final BlockPosition.MutableBlockPosition mutablePos = customSource ? new BlockPosition.MutableBlockPosition() : null;
++        final boolean checkCapture = this.world.captureTreeGeneration;
++
++        int cachedCx = Integer.MIN_VALUE;
++        int cachedCz = Integer.MIN_VALUE;
++        Chunk cachedChunk = null;
++
++        for (int rayIdx = 0; rayIdx < RAY_DIRECTIONS.length; rayIdx += 3) {
++            double d0 = RAY_DIRECTIONS[rayIdx];
++            double d1 = RAY_DIRECTIONS[rayIdx + 1];
++            double d2 = RAY_DIRECTIONS[rayIdx + 2];
++            float f = this.size * (0.7F + this.world.random.nextFloat() * 0.6F);
++            double d4 = this.posX;
++            double d5 = this.posY;
++            double d6 = this.posZ;
++
++            for (; f > 0.0F; f -= 0.22500001F) {
++                int bx = MathHelper.floor(d4);
++                int by = MathHelper.floor(d5);
++                int bz = MathHelper.floor(d6);
++
++                IBlockData iblockdata;
++                if (checkCapture) {
++                    iblockdata = this.world.getType(bx, by, bz);
++                } else {
++                    int cx = bx >> 4;
++                    int cz = bz >> 4;
++                    if (cx != cachedCx || cz != cachedCz) {
++                        cachedCx = cx;
++                        cachedCz = cz;
++                        cachedChunk = this.world.getChunkIfLoaded(cx, cz);
++                    }
++                    iblockdata = cachedChunk != null ? cachedChunk.getBlockData(bx, by, bz) : this.world.getType(bx, by, bz);
++                }
+ 
+-                                f -= (f2 + 0.3F) * 0.3F;
+-                            }
++                if (iblockdata.getMaterial() != Material.AIR) {
++                    float f2;
++                    if (customSource) {
++                        mutablePos.c(bx, by, bz);
++                        f2 = this.source.a(this, this.world, mutablePos, iblockdata);
++                    } else {
++                        f2 = iblockdata.getBlock().a((Entity) null);
++                    }
+ 
+-                            if (f > 0.0F && (this.source == null || this.source.a(this, this.world, blockposition, iblockdata, f)) && blockposition.getY() < 256 && blockposition.getY() >= 0) { // CraftBukkit - don't wrap explosions
+-                                hashset.add(blockposition);
+-                            }
++                    f -= (f2 + 0.3F) * 0.3F;
++                }
+ 
+-                            d4 += d0 * 0.30000001192092896D;
+-                            d5 += d1 * 0.30000001192092896D;
+-                            d6 += d2 * 0.30000001192092896D;
++                if (f > 0.0F && by < 256 && by >= 0) { // CraftBukkit - don't wrap explosions
++                    if (!customSource) {
++                        affected.add(BlockPosition.asLong(bx, by, bz));
++                    } else {
++                        mutablePos.c(bx, by, bz);
++                        if (this.source.a(this, this.world, mutablePos, iblockdata, f)) {
++                            affected.add(BlockPosition.asLong(bx, by, bz));
+                         }
+                     }
+                 }
++
++                d4 += d0 * 0.30000001192092896D;
++                d5 += d1 * 0.30000001192092896D;
++                d6 += d2 * 0.30000001192092896D;
+             }
+         }
+ 
+-        this.blocks.addAll(hashset);
++        if (!affected.isEmpty()) {
++            LongIterator it = affected.iterator();
++            while (it.hasNext()) {
++                this.blocks.add(BlockPosition.fromLong(it.nextLong()));
++            }
++        }
++        // Antarctic end
+         float f3 = this.size * 2.0F;
+ 
+-        i = MathHelper.floor(this.posX - (double) f3 - 1.0D);
+-        j = MathHelper.floor(this.posX + (double) f3 + 1.0D);
++        int i = MathHelper.floor(this.posX - (double) f3 - 1.0D);
++        int j = MathHelper.floor(this.posX + (double) f3 + 1.0D);
+         int l = MathHelper.floor(this.posY - (double) f3 - 1.0D);
+         int i1 = MathHelper.floor(this.posY + (double) f3 + 1.0D);
+         int j1 = MathHelper.floor(this.posZ - (double) f3 - 1.0D);
+         int k1 = MathHelper.floor(this.posZ + (double) f3 + 1.0D);
+         // Paper start - Fix lag from explosions processing dead entities
+-        List list = this.world.getEntities(this.source, new AxisAlignedBB((double) i, (double) l, (double) j1, (double) j, (double) i1, (double) k1), new com.google.common.base.Predicate<Entity>() {
+-            @Override
+-            public boolean apply(Entity entity) {
+-                return IEntitySelector.d.apply(entity) && !entity.dead;
+-            }
+-        });
++        List list = this.world.getEntities(this.source, new AxisAlignedBB((double) i, (double) l, (double) j1, (double) j, (double) i1, (double) k1), ALIVE_DAMAGEABLE);
+         // Paper end
+         Vec3D vec3d = new Vec3D(this.posX, this.posY, this.posZ);
+ 
+diff --git a/main/java/net/minecraft/server/PacketPlayOutExplosion.java b/main/java/net/minecraft/server/PacketPlayOutExplosion.java
+new file mode 100644
+index 0000000..78ebdef
+--- /dev/null
++++ b/main/java/net/minecraft/server/PacketPlayOutExplosion.java
+@@ -0,0 +1,96 @@
++package net.minecraft.server;
++
++import com.google.common.collect.Lists;
++import java.io.IOException;
++import java.util.Iterator;
++import java.util.List;
++
++public class PacketPlayOutExplosion implements Packet<PacketListenerPlayOut> {
++
++    private double a;
++    private double b;
++    private double c;
++    private float d;
++    private List<BlockPosition> e;
++    private float f;
++    private float g;
++    private float h;
++
++    public PacketPlayOutExplosion() {}
++
++    public PacketPlayOutExplosion(double d0, double d1, double d2, float f, List<BlockPosition> list, Vec3D vec3d) {
++        this(d0, d1, d2, f, list, vec3d, false);
++    }
++
++    // Antarctic start - allow sharing a pre-frozen block list across all players in one explosion
++    PacketPlayOutExplosion(double d0, double d1, double d2, float f, List<BlockPosition> list, Vec3D vec3d, boolean shareList) {
++        this.a = d0;
++        this.b = d1;
++        this.c = d2;
++        this.d = f;
++        this.e = shareList ? list : Lists.newArrayList(list);
++        if (vec3d != null) {
++            this.f = (float) vec3d.x;
++            this.g = (float) vec3d.y;
++            this.h = (float) vec3d.z;
++        }
++
++    }
++    // Antarctic end
++
++    public void a(PacketDataSerializer packetdataserializer) throws IOException {
++        this.a = (double) packetdataserializer.readFloat();
++        this.b = (double) packetdataserializer.readFloat();
++        this.c = (double) packetdataserializer.readFloat();
++        this.d = packetdataserializer.readFloat();
++        int i = packetdataserializer.readInt();
++
++        this.e = Lists.newArrayListWithCapacity(i);
++        int j = (int) this.a;
++        int k = (int) this.b;
++        int l = (int) this.c;
++
++        for (int i1 = 0; i1 < i; ++i1) {
++            int j1 = packetdataserializer.readByte() + j;
++            int k1 = packetdataserializer.readByte() + k;
++            int l1 = packetdataserializer.readByte() + l;
++
++            this.e.add(new BlockPosition(j1, k1, l1));
++        }
++
++        this.f = packetdataserializer.readFloat();
++        this.g = packetdataserializer.readFloat();
++        this.h = packetdataserializer.readFloat();
++    }
++
++    public void b(PacketDataSerializer packetdataserializer) throws IOException {
++        packetdataserializer.writeFloat((float) this.a);
++        packetdataserializer.writeFloat((float) this.b);
++        packetdataserializer.writeFloat((float) this.c);
++        packetdataserializer.writeFloat(this.d);
++        int size = this.e.size();
++        packetdataserializer.writeInt(size);
++        int i = (int) this.a;
++        int j = (int) this.b;
++        int k = (int) this.c;
++
++        for (int idx = 0; idx < size; ++idx) {
++            BlockPosition blockposition = this.e.get(idx);
++            int l = blockposition.getX() - i;
++            int i1 = blockposition.getY() - j;
++            int j1 = blockposition.getZ() - k;
++
++            packetdataserializer.writeByte(l);
++            packetdataserializer.writeByte(i1);
++            packetdataserializer.writeByte(j1);
++        }
++
++        packetdataserializer.writeFloat(this.f);
++        packetdataserializer.writeFloat(this.g);
++        packetdataserializer.writeFloat(this.h);
++    }
++
++    public void a(PacketListenerPlayOut packetlistenerplayout) {
++        packetlistenerplayout.a(this);
++    }
++}
+diff --git a/main/java/net/minecraft/server/World.java b/main/java/net/minecraft/server/World.java
+index 623c40f..7c4e4d4 100644
+--- a/main/java/net/minecraft/server/World.java
++++ b/main/java/net/minecraft/server/World.java
+@@ -3365,7 +3365,7 @@ public abstract class World implements IBlockAccess {
+                         double d6 = axisalignedbb.b + (axisalignedbb.e - axisalignedbb.b) * (double) f1;
+                         double d7 = axisalignedbb.c + (axisalignedbb.f - axisalignedbb.c) * (double) f2;
+ 
+-                        if (this.rayTrace(new Vec3D(d5 + d3, d6, d7 + d4), vec3d) == null) {
++                        if (!this.hasBlockRayHit(d5 + d3, d6, d7 + d4, vec3d.x, vec3d.y, vec3d.z)) {
+                             ++i;
+                         }
+ 
+@@ -3380,6 +3380,249 @@ public abstract class World implements IBlockAccess {
+         }
+     }
+ 
++    // Antarctic start - zero-alloc boolean ray-hit test for World.a(Vec3D, AxisAlignedBB) matching rayTrace(start, end, false, false, false)
++    public boolean hasBlockRayHit(double curX, double curY, double curZ, double endX, double endY, double endZ) {
++        if (Double.isNaN(curX) || Double.isNaN(curY) || Double.isNaN(curZ) || Double.isNaN(endX) || Double.isNaN(endY) || Double.isNaN(endZ)) {
++            return false;
++        }
++        final int i = MathHelper.floor(endX);
++        final int j = MathHelper.floor(endY);
++        final int k = MathHelper.floor(endZ);
++        int l = MathHelper.floor(curX);
++        int i1 = MathHelper.floor(curY);
++        int j1 = MathHelper.floor(curZ);
++
++        int cachedChunkX = l >> 4;
++        int cachedChunkZ = j1 >> 4;
++        Chunk cachedChunk = this.getChunkIfLoaded(cachedChunkX, cachedChunkZ);
++        if (cachedChunk == null) {
++            return false;
++        }
++
++        BlockPosition.MutableBlockPosition mutablePos = null;
++        Vec3D endVec = null;
++
++        if (i1 >= 0 && i1 < 256 && l >= -30000000 && l < 30000000 && j1 >= -30000000 && j1 < 30000000) {
++            ChunkSection sec = cachedChunk.getSections()[i1 >> 4];
++            if (sec != Chunk.a) {
++                IBlockData iblockdata = sec.getType(l & 15, i1 & 15, j1 & 15);
++                Block block = iblockdata.getBlock();
++                if (block != Blocks.AIR && !(block instanceof BlockFluids) && block != Blocks.FIRE && block != Blocks.PISTON_EXTENSION && block.a(iblockdata, false)) {
++                    if (mutablePos == null) {
++                        mutablePos = new BlockPosition.MutableBlockPosition(l, i1, j1);
++                    } else {
++                        mutablePos.c(l, i1, j1);
++                    }
++                    if (!(block instanceof BlockStairs) && iblockdata.e(this, mutablePos) == Block.j) {
++                        if (rayHitsUnitCube(curX - l, curY - i1, curZ - j1, endX - l, endY - i1, endZ - j1)) {
++                            return true;
++                        }
++                    } else {
++                        if (endVec == null) {
++                            endVec = new Vec3D(endX, endY, endZ);
++                        }
++                        if (iblockdata.a(this, mutablePos, new Vec3D(curX, curY, curZ), endVec) != null) {
++                            return true;
++                        }
++                    }
++                }
++            }
++        }
++
++        int k1 = 200;
++        while (k1-- >= 0) {
++            if (Double.isNaN(curX) || Double.isNaN(curY) || Double.isNaN(curZ)) {
++                return false;
++            }
++            if (l == i && i1 == j && j1 == k) {
++                return false;
++            }
++
++            boolean flag3 = true;
++            boolean flag4 = true;
++            boolean flag5 = true;
++            double d0 = 999.0D;
++            double d1 = 999.0D;
++            double d2 = 999.0D;
++
++            if (i > l) {
++                d0 = (double) l + 1.0D;
++            } else if (i < l) {
++                d0 = (double) l + 0.0D;
++            } else {
++                flag3 = false;
++            }
++
++            if (j > i1) {
++                d1 = (double) i1 + 1.0D;
++            } else if (j < i1) {
++                d1 = (double) i1 + 0.0D;
++            } else {
++                flag4 = false;
++            }
++
++            if (k > j1) {
++                d2 = (double) j1 + 1.0D;
++            } else if (k < j1) {
++                d2 = (double) j1 + 0.0D;
++            } else {
++                flag5 = false;
++            }
++
++            double d3 = 999.0D;
++            double d4 = 999.0D;
++            double d5 = 999.0D;
++            double d6 = endX - curX;
++            double d7 = endY - curY;
++            double d8 = endZ - curZ;
++
++            if (flag3) {
++                d3 = (d0 - curX) / d6;
++            }
++            if (flag4) {
++                d4 = (d1 - curY) / d7;
++            }
++            if (flag5) {
++                d5 = (d2 - curZ) / d8;
++            }
++            if (d3 == -0.0D) {
++                d3 = -1.0E-4D;
++            }
++            if (d4 == -0.0D) {
++                d4 = -1.0E-4D;
++            }
++            if (d5 == -0.0D) {
++                d5 = -1.0E-4D;
++            }
++
++            EnumDirection enumdirection;
++            if (d3 < d4 && d3 < d5) {
++                enumdirection = i > l ? EnumDirection.WEST : EnumDirection.EAST;
++                curX = d0;
++                curY += d7 * d3;
++                curZ += d8 * d3;
++            } else if (d4 < d5) {
++                enumdirection = j > i1 ? EnumDirection.DOWN : EnumDirection.UP;
++                curX += d6 * d4;
++                curY = d1;
++                curZ += d8 * d4;
++            } else {
++                enumdirection = k > j1 ? EnumDirection.NORTH : EnumDirection.SOUTH;
++                curX += d6 * d5;
++                curY += d7 * d5;
++                curZ = d2;
++            }
++
++            l = MathHelper.floor(curX) - (enumdirection == EnumDirection.EAST ? 1 : 0);
++            i1 = MathHelper.floor(curY) - (enumdirection == EnumDirection.UP ? 1 : 0);
++            j1 = MathHelper.floor(curZ) - (enumdirection == EnumDirection.SOUTH ? 1 : 0);
++
++            int cx = l >> 4;
++            int cz = j1 >> 4;
++            if (cx != cachedChunkX || cz != cachedChunkZ) {
++                cachedChunkX = cx;
++                cachedChunkZ = cz;
++                cachedChunk = this.getChunkIfLoaded(cx, cz);
++            }
++            if (cachedChunk == null) {
++                return false;
++            }
++
++            if (i1 < 0 || i1 >= 256 || l < -30000000 || l >= 30000000 || j1 < -30000000 || j1 >= 30000000) {
++                continue;
++            }
++            ChunkSection sec = cachedChunk.getSections()[i1 >> 4];
++            if (sec == Chunk.a) {
++                continue;
++            }
++            IBlockData iblockdata1 = sec.getType(l & 15, i1 & 15, j1 & 15);
++            Block block1 = iblockdata1.getBlock();
++            if (block1 != Blocks.AIR && !(block1 instanceof BlockFluids) && block1 != Blocks.FIRE && block1 != Blocks.PISTON_EXTENSION && block1.a(iblockdata1, false)) {
++                if (mutablePos == null) {
++                    mutablePos = new BlockPosition.MutableBlockPosition(l, i1, j1);
++                } else {
++                    mutablePos.c(l, i1, j1);
++                }
++                if (!(block1 instanceof BlockStairs) && iblockdata1.e(this, mutablePos) == Block.j) {
++                    if (rayHitsUnitCube(curX - l, curY - i1, curZ - j1, endX - l, endY - i1, endZ - j1)) {
++                        return true;
++                    }
++                } else {
++                    if (endVec == null) {
++                        endVec = new Vec3D(endX, endY, endZ);
++                    }
++                    if (iblockdata1.a(this, mutablePos, new Vec3D(curX, curY, curZ), endVec) != null) {
++                        return true;
++                    }
++                }
++            }
++        }
++        return false;
++    }
++
++    private static boolean rayHitsUnitCube(double sx, double sy, double sz, double ex, double ey, double ez) {
++        double dx = ex - sx;
++        double dy = ey - sy;
++        double dz = ez - sz;
++
++        if (dx * dx >= 1.0E-7D) {
++            double t = (0.0D - sx) / dx;
++            if (t >= 0.0D && t <= 1.0D) {
++                double y = sy + dy * t;
++                double z = sz + dz * t;
++                if (y >= 0.0D && y <= 1.0D && z >= 0.0D && z <= 1.0D) {
++                    return true;
++                }
++            }
++            t = (1.0D - sx) / dx;
++            if (t >= 0.0D && t <= 1.0D) {
++                double y = sy + dy * t;
++                double z = sz + dz * t;
++                if (y >= 0.0D && y <= 1.0D && z >= 0.0D && z <= 1.0D) {
++                    return true;
++                }
++            }
++        }
++        if (dy * dy >= 1.0E-7D) {
++            double t = (0.0D - sy) / dy;
++            if (t >= 0.0D && t <= 1.0D) {
++                double x = sx + dx * t;
++                double z = sz + dz * t;
++                if (x >= 0.0D && x <= 1.0D && z >= 0.0D && z <= 1.0D) {
++                    return true;
++                }
++            }
++            t = (1.0D - sy) / dy;
++            if (t >= 0.0D && t <= 1.0D) {
++                double x = sx + dx * t;
++                double z = sz + dz * t;
++                if (x >= 0.0D && x <= 1.0D && z >= 0.0D && z <= 1.0D) {
++                    return true;
++                }
++            }
++        }
++        if (dz * dz >= 1.0E-7D) {
++            double t = (0.0D - sz) / dz;
++            if (t >= 0.0D && t <= 1.0D) {
++                double x = sx + dx * t;
++                double y = sy + dy * t;
++                if (x >= 0.0D && x <= 1.0D && y >= 0.0D && y <= 1.0D) {
++                    return true;
++                }
++            }
++            t = (1.0D - sz) / dz;
++            if (t >= 0.0D && t <= 1.0D) {
++                double x = sx + dx * t;
++                double y = sy + dy * t;
++                if (x >= 0.0D && x <= 1.0D && y >= 0.0D && y <= 1.0D) {
++                    return true;
++                }
++            }
++        }
++        return false;
++    }
++    // Antarctic end
++
+     public boolean douseFire(@Nullable EntityHuman entityhuman, BlockPosition blockposition, EnumDirection enumdirection) {
+         blockposition = blockposition.shift(enumdirection);
+         if (this.getType(blockposition).getBlock() == Blocks.FIRE) {
+diff --git a/main/java/net/minecraft/server/WorldServer.java b/main/java/net/minecraft/server/WorldServer.java
+index 4a553a9..fa5f097 100644
+--- a/main/java/net/minecraft/server/WorldServer.java
++++ b/main/java/net/minecraft/server/WorldServer.java
+@@ -1368,13 +1368,12 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+             explosion.clearBlocks();
+         }
+ 
+-        Iterator iterator = this.players.iterator();
+-
+-        while (iterator.hasNext()) {
+-            EntityHuman entityhuman = (EntityHuman) iterator.next();
++        List<BlockPosition> frozenBlocks = explosion.getBlocks().isEmpty() ? java.util.Collections.emptyList() : new java.util.ArrayList<>(explosion.getBlocks());
++        for (int idx = 0, pSize = this.players.size(); idx < pSize; ++idx) {
++            EntityHuman entityhuman = this.players.get(idx);
+ 
+             if (entityhuman.d(d0, d1, d2) < 4096.0D) {
+-                ((EntityPlayer) entityhuman).playerConnection.sendPacket(new PacketPlayOutExplosion(d0, d1, d2, f, explosion.getBlocks(), (Vec3D) explosion.b().get(entityhuman)));
++                ((EntityPlayer) entityhuman).playerConnection.sendPacket(new PacketPlayOutExplosion(d0, d1, d2, f, frozenBlocks, (Vec3D) explosion.b().get(entityhuman), true));
+             }
+         }
+ 
+diff --git a/test/java/net/minecraft/server/ExplosionAndRayDensityPerfTest.java b/test/java/net/minecraft/server/ExplosionAndRayDensityPerfTest.java
+new file mode 100644
+index 0000000..975ad4b
+--- /dev/null
++++ b/test/java/net/minecraft/server/ExplosionAndRayDensityPerfTest.java
+@@ -0,0 +1,411 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.PaperWorldConfig;
++import com.destroystokyo.paper.antixray.ChunkPacketBlockController;
++import com.sun.management.ThreadMXBean;
++import io.netty.buffer.Unpooled;
++import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
++import java.lang.management.ManagementFactory;
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Random;
++import java.util.Set;
++import org.junit.Assert;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import org.spigotmc.SpigotWorldConfig;
++import sun.misc.Unsafe;
++
++public class ExplosionAndRayDensityPerfTest {
++
++    private static Unsafe unsafe;
++
++    @BeforeClass
++    public static void init() throws Exception {
++        DispenserRegistry.c();
++        org.spigotmc.AsyncCatcher.enabled = false;
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        unsafe = (Unsafe) f.get(null);
++    }
++
++    private static final class TestWorld extends World {
++        final Long2ObjectOpenHashMap<Chunk> map = new Long2ObjectOpenHashMap<>();
++
++        TestWorld() {
++            super(null, null, null, null, false, null, null);
++        }
++
++        @Override
++        protected IChunkProvider n() {
++            return null;
++        }
++
++        @Override
++        public Chunk getChunkIfLoaded(int x, int z) {
++            return map.get(ChunkCoordIntPair.a(x, z));
++        }
++
++        @Override
++        public Chunk getChunkAt(int x, int z) {
++            return map.get(ChunkCoordIntPair.a(x, z));
++        }
++
++        @Override
++        public boolean isChunkLoaded(int x, int z, boolean allowEmpty) {
++            return map.containsKey(ChunkCoordIntPair.a(x, z));
++        }
++
++        @Override
++        public TileEntity getTileEntity(BlockPosition pos) {
++            return null;
++        }
++    }
++
++    private static final class TestChunkProviderServer extends ChunkProviderServer {
++        Long2ObjectOpenHashMap<Chunk> map;
++
++        TestChunkProviderServer() {
++            super(null, null, null);
++        }
++
++        @Override
++        public Chunk getChunkIfLoaded(int x, int z) {
++            return map.get(ChunkCoordIntPair.a(x, z));
++        }
++
++        @Override
++        public Chunk getChunkAt(int x, int z) {
++            return map.get(ChunkCoordIntPair.a(x, z));
++        }
++    }
++
++    @SuppressWarnings("unchecked")
++    private static TestWorld createWorld() throws Exception {
++        TestWorld world = (TestWorld) unsafe.allocateInstance(TestWorld.class);
++        Field mapField = TestWorld.class.getDeclaredField("map");
++        mapField.setAccessible(true);
++        Long2ObjectOpenHashMap<Chunk> map = new Long2ObjectOpenHashMap<>();
++        mapField.set(world, map);
++
++        world.worldData = new WorldData();
++        world.u = new ArrayList<>();
++        world.J = new int[32768];
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("players")), new ArrayList<>());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("j")), new ArrayList<>());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("f")), new HashSet<>());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("entityList")), new ArrayList<>());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("tileEntityListTick")), new World.TickableTileEntityList());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("b")), new ArrayList<>());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("tileEntityListUnload")), new HashSet<>());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("random")), new Random(42L));
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("spigotConfig")), unsafe.allocateInstance(SpigotWorldConfig.class));
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("paperConfig")), unsafe.allocateInstance(PaperWorldConfig.class));
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("chunkPacketBlockController")), new ChunkPacketBlockController() {});
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("pendingLight")), new me.stella.antarctic.collection.PendingLightRegistry(256));
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("methodProfiler")), new MethodProfiler());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("P")), new WorldBorder());
++        world.worldProvider = new WorldProviderNormal();
++        world.worldProvider.a(world);
++
++        for (int cx = 0; cx <= 1; cx++) {
++            for (int cz = 0; cz <= 1; cz++) {
++                Chunk c = (Chunk) unsafe.allocateInstance(Chunk.class);
++                Field wf = Chunk.class.getDeclaredField("world");
++                wf.setAccessible(true);
++                wf.set(c, world);
++                Field lx = Chunk.class.getDeclaredField("locX");
++                lx.setAccessible(true);
++                lx.setInt(c, cx);
++                Field lz = Chunk.class.getDeclaredField("locZ");
++                lz.setAccessible(true);
++                lz.setInt(c, cz);
++                Field sf = Chunk.class.getDeclaredField("sections");
++                sf.setAccessible(true);
++                ChunkSection[] secs = new ChunkSection[16];
++                for (int i = 0; i < 16; i++) {
++                    secs[i] = Chunk.a;
++                }
++                secs[4] = new ChunkSection(64, true);
++                secs[3] = new ChunkSection(48, true);
++                sf.set(c, secs);
++
++                Field slicesField = Chunk.class.getDeclaredField("entitySlices");
++                slicesField.setAccessible(true);
++                List<Entity>[] slices = new List[16];
++                for (int i = 0; i < 16; i++) {
++                    slices[i] = new ArrayList<>();
++                }
++                slicesField.set(c, slices);
++
++                for (String fn : new String[]{"itemCounts", "inventoryEntityCounts", "hardCollidableCounts", "itemFrameCounts"}) {
++                    Field f = Chunk.class.getDeclaredField(fn);
++                    f.setAccessible(true);
++                    f.set(c, new int[16]);
++                }
++                Field hm = Chunk.class.getDeclaredField("heightMap");
++                hm.setAccessible(true);
++                hm.set(c, new int[256]);
++                Field ch = Chunk.class.getDeclaredField("h");
++                ch.setAccessible(true);
++                ch.set(c, new int[256]);
++                Field ci = Chunk.class.getDeclaredField("i");
++                ci.setAccessible(true);
++                ci.set(c, new boolean[256]);
++                Field cte = Chunk.class.getDeclaredField("tileEntities");
++                cte.setAccessible(true);
++                cte.set(c, new HashMap<>());
++                map.put(ChunkCoordIntPair.a(cx, cz), c);
++            }
++        }
++
++        TestChunkProviderServer cps = (TestChunkProviderServer) unsafe.allocateInstance(TestChunkProviderServer.class);
++        cps.map = map;
++        world.chunkProvider = cps;
++        return world;
++    }
++
++    private static void setBlock(TestWorld world, int x, int y, int z, IBlockData data) {
++        Chunk c = world.getChunkIfLoaded(x >> 4, z >> 4);
++        c.getSections()[y >> 4].setType(x & 15, y & 15, z & 15, data);
++    }
++
++    private static Set<BlockPosition> vanillaExplosionBlocks(World world, Entity source, double posX, double posY, double posZ, float size) {
++        Set<BlockPosition> set = new HashSet<>();
++        for (int k = 0; k < 16; ++k) {
++            for (int i = 0; i < 16; ++i) {
++                for (int j = 0; j < 16; ++j) {
++                    if (k == 0 || k == 15 || i == 0 || i == 15 || j == 0 || j == 15) {
++                        double d0 = (double) ((float) k / 15.0F * 2.0F - 1.0F);
++                        double d1 = (double) ((float) i / 15.0F * 2.0F - 1.0F);
++                        double d2 = (double) ((float) j / 15.0F * 2.0F - 1.0F);
++                        double d3 = Math.sqrt(d0 * d0 + d1 * d1 + d2 * d2);
++                        d0 /= d3;
++                        d1 /= d3;
++                        d2 /= d3;
++                        float f = size * (0.7F + world.random.nextFloat() * 0.6F);
++                        double d4 = posX;
++                        double d5 = posY;
++                        double d6 = posZ;
++                        for (; f > 0.0F; f -= 0.22500001F) {
++                            BlockPosition pos = new BlockPosition(d4, d5, d6);
++                            IBlockData data = world.getType(pos);
++                            if (data.getMaterial() != Material.AIR) {
++                                float f2 = source != null ? source.a(null, world, pos, data) : data.getBlock().a((Entity) null);
++                                f -= (f2 + 0.3F) * 0.3F;
++                            }
++                            if (f > 0.0F && (source == null || source.a(null, world, pos, data, f)) && pos.getY() < 256 && pos.getY() >= 0) {
++                                set.add(pos);
++                            }
++                            d4 += d0 * 0.30000001192092896D;
++                            d5 += d1 * 0.30000001192092896D;
++                            d6 += d2 * 0.30000001192092896D;
++                        }
++                    }
++                }
++            }
++        }
++        return set;
++    }
++
++    private static float vanillaBlockDensity(World world, Vec3D vec3d, AxisAlignedBB aabb) {
++        double d0 = 1.0D / ((aabb.d - aabb.a) * 2.0D + 1.0D);
++        double d1 = 1.0D / ((aabb.e - aabb.b) * 2.0D + 1.0D);
++        double d2 = 1.0D / ((aabb.f - aabb.c) * 2.0D + 1.0D);
++        double d3 = (1.0D - Math.floor(1.0D / d0) * d0) / 2.0D;
++        double d4 = (1.0D - Math.floor(1.0D / d2) * d2) / 2.0D;
++        if (d0 >= 0.0D && d1 >= 0.0D && d2 >= 0.0D) {
++            int i = 0;
++            int j = 0;
++            for (float f = 0.0F; f <= 1.0F; f = (float) ((double) f + d0)) {
++                for (float f1 = 0.0F; f1 <= 1.0F; f1 = (float) ((double) f1 + d1)) {
++                    for (float f2 = 0.0F; f2 <= 1.0F; f2 = (float) ((double) f2 + d2)) {
++                        double d5 = aabb.a + (aabb.d - aabb.a) * (double) f;
++                        double d6 = aabb.b + (aabb.e - aabb.b) * (double) f1;
++                        double d7 = aabb.c + (aabb.f - aabb.c) * (double) f2;
++                        if (world.rayTrace(new Vec3D(d5 + d3, d6, d7 + d4), vec3d) == null) {
++                            ++i;
++                        }
++                        ++j;
++                    }
++                }
++            }
++            return (float) i / (float) j;
++        }
++        return 0.0F;
++    }
++
++    @Test
++    public void testExplosionRayDirectionsBlocksDensityAndPacketParity() throws Exception {
++        // 1. RAY_DIRECTIONS bit-for-bit parity
++        Field rdField = Explosion.class.getDeclaredField("RAY_DIRECTIONS");
++        rdField.setAccessible(true);
++        double[] dirs = (double[]) rdField.get(null);
++        int idx = 0;
++        for (int k = 0; k < 16; ++k) {
++            for (int i = 0; i < 16; ++i) {
++                for (int j = 0; j < 16; ++j) {
++                    if (k == 0 || k == 15 || i == 0 || i == 15 || j == 0 || j == 15) {
++                        double d0 = (double) ((float) k / 15.0F * 2.0F - 1.0F);
++                        double d1 = (double) ((float) i / 15.0F * 2.0F - 1.0F);
++                        double d2 = (double) ((float) j / 15.0F * 2.0F - 1.0F);
++                        double d3 = Math.sqrt(d0 * d0 + d1 * d1 + d2 * d2);
++                        Assert.assertEquals(Double.doubleToRawLongBits(d0 / d3), Double.doubleToRawLongBits(dirs[idx++]));
++                        Assert.assertEquals(Double.doubleToRawLongBits(d1 / d3), Double.doubleToRawLongBits(dirs[idx++]));
++                        Assert.assertEquals(Double.doubleToRawLongBits(d2 / d3), Double.doubleToRawLongBits(dirs[idx++]));
++                    }
++                }
++            }
++        }
++        Assert.assertEquals(1352 * 3, idx);
++
++        // 2. Explosion.a() parity: null source, AIR preserved, EntityMinecartTNT, EntityWitherSkull
++        TestWorld world = createWorld();
++        for (int x = 4; x <= 12; x++) {
++            for (int z = 4; z <= 12; z++) {
++                setBlock(world, x, 63, z, Blocks.STONE.getBlockData());
++            }
++        }
++        setBlock(world, 8, 64, 10, Blocks.STONE.getBlockData());
++        setBlock(world, 8, 64, 9, Blocks.WATER.getBlockData());
++        setBlock(world, 9, 64, 8, Blocks.RAIL.getBlockData());
++
++        world.random.setSeed(12345L);
++        Explosion expOpt = new Explosion(world, null, 8.5D, 64.5D, 8.5D, 4.0F, true, false);
++        expOpt.a();
++        long rngAfterOpt = world.random.nextLong();
++
++        world.random.setSeed(12345L);
++        Set<BlockPosition> expectedBlocks = vanillaExplosionBlocks(world, null, 8.5D, 64.5D, 8.5D, 4.0F);
++        long rngAfterVan = world.random.nextLong();
++        Assert.assertEquals(rngAfterVan, rngAfterOpt);
++        Assert.assertEquals(expectedBlocks, new HashSet<>(expOpt.getBlocks()));
++        Assert.assertTrue("AIR blocks must be preserved for fire-only explosions", expOpt.getBlocks().contains(new BlockPosition(7, 64, 7)));
++
++        // EntityMinecartTNT rail protection (only active when ignited via j())
++        EntityMinecartTNT minecartTnt = new EntityMinecartTNT(world, 8.5D, 64.5D, 8.5D);
++        minecartTnt.j();
++        world.random.setSeed(999L);
++        Explosion expCart = new Explosion(world, minecartTnt, 8.5D, 64.5D, 8.5D, 4.0F, false, true);
++        expCart.a();
++        Assert.assertFalse(expCart.getBlocks().contains(new BlockPosition(9, 64, 8)));
++
++        // EntityWitherSkull charged clamping
++        EntityWitherSkull skull = new EntityWitherSkull(world);
++        skull.setCharged(true);
++        setBlock(world, 7, 64, 8, Blocks.OBSIDIAN.getBlockData());
++        world.random.setSeed(777L);
++        Explosion expSkull = new Explosion(world, skull, 8.5D, 64.5D, 8.5D, 4.0F, false, true);
++        expSkull.a();
++        world.random.setSeed(777L);
++        Set<BlockPosition> expectedSkull = vanillaExplosionBlocks(world, skull, 8.5D, 64.5D, 8.5D, 4.0F);
++        Assert.assertEquals(expectedSkull, new HashSet<>(expSkull.getBlocks()));
++
++        // 3. World.a(Vec3D, AxisAlignedBB) & hasBlockRayHit parity across diverse block shapes
++        setBlock(world, 6, 65, 6, Blocks.TALLGRASS.getBlockData());
++        setBlock(world, 6, 65, 7, Blocks.STONE_SLAB.getBlockData());
++        setBlock(world, 7, 65, 6, Blocks.OAK_STAIRS.getBlockData());
++        setBlock(world, 7, 65, 7, Blocks.TORCH.getBlockData());
++        setBlock(world, 6, 65, 8, Blocks.FIRE.getBlockData());
++        setBlock(world, 8, 65, 6, Blocks.WATER.getBlockData());
++
++        Vec3D[] origins = {
++            new Vec3D(5.5D, 65.5D, 5.5D),
++            new Vec3D(8.5D, 66.2D, 8.5D),
++            new Vec3D(35.0D, 65.5D, 35.0D) // crosses into unloaded chunk
++        };
++        AxisAlignedBB[] boxes = {
++            new AxisAlignedBB(7.2D, 65.0D, 7.2D, 7.8D, 66.8D, 7.8D),
++            new AxisAlignedBB(5.8D, 64.5D, 5.8D, 6.4D, 65.9D, 6.4D),
++            new AxisAlignedBB(6.0D, 65.0D, 6.0D, 8.0D, 66.0D, 8.0D)
++        };
++        for (Vec3D orig : origins) {
++            for (AxisAlignedBB box : boxes) {
++                float vanDensity = vanillaBlockDensity(world, orig, box);
++                float optDensity = world.a(orig, box);
++                Assert.assertEquals(Float.floatToRawIntBits(vanDensity), Float.floatToRawIntBits(optDensity));
++            }
++        }
++
++        // 4. PacketPlayOutExplosion wire-format parity
++        List<BlockPosition> frozen = new ArrayList<>(expOpt.getBlocks());
++        Vec3D kb = new Vec3D(0.25D, 0.5D, -0.125D);
++        PacketPlayOutExplosion pktStandard = new PacketPlayOutExplosion(8.5D, 64.5D, 8.5D, 4.0F, frozen, kb);
++        PacketPlayOutExplosion pktShared = new PacketPlayOutExplosion(8.5D, 64.5D, 8.5D, 4.0F, frozen, kb, true);
++        PacketDataSerializer bufA = new PacketDataSerializer(Unpooled.buffer());
++        PacketDataSerializer bufB = new PacketDataSerializer(Unpooled.buffer());
++        pktStandard.b(bufA);
++        pktShared.b(bufB);
++        Assert.assertEquals(bufA, bufB);
++        bufA.release();
++        bufB.release();
++    }
++
++    @Test
++    public void testExplosionAndBlockDensityPerf() throws Exception {
++        TestWorld world = createWorld();
++        for (int x = 2; x <= 14; x++) {
++            for (int z = 2; z <= 14; z++) {
++                setBlock(world, x, 63, z, Blocks.STONE.getBlockData());
++            }
++        }
++        setBlock(world, 7, 65, 7, Blocks.STONE.getBlockData());
++        Vec3D orig = new Vec3D(4.5D, 65.5D, 4.5D);
++        AxisAlignedBB targetBox = new AxisAlignedBB(8.2D, 65.0D, 8.2D, 8.8D, 66.8D, 8.8D);
++
++        final int warmup = 200;
++        final int densityIters = 1500;
++        long sink = 0L;
++
++        for (int i = 0; i < warmup; i++) {
++            sink += Float.floatToRawIntBits(vanillaBlockDensity(world, orig, targetBox));
++            sink += Float.floatToRawIntBits(world.a(orig, targetBox));
++        }
++        for (int i = 0; i < 20; i++) {
++            sink += vanillaExplosionBlocks(world, null, 8.5D, 64.5D, 8.5D, 4.0F).size();
++            Explosion wExp = new Explosion(world, null, 8.5D, 64.5D, 8.5D, 4.0F, false, true);
++            wExp.a();
++            sink += wExp.getBlocks().size();
++        }
++
++        ThreadMXBean bean = (ThreadMXBean) ManagementFactory.getThreadMXBean();
++        long tid = Thread.currentThread().getId();
++        bean.getThreadAllocatedBytes(tid);
++
++        long vanBytes0 = bean.getThreadAllocatedBytes(tid);
++        long vanT0 = System.nanoTime();
++        for (int i = 0; i < densityIters; i++) {
++            sink += Float.floatToRawIntBits(vanillaBlockDensity(world, orig, targetBox));
++        }
++        for (int i = 0; i < 15; i++) {
++            sink += vanillaExplosionBlocks(world, null, 8.5D, 64.5D, 8.5D, 4.0F).size();
++        }
++        long vanNs = System.nanoTime() - vanT0;
++        long vanBytes = bean.getThreadAllocatedBytes(tid) - vanBytes0;
++
++        long optBytes0 = bean.getThreadAllocatedBytes(tid);
++        long optT0 = System.nanoTime();
++        for (int i = 0; i < densityIters; i++) {
++            sink += Float.floatToRawIntBits(world.a(orig, targetBox));
++        }
++        long densityBytes = bean.getThreadAllocatedBytes(tid) - optBytes0;
++        for (int i = 0; i < 15; i++) {
++            Explosion exp = new Explosion(world, null, 8.5D, 64.5D, 8.5D, 4.0F, false, true);
++            exp.a();
++            sink += exp.getBlocks().size();
++        }
++        long optNs = System.nanoTime() - optT0;
++        long optBytes = bean.getThreadAllocatedBytes(tid) - optBytes0;
++
++        double speedup = (double) vanNs / Math.max(1L, optNs);
++        System.out.println("C7_BENCH vanilla_ns=" + vanNs + " opt_ns=" + optNs
++            + " speedup=" + String.format("%.2fx", speedup)
++            + " vanilla_bytes=" + vanBytes + " opt_bytes=" + optBytes + " density_bytes=" + densityBytes + " sink=" + sink);
++
++        Assert.assertEquals("World.a(Vec3D, AABB) should allocate 0 bytes on full cubes/air", 0L, densityBytes);
++        Assert.assertTrue("Expected >= 1.5x speedup, got " + speedup, speedup > 1.5D);
++    }
++}
