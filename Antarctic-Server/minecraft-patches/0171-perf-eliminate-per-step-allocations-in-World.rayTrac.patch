@@ -1,0 +1,581 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 12:59:57 +0700
+Subject: [PATCH 171/171] perf: eliminate per-step allocations in
+ World.rayTrace
+
+
+diff --git a/main/java/net/minecraft/server/World.java b/main/java/net/minecraft/server/World.java
+index 2b9f617..31cec06 100644
+--- a/main/java/net/minecraft/server/World.java
++++ b/main/java/net/minecraft/server/World.java
+@@ -1054,35 +1054,70 @@ public abstract class World implements IBlockAccess {
+     public MovingObjectPosition rayTrace(Vec3D vec3d, Vec3D vec3d1, boolean flag, boolean flag1, boolean flag2) {
+         if (!Double.isNaN(vec3d.x) && !Double.isNaN(vec3d.y) && !Double.isNaN(vec3d.z)) {
+             if (!Double.isNaN(vec3d1.x) && !Double.isNaN(vec3d1.y) && !Double.isNaN(vec3d1.z)) {
+-                int i = MathHelper.floor(vec3d1.x);
+-                int j = MathHelper.floor(vec3d1.y);
+-                int k = MathHelper.floor(vec3d1.z);
+-                int l = MathHelper.floor(vec3d.x);
+-                int i1 = MathHelper.floor(vec3d.y);
+-                int j1 = MathHelper.floor(vec3d.z);
+-                BlockPosition blockposition = new BlockPosition(l, i1, j1);
+-                IBlockData iblockdata = this.getTypeIfLoaded(blockposition); // Paper
+-                if (iblockdata == null) return null; // Paper
++                double curX = vec3d.x;
++                double curY = vec3d.y;
++                double curZ = vec3d.z;
++                final double endX = vec3d1.x;
++                final double endY = vec3d1.y;
++                final double endZ = vec3d1.z;
++
++                int i = MathHelper.floor(endX);
++                int j = MathHelper.floor(endY);
++                int k = MathHelper.floor(endZ);
++                int l = MathHelper.floor(curX);
++                int i1 = MathHelper.floor(curY);
++                int j1 = MathHelper.floor(curZ);
++
++                int cachedChunkX = l >> 4;
++                int cachedChunkZ = j1 >> 4;
++                Chunk cachedChunk = this.getChunkIfLoaded(cachedChunkX, cachedChunkZ);
++                if (cachedChunk == null) return null; // Paper
++
++                IBlockData iblockdata;
++                if (i1 < 0 || i1 >= 256 || l < -30000000 || l >= 30000000 || j1 < -30000000 || j1 >= 30000000) {
++                    iblockdata = Blocks.AIR.getBlockData();
++                } else {
++                    ChunkSection sec = cachedChunk.getSections()[i1 >> 4];
++                    iblockdata = sec == Chunk.a ? Blocks.AIR.getBlockData() : sec.getType(l & 15, i1 & 15, j1 & 15);
++                }
++
+                 Block block = iblockdata.getBlock();
++                BlockPosition.MutableBlockPosition mutablePos = null;
+ 
+-                if ((!flag1 || iblockdata.d(this, blockposition) != Block.k) && block.a(iblockdata, flag)) {
+-                    MovingObjectPosition movingobjectposition = iblockdata.a(this, blockposition, vec3d, vec3d1);
++                if (block.a(iblockdata, flag)) {
++                    boolean passesStart = !flag1;
++                    if (!passesStart) {
++                        mutablePos = new BlockPosition.MutableBlockPosition(l, i1, j1);
++                        passesStart = iblockdata.d(this, mutablePos) != Block.k;
++                    }
++                    if (passesStart) {
++                        MovingObjectPosition movingobjectposition = iblockdata.a(this, new BlockPosition(l, i1, j1), vec3d, vec3d1);
+ 
+-                    if (movingobjectposition != null) {
+-                        return movingobjectposition;
++                        if (movingobjectposition != null) {
++                            return movingobjectposition;
++                        }
+                     }
+                 }
+ 
+-                MovingObjectPosition movingobjectposition1 = null;
++                boolean hasMiss = false;
++                double missX = 0.0D;
++                double missY = 0.0D;
++                double missZ = 0.0D;
++                EnumDirection missDir = null;
++                int missBx = 0;
++                int missBy = 0;
++                int missBz = 0;
+                 int k1 = 200;
+ 
+                 while (k1-- >= 0) {
+-                    if (Double.isNaN(vec3d.x) || Double.isNaN(vec3d.y) || Double.isNaN(vec3d.z)) {
++                    if (Double.isNaN(curX) || Double.isNaN(curY) || Double.isNaN(curZ)) {
+                         return null;
+                     }
+ 
+                     if (l == i && i1 == j && j1 == k) {
+-                        return flag2 ? movingobjectposition1 : null;
++                        return (flag2 && hasMiss)
++                                ? new MovingObjectPosition(MovingObjectPosition.EnumMovingObjectType.MISS, new Vec3D(missX, missY, missZ), missDir, new BlockPosition(missBx, missBy, missBz))
++                                : null;
+                     }
+ 
+                     boolean flag3 = true;
+@@ -1119,20 +1154,20 @@ public abstract class World implements IBlockAccess {
+                     double d3 = 999.0D;
+                     double d4 = 999.0D;
+                     double d5 = 999.0D;
+-                    double d6 = vec3d1.x - vec3d.x;
+-                    double d7 = vec3d1.y - vec3d.y;
+-                    double d8 = vec3d1.z - vec3d.z;
++                    double d6 = endX - curX;
++                    double d7 = endY - curY;
++                    double d8 = endZ - curZ;
+ 
+                     if (flag3) {
+-                        d3 = (d0 - vec3d.x) / d6;
++                        d3 = (d0 - curX) / d6;
+                     }
+ 
+                     if (flag4) {
+-                        d4 = (d1 - vec3d.y) / d7;
++                        d4 = (d1 - curY) / d7;
+                     }
+ 
+                     if (flag5) {
+-                        d5 = (d2 - vec3d.z) / d8;
++                        d5 = (d2 - curZ) / d8;
+                     }
+ 
+                     if (d3 == -0.0D) {
+@@ -1151,37 +1186,75 @@ public abstract class World implements IBlockAccess {
+ 
+                     if (d3 < d4 && d3 < d5) {
+                         enumdirection = i > l ? EnumDirection.WEST : EnumDirection.EAST;
+-                        vec3d = new Vec3D(d0, vec3d.y + d7 * d3, vec3d.z + d8 * d3);
++                        curX = d0;
++                        curY += d7 * d3;
++                        curZ += d8 * d3;
+                     } else if (d4 < d5) {
+                         enumdirection = j > i1 ? EnumDirection.DOWN : EnumDirection.UP;
+-                        vec3d = new Vec3D(vec3d.x + d6 * d4, d1, vec3d.z + d8 * d4);
++                        curX += d6 * d4;
++                        curY = d1;
++                        curZ += d8 * d4;
+                     } else {
+                         enumdirection = k > j1 ? EnumDirection.NORTH : EnumDirection.SOUTH;
+-                        vec3d = new Vec3D(vec3d.x + d6 * d5, vec3d.y + d7 * d5, d2);
++                        curX += d6 * d5;
++                        curY += d7 * d5;
++                        curZ = d2;
++                    }
++
++                    l = MathHelper.floor(curX) - (enumdirection == EnumDirection.EAST ? 1 : 0);
++                    i1 = MathHelper.floor(curY) - (enumdirection == EnumDirection.UP ? 1 : 0);
++                    j1 = MathHelper.floor(curZ) - (enumdirection == EnumDirection.SOUTH ? 1 : 0);
++
++                    int cx = l >> 4;
++                    int cz = j1 >> 4;
++                    if (cx != cachedChunkX || cz != cachedChunkZ) {
++                        cachedChunkX = cx;
++                        cachedChunkZ = cz;
++                        cachedChunk = this.getChunkIfLoaded(cx, cz);
+                     }
++                    if (cachedChunk == null) return null; // Paper
+ 
+-                    l = MathHelper.floor(vec3d.x) - (enumdirection == EnumDirection.EAST ? 1 : 0);
+-                    i1 = MathHelper.floor(vec3d.y) - (enumdirection == EnumDirection.UP ? 1 : 0);
+-                    j1 = MathHelper.floor(vec3d.z) - (enumdirection == EnumDirection.SOUTH ? 1 : 0);
+-                    blockposition = new BlockPosition(l, i1, j1);
+-                    IBlockData iblockdata1 = this.getTypeIfLoaded(blockposition); // Paper
+-                    if (iblockdata1 == null) return null; // Paper
++                    IBlockData iblockdata1;
++                    if (i1 < 0 || i1 >= 256 || l < -30000000 || l >= 30000000 || j1 < -30000000 || j1 >= 30000000) {
++                        iblockdata1 = Blocks.AIR.getBlockData();
++                    } else {
++                        ChunkSection sec = cachedChunk.getSections()[i1 >> 4];
++                        iblockdata1 = sec == Chunk.a ? Blocks.AIR.getBlockData() : sec.getType(l & 15, i1 & 15, j1 & 15);
++                    }
+                     Block block1 = iblockdata1.getBlock();
+ 
+-                    if (!flag1 || iblockdata1.getMaterial() == Material.PORTAL || iblockdata1.d(this, blockposition) != Block.k) {
++                    boolean passesFlag1 = !flag1 || iblockdata1.getMaterial() == Material.PORTAL;
++                    if (!passesFlag1 && block1 != Blocks.AIR) {
++                        if (mutablePos == null) {
++                            mutablePos = new BlockPosition.MutableBlockPosition(l, i1, j1);
++                        } else {
++                            mutablePos.c(l, i1, j1);
++                        }
++                        passesFlag1 = iblockdata1.d(this, mutablePos) != Block.k;
++                    }
++                    if (passesFlag1) {
+                         if (block1.a(iblockdata1, flag)) {
+-                            MovingObjectPosition movingobjectposition2 = iblockdata1.a(this, blockposition, vec3d, vec3d1);
++                            MovingObjectPosition movingobjectposition2 = iblockdata1.a(this, new BlockPosition(l, i1, j1), new Vec3D(curX, curY, curZ), vec3d1);
+ 
+                             if (movingobjectposition2 != null) {
+                                 return movingobjectposition2;
+                             }
+-                        } else {
+-                            movingobjectposition1 = new MovingObjectPosition(MovingObjectPosition.EnumMovingObjectType.MISS, vec3d, enumdirection, blockposition);
++                        } else if (flag2) {
++                            hasMiss = true;
++                            missX = curX;
++                            missY = curY;
++                            missZ = curZ;
++                            missDir = enumdirection;
++                            missBx = l;
++                            missBy = i1;
++                            missBz = j1;
+                         }
+                     }
+                 }
+ 
+-                return flag2 ? movingobjectposition1 : null;
++                return (flag2 && hasMiss)
++                        ? new MovingObjectPosition(MovingObjectPosition.EnumMovingObjectType.MISS, new Vec3D(missX, missY, missZ), missDir, new BlockPosition(missBx, missBy, missBz))
++                        : null;
+             } else {
+                 return null;
+             }
+diff --git a/test/java/net/minecraft/server/WorldRayTracePerfTest.java b/test/java/net/minecraft/server/WorldRayTracePerfTest.java
+new file mode 100644
+index 0000000..7f34f7a
+--- /dev/null
++++ b/test/java/net/minecraft/server/WorldRayTracePerfTest.java
+@@ -0,0 +1,360 @@
++package net.minecraft.server;
++
++import com.sun.management.ThreadMXBean;
++import java.lang.management.ManagementFactory;
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.List;
++import javax.annotation.Nullable;
++import org.junit.Assert;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++public class WorldRayTracePerfTest {
++
++    private static Unsafe unsafe;
++
++    @BeforeClass
++    public static void init() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        unsafe = (Unsafe) f.get(null);
++    }
++
++    private static final class TestWorld extends World {
++        Chunk[][] grid = new Chunk[4][4];
++
++        TestWorld() {
++            super(null, null, null, null, false, null, null);
++        }
++
++        @Override
++        protected IChunkProvider n() {
++            return null;
++        }
++
++        @Override
++        public Chunk getChunkIfLoaded(int x, int z) {
++            return (x >= 0 && x < 4 && z >= 0 && z < 4) ? grid[x][z] : null;
++        }
++
++        @Override
++        public Chunk getChunkAt(int x, int z) {
++            return getChunkIfLoaded(x, z);
++        }
++
++        @Override
++        public boolean isChunkLoaded(int x, int z, boolean allowEmpty) {
++            return getChunkIfLoaded(x, z) != null;
++        }
++
++        @Override
++        public IBlockData getType(BlockPosition pos) {
++            Chunk c = getChunkIfLoaded(pos.getX() >> 4, pos.getZ() >> 4);
++            if (c == null || pos.getY() < 0 || pos.getY() >= 256) {
++                return Blocks.AIR.getBlockData();
++            }
++            ChunkSection sec = c.getSections()[pos.getY() >> 4];
++            return sec == Chunk.a ? Blocks.AIR.getBlockData() : sec.getType(pos.getX() & 15, pos.getY() & 15, pos.getZ() & 15);
++        }
++    }
++
++    private static final class TestChunkProviderServer extends ChunkProviderServer {
++        TestWorld tw;
++
++        TestChunkProviderServer() {
++            super(null, null, null);
++        }
++
++        @Override
++        public Chunk getChunkIfLoaded(int x, int z) {
++            return tw.getChunkIfLoaded(x, z);
++        }
++    }
++
++    private static TestWorld createWorld() throws Exception {
++        TestWorld world = (TestWorld) unsafe.allocateInstance(TestWorld.class);
++        world.grid = new Chunk[4][4];
++        TestChunkProviderServer cps = (TestChunkProviderServer) unsafe.allocateInstance(TestChunkProviderServer.class);
++        cps.tw = world;
++        world.chunkProvider = cps;
++        for (int cx = 0; cx < 4; cx++) {
++            for (int cz = 0; cz < 4; cz++) {
++                Chunk c = (Chunk) unsafe.allocateInstance(Chunk.class);
++                initChunk(c, world, cx, cz);
++                world.grid[cx][cz] = c;
++            }
++        }
++        return world;
++    }
++
++    private static void initChunk(Chunk c, World world, int cx, int cz) throws Exception {
++        Field worldField = Chunk.class.getDeclaredField("world");
++        worldField.setAccessible(true);
++        worldField.set(c, world);
++        Field locXField = Chunk.class.getDeclaredField("locX");
++        locXField.setAccessible(true);
++        locXField.setInt(c, cx);
++        Field locZField = Chunk.class.getDeclaredField("locZ");
++        locZField.setAccessible(true);
++        locZField.setInt(c, cz);
++        ChunkSection[] sections = new ChunkSection[16];
++        for (int i = 0; i < 16; i++) {
++            sections[i] = Chunk.a;
++        }
++        Field secField = Chunk.class.getDeclaredField("sections");
++        secField.setAccessible(true);
++        secField.set(c, sections);
++    }
++
++    private static void setBlock(TestWorld world, int x, int y, int z, IBlockData data) {
++        Chunk c = world.getChunkIfLoaded(x >> 4, z >> 4);
++        if (c == null || y < 0 || y >= 256) return;
++        ChunkSection[] sections = c.getSections();
++        ChunkSection sec = sections[y >> 4];
++        if (sec == Chunk.a) {
++            sec = new ChunkSection((y >> 4) << 4, true);
++            sections[y >> 4] = sec;
++        }
++        sec.setType(x & 15, y & 15, z & 15, data);
++    }
++
++    @Nullable
++    private static MovingObjectPosition vanillaRayTrace(World world, Vec3D vec3d, Vec3D vec3d1, boolean flag, boolean flag1, boolean flag2) {
++        if (!Double.isNaN(vec3d.x) && !Double.isNaN(vec3d.y) && !Double.isNaN(vec3d.z)) {
++            if (!Double.isNaN(vec3d1.x) && !Double.isNaN(vec3d1.y) && !Double.isNaN(vec3d1.z)) {
++                int i = MathHelper.floor(vec3d1.x);
++                int j = MathHelper.floor(vec3d1.y);
++                int k = MathHelper.floor(vec3d1.z);
++                int l = MathHelper.floor(vec3d.x);
++                int i1 = MathHelper.floor(vec3d.y);
++                int j1 = MathHelper.floor(vec3d.z);
++                BlockPosition blockposition = new BlockPosition(l, i1, j1);
++                IBlockData iblockdata = world.getTypeIfLoaded(blockposition);
++                if (iblockdata == null) return null;
++                Block block = iblockdata.getBlock();
++
++                if ((!flag1 || iblockdata.d(world, blockposition) != Block.k) && block.a(iblockdata, flag)) {
++                    MovingObjectPosition movingobjectposition = iblockdata.a(world, blockposition, vec3d, vec3d1);
++                    if (movingobjectposition != null) {
++                        return movingobjectposition;
++                    }
++                }
++
++                MovingObjectPosition movingobjectposition1 = null;
++                int k1 = 200;
++
++                while (k1-- >= 0) {
++                    if (Double.isNaN(vec3d.x) || Double.isNaN(vec3d.y) || Double.isNaN(vec3d.z)) {
++                        return null;
++                    }
++                    if (l == i && i1 == j && j1 == k) {
++                        return flag2 ? movingobjectposition1 : null;
++                    }
++
++                    boolean flag3 = true;
++                    boolean flag4 = true;
++                    boolean flag5 = true;
++                    double d0 = 999.0D;
++                    double d1 = 999.0D;
++                    double d2 = 999.0D;
++
++                    if (i > l) { d0 = (double) l + 1.0D; } else if (i < l) { d0 = (double) l + 0.0D; } else { flag3 = false; }
++                    if (j > i1) { d1 = (double) i1 + 1.0D; } else if (j < i1) { d1 = (double) i1 + 0.0D; } else { flag4 = false; }
++                    if (k > j1) { d2 = (double) j1 + 1.0D; } else if (k < j1) { d2 = (double) j1 + 0.0D; } else { flag5 = false; }
++
++                    double d3 = 999.0D;
++                    double d4 = 999.0D;
++                    double d5 = 999.0D;
++                    double d6 = vec3d1.x - vec3d.x;
++                    double d7 = vec3d1.y - vec3d.y;
++                    double d8 = vec3d1.z - vec3d.z;
++
++                    if (flag3) d3 = (d0 - vec3d.x) / d6;
++                    if (flag4) d4 = (d1 - vec3d.y) / d7;
++                    if (flag5) d5 = (d2 - vec3d.z) / d8;
++                    if (d3 == -0.0D) d3 = -1.0E-4D;
++                    if (d4 == -0.0D) d4 = -1.0E-4D;
++                    if (d5 == -0.0D) d5 = -1.0E-4D;
++
++                    EnumDirection enumdirection;
++                    if (d3 < d4 && d3 < d5) {
++                        enumdirection = i > l ? EnumDirection.WEST : EnumDirection.EAST;
++                        vec3d = new Vec3D(d0, vec3d.y + d7 * d3, vec3d.z + d8 * d3);
++                    } else if (d4 < d5) {
++                        enumdirection = j > i1 ? EnumDirection.DOWN : EnumDirection.UP;
++                        vec3d = new Vec3D(vec3d.x + d6 * d4, d1, vec3d.z + d8 * d4);
++                    } else {
++                        enumdirection = k > j1 ? EnumDirection.NORTH : EnumDirection.SOUTH;
++                        vec3d = new Vec3D(vec3d.x + d6 * d5, vec3d.y + d7 * d5, d2);
++                    }
++
++                    l = MathHelper.floor(vec3d.x) - (enumdirection == EnumDirection.EAST ? 1 : 0);
++                    i1 = MathHelper.floor(vec3d.y) - (enumdirection == EnumDirection.UP ? 1 : 0);
++                    j1 = MathHelper.floor(vec3d.z) - (enumdirection == EnumDirection.SOUTH ? 1 : 0);
++                    blockposition = new BlockPosition(l, i1, j1);
++                    IBlockData iblockdata1 = world.getTypeIfLoaded(blockposition);
++                    if (iblockdata1 == null) return null;
++                    Block block1 = iblockdata1.getBlock();
++
++                    if (!flag1 || iblockdata1.getMaterial() == Material.PORTAL || iblockdata1.d(world, blockposition) != Block.k) {
++                        if (block1.a(iblockdata1, flag)) {
++                            MovingObjectPosition movingobjectposition2 = iblockdata1.a(world, blockposition, vec3d, vec3d1);
++                            if (movingobjectposition2 != null) {
++                                return movingobjectposition2;
++                            }
++                        } else {
++                            movingobjectposition1 = new MovingObjectPosition(MovingObjectPosition.EnumMovingObjectType.MISS, vec3d, enumdirection, blockposition);
++                        }
++                    }
++                }
++                return flag2 ? movingobjectposition1 : null;
++            }
++        }
++        return null;
++    }
++
++    private static void assertHitEquals(String ctx, @Nullable MovingObjectPosition expected, @Nullable MovingObjectPosition actual) {
++        if (expected == null) {
++            Assert.assertNull(ctx + ": expected null hit", actual);
++            return;
++        }
++        Assert.assertNotNull(ctx + ": expected non-null hit", actual);
++        Assert.assertEquals(ctx + ": type mismatch", expected.type, actual.type);
++        Assert.assertEquals(ctx + ": direction mismatch", expected.direction, actual.direction);
++        Assert.assertEquals(ctx + ": block pos mismatch", expected.a(), actual.a());
++        Assert.assertEquals(ctx + ": pos.x mismatch", expected.pos.x, actual.pos.x, 0.0D);
++        Assert.assertEquals(ctx + ": pos.y mismatch", expected.pos.y, actual.pos.y, 0.0D);
++        Assert.assertEquals(ctx + ": pos.z mismatch", expected.pos.z, actual.pos.z, 0.0D);
++    }
++
++    @Test
++    public void testRayTraceParity() throws Exception {
++        TestWorld world = createWorld();
++        // Stone wall across chunk boundary (x=25, y=60..68, z=10..30)
++        for (int y = 60; y <= 68; y++) {
++            for (int z = 10; z <= 30; z++) {
++                setBlock(world, 25, y, z, Blocks.STONE.getBlockData());
++            }
++        }
++        // Glass, slabs, stairs, water, tall grass, portal
++        setBlock(world, 15, 64, 15, Blocks.GLASS.getBlockData());
++        setBlock(world, 16, 64, 15, Blocks.STONE_SLAB.getBlockData());
++        setBlock(world, 17, 64, 15, Blocks.OAK_STAIRS.getBlockData());
++        setBlock(world, 18, 64, 15, Blocks.WATER.getBlockData());
++        setBlock(world, 19, 64, 15, Blocks.TALLGRASS.getBlockData());
++        setBlock(world, 20, 64, 15, Blocks.PORTAL.getBlockData());
++        // Start-inside-block fixture
++        setBlock(world, 10, 64, 10, Blocks.STONE.getBlockData());
++
++        List<Vec3D[]> rays = new ArrayList<>();
++        // Start inside stone
++        rays.add(new Vec3D[]{new Vec3D(10.5D, 64.5D, 10.5D), new Vec3D(12.5D, 64.5D, 10.5D)});
++        // NaN cases
++        rays.add(new Vec3D[]{new Vec3D(Double.NaN, 64.0D, 10.0D), new Vec3D(12.0D, 64.0D, 10.0D)});
++        rays.add(new Vec3D[]{new Vec3D(10.0D, 64.0D, 10.0D), new Vec3D(12.0D, Double.NaN, 10.0D)});
++        // Unloaded chunk border (x=64 is chunk 4, unloaded)
++        rays.add(new Vec3D[]{new Vec3D(55.5D, 64.5D, 16.5D), new Vec3D(72.5D, 64.5D, 16.5D)});
++        // Open-air miss (no blocks in y=90)
++        rays.add(new Vec3D[]{new Vec3D(8.2D, 90.5D, 8.2D), new Vec3D(35.8D, 92.3D, 34.7D)});
++        // Through glass, slab, stairs, water, tallgrass, portal
++        rays.add(new Vec3D[]{new Vec3D(12.5D, 64.25D, 15.5D), new Vec3D(28.5D, 64.25D, 15.5D)});
++        rays.add(new Vec3D[]{new Vec3D(12.5D, 64.85D, 15.5D), new Vec3D(28.5D, 64.85D, 15.5D)});
++        // Deterministic 15+ diagonal/axis rays across chunks
++        for (int idx = 0; idx < 16; idx++) {
++            double sx = 5.1D + idx * 0.7D;
++            double sy = 60.2D + (idx % 5) * 1.1D;
++            double sz = 8.3D + idx * 0.9D;
++            double ex = 32.4D - idx * 0.4D;
++            double ey = 66.8D - (idx % 4) * 1.3D;
++            double ez = 31.6D - idx * 0.6D;
++            rays.add(new Vec3D[]{new Vec3D(sx, sy, sz), new Vec3D(ex, ey, ez)});
++        }
++
++        // 23 rays * 8 boolean combinations = 184 parity checks
++        int checks = 0;
++        for (int r = 0; r < rays.size(); r++) {
++            Vec3D start = rays.get(r)[0];
++            Vec3D end = rays.get(r)[1];
++            for (int mask = 0; mask < 8; mask++) {
++                boolean f0 = (mask & 1) != 0;
++                boolean f1 = (mask & 2) != 0;
++                boolean f2 = (mask & 4) != 0;
++                MovingObjectPosition expected = vanillaRayTrace(world, start, end, f0, f1, f2);
++                MovingObjectPosition actual = world.rayTrace(start, end, f0, f1, f2);
++                assertHitEquals("ray=" + r + " mask=" + mask, expected, actual);
++                checks++;
++            }
++        }
++        Assert.assertTrue(checks >= 120);
++    }
++
++    @Test
++    public void testRayTraceBenchmark() throws Exception {
++        TestWorld world = createWorld();
++        for (int y = 60; y <= 68; y++) {
++            for (int z = 8; z <= 32; z++) {
++                setBlock(world, 28, y, z, Blocks.STONE.getBlockData());
++            }
++        }
++
++        Vec3D airStart = new Vec3D(4.2D, 90.5D, 4.2D);
++        Vec3D airEnd = new Vec3D(24.7D, 94.3D, 18.6D); // ~24 blocks open air
++        Vec3D hitStart = new Vec3D(8.2D, 64.5D, 12.2D);
++        Vec3D hitEnd = new Vec3D(35.0D, 64.5D, 24.0D);
++
++        ThreadMXBean bean = (ThreadMXBean) ManagementFactory.getThreadMXBean();
++        long tid = Thread.currentThread().getId();
++
++        // Warmup
++        for (int i = 0; i < 2000; i++) {
++            vanillaRayTrace(world, airStart, airEnd, false, false, false);
++            world.rayTrace(airStart, airEnd, false, false, false);
++            vanillaRayTrace(world, hitStart, hitEnd, false, false, false);
++            world.rayTrace(hitStart, hitEnd, false, false, false);
++        }
++
++        final int iters = 10000;
++        long airVAlloc0 = bean.getThreadAllocatedBytes(tid);
++        long airVT0 = System.nanoTime();
++        int sink = 0;
++        for (int i = 0; i < iters; i++) {
++            if (vanillaRayTrace(world, airStart, airEnd, false, false, false) != null) sink++;
++        }
++        long airVNs = System.nanoTime() - airVT0;
++        long airVBytes = bean.getThreadAllocatedBytes(tid) - airVAlloc0;
++
++        long airOAlloc0 = bean.getThreadAllocatedBytes(tid);
++        long airOT0 = System.nanoTime();
++        for (int i = 0; i < iters; i++) {
++            if (world.rayTrace(airStart, airEnd, false, false, false) != null) sink++;
++        }
++        long airONs = System.nanoTime() - airOT0;
++        long airOBytes = bean.getThreadAllocatedBytes(tid) - airOAlloc0;
++
++        long hitVT0 = System.nanoTime();
++        for (int i = 0; i < iters; i++) {
++            MovingObjectPosition mop = vanillaRayTrace(world, hitStart, hitEnd, false, false, false);
++            if (mop != null) sink += mop.a().getX();
++        }
++        long hitVNs = System.nanoTime() - hitVT0;
++
++        long hitOT0 = System.nanoTime();
++        for (int i = 0; i < iters; i++) {
++            MovingObjectPosition mop = world.rayTrace(hitStart, hitEnd, false, false, false);
++            if (mop != null) sink += mop.a().getX();
++        }
++        long hitONs = System.nanoTime() - hitOT0;
++
++        double airSpeedup = (double) airVNs / (double) Math.max(1L, airONs);
++        double hitSpeedup = (double) hitVNs / (double) Math.max(1L, hitONs);
++        System.out.println(String.format(
++                "B7_BENCH air10k_vanilla_ns=%d air10k_opt_ns=%d air_speedup=%.2fx air_vanilla_bytes=%d air_opt_bytes=%d hit10k_vanilla_ns=%d hit10k_opt_ns=%d hit_speedup=%.2fx sink=%d",
++                airVNs, airONs, airSpeedup, airVBytes, airOBytes, hitVNs, hitONs, hitSpeedup, sink));
++
++        Assert.assertEquals("Open-air rayTrace should allocate 0 bytes", 0L, airOBytes);
++        Assert.assertTrue("Expected air_speedup > 1.3x, got " + airSpeedup, airSpeedup > 1.3D);
++    }
++}
