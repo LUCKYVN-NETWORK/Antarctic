@@ -1,0 +1,480 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 20:44:20 +0700
+Subject: [PATCH 190/190] fix: keep TickableTileEntityList flags, Chunk.n
+ relight, and RecipesFurnace version coherent
+
+
+diff --git a/main/java/net/minecraft/server/Chunk.java b/main/java/net/minecraft/server/Chunk.java
+index 02ea052..1cd81ad 100644
+--- a/main/java/net/minecraft/server/Chunk.java
++++ b/main/java/net/minecraft/server/Chunk.java
+@@ -1871,6 +1871,33 @@ public class Chunk {
+ 
+     private static final EnumDirection[] ANTARCTIC_DIRECTIONS = EnumDirection.values(); // Antarctic - avoid values() array clone in Chunk.n()
+ 
++    private void relightColumnBlock(int j, int k, int i1, int l, int baseX, int baseZ, EnumDirection[] aenumdirection, int dirCount) {
++        int wy = (j << 4) + i1;
++        int wx = baseX + k;
++        int wz = baseZ + l;
++        for (int k1 = 0; k1 < dirCount; ++k1) {
++            EnumDirection enumdirection = aenumdirection[k1];
++            int nx = k + enumdirection.getAdjacentX();
++            int ny = wy + enumdirection.getAdjacentY();
++            int nz = l + enumdirection.getAdjacentZ();
++            IBlockData neighborData;
++            if ((nx & ~15) == 0 && (nz & ~15) == 0) {
++                if (ny < 0 || ny >= 256) {
++                    neighborData = null;
++                } else {
++                    ChunkSection nsec = this.sections[ny >> 4];
++                    neighborData = nsec == Chunk.a ? null : nsec.getType(nx, ny & 15, nz);
++                }
++            } else {
++                neighborData = this.world.getTypeIfLoaded(baseX + nx, ny, baseZ + nz);
++            }
++            if (neighborData != null && neighborData.d() > 0) {
++                this.world.w(new BlockPosition(baseX + nx, ny, baseZ + nz));
++            }
++        }
++        this.world.w(new BlockPosition(wx, wy, wz));
++    }
++
+     public void n() {
+         if (this.x < 4096) {
+             final int baseX = this.locX << 4;
+@@ -1893,65 +1920,26 @@ public class Chunk {
+                 final boolean emptySection = section == Chunk.a;
+                 final boolean xzBorder = k == 0 || k == 15 || l == 0 || l == 15;
+ 
+-                // Antarctic start - skip interior of empty sections; read in-chunk neighbors directly
++                // Antarctic start - skip interior of empty sections unless relight allocates section[j]
+                 if (emptySection && !xzBorder) {
+-                    // Only i1 = 0 and i1 = 15 satisfy flag when emptySection && !xzBorder
+-                    for (int step = 0; step < 2; ++step) {
+-                        int i1 = step == 0 ? 0 : 15;
+-                        int wy = (j << 4) + i1;
+-                        int wx = baseX + k;
+-                        int wz = baseZ + l;
+-                        for (int k1 = 0; k1 < dirCount; ++k1) {
+-                            EnumDirection enumdirection = aenumdirection[k1];
+-                            int nx = k + enumdirection.getAdjacentX();
+-                            int ny = wy + enumdirection.getAdjacentY();
+-                            int nz = l + enumdirection.getAdjacentZ();
+-                            IBlockData neighborData;
+-                            if ((nx & ~15) == 0 && (nz & ~15) == 0) {
+-                                if (ny < 0 || ny >= 256) {
+-                                    neighborData = null;
+-                                } else {
+-                                    ChunkSection nsec = this.sections[ny >> 4];
+-                                    neighborData = nsec == Chunk.a ? null : nsec.getType(nx, ny & 15, nz);
+-                                }
+-                            } else {
+-                                neighborData = this.world.getTypeIfLoaded(baseX + nx, ny, baseZ + nz);
+-                            }
+-                            if (neighborData != null && neighborData.d() > 0) {
+-                                this.world.w(new BlockPosition(baseX + nx, ny, baseZ + nz));
++                    this.relightColumnBlock(j, k, 0, l, baseX, baseZ, aenumdirection, dirCount);
++                    ChunkSection liveSection = this.sections[j];
++                    if (liveSection == Chunk.a) {
++                        this.relightColumnBlock(j, k, 15, l, baseX, baseZ, aenumdirection, dirCount);
++                    } else {
++                        for (int i1 = 1; i1 < 16; ++i1) {
++                            if (liveSection.getType(k, i1, l).getMaterial() == Material.AIR) {
++                                this.relightColumnBlock(j, k, i1, l, baseX, baseZ, aenumdirection, dirCount);
+                             }
+                         }
+-                        this.world.w(new BlockPosition(wx, wy, wz));
+                     }
+                     continue;
+                 }
+ 
+                 for (int i1 = 0; i1 < 16; ++i1) {
+-                    if (emptySection || section.getType(k, i1, l).getMaterial() == Material.AIR) {
+-                        int wy = (j << 4) + i1;
+-                        int wx = baseX + k;
+-                        int wz = baseZ + l;
+-                        for (int k1 = 0; k1 < dirCount; ++k1) {
+-                            EnumDirection enumdirection = aenumdirection[k1];
+-                            int nx = k + enumdirection.getAdjacentX();
+-                            int ny = wy + enumdirection.getAdjacentY();
+-                            int nz = l + enumdirection.getAdjacentZ();
+-                            IBlockData neighborData;
+-                            if ((nx & ~15) == 0 && (nz & ~15) == 0) {
+-                                if (ny < 0 || ny >= 256) {
+-                                    neighborData = null;
+-                                } else {
+-                                    ChunkSection nsec = this.sections[ny >> 4];
+-                                    neighborData = nsec == Chunk.a ? null : nsec.getType(nx, ny & 15, nz);
+-                                }
+-                            } else {
+-                                neighborData = this.world.getTypeIfLoaded(baseX + nx, ny, baseZ + nz);
+-                            }
+-                            if (neighborData != null && neighborData.d() > 0) {
+-                                this.world.w(new BlockPosition(baseX + nx, ny, baseZ + nz));
+-                            }
+-                        }
+-                        this.world.w(new BlockPosition(wx, wy, wz));
++                    ChunkSection liveSection = this.sections[j];
++                    if (liveSection == Chunk.a || liveSection.getType(k, i1, l).getMaterial() == Material.AIR) {
++                        this.relightColumnBlock(j, k, i1, l, baseX, baseZ, aenumdirection, dirCount);
+                     }
+                 }
+                 // Antarctic end
+diff --git a/main/java/net/minecraft/server/RecipesFurnace.java b/main/java/net/minecraft/server/RecipesFurnace.java
+index bd9841c..b903363 100644
+--- a/main/java/net/minecraft/server/RecipesFurnace.java
++++ b/main/java/net/minecraft/server/RecipesFurnace.java
+@@ -58,8 +58,9 @@ public class RecipesFurnace {
+ 
+         @Override
+         public V remove(Object key) {
++            int before = this.size();
+             V prev = super.remove(key);
+-            if (prev != null || containsKey(key)) {
++            if (this.size() != before) {
+                 ++this.version;
+             }
+             return prev;
+diff --git a/main/java/net/minecraft/server/World.java b/main/java/net/minecraft/server/World.java
+index afa3745..feca496 100644
+--- a/main/java/net/minecraft/server/World.java
++++ b/main/java/net/minecraft/server/World.java
+@@ -159,29 +159,142 @@ public abstract class World implements IBlockAccess {
+ 
+         @Override
+         public boolean removeAll(Collection<?> c) {
+-            boolean modified = super.removeAll(c);
+-            if (modified) {
++            if (this.isEmpty()) {
++                return false;
++            }
++            this.clearMembershipFlags();
++            try {
++                return super.removeAll(c);
++            } finally {
+                 this.recomputeMembership();
+             }
+-            return modified;
+         }
+ 
+         @Override
+         public boolean retainAll(Collection<?> c) {
+-            boolean modified = super.retainAll(c);
+-            if (modified) {
++            if (this.isEmpty()) {
++                return false;
++            }
++            this.clearMembershipFlags();
++            try {
++                return super.retainAll(c);
++            } finally {
+                 this.recomputeMembership();
+             }
+-            return modified;
+         }
+ 
+         @Override
+         public boolean removeIf(java.util.function.Predicate<? super TileEntity> filter) {
+-            boolean modified = super.removeIf(filter);
+-            if (modified) {
++            if (this.isEmpty()) {
++                return false;
++            }
++            this.clearMembershipFlags();
++            try {
++                return super.removeIf(filter);
++            } finally {
+                 this.recomputeMembership();
+             }
+-            return modified;
++        }
++
++        @Override
++        protected void removeRange(int fromIndex, int toIndex) {
++            for (int i = fromIndex; i < toIndex; ++i) {
++                TileEntity te = this.get(i);
++                if (te != null) {
++                    te.antarcticInTickList = false;
++                }
++            }
++            super.removeRange(fromIndex, toIndex);
++            this.recomputeMembership();
++        }
++
++        @Override
++        public void replaceAll(java.util.function.UnaryOperator<TileEntity> operator) {
++            if (this.isEmpty()) {
++                return;
++            }
++            this.clearMembershipFlags();
++            try {
++                super.replaceAll(operator);
++            } finally {
++                this.recomputeMembership();
++            }
++        }
++
++        @Override
++        public java.util.ListIterator<TileEntity> listIterator() {
++            return this.listIterator(0);
++        }
++
++        @Override
++        public java.util.ListIterator<TileEntity> listIterator(int index) {
++            final java.util.ListIterator<TileEntity> it = super.listIterator(index);
++            return new java.util.ListIterator<TileEntity>() {
++                private TileEntity lastReturned;
++
++                @Override
++                public boolean hasNext() {
++                    return it.hasNext();
++                }
++
++                @Override
++                public TileEntity next() {
++                    this.lastReturned = it.next();
++                    return this.lastReturned;
++                }
++
++                @Override
++                public boolean hasPrevious() {
++                    return it.hasPrevious();
++                }
++
++                @Override
++                public TileEntity previous() {
++                    this.lastReturned = it.previous();
++                    return this.lastReturned;
++                }
++
++                @Override
++                public int nextIndex() {
++                    return it.nextIndex();
++                }
++
++                @Override
++                public int previousIndex() {
++                    return it.previousIndex();
++                }
++
++                @Override
++                public void remove() {
++                    it.remove();
++                    if (this.lastReturned != null) {
++                        this.lastReturned.antarcticInTickList = TickableTileEntityList.this.contains(this.lastReturned);
++                        this.lastReturned = null;
++                    }
++                }
++
++                @Override
++                public void set(TileEntity e) {
++                    TileEntity prev = this.lastReturned;
++                    it.set(e);
++                    if (prev != null) {
++                        prev.antarcticInTickList = TickableTileEntityList.this.contains(prev);
++                    }
++                    if (e != null) {
++                        e.antarcticInTickList = true;
++                    }
++                    this.lastReturned = e;
++                }
++
++                @Override
++                public void add(TileEntity e) {
++                    it.add(e);
++                    if (e != null) {
++                        e.antarcticInTickList = true;
++                    }
++                    this.lastReturned = null;
++                }
++            };
+         }
+ 
+         @Override
+@@ -212,6 +325,15 @@ public abstract class World implements IBlockAccess {
+             };
+         }
+ 
++        private void clearMembershipFlags() {
++            for (int i = 0, s = this.size(); i < s; ++i) {
++                TileEntity te = this.get(i);
++                if (te != null) {
++                    te.antarcticInTickList = false;
++                }
++            }
++        }
++
+         private void recomputeMembership() {
+             for (int i = 0, s = this.size(); i < s; ++i) {
+                 TileEntity te = this.get(i);
+diff --git a/test/java/net/minecraft/server/TileTickListAndChunkRelightParityTest.java b/test/java/net/minecraft/server/TileTickListAndChunkRelightParityTest.java
+new file mode 100644
+index 0000000..ea6d57f
+--- /dev/null
++++ b/test/java/net/minecraft/server/TileTickListAndChunkRelightParityTest.java
+@@ -0,0 +1,164 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.PaperWorldConfig;
++import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
++import java.lang.reflect.Constructor;
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.HashSet;
++import java.util.List;
++import java.util.ListIterator;
++import java.util.Map;
++import java.util.Random;
++import java.util.Set;
++import org.junit.Assert;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import org.spigotmc.SpigotWorldConfig;
++import sun.misc.Unsafe;
++
++public class TileTickListAndChunkRelightParityTest {
++
++    private static Unsafe unsafe;
++
++    @BeforeClass
++    public static void init() throws Exception {
++        DispenserRegistry.c();
++        org.spigotmc.AsyncCatcher.enabled = false;
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        unsafe = (Unsafe) f.get(null);
++    }
++
++    private static final class DummyTileEntity extends TileEntity {
++    }
++
++    @Test
++    public void testTickableTileEntityListMaintainsFlagAcrossAllMutators() {
++        World.TickableTileEntityList list = new World.TickableTileEntityList();
++        TileEntity a = new DummyTileEntity();
++        TileEntity b = new DummyTileEntity();
++        TileEntity c = new DummyTileEntity();
++        TileEntity d = new DummyTileEntity();
++
++        // removeAll
++        list.add(a);
++        list.add(b);
++        Assert.assertTrue(list.removeAll(Collections.singletonList(a)));
++        Assert.assertFalse(a.antarcticInTickList);
++        Assert.assertTrue(b.antarcticInTickList);
++        Assert.assertTrue(list.add(a));
++
++        // retainAll
++        Assert.assertTrue(list.retainAll(Collections.singletonList(a)));
++        Assert.assertFalse(b.antarcticInTickList);
++        Assert.assertTrue(a.antarcticInTickList);
++
++        // removeIf
++        list.add(b);
++        Assert.assertTrue(list.removeIf(te -> te == b));
++        Assert.assertFalse(b.antarcticInTickList);
++        Assert.assertTrue(list.add(b));
++
++        // subList().clear() -> removeRange
++        list.add(c);
++        list.subList(1, 3).clear();
++        Assert.assertFalse(b.antarcticInTickList);
++        Assert.assertFalse(c.antarcticInTickList);
++        Assert.assertTrue(a.antarcticInTickList);
++
++        // replaceAll
++        list.replaceAll(te -> d);
++        Assert.assertFalse(a.antarcticInTickList);
++        Assert.assertTrue(d.antarcticInTickList);
++        Assert.assertTrue(list.add(a));
++
++        // listIterator().remove() and set()
++        ListIterator<TileEntity> it = list.listIterator();
++        Assert.assertSame(d, it.next());
++        it.set(b);
++        Assert.assertFalse(d.antarcticInTickList);
++        Assert.assertTrue(b.antarcticInTickList);
++        Assert.assertSame(a, it.next());
++        it.remove();
++        Assert.assertFalse(a.antarcticInTickList);
++        Assert.assertTrue(list.add(a));
++    }
++
++    private static final class RelightHookWorld extends WorldServer {
++        final Set<Integer> relitY = new HashSet<>();
++        Chunk targetChunk;
++
++        RelightHookWorld() {
++            super(null, null, null, 0, null, null, null);
++        }
++
++        @Override
++        public boolean w(BlockPosition blockposition) {
++            relitY.add(blockposition.getY());
++            // When i1 = 0 (y = 64) is relit on an empty section (j = 4), allocate section[4] mid-column
++            if (blockposition.getY() == 64 && targetChunk != null && targetChunk.getSections()[4] == Chunk.a) {
++                targetChunk.getSections()[4] = new ChunkSection(64, true);
++            }
++            return true;
++        }
++
++        @Override
++        public IBlockData getTypeIfLoaded(int x, int y, int z) {
++            return Blocks.AIR.getBlockData();
++        }
++    }
++
++    @Test
++    public void testChunkNRelightsMidColumnWhenWAllocatesSection() throws Exception {
++        RelightHookWorld world = (RelightHookWorld) unsafe.allocateInstance(RelightHookWorld.class);
++        unsafe.putObject(world, unsafe.objectFieldOffset(RelightHookWorld.class.getDeclaredField("relitY")), new HashSet<>());
++        world.worldData = new WorldData();
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("spigotConfig")), unsafe.allocateInstance(SpigotWorldConfig.class));
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("paperConfig")), unsafe.allocateInstance(PaperWorldConfig.class));
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("random")), new Random(1L));
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("methodProfiler")), new MethodProfiler());
++        unsafe.putObject(world, unsafe.objectFieldOffset(World.class.getDeclaredField("P")), new WorldBorder());
++        world.worldProvider = new WorldProviderNormal();
++        world.worldProvider.a(world);
++
++        Chunk chunk = (Chunk) unsafe.allocateInstance(Chunk.class);
++        unsafe.putObject(chunk, unsafe.objectFieldOffset(Chunk.class.getDeclaredField("world")), world);
++        unsafe.putInt(chunk, unsafe.objectFieldOffset(Chunk.class.getDeclaredField("locX")), 0);
++        unsafe.putInt(chunk, unsafe.objectFieldOffset(Chunk.class.getDeclaredField("locZ")), 0);
++        ChunkSection[] secs = new ChunkSection[16];
++        for (int i = 0; i < 16; i++) {
++            secs[i] = Chunk.a;
++        }
++        unsafe.putObject(chunk, unsafe.objectFieldOffset(Chunk.class.getDeclaredField("sections")), secs);
++        world.targetChunk = chunk;
++
++        // Position Chunk.x at j=4, k=8, l=8 -> x = 4 + 16 * 8 + 256 * 8 = 2180
++        unsafe.putInt(chunk, unsafe.objectFieldOffset(Chunk.class.getDeclaredField("x")), 4 + 16 * 8 + 256 * 8);
++        chunk.n();
++
++        for (int y = 64; y < 80; y++) {
++            Assert.assertTrue("Expected y=" + y + " to be relit after section[4] allocation at y=64", world.relitY.contains(y));
++        }
++    }
++
++    @Test
++    @SuppressWarnings("unchecked")
++    public void testTrackedRecipeMapRemoveNullValueIncrementsVersion() throws Exception {
++        Class<?> cls = Class.forName("net.minecraft.server.RecipesFurnace$TrackedRecipeMap");
++        Constructor<?> ctor = cls.getDeclaredConstructor();
++        ctor.setAccessible(true);
++        Map<ItemStack, ItemStack> map = (Map<ItemStack, ItemStack>) ctor.newInstance();
++        Field vf = cls.getDeclaredField("version");
++        vf.setAccessible(true);
++
++        ItemStack key = new ItemStack(Blocks.STONE);
++        map.put(key, null);
++        int vAfterPut = vf.getInt(map);
++
++        map.remove(key);
++        int vAfterRemove = vf.getInt(map);
++        Assert.assertEquals("Removing a key mapped to null must increment version", vAfterPut + 1, vAfterRemove);
++    }
++}
