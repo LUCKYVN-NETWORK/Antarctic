@@ -1,0 +1,276 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 20:57:28 +0700
+Subject: [PATCH 191/191] fix: match JDK UTF-8 unpaired surrogate encoding and
+ EntityPlayer tracker mount sync
+
+
+diff --git a/main/java/net/minecraft/server/EntityTrackerEntry.java b/main/java/net/minecraft/server/EntityTrackerEntry.java
+index e8f9b74..809bfa7 100644
+--- a/main/java/net/minecraft/server/EntityTrackerEntry.java
++++ b/main/java/net/minecraft/server/EntityTrackerEntry.java
+@@ -449,7 +449,7 @@ public class EntityTrackerEntry {
+                         }
+                     }
+ 
+-                    if (wasUntracked) {
++                    if (wasUntracked && !(this.tracker instanceof EntityPlayer)) {
+                         this.xLoc = EntityTracker.a(this.tracker.locX);
+                         this.yLoc = EntityTracker.a(this.tracker.locY);
+                         this.zLoc = EntityTracker.a(this.tracker.locZ);
+@@ -490,7 +490,7 @@ public class EntityTrackerEntry {
+                     // Antarctic - send initial head rotation only to the joining viewer; only sync headYaw if this is the first viewer
+                     if (livingTracker != null) {
+                         int initialHeadYaw = MathHelper.d(livingTracker.getHeadRotation() * 256.0F / 360.0F);
+-                        if (wasUntracked) {
++                        if (wasUntracked && !(this.tracker instanceof EntityPlayer)) {
+                             this.headYaw = initialHeadYaw;
+                         }
+                         entityplayer.playerConnection.sendPacket(new PacketPlayOutEntityHeadRotation(livingTracker, (byte) initialHeadYaw));
+diff --git a/main/java/net/minecraft/server/PacketDataSerializer.java b/main/java/net/minecraft/server/PacketDataSerializer.java
+index ce44055..266fba4 100644
+--- a/main/java/net/minecraft/server/PacketDataSerializer.java
++++ b/main/java/net/minecraft/server/PacketDataSerializer.java
+@@ -349,33 +349,39 @@ public class PacketDataSerializer extends ByteBuf {
+         }
+     }
+ 
+-    private static int utf8Length(String s) {
++    private static int measureUtf8(String s) {
+         final int len = s.length();
+         int bytes = 0;
++        boolean ascii = true;
+         for (int i = 0; i < len; ++i) {
+             char c = s.charAt(i);
+             if (c < 0x80) {
+                 ++bytes;
+-            } else if (c < 0x800) {
+-                bytes += 2;
+-            } else if (Character.isHighSurrogate(c) && i + 1 < len && Character.isLowSurrogate(s.charAt(i + 1))) {
+-                bytes += 4;
+-                ++i;
+             } else {
+-                bytes += 3;
++                ascii = false;
++                if (c < 0x800) {
++                    bytes += 2;
++                } else if (Character.isHighSurrogate(c) && i + 1 < len && Character.isLowSurrogate(s.charAt(i + 1))) {
++                    bytes += 4;
++                    ++i;
++                } else if (Character.isSurrogate(c)) {
++                    ++bytes;
++                } else {
++                    bytes += 3;
++                }
+             }
+         }
+-        return bytes;
++        return ascii ? bytes : -(bytes + 1);
+     }
+ 
+-    private static void writeUtf8Direct(ByteBuf buf, String s, int utf8Len) {
++    private static void writeUtf8Direct(ByteBuf buf, String s, int utf8Len, boolean ascii) {
+         final int len = s.length();
+         buf.ensureWritable(utf8Len);
+         if (buf.hasArray()) {
+             final byte[] arr = buf.array();
+             final int wIdx = buf.writerIndex();
+             int off = buf.arrayOffset() + wIdx;
+-            if (utf8Len == len) {
++            if (ascii) {
+                 for (int i = 0; i < len; ++i) {
+                     arr[off++] = (byte) s.charAt(i);
+                 }
+@@ -394,9 +400,7 @@ public class PacketDataSerializer extends ByteBuf {
+                         arr[off++] = (byte) (0x80 | ((cp >> 6) & 0x3F));
+                         arr[off++] = (byte) (0x80 | (cp & 0x3F));
+                     } else if (Character.isSurrogate(c)) {
+-                        arr[off++] = (byte) 0xEF;
+-                        arr[off++] = (byte) 0xBF;
+-                        arr[off++] = (byte) 0xBD;
++                        arr[off++] = (byte) '?';
+                     } else {
+                         arr[off++] = (byte) (0xE0 | (c >> 12));
+                         arr[off++] = (byte) (0x80 | ((c >> 6) & 0x3F));
+@@ -407,7 +411,7 @@ public class PacketDataSerializer extends ByteBuf {
+             buf.writerIndex(wIdx + utf8Len);
+             return;
+         }
+-        if (utf8Len == len) {
++        if (ascii) {
+             for (int i = 0; i < len; ++i) {
+                 buf.writeByte(s.charAt(i));
+             }
+@@ -427,9 +431,7 @@ public class PacketDataSerializer extends ByteBuf {
+                 buf.writeByte(0x80 | ((cp >> 6) & 0x3F));
+                 buf.writeByte(0x80 | (cp & 0x3F));
+             } else if (Character.isSurrogate(c)) {
+-                buf.writeByte(0xEF);
+-                buf.writeByte(0xBF);
+-                buf.writeByte(0xBD);
++                buf.writeByte('?');
+             } else {
+                 buf.writeByte(0xE0 | (c >> 12));
+                 buf.writeByte(0x80 | ((c >> 6) & 0x3F));
+@@ -443,12 +445,14 @@ public class PacketDataSerializer extends ByteBuf {
+         if (s.length() > 44767) {
+             throw new EncoderException("String too big (was " + s.length() + " chars, max " + 44767 + ")");
+         }
+-        int utf8Len = utf8Length(s);
++        int measured = measureUtf8(s);
++        boolean ascii = measured >= 0;
++        int utf8Len = ascii ? measured : -measured - 1;
+         if (utf8Len > 44767) { // Paper - raise limit a bit more as normal means can trigger this
+             throw new EncoderException("String too big (was " + s.length() + " bytes encoded, max " + 44767 + ")"); // Paper
+         } else {
+             this.d(utf8Len);
+-            writeUtf8Direct(this.a, s, utf8Len);
++            writeUtf8Direct(this.a, s, utf8Len, ascii);
+             return this;
+         }
+         // Antarctic end
+diff --git a/test/java/net/minecraft/server/Utf8SurrogateAndPlayerMountParityTest.java b/test/java/net/minecraft/server/Utf8SurrogateAndPlayerMountParityTest.java
+new file mode 100644
+index 0000000..106aec1
+--- /dev/null
++++ b/test/java/net/minecraft/server/Utf8SurrogateAndPlayerMountParityTest.java
+@@ -0,0 +1,139 @@
++package net.minecraft.server;
++
++import io.netty.buffer.ByteBuf;
++import io.netty.buffer.Unpooled;
++import java.lang.reflect.Field;
++import java.nio.charset.StandardCharsets;
++import java.util.Collections;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.List;
++import org.junit.Assert;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++public class Utf8SurrogateAndPlayerMountParityTest {
++
++    private static Unsafe unsafe;
++
++    @BeforeClass
++    public static void init() throws Exception {
++        DispenserRegistry.c();
++        org.spigotmc.AsyncCatcher.enabled = false;
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        unsafe = (Unsafe) f.get(null);
++    }
++
++    private static void assertUtf8Parity(String s, ByteBuf rawBuf) {
++        PacketDataSerializer ser = new PacketDataSerializer(rawBuf);
++        ser.a(s);
++        int len = ser.g();
++        byte[] actual = new byte[len];
++        ser.readBytes(actual);
++        byte[] expected = s.getBytes(StandardCharsets.UTF_8);
++        Assert.assertArrayEquals("UTF-8 mismatch for string length=" + s.length(), expected, actual);
++        rawBuf.release();
++    }
++
++    @Test
++    public void testUtf8EncodingMatchesJdkForUnpairedSurrogatesOnHeapAndDirectBuffers() {
++        String[] samples = {
++            "",
++            "hello world 123",
++            "\u00E9\u00DF\u20AC",
++            "\uD83D\uDE00",
++            "\uD800",
++            "\uDC00",
++            "\uDC00\uD800",
++            "abc\uD800xyz\uDC00\uD83D\uDE80end"
++        };
++        for (String s : samples) {
++            assertUtf8Parity(s, Unpooled.buffer());
++            assertUtf8Parity(s, Unpooled.directBuffer());
++        }
++    }
++
++    @Test
++    public void testEntityPlayerTrackerMountBaselineNotOverwrittenWhenWasUntracked() throws Exception {
++        WorldServer dummyWorld = (WorldServer) unsafe.allocateInstance(WorldServer.class);
++        org.spigotmc.SpigotWorldConfig spigotCfg = (org.spigotmc.SpigotWorldConfig) unsafe.allocateInstance(org.spigotmc.SpigotWorldConfig.class);
++        spigotCfg.viewDistance = 8;
++        unsafe.putObject(dummyWorld, unsafe.objectFieldOffset(World.class.getDeclaredField("spigotConfig")), spigotCfg);
++        dummyWorld.worldProvider = new WorldProviderNormal();
++        PlayerChunkMap dummyMap = new PlayerChunkMap(dummyWorld) {
++            @Override
++            public boolean a(EntityPlayer entityplayer, int i, int j) {
++                return true;
++            }
++        };
++        unsafe.putObject(dummyWorld, unsafe.objectFieldOffset(WorldServer.class.getDeclaredField("manager")), dummyMap);
++
++        long idOffset = unsafe.objectFieldOffset(Entity.class.getDeclaredField("id"));
++        EntityPlayer viewer = (EntityPlayer) unsafe.allocateInstance(EntityPlayer.class);
++        viewer.world = dummyWorld;
++        unsafe.putInt(viewer, idOffset, 2);
++        unsafe.putObject(viewer, unsafe.objectFieldOffset(EntityPlayer.class.getDeclaredField("removeQueue")), new java.util.ArrayDeque<>());
++        PlayerConnection conn = (PlayerConnection) unsafe.allocateInstance(PlayerConnection.class);
++        unsafe.putObject(conn, unsafe.objectFieldOffset(PlayerConnection.class.getDeclaredField("networkManager")), new NetworkManager(EnumProtocolDirection.SERVERBOUND));
++        viewer.playerConnection = conn;
++        viewer.locX = 0; viewer.locY = 64; viewer.locZ = 0;
++        org.bukkit.craftbukkit.entity.CraftPlayer viewerBukkit = (org.bukkit.craftbukkit.entity.CraftPlayer) unsafe.allocateInstance(org.bukkit.craftbukkit.entity.CraftPlayer.class);
++        unsafe.putObject(viewerBukkit, unsafe.objectFieldOffset(org.bukkit.craftbukkit.entity.CraftPlayer.class.getDeclaredField("hiddenPlayers")), new HashMap<>());
++        unsafe.putObject(viewer, unsafe.objectFieldOffset(Entity.class.getDeclaredField("bukkitEntity")), viewerBukkit);
++
++        List<Entity> sentinelPassengers = Collections.singletonList(viewer);
++        Field wField = EntityTrackerEntry.class.getDeclaredField("w");
++        wField.setAccessible(true);
++        Field eField = EntityTrackerEntry.class.getDeclaredField("e");
++        eField.setAccessible(true);
++
++        EntityPlayer trackedPlayer = (EntityPlayer) unsafe.allocateInstance(EntityPlayer.class);
++        unsafe.putInt(trackedPlayer, idOffset, 1);
++        unsafe.putObject(trackedPlayer, unsafe.objectFieldOffset(Entity.class.getDeclaredField("passengers")), Collections.emptyList());
++        DataWatcher dw = new DataWatcher(trackedPlayer);
++        dw.register(Entity.Z, (byte) 0);
++        unsafe.putObject(trackedPlayer, unsafe.objectFieldOffset(Entity.class.getDeclaredField("datawatcher")), dw);
++        unsafe.putObject(trackedPlayer, unsafe.objectFieldOffset(Entity.class.getDeclaredField("uniqueID")), java.util.UUID.randomUUID());
++        trackedPlayer.setProfile(new com.mojang.authlib.GameProfile(java.util.UUID.randomUUID(), "test"));
++        trackedPlayer.inventory = new PlayerInventory(trackedPlayer);
++        unsafe.putObject(trackedPlayer, unsafe.objectFieldOffset(EntityLiving.class.getDeclaredField("effects")), new HashMap<>());
++        org.bukkit.craftbukkit.entity.CraftPlayer trackedBukkit = (org.bukkit.craftbukkit.entity.CraftPlayer) unsafe.allocateInstance(org.bukkit.craftbukkit.entity.CraftPlayer.class);
++        unsafe.putObject(trackedBukkit, unsafe.objectFieldOffset(org.bukkit.craftbukkit.entity.CraftEntity.class.getDeclaredField("entity")), trackedPlayer);
++        unsafe.putObject(trackedPlayer, unsafe.objectFieldOffset(Entity.class.getDeclaredField("bukkitEntity")), trackedBukkit);
++        PlayerInteractManager pim = (PlayerInteractManager) unsafe.allocateInstance(PlayerInteractManager.class);
++        unsafe.putObject(pim, unsafe.objectFieldOffset(PlayerInteractManager.class.getDeclaredField("gamemode")), EnumGamemode.SURVIVAL);
++        long pimOffset = unsafe.objectFieldOffset(EntityPlayer.class.getDeclaredField("playerInteractManager"));
++        unsafe.putObject(viewer, pimOffset, pim);
++        unsafe.putObject(trackedPlayer, pimOffset, pim);
++        unsafe.putObject(trackedPlayer, unsafe.objectFieldOffset(EntityLiving.class.getDeclaredField("attributeMap")), new AttributeMapServer());
++        trackedPlayer.attachedToPlayer = true;
++        trackedPlayer.locX = 0; trackedPlayer.locY = 64; trackedPlayer.locZ = 0;
++
++        EntityTrackerEntry playerEntry = new EntityTrackerEntry(trackedPlayer, 64, 64, 1, true);
++        wField.set(playerEntry, sentinelPassengers);
++        playerEntry.trackedPlayerMap = new HashMap<>();
++        playerEntry.trackedPlayers = playerEntry.trackedPlayerMap.keySet();
++        eField.setInt(playerEntry, 64);
++
++        playerEntry.updatePlayer(viewer);
++        Assert.assertFalse("EntityPlayer must be added to trackedPlayerMap", playerEntry.trackedPlayerMap.isEmpty());
++        Assert.assertSame("EntityPlayer tracker must keep prior mount baseline w when wasUntracked=true", sentinelPassengers, wField.get(playerEntry));
++
++        // Now verify non-player entity DOES update w when wasUntracked=true
++        EntityArrow arrow = (EntityArrow) unsafe.allocateInstance(EntityTippedArrow.class);
++        unsafe.putObject(arrow, unsafe.objectFieldOffset(Entity.class.getDeclaredField("passengers")), Collections.emptyList());
++        unsafe.putObject(arrow, unsafe.objectFieldOffset(Entity.class.getDeclaredField("datawatcher")), new DataWatcher(arrow));
++        unsafe.putObject(arrow, unsafe.objectFieldOffset(Entity.class.getDeclaredField("uniqueID")), java.util.UUID.randomUUID());
++        arrow.attachedToPlayer = true;
++        arrow.locX = 0; arrow.locY = 64; arrow.locZ = 0;
++        EntityTrackerEntry arrowEntry = new EntityTrackerEntry(arrow, 64, 64, 1, true);
++        wField.set(arrowEntry, sentinelPassengers);
++        arrowEntry.trackedPlayerMap = new HashMap<>();
++        arrowEntry.trackedPlayers = arrowEntry.trackedPlayerMap.keySet();
++        eField.setInt(arrowEntry, 64);
++        arrowEntry.updatePlayer(viewer);
++        Assert.assertNotSame("Non-player tracker must refresh mount baseline w when wasUntracked=true", sentinelPassengers, wField.get(arrowEntry));
++    }
++}
