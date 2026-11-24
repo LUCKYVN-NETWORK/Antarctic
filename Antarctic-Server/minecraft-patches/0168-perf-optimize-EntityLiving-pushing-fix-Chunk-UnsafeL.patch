@@ -1,0 +1,678 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Tue, 24 Nov 2026 12:31:22 +0700
+Subject: [PATCH 168/168] perf: optimize EntityLiving pushing, fix Chunk
+ UnsafeList.Itr leak and cache maxEntityCramming
+
+
+diff --git a/main/java/net/minecraft/server/Chunk.java b/main/java/net/minecraft/server/Chunk.java
+index 3dac8e2..83f3fe0 100644
+--- a/main/java/net/minecraft/server/Chunk.java
++++ b/main/java/net/minecraft/server/Chunk.java
+@@ -1209,20 +1209,13 @@ public class Chunk {
+         j = MathHelper.clamp(j, 0, this.entitySlices.length - 1);
+ 
+         for (int k = i; k <= j; ++k) {
+-            if (!this.entitySlices[k].isEmpty()) {
+-                Iterator iterator = this.entitySlices[k].iterator();
+-
+-                // Paper start - Don't search for inventories if we have none, and that is all we want
+-                /*
+-                * We check if they want inventories by seeing if it is the static `IEntitySelector.c`
+-                *
+-                * Make sure the inventory selector stays in sync.
+-                * It should be the one that checks `var1 instanceof IInventory && var1.isAlive()`
+-                */
+-                if (predicate == IEntitySelector.c && inventoryEntityCounts[k] <= 0) continue;
+-                // Paper end
+-                while (iterator.hasNext()) {
+-                    Entity entity1 = (Entity) iterator.next();
++            // Paper start - Don't search for inventories if we have none, and that is all we want
++            if (predicate == IEntitySelector.c && inventoryEntityCounts[k] <= 0) continue;
++            // Paper end
++            List<Entity> slice = this.entitySlices[k];
++            if (!slice.isEmpty()) {
++                for (int idx = 0, len = slice.size(); idx < len; ++idx) {
++                    Entity entity1 = slice.get(idx);
+ 
+                     if (entity1.getBoundingBox().c(axisalignedbb) && entity1 != entity) {
+                         if (predicate == null || predicate.apply(entity1)) {
+@@ -1232,11 +1225,10 @@ public class Chunk {
+                         Entity[] aentity = entity1.bb();
+ 
+                         if (aentity != null) {
+-                            Entity[] aentity1 = aentity;
+                             int l = aentity.length;
+ 
+                             for (int i1 = 0; i1 < l; ++i1) {
+-                                Entity entity2 = aentity1[i1];
++                                Entity entity2 = aentity[i1];
+ 
+                                 if (entity2 != entity && entity2.getBoundingBox().c(axisalignedbb) && (predicate == null || predicate.apply(entity2))) {
+                                     list.add(entity2);
+@@ -1250,6 +1242,59 @@ public class Chunk {
+ 
+     }
+ 
++    private static boolean isEntityPushable(Entity target, @Nullable ScoreboardTeamBase selfTeam, ScoreboardTeamBase.EnumTeamPush selfPush, boolean isClientSide) {
++        if (target instanceof EntityHuman && ((EntityHuman) target).isSpectator()) {
++            return false;
++        }
++        if (!target.isCollidable()) {
++            return false;
++        }
++        if (isClientSide && (!(target instanceof EntityHuman) || !((EntityHuman) target).cZ())) {
++            return false;
++        }
++        ScoreboardTeamBase targetTeam = target.aY();
++        ScoreboardTeamBase.EnumTeamPush targetPush = targetTeam == null ? ScoreboardTeamBase.EnumTeamPush.ALWAYS : targetTeam.getCollisionRule();
++        if (targetPush == ScoreboardTeamBase.EnumTeamPush.NEVER) {
++            return false;
++        }
++        boolean sameTeam = selfTeam != null && selfTeam.isAlly(targetTeam);
++        if ((selfPush == ScoreboardTeamBase.EnumTeamPush.HIDE_FOR_OWN_TEAM || targetPush == ScoreboardTeamBase.EnumTeamPush.HIDE_FOR_OWN_TEAM) && sameTeam) {
++            return false;
++        }
++        return selfPush != ScoreboardTeamBase.EnumTeamPush.HIDE_FOR_OTHER_TEAMS && targetPush != ScoreboardTeamBase.EnumTeamPush.HIDE_FOR_OTHER_TEAMS || sameTeam;
++    }
++
++    void collectPushableEntities(EntityLiving self, AxisAlignedBB axisalignedbb, @Nullable ScoreboardTeamBase selfTeam, ScoreboardTeamBase.EnumTeamPush selfPush, boolean isClientSide, List<Entity> out) {
++        int i = MathHelper.floor((axisalignedbb.b - 2.0D) / 16.0D);
++        int j = MathHelper.floor((axisalignedbb.e + 2.0D) / 16.0D);
++
++        i = MathHelper.clamp(i, 0, this.entitySlices.length - 1);
++        j = MathHelper.clamp(j, 0, this.entitySlices.length - 1);
++
++        for (int k = i; k <= j; ++k) {
++            List<Entity> slice = this.entitySlices[k];
++            for (int idx = 0, len = slice.size(); idx < len; ++idx) {
++                Entity entity1 = slice.get(idx);
++
++                if (entity1.getBoundingBox().c(axisalignedbb) && entity1 != self) {
++                    if (isEntityPushable(entity1, selfTeam, selfPush, isClientSide)) {
++                        out.add(entity1);
++                    }
++
++                    Entity[] aentity = entity1.bb();
++                    if (aentity != null) {
++                        for (int m = 0, alen = aentity.length; m < alen; ++m) {
++                            Entity entity2 = aentity[m];
++                            if (entity2 != self && entity2.getBoundingBox().c(axisalignedbb) && isEntityPushable(entity2, selfTeam, selfPush, isClientSide)) {
++                                out.add(entity2);
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
++
+     public <T extends Entity> void a(Class<? extends T> oclass, AxisAlignedBB axisalignedbb, List<T> list, Predicate<? super T> predicate) {
+         int i = MathHelper.floor((axisalignedbb.b - 2.0D) / 16.0D);
+         int j = MathHelper.floor((axisalignedbb.e + 2.0D) / 16.0D);
+@@ -1269,10 +1314,9 @@ public class Chunk {
+         // Paper end
+         for (int k = i; k <= j; ++k) {
+             if (counts != null && counts[k] <= 0) continue; // Paper - Don't check a chunk if it doesn't have the type we are looking for
+-            Iterator iterator = this.entitySlices[k].iterator(); // Spigot
+-
+-            while (iterator.hasNext()) {
+-                Entity entity = (Entity) iterator.next();
++            List<Entity> slice = this.entitySlices[k];
++            for (int idx = 0, len = slice.size(); idx < len; ++idx) {
++                Entity entity = slice.get(idx);
+ 
+                 if (oclass.isInstance(entity) && entity.getBoundingBox().c(axisalignedbb) && (predicate == null || predicate.apply((T) entity))) { // CraftBukkit - fix decompile error // Spigot - instance check
+                     list.add((T) entity); // Fix decompile error
+diff --git a/main/java/net/minecraft/server/EntityLiving.java b/main/java/net/minecraft/server/EntityLiving.java
+index 702e02e..e554974 100644
+--- a/main/java/net/minecraft/server/EntityLiving.java
++++ b/main/java/net/minecraft/server/EntityLiving.java
+@@ -2265,39 +2265,68 @@ public abstract class EntityLiving extends Entity {
+ 
+     protected void doTick() {}
+ 
++    private static final ThreadLocal<java.util.ArrayList<Entity>> PUSH_SCRATCH =
++            ThreadLocal.withInitial(() -> new java.util.ArrayList<Entity>(16));
++    private static final ThreadLocal<boolean[]> PUSH_IN_USE =
++            ThreadLocal.withInitial(() -> new boolean[1]);
++
+     protected void cB() {
+         // Leaf start - Only player pushable (backport of Leaf MC 0190 / 0119)
+         if (com.destroystokyo.paper.config.toml.modules.gameplay.Collisions.onlyPlayerPushable && !(this instanceof EntityHuman)) {
+             return;
+         }
+         // Leaf end
+-        List list = this.world.getEntities(this, this.getBoundingBox(), IEntitySelector.a(this));
++        ScoreboardTeamBase selfTeam = this.aY();
++        ScoreboardTeamBase.EnumTeamPush selfPush = selfTeam == null ? ScoreboardTeamBase.EnumTeamPush.ALWAYS : selfTeam.getCollisionRule();
++        if (selfPush == ScoreboardTeamBase.EnumTeamPush.NEVER) {
++            return;
++        }
++
++        boolean[] inUse = PUSH_IN_USE.get();
++        boolean usingScratch = !inUse[0];
++        java.util.ArrayList<Entity> list;
++        if (usingScratch) {
++            inUse[0] = true;
++            list = PUSH_SCRATCH.get();
++        } else {
++            list = new java.util.ArrayList<Entity>(16);
++        }
++
++        try {
++            this.world.collectPushableEntities(this, this.getBoundingBox(), selfTeam, selfPush, list);
+ 
+-        if (!list.isEmpty()) {
+-            int i = this.world.getGameRules().c("maxEntityCramming");
+-            int j;
++            int size = list.size();
++            if (size > 0) {
++                int i = this.world.getGameRules().getMaxEntityCramming();
++                int j;
+ 
+-            if (i > 0 && list.size() > i - 1 && this.random.nextInt(4) == 0) {
+-                j = 0;
++                if (i > 0 && size > i - 1 && this.random.nextInt(4) == 0) {
++                    j = 0;
+ 
+-                for (int k = 0; k < list.size(); ++k) {
+-                    if (!((Entity) list.get(k)).isPassenger()) {
+-                        ++j;
++                    for (int k = 0; k < size; ++k) {
++                        if (!list.get(k).isPassenger()) {
++                            ++j;
++                        }
+                     }
+-                }
+ 
+-                if (j > i - 1) {
+-                    this.damageEntity(DamageSource.CRAMMING, 6.0F);
++                    if (j > i - 1) {
++                        this.damageEntity(DamageSource.CRAMMING, 6.0F);
++                    }
+                 }
+-            }
+ 
+-            numCollisions = Math.max(0, numCollisions - world.paperConfig.maxCollisionsPerEntity); // Paper
+-            for (j = 0; j < list.size() && numCollisions < world.paperConfig.maxCollisionsPerEntity; ++j) { // Paper
+-                Entity entity = (Entity) list.get(j);
+-                entity.numCollisions++; // Paper
+-                numCollisions++; // Paper
++                numCollisions = Math.max(0, numCollisions - world.paperConfig.maxCollisionsPerEntity); // Paper
++                for (j = 0; j < size && numCollisions < world.paperConfig.maxCollisionsPerEntity; ++j) { // Paper
++                    Entity entity = list.get(j);
++                    entity.numCollisions++; // Paper
++                    numCollisions++; // Paper
+ 
+-                this.C(entity);
++                    this.C(entity);
++                }
++            }
++        } finally {
++            list.clear();
++            if (usingScratch) {
++                inUse[0] = false;
+             }
+         }
+ 
+diff --git a/main/java/net/minecraft/server/GameRules.java b/main/java/net/minecraft/server/GameRules.java
+new file mode 100644
+index 0000000..dc89c6b
+--- /dev/null
++++ b/main/java/net/minecraft/server/GameRules.java
+@@ -0,0 +1,183 @@
++package net.minecraft.server;
++
++import java.util.Iterator;
++import java.util.Set;
++import java.util.TreeMap;
++
++public class GameRules {
++
++    private final TreeMap<String, GameRules.GameRuleValue> a = new TreeMap();
++    private int maxEntityCramming = 24;
++
++    public GameRules() {
++        this.a("doFireTick", "true", GameRules.EnumGameRuleType.BOOLEAN_VALUE);
++        this.a("mobGriefing", "true", GameRules.EnumGameRuleType.BOOLEAN_VALUE);
++        this.a("keepInventory", "false", GameRules.EnumGameRuleType.BOOLEAN_VALUE);
++        this.a("doMobSpawning", "true", GameRules.EnumGameRuleType.BOOLEAN_VALUE);
++        this.a("doMobLoot", "true", GameRules.EnumGameRuleType.BOOLEAN_VALUE);
++        this.a("doTileDrops", "true", GameRules.EnumGameRuleType.BOOLEAN_VALUE);
++        this.a("doEntityDrops", "true", GameRules.EnumGameRuleType.BOOLEAN_VALUE);
++        this.a("commandBlockOutput", "true", GameRules.EnumGameRuleType.BOOLEAN_VALUE);
++        this.a("naturalRegeneration", "true", GameRules.EnumGameRuleType.BOOLEAN_VALUE);
++        this.a("doDaylightCycle", "true", GameRules.EnumGameRuleType.BOOLEAN_VALUE);
++        this.a("logAdminCommands", "true", GameRules.EnumGameRuleType.BOOLEAN_VALUE);
++        this.a("showDeathMessages", "true", GameRules.EnumGameRuleType.BOOLEAN_VALUE);
++        this.a("randomTickSpeed", "3", GameRules.EnumGameRuleType.NUMERICAL_VALUE);
++        this.a("sendCommandFeedback", "true", GameRules.EnumGameRuleType.BOOLEAN_VALUE);
++        this.a("reducedDebugInfo", "false", GameRules.EnumGameRuleType.BOOLEAN_VALUE);
++        this.a("spectatorsGenerateChunks", "true", GameRules.EnumGameRuleType.BOOLEAN_VALUE);
++        this.a("spawnRadius", "10", GameRules.EnumGameRuleType.NUMERICAL_VALUE);
++        this.a("disableElytraMovementCheck", "false", GameRules.EnumGameRuleType.BOOLEAN_VALUE);
++        this.a("maxEntityCramming", "24", GameRules.EnumGameRuleType.NUMERICAL_VALUE);
++        this.a("doWeatherCycle", "true", GameRules.EnumGameRuleType.BOOLEAN_VALUE);
++        this.a("doLimitedCrafting", "false", GameRules.EnumGameRuleType.BOOLEAN_VALUE);
++        this.a("maxCommandChainLength", "65536", GameRules.EnumGameRuleType.NUMERICAL_VALUE);
++        this.a("announceAdvancements", "true", GameRules.EnumGameRuleType.BOOLEAN_VALUE);
++        this.a("gameLoopFunction", "-", GameRules.EnumGameRuleType.FUNCTION);
++    }
++
++    public void a(String s, String s1, GameRules.EnumGameRuleType gamerules_enumgameruletype) {
++        GameRules.GameRuleValue val = new GameRules.GameRuleValue(s1, gamerules_enumgameruletype);
++        this.a.put(s, val);
++        if ("maxEntityCramming".equals(s)) {
++            this.maxEntityCramming = val.c();
++        }
++    }
++
++    public void set(String s, String s1) {
++        GameRules.GameRuleValue gamerules_gamerulevalue = (GameRules.GameRuleValue) this.a.get(s);
++
++        if (gamerules_gamerulevalue != null) {
++            gamerules_gamerulevalue.a(s1);
++            if ("maxEntityCramming".equals(s)) {
++                this.maxEntityCramming = gamerules_gamerulevalue.c();
++            }
++        } else {
++            this.a(s, s1, GameRules.EnumGameRuleType.ANY_VALUE);
++        }
++
++    }
++
++    public String get(String s) {
++        GameRules.GameRuleValue gamerules_gamerulevalue = (GameRules.GameRuleValue) this.a.get(s);
++
++        return gamerules_gamerulevalue != null ? gamerules_gamerulevalue.a() : "";
++    }
++
++    public boolean getBoolean(String s) {
++        GameRules.GameRuleValue gamerules_gamerulevalue = (GameRules.GameRuleValue) this.a.get(s);
++
++        return gamerules_gamerulevalue != null ? gamerules_gamerulevalue.b() : false;
++    }
++
++    public int getMaxEntityCramming() {
++        return this.maxEntityCramming;
++    }
++
++    public int c(String s) {
++        if ("maxEntityCramming".equals(s)) {
++            return this.maxEntityCramming;
++        }
++        GameRules.GameRuleValue gamerules_gamerulevalue = (GameRules.GameRuleValue) this.a.get(s);
++
++        return gamerules_gamerulevalue != null ? gamerules_gamerulevalue.c() : 0;
++    }
++
++    public NBTTagCompound a() {
++        NBTTagCompound nbttagcompound = new NBTTagCompound();
++        Iterator iterator = this.a.keySet().iterator();
++
++        while (iterator.hasNext()) {
++            String s = (String) iterator.next();
++            GameRules.GameRuleValue gamerules_gamerulevalue = (GameRules.GameRuleValue) this.a.get(s);
++
++            nbttagcompound.setString(s, gamerules_gamerulevalue.a());
++        }
++
++        return nbttagcompound;
++    }
++
++    public void a(NBTTagCompound nbttagcompound) {
++        Set set = nbttagcompound.c();
++        Iterator iterator = set.iterator();
++
++        while (iterator.hasNext()) {
++            String s = (String) iterator.next();
++
++            this.set(s, nbttagcompound.getString(s));
++        }
++
++    }
++
++    public String[] getGameRules() {
++        Set set = this.a.keySet();
++
++        return (String[]) set.toArray(new String[set.size()]);
++    }
++
++    public boolean contains(String s) {
++        return this.a.containsKey(s);
++    }
++
++    public boolean a(String s, GameRules.EnumGameRuleType gamerules_enumgameruletype) {
++        GameRules.GameRuleValue gamerules_gamerulevalue = (GameRules.GameRuleValue) this.a.get(s);
++
++        return gamerules_gamerulevalue != null && (gamerules_gamerulevalue.e() == gamerules_enumgameruletype || gamerules_enumgameruletype == GameRules.EnumGameRuleType.ANY_VALUE);
++    }
++
++    public static enum EnumGameRuleType {
++
++        ANY_VALUE, BOOLEAN_VALUE, NUMERICAL_VALUE, FUNCTION;
++
++        private EnumGameRuleType() {}
++    }
++
++    static class GameRuleValue {
++
++        private String a;
++        private boolean b;
++        private int c;
++        private double d;
++        private final GameRules.EnumGameRuleType e;
++
++        public GameRuleValue(String s, GameRules.EnumGameRuleType gamerules_enumgameruletype) {
++            this.e = gamerules_enumgameruletype;
++            this.a(s);
++        }
++
++        public void a(String s) {
++            this.a = s;
++            this.b = Boolean.parseBoolean(s);
++            this.c = this.b ? 1 : 0;
++
++            try {
++                this.c = Integer.parseInt(s);
++            } catch (NumberFormatException numberformatexception) {
++                ;
++            }
++
++            try {
++                this.d = Double.parseDouble(s);
++            } catch (NumberFormatException numberformatexception1) {
++                ;
++            }
++
++        }
++
++        public String a() {
++            return this.a;
++        }
++
++        public boolean b() {
++            return this.b;
++        }
++
++        public int c() {
++            return this.c;
++        }
++
++        public GameRules.EnumGameRuleType e() {
++            return this.e;
++        }
++    }
++}
+diff --git a/main/java/net/minecraft/server/World.java b/main/java/net/minecraft/server/World.java
+index ff47877..fb54236 100644
+--- a/main/java/net/minecraft/server/World.java
++++ b/main/java/net/minecraft/server/World.java
+@@ -3582,8 +3582,9 @@ public abstract class World implements IBlockAccess {
+ 
+         for (int i1 = i; i1 < j; ++i1) {
+             for (int j1 = k; j1 < l; ++j1) {
+-                if (this.isChunkLoaded(i1, j1, true)) {
+-                    this.getChunkAt(i1, j1).a(oclass, axisalignedbb, arraylist, predicate);
++                Chunk chunk = this.getChunkIfLoaded(i1, j1);
++                if (chunk != null) {
++                    chunk.a(oclass, axisalignedbb, arraylist, predicate);
+                 }
+             }
+         }
+@@ -3591,6 +3592,22 @@ public abstract class World implements IBlockAccess {
+         return arraylist;
+     }
+ 
++    void collectPushableEntities(EntityLiving self, AxisAlignedBB axisalignedbb, @Nullable ScoreboardTeamBase selfTeam, ScoreboardTeamBase.EnumTeamPush selfPush, List<Entity> out) {
++        int i = MathHelper.floor((axisalignedbb.a - 2.0D) / 16.0D);
++        int j = MathHelper.f((axisalignedbb.d + 2.0D) / 16.0D);
++        int k = MathHelper.floor((axisalignedbb.c - 2.0D) / 16.0D);
++        int l = MathHelper.f((axisalignedbb.f + 2.0D) / 16.0D);
++
++        for (int i1 = i; i1 < j; ++i1) {
++            for (int j1 = k; j1 < l; ++j1) {
++                Chunk chunk = this.getChunkIfLoaded(i1, j1);
++                if (chunk != null) {
++                    chunk.collectPushableEntities(self, axisalignedbb, selfTeam, selfPush, this.isClientSide, out);
++                }
++            }
++        }
++    }
++
+     // Antarctic start - zero-allocation early-exit count matching a(Class, AxisAlignedBB, Predicate).size()
+     public <T extends Entity> int countEntities(Class<? extends T> oclass, AxisAlignedBB axisalignedbb, @Nullable Predicate<? super T> predicate, int limit) {
+         if (limit <= 0) {
+diff --git a/test/java/net/minecraft/server/EntityPushAndChunkQueryPerfTest.java b/test/java/net/minecraft/server/EntityPushAndChunkQueryPerfTest.java
+new file mode 100644
+index 0000000..fc26383
+--- /dev/null
++++ b/test/java/net/minecraft/server/EntityPushAndChunkQueryPerfTest.java
+@@ -0,0 +1,226 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.PaperWorldConfig;
++import com.sun.management.ThreadMXBean;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++import java.lang.management.ManagementFactory;
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.List;
++
++import static org.junit.Assert.*;
++
++public class EntityPushAndChunkQueryPerfTest {
++
++    private static Unsafe UNSAFE;
++    private static int nextEntityId = 1;
++
++    @BeforeClass
++    public static void setup() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        UNSAFE = (Unsafe) f.get(null);
++    }
++
++    private static final class PushTestWorld extends World {
++        final Chunk chunk;
++
++        PushTestWorld(Chunk chunk) {
++            super(null, new WorldData(), new WorldProviderNormal(), new MethodProfiler(), false, null, null);
++            this.chunk = chunk;
++        }
++
++        @Override
++        protected IChunkProvider n() {
++            return null;
++        }
++
++        @Override
++        protected boolean isChunkLoaded(int i, int j, boolean flag) {
++            return i == 0 && j == 0;
++        }
++
++        @Override
++        public Chunk getChunkIfLoaded(int i, int j) {
++            return (i == 0 && j == 0) ? this.chunk : null;
++        }
++    }
++
++    private static PushTestWorld createTestWorld() throws Exception {
++        Chunk chunk = (Chunk) UNSAFE.allocateInstance(Chunk.class);
++        Field secField = Chunk.class.getDeclaredField("sections");
++        secField.setAccessible(true);
++        ChunkSection[] sections = new ChunkSection[16];
++        for (int s = 0; s < 16; ++s) {
++            sections[s] = new ChunkSection(s << 4, true);
++        }
++        secField.set(chunk, sections);
++
++        Field slicesField = Chunk.class.getDeclaredField("entitySlices");
++        slicesField.setAccessible(true);
++        @SuppressWarnings("unchecked")
++        List<Entity>[] slices = new List[16];
++        for (int s = 0; s < 16; ++s) {
++            slices[s] = new ArrayList<Entity>();
++        }
++        slicesField.set(chunk, slices);
++
++        for (String fn : new String[]{"hardCollidableCounts", "itemCounts", "inventoryEntityCounts"}) {
++            Field f = Chunk.class.getDeclaredField(fn);
++            f.setAccessible(true);
++            f.set(chunk, new int[16]);
++        }
++        Field ec = Chunk.class.getDeclaredField("entityCounts");
++        ec.setAccessible(true);
++        ec.set(chunk, new co.aikar.util.Counter<String>());
++        Field ect = Chunk.class.getDeclaredField("entityCount");
++        ect.setAccessible(true);
++        ect.set(chunk, new gnu.trove.map.hash.TObjectIntHashMap<Class>());
++        Field acc = Chunk.class.getDeclaredField("antarcticCreatureCounts");
++        acc.setAccessible(true);
++        acc.set(chunk, new int[EnumCreatureType.values().length]);
++
++        PushTestWorld world = (PushTestWorld) UNSAFE.allocateInstance(PushTestWorld.class);
++        Field cf = PushTestWorld.class.getDeclaredField("chunk");
++        cf.setAccessible(true);
++        cf.set(world, chunk);
++        Field wc = Chunk.class.getDeclaredField("world");
++        wc.setAccessible(true);
++        wc.set(chunk, world);
++        Field pwc = World.class.getDeclaredField("paperConfig");
++        pwc.setAccessible(true);
++        pwc.set(world, UNSAFE.allocateInstance(PaperWorldConfig.class));
++        Field cpField = World.class.getDeclaredField("chunkProvider");
++        cpField.setAccessible(true);
++        cpField.set(world, new IChunkProvider() {
++            @Override public Chunk getLoadedChunkAt(int i, int j) { return (i == 0 && j == 0) ? chunk : null; }
++            @Override public Chunk getChunkAt(int i, int j) { return (i == 0 && j == 0) ? chunk : null; }
++            @Override public boolean unloadChunks() { return false; }
++            @Override public String getName() { return "PushTestChunkProvider"; }
++            @Override public boolean e(int i, int j) { return i == 0 && j == 0; }
++        });
++        return world;
++    }
++
++    private static void initLivingHealth(EntityLiving e) throws Exception {
++        DataWatcher dw = new DataWatcher(e);
++        dw.register(EntityLiving.HEALTH, 20.0F);
++        Field dwField = Entity.class.getDeclaredField("datawatcher");
++        dwField.setAccessible(true);
++        dwField.set(e, dw);
++        e.collides = true;
++    }
++
++    private static EntityZombie createMob(World world, double x, double y, double z) throws Exception {
++        EntityZombie e = (EntityZombie) UNSAFE.allocateInstance(EntityZombie.class);
++        e.h(nextEntityId++);
++        e.world = world;
++        initLivingHealth(e);
++        e.locX = x; e.locY = y; e.locZ = z;
++        e.a(new AxisAlignedBB(x - 0.3, y, z - 0.3, x + 0.3, y + 1.95, z + 0.3));
++        return e;
++    }
++
++    @Test
++    public void testPushableCollectionAndGameRulesParity() throws Exception {
++        GameRules rules = new GameRules();
++        assertEquals(24, rules.getMaxEntityCramming());
++        assertEquals(24, rules.c("maxEntityCramming"));
++        rules.set("maxEntityCramming", "12");
++        assertEquals(12, rules.getMaxEntityCramming());
++        assertEquals(12, rules.c("maxEntityCramming"));
++
++        PushTestWorld world = createTestWorld();
++        EntityZombie self = createMob(world, 5.0, 65.0, 5.0);
++        EntityZombie other1 = createMob(world, 5.1, 65.0, 5.1);
++        EntityZombie farMob = createMob(world, 10.0, 65.0, 10.0);
++
++        EntityItem item = (EntityItem) UNSAFE.allocateInstance(EntityItem.class);
++        item.h(nextEntityId++);
++        item.world = world;
++        item.locX = 5.0; item.locY = 65.0; item.locZ = 5.0;
++        item.a(new AxisAlignedBB(4.8, 65.0, 4.8, 5.2, 65.25, 5.2));
++
++        EntityPlayer spec = (EntityPlayer) UNSAFE.allocateInstance(EntityPlayer.class);
++        spec.h(nextEntityId++);
++        spec.world = world;
++        initLivingHealth(spec);
++        spec.locX = 5.0; spec.locY = 65.0; spec.locZ = 5.0;
++        spec.a(new AxisAlignedBB(4.7, 65.0, 4.7, 5.3, 66.8, 5.3));
++        PlayerInteractManager pim = (PlayerInteractManager) UNSAFE.allocateInstance(PlayerInteractManager.class);
++        Field gmField = PlayerInteractManager.class.getDeclaredField("gamemode");
++        gmField.setAccessible(true);
++        gmField.set(pim, EnumGamemode.SPECTATOR);
++        Field pimField = EntityPlayer.class.getDeclaredField("playerInteractManager");
++        pimField.setAccessible(true);
++        pimField.set(spec, pim);
++
++        world.chunk.a(self);
++        world.chunk.a(other1);
++        world.chunk.a(farMob);
++        world.chunk.a(item);
++        world.chunk.a(spec);
++
++        List<Entity> expected = world.getEntities(self, self.getBoundingBox(), IEntitySelector.a(self));
++        List<Entity> actual = new ArrayList<Entity>();
++        world.collectPushableEntities(self, self.getBoundingBox(), null, ScoreboardTeamBase.EnumTeamPush.ALWAYS, actual);
++        assertEquals(expected, actual);
++        assertEquals(1, actual.size());
++        assertSame(other1, actual.get(0));
++    }
++
++    @Test
++    public void testPushCollectionBenchmark() throws Exception {
++        PushTestWorld world = createTestWorld();
++        EntityZombie self = createMob(world, 5.0, 65.0, 5.0);
++        world.chunk.a(self);
++        for (int i = 0; i < 30; ++i) {
++            if (i < 2) {
++                world.chunk.a(createMob(world, 5.05 + i * 0.05, 65.0, 5.05));
++            } else {
++                world.chunk.a(createMob(world, 1.0 + (i % 6) * 2.5, 65.0, 1.0 + (i / 6) * 2.5));
++            }
++        }
++
++        ArrayList<Entity> scratch = new ArrayList<Entity>(32);
++        ThreadMXBean threadBean = (ThreadMXBean) ManagementFactory.getThreadMXBean();
++        long tid = Thread.currentThread().getId();
++
++        long sink = 0L;
++        for (int w = 0; w < 2000; ++w) {
++            sink += world.getEntities(self, self.getBoundingBox(), IEntitySelector.a(self)).size();
++            scratch.clear();
++            world.collectPushableEntities(self, self.getBoundingBox(), null, ScoreboardTeamBase.EnumTeamPush.ALWAYS, scratch);
++            sink += scratch.size();
++        }
++
++        int iters = 10000;
++        long a0 = threadBean.getThreadAllocatedBytes(tid);
++        long t0 = System.nanoTime();
++        for (int i = 0; i < iters; ++i) {
++            sink += world.getEntities(self, self.getBoundingBox(), IEntitySelector.a(self)).size();
++        }
++        long vanillaNs = System.nanoTime() - t0;
++        long vanillaBytes = Math.max(0L, threadBean.getThreadAllocatedBytes(tid) - a0);
++
++        a0 = threadBean.getThreadAllocatedBytes(tid);
++        t0 = System.nanoTime();
++        for (int i = 0; i < iters; ++i) {
++            scratch.clear();
++            world.collectPushableEntities(self, self.getBoundingBox(), null, ScoreboardTeamBase.EnumTeamPush.ALWAYS, scratch);
++            sink += scratch.size();
++        }
++        long optNs = System.nanoTime() - t0;
++        long optBytes = Math.max(0L, threadBean.getThreadAllocatedBytes(tid) - a0);
++
++        System.out.printf("B4_BENCH push10k_vanilla_ns=%d push10k_opt_ns=%d speedup=%.2fx vanilla_bytes=%d opt_bytes=%d blackhole=%d%n",
++                vanillaNs, optNs, (double) vanillaNs / Math.max(1L, optNs), vanillaBytes, optBytes, sink);
++
++        assertEquals("Push collection with reusable list must allocate 0 bytes", 0L, optBytes);
++        assertTrue("Expected push collection speedup > 1.2x, got " + vanillaNs + " vs " + optNs, optNs * 1.2 < vanillaNs);
++    }
++}
