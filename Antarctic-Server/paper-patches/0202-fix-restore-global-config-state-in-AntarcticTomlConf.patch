@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Wed, 25 Nov 2026 15:15:47 +0700
+Subject: [PATCH 202/203] fix: restore global config state in
+ AntarcticTomlConfigTest and PathfinderGoalSelectorPerfTest
+
+
+diff --git a/test/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfigTest.java b/test/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfigTest.java
+index 52e4dbb..5044909 100644
+--- a/test/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfigTest.java
++++ b/test/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfigTest.java
+@@ -4,6 +4,8 @@ import com.destroystokyo.paper.config.toml.modules.fixes.Books;
+ import com.destroystokyo.paper.config.toml.modules.misc.Rebrand;
+ import com.destroystokyo.paper.config.toml.modules.network.Deflate;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Pathfinder;
++import org.junit.After;
++import org.junit.Before;
+ import org.junit.Rule;
+ import org.junit.Test;
+ import org.junit.rules.TemporaryFolder;
+@@ -18,6 +20,25 @@ import static org.junit.Assert.*;
+ public class AntarcticTomlConfigTest {
+     @Rule public TemporaryFolder temporary = new TemporaryFolder();
+ 
++    private int prevGoalSelectionDelay;
++    private int prevCompressionLevel;
++    private boolean prevEnableBooks;
++    private String prevServerModName;
++
++    @Before public void saveGlobals() {
++        this.prevGoalSelectionDelay = Pathfinder.goalSelectionDelay;
++        this.prevCompressionLevel = Deflate.compressionLevel;
++        this.prevEnableBooks = Books.enableBooks;
++        this.prevServerModName = Rebrand.serverModName;
++    }
++
++    @After public void restoreGlobals() {
++        Pathfinder.goalSelectionDelay = this.prevGoalSelectionDelay;
++        Deflate.compressionLevel = this.prevCompressionLevel;
++        Books.enableBooks = this.prevEnableBooks;
++        Rebrand.serverModName = this.prevServerModName;
++    }
++
+     @Test public void createsNestedFileAndReloadsWithoutRecursiveSave() throws Exception {
+         File file = new File(temporary.getRoot(), "nested/antarctic.toml");
+         int before = AntarcticTomlConfig.getUpdates();
+diff --git a/test/java/net/minecraft/server/PathfinderGoalSelectorPerfTest.java b/test/java/net/minecraft/server/PathfinderGoalSelectorPerfTest.java
+index 2eb6bbd..de3a8bc 100644
+--- a/test/java/net/minecraft/server/PathfinderGoalSelectorPerfTest.java
++++ b/test/java/net/minecraft/server/PathfinderGoalSelectorPerfTest.java
+@@ -154,6 +154,9 @@ public class PathfinderGoalSelectorPerfTest {
+ 
+     @Test
+     public void testGoalSelectorParityAndReentrancy() throws Exception {
++        int prevDelay = com.destroystokyo.paper.config.toml.modules.optimizations.Pathfinder.goalSelectionDelay;
++        com.destroystokyo.paper.config.toml.modules.optimizations.Pathfinder.goalSelectionDelay = 3;
++        try {
+         MethodProfiler profiler = new MethodProfiler();
+         PathfinderGoalSelector sel = new PathfinderGoalSelector(profiler);
+ 
+@@ -214,6 +217,9 @@ public class PathfinderGoalSelectorPerfTest {
+         sel.a();
+         sel.a();
+         assertEquals(0, g0.startCount);
++        } finally {
++            com.destroystokyo.paper.config.toml.modules.optimizations.Pathfinder.goalSelectionDelay = prevDelay;
++        }
+     }
+ 
+     @Test

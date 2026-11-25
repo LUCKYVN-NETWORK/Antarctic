@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Mon, 23 Nov 2026 10:16:36 +0700
-Subject: [PATCH 110/195] feat: wire post-apply light verifier and border
+Subject: [PATCH 110/203] feat: wire post-apply light verifier and border
  repair via PendingLightRegistry
 
 

@@ -1,0 +1,235 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Wed, 25 Nov 2026 14:20:42 +0700
+Subject: [PATCH 198/203] perf: track section observer counts to skip interior
+ observer scans
+
+
+diff --git a/main/java/net/minecraft/server/Chunk.java b/main/java/net/minecraft/server/Chunk.java
+index 1cd81ad..461a199 100644
+--- a/main/java/net/minecraft/server/Chunk.java
++++ b/main/java/net/minecraft/server/Chunk.java
+@@ -623,6 +623,26 @@ public class Chunk {
+         return getBlockData(i, j, k);
+     }
+ 
++    // Antarctic start - O(1) section observer presence check for World.c interior skip
++    public boolean hasObserversNearY(int y) {
++        int minSec = (y - 1) >> 4;
++        if (minSec < 0) {
++            minSec = 0;
++        }
++        int maxSec = (y + 1) >> 4;
++        if (maxSec >= this.sections.length) {
++            maxSec = this.sections.length - 1;
++        }
++        for (int s = minSec; s <= maxSec; ++s) {
++            ChunkSection sec = this.sections[s];
++            if (sec != Chunk.a && sec.hasObservers()) {
++                return true;
++            }
++        }
++        return false;
++    }
++    // Antarctic end
++
+     public IBlockData unused(final int i, final int j, final int k) {
+     // Paper end
+         if (this.world.N() == WorldType.DEBUG_ALL_BLOCK_STATES) {
+diff --git a/main/java/net/minecraft/server/ChunkSection.java b/main/java/net/minecraft/server/ChunkSection.java
+index 6a3c9ac..92ec2d1 100644
+--- a/main/java/net/minecraft/server/ChunkSection.java
++++ b/main/java/net/minecraft/server/ChunkSection.java
+@@ -8,6 +8,7 @@ public class ChunkSection {
+     private int fluidCount; // Antarctic - O(1) section fluid skip for World fluid sweeps
+     private int fireOrLavaCount; // Antarctic - O(1) section fire/lava skip for World.e(AABB)
+     private int lightSourceCount; // Antarctic - O(1) section light-emitter skip for Chunk.e(x, z)
++    private int observerCount; // Antarctic - O(1) section observer skip for World.c
+     final DataPaletteBlock blockIds; // Paper - package
+     private NibbleArray emittedLight;
+     private NibbleArray skyLight;
+@@ -41,11 +42,16 @@ public class ChunkSection {
+     }
+ 
+     void setBlockCounts(int nonEmpty, int ticking, int fluids, int fireOrLava, int lightSources) {
++        this.setBlockCounts(nonEmpty, ticking, fluids, fireOrLava, lightSources, 0);
++    }
++
++    void setBlockCounts(int nonEmpty, int ticking, int fluids, int fireOrLava, int lightSources, int observers) {
+         this.nonEmptyBlockCount = nonEmpty;
+         this.tickingBlockCount = ticking;
+         this.fluidCount = fluids;
+         this.fireOrLavaCount = fireOrLava;
+         this.lightSourceCount = lightSources;
++        this.observerCount = observers;
+     }
+     // Antarctic end
+ 
+@@ -96,6 +102,9 @@ public class ChunkSection {
+             if (iblockdata1.d() > 0) {
+                 --this.lightSourceCount;
+             }
++            if (block == Blocks.dk) {
++                --this.observerCount;
++            }
+         }
+ 
+         if (block1 != Blocks.AIR) {
+@@ -112,6 +121,9 @@ public class ChunkSection {
+             if (iblockdata.d() > 0) {
+                 ++this.lightSourceCount;
+             }
++            if (block1 == Blocks.dk) {
++                ++this.observerCount;
++            }
+         }
+ 
+         this.blockIds.setBlock(i, j, k, iblockdata);
+@@ -125,6 +137,7 @@ public class ChunkSection {
+         int fluids = 0;
+         int fireOrLava = 0;
+         int lightSources = 0;
++        int observers = 0;
+ 
+         char lastId = 0;
+         IBlockData lastData = null;
+@@ -133,6 +146,7 @@ public class ChunkSection {
+         boolean lastLiquid = false;
+         boolean lastFireOrLava = false;
+         boolean lastLightSource = false;
++        boolean lastObserver = false;
+ 
+         for (int dy = 0; dy < 16; ++dy) {
+             int y = baseY + dy;
+@@ -158,6 +172,7 @@ public class ChunkSection {
+                         lastLiquid = data.getMaterial().isLiquid();
+                         lastFireOrLava = block == Blocks.FIRE || block == Blocks.FLOWING_LAVA || block == Blocks.LAVA;
+                         lastLightSource = lastNotAir && data.d() > 0;
++                        lastObserver = block == Blocks.dk;
+                     }
+                     wroteAny = true;
+                     if (lastNotAir) {
+@@ -174,6 +189,9 @@ public class ChunkSection {
+                         if (lastLightSource) {
+                             ++lightSources;
+                         }
++                        if (lastObserver) {
++                            ++observers;
++                        }
+                     }
+                     this.blockIds.setBlockIndex(zyShift | x, lastData);
+                 }
+@@ -185,6 +203,7 @@ public class ChunkSection {
+         this.fluidCount = fluids;
+         this.fireOrLavaCount = fireOrLava;
+         this.lightSourceCount = lightSources;
++        this.observerCount = observers;
+         return wroteAny;
+     }
+     // Antarctic end
+@@ -209,6 +228,10 @@ public class ChunkSection {
+     public boolean hasLightSources() {
+         return this.lightSourceCount > 0;
+     }
++
++    public boolean hasObservers() {
++        return this.observerCount > 0;
++    }
+     // Antarctic end
+ 
+     public int getYPosition() {
+@@ -237,6 +260,7 @@ public class ChunkSection {
+         this.fluidCount = 0;
+         this.fireOrLavaCount = 0;
+         this.lightSourceCount = 0;
++        this.observerCount = 0;
+ 
+         for (int i = 0; i < 16; ++i) {
+             for (int j = 0; j < 16; ++j) {
+@@ -258,6 +282,9 @@ public class ChunkSection {
+                         if (data.d() > 0) {
+                             ++this.lightSourceCount;
+                         }
++                        if (block == Blocks.dk) {
++                            ++this.observerCount;
++                        }
+                     }
+                 }
+             }
+diff --git a/main/java/net/minecraft/server/DataPaletteBlock.java b/main/java/net/minecraft/server/DataPaletteBlock.java
+index 954c744..386889a 100644
+--- a/main/java/net/minecraft/server/DataPaletteBlock.java
++++ b/main/java/net/minecraft/server/DataPaletteBlock.java
+@@ -431,6 +431,7 @@ public class DataPaletteBlock implements DataPaletteExpandable {
+                 int fluids = 0;
+                 int fireOrLava = 0;
+                 int lightSources = 0;
++                int observers = 0;
+                 for (int u = 0; u < uniqueCount; ++u) {
+                     IBlockData data = uniqueStates[u];
+                     Block block = data.getBlock();
+@@ -449,9 +450,12 @@ public class DataPaletteBlock implements DataPaletteExpandable {
+                         if (data.d() > 0) {
+                             lightSources += count;
+                         }
++                        if (block == Blocks.dk) {
++                            observers += count;
++                        }
+                     }
+                 }
+-                countsTarget.setBlockCounts(nonEmpty, ticking, fluids, fireOrLava, lightSources);
++                countsTarget.setBlockCounts(nonEmpty, ticking, fluids, fireOrLava, lightSources, observers);
+             }
+ 
+             int neededEntries = (scratch.sawAir ? uniqueCount : uniqueCount + 1) + (this.predefinedBlockData == null ? 0 : this.predefinedBlockData.length);
+@@ -495,11 +499,13 @@ public class DataPaletteBlock implements DataPaletteExpandable {
+         int fluids = 0;
+         int fireOrLava = 0;
+         int lightSources = 0;
++        int observers = 0;
+         boolean lastNotAir = false;
+         boolean lastTicking = false;
+         boolean lastLiquid = false;
+         boolean lastFireOrLava = false;
+         boolean lastLightSource = false;
++        boolean lastObserver = false;
+ 
+         for (int i = 0; i < 4096; ++i) {
+             int j1 = nibblearray1.a(i) << 12 | (abyte[i] & 255) << 4 | nibblearray.a(i);
+@@ -513,6 +519,7 @@ public class DataPaletteBlock implements DataPaletteExpandable {
+                     lastLiquid = lastData.getMaterial().isLiquid();
+                     lastFireOrLava = block == Blocks.FIRE || block == Blocks.FLOWING_LAVA || block == Blocks.LAVA;
+                     lastLightSource = lastNotAir && lastData.d() > 0;
++                    lastObserver = block == Blocks.dk;
+                 }
+             }
+             this.setBlockIndex(i, lastData);
+@@ -522,10 +529,11 @@ public class DataPaletteBlock implements DataPaletteExpandable {
+                 if (lastLiquid) ++fluids;
+                 if (lastFireOrLava) ++fireOrLava;
+                 if (lastLightSource) ++lightSources;
++                if (lastObserver) ++observers;
+             }
+         }
+         if (countsTarget != null) {
+-            countsTarget.setBlockCounts(nonEmpty, ticking, fluids, fireOrLava, lightSources);
++            countsTarget.setBlockCounts(nonEmpty, ticking, fluids, fireOrLava, lightSources, observers);
+         }
+     }
+     // Antarctic end
+diff --git a/main/java/net/minecraft/server/World.java b/main/java/net/minecraft/server/World.java
+index feca496..d547e47 100644
+--- a/main/java/net/minecraft/server/World.java
++++ b/main/java/net/minecraft/server/World.java
+@@ -896,6 +896,11 @@ public abstract class World implements IBlockAccess {
+         int x = blockposition.getX();
+         int y = blockposition.getY();
+         int z = blockposition.getZ();
++        int lx = x & 15;
++        int lz = z & 15;
++        if (chunk != null && !this.captureTreeGeneration && lx > 0 && lx < 15 && lz > 0 && lz < 15 && !chunk.hasObserversNearY(y)) {
++            return;
++        }
+         this.notifyObserver(chunk, x - 1, y, z, block, blockposition);
+         this.notifyObserver(chunk, x + 1, y, z, block, blockposition);
+         this.notifyObserver(chunk, x, y - 1, z, block, blockposition);

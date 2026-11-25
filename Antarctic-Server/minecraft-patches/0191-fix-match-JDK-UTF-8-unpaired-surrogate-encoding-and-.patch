@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Tue, 24 Nov 2026 20:57:28 +0700
-Subject: [PATCH 191/195] fix: match JDK UTF-8 unpaired surrogate encoding and
+Subject: [PATCH 191/203] fix: match JDK UTF-8 unpaired surrogate encoding and
  EntityPlayer tracker mount sync
 
 

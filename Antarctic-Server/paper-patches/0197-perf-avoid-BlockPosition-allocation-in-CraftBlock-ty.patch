@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Wed, 25 Nov 2026 14:20:42 +0700
+Subject: [PATCH 197/203] perf: avoid BlockPosition allocation in CraftBlock
+ type and data lookups
+
+
+diff --git a/main/java/org/bukkit/craftbukkit/block/CraftBlock.java b/main/java/org/bukkit/craftbukkit/block/CraftBlock.java
+index a9d3f12..0b2f7ae 100644
+--- a/main/java/org/bukkit/craftbukkit/block/CraftBlock.java
++++ b/main/java/org/bukkit/craftbukkit/block/CraftBlock.java
+@@ -106,11 +106,11 @@ public class CraftBlock implements Block {
+     }
+ 
+     private IBlockData getData0() {
+-        return chunk.getHandle().getBlockData(new BlockPosition(x, y, z));
++        return chunk.getHandle().getBlockData(this.x, this.y, this.z);
+     }
+ 
+     public byte getData() {
+-        IBlockData blockData = chunk.getHandle().getBlockData(new BlockPosition(x, y, z));
++        IBlockData blockData = chunk.getHandle().getBlockData(this.x, this.y, this.z);
+         return (byte) blockData.getBlock().toLegacyData(blockData);
+     }
+ 
+@@ -144,7 +144,7 @@ public class CraftBlock implements Block {
+         if (applyPhysics) {
+             return chunk.getHandle().getWorld().setTypeAndData(position, blockData, 3);
+         } else {
+-            IBlockData old = chunk.getHandle().getBlockData(position);
++            IBlockData old = chunk.getHandle().getBlockData(this.x, this.y, this.z);
+             boolean success = chunk.getHandle().getWorld().setTypeAndData(position, blockData, 18); // NOTIFY | NO_OBSERVER
+             if (success) {
+                 chunk.getHandle().getWorld().notify(
+@@ -165,7 +165,7 @@ public class CraftBlock implements Block {
+     @Deprecated
+     @Override
+     public int getTypeId() {
+-        return CraftMagicNumbers.getId(chunk.getHandle().getBlockData(new BlockPosition(this.x, this.y, this.z)).getBlock());
++        return CraftMagicNumbers.getId(chunk.getHandle().getBlockData(this.x, this.y, this.z).getBlock());
+     }
+ 
+     public byte getLightLevel() {

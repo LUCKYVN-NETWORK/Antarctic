@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Wed, 25 Nov 2026 14:20:42 +0700
+Subject: [PATCH 196/203] perf: defer CraftBlock source allocation and reuse
+ chunk in BlockFlowing
+
+
+diff --git a/main/java/net/minecraft/server/BlockFlowing.java b/main/java/net/minecraft/server/BlockFlowing.java
+index b5145c9..6814511 100644
+--- a/main/java/net/minecraft/server/BlockFlowing.java
++++ b/main/java/net/minecraft/server/BlockFlowing.java
+@@ -94,17 +94,20 @@ public class BlockFlowing extends BlockFluids {
+             this.f(world, blockposition, iblockdata);
+         }
+ 
+-        if (world.getType(bx, by, bz).getBlock().getBlockData().getMaterial() != material) return; // Paper - Stop updating flowing block if material has changed
+-        // Antarctic start - skip the CraftBlock, the events and the dispatch entirely when no plugin listens to BlockFromToEvent
++        // Antarctic start - reuse origin chunk across local reads, defer CraftBlock source allocation until an event fires,
++        // and short-circuit interior sources surrounded by blocked or level-0 same-fluid neighbors before touching ThreadLocal BFS state
++        final Chunk originChunk = !world.captureTreeGeneration ? world.getChunkIfLoaded(bx >> 4, bz >> 4) : null;
++        IBlockData selfData = originChunk != null ? originChunk.getBlockData(bx, by, bz) : world.getType(bx, by, bz);
++        if (selfData.getBlock().getBlockData().getMaterial() != material) return; // Paper - Stop updating flowing block if material has changed
+         final boolean fromToListeners = BlockFromToEvent.getHandlerList().getRegisteredListeners().length != 0;
+-        org.bukkit.block.Block source = fromToListeners ? world.getWorld().getBlockAt(bx, by, bz) : null; // CraftBukkit
+-        // Antarctic end
+-        IBlockData iblockdata2 = world.getType(bx, by - 1, bz);
++        org.bukkit.block.Block source = null; // CraftBukkit - allocated lazily only when an event is dispatched
++        IBlockData iblockdata2 = originChunk != null ? originChunk.getBlockData(bx, by - 1, bz) : world.getType(bx, by - 1, bz);
+ 
+         if (this.h(world, blockposition, iblockdata2)) {
+             // CraftBukkit start
+-            if (!canFlowTo(world, bx, bz, EnumDirection.DOWN)) { return; } // Paper // Antarctic - coordinate based, same result as the Bukkit-side check
++            if (originChunk == null && !canFlowTo(world, bx, bz, EnumDirection.DOWN)) { return; } // Paper // Antarctic - originChunk proves (bx>>4, bz>>4) is loaded
+             if (fromToListeners) { // Antarctic
++            source = world.getWorld().getBlockAt(bx, by, bz);
+             BlockFromToEvent event = new BlockFromToEvent(source, BlockFace.DOWN);
+             world.getServer().getPluginManager().callEvent(event);
+ 
+@@ -116,7 +119,7 @@ public class BlockFlowing extends BlockFluids {
+ 
+             BlockPosition downPos = new BlockPosition(bx, by - 1, bz);
+             if (fromToListeners) {
+-                iblockdata2 = world.getType(bx, by - 1, bz);
++                iblockdata2 = originChunk != null ? originChunk.getBlockData(bx, by - 1, bz) : world.getType(bx, by - 1, bz);
+             }
+             if (this.material == Material.LAVA && iblockdata2.getMaterial() == Material.WATER) {
+                 // CraftBukkit start
+@@ -133,8 +136,6 @@ public class BlockFlowing extends BlockFluids {
+                 this.flow(world, downPos, iblockdata2, i + 8);
+             }
+         } else if (i >= 0 && (i == 0 || this.blocksFlow(iblockdata2))) {
+-            int flowMask = this.getFlowDirections(world, blockposition); // Antarctic - bit n set = HORIZONTAL_DIRECTIONS[n]; was an EnumSet
+-
+             k = i + b0;
+             if (i >= 8) {
+                 k = 1;
+@@ -144,6 +145,17 @@ public class BlockFlowing extends BlockFluids {
+                 return;
+             }
+ 
++            if (originChunk != null && (bx & 15) > 0 && (bx & 15) < 15 && (bz & 15) > 0 && (bz & 15) < 15) {
++                if (!this.canHorizontallySpreadInto(originChunk.getBlockData(bx, by, bz - 1))
++                        && !this.canHorizontallySpreadInto(originChunk.getBlockData(bx + 1, by, bz))
++                        && !this.canHorizontallySpreadInto(originChunk.getBlockData(bx, by, bz + 1))
++                        && !this.canHorizontallySpreadInto(originChunk.getBlockData(bx - 1, by, bz))) {
++                    return;
++                }
++            }
++
++            int flowMask = this.getFlowDirections(world, blockposition); // Antarctic - bit n set = HORIZONTAL_DIRECTIONS[n]; was an EnumSet
++
+             // Antarctic start - the old EnumSet iterated in EnumDirection ordinal order (NORTH, SOUTH, WEST, EAST); keep exactly that order
+             for (int n = 0; n < 4; ++n) {
+                 int bit = FLOW_ORDER_BITS[n];
+@@ -157,6 +169,9 @@ public class BlockFlowing extends BlockFluids {
+                 // CraftBukkit start
+                 if (!canFlowTo(world, bx, bz, enumdirection1)) { continue; } // Paper
+                 if (fromToListeners) {
++                if (source == null) {
++                    source = world.getWorld().getBlockAt(bx, by, bz);
++                }
+                 BlockFromToEvent event = new BlockFromToEvent(source, org.bukkit.craftbukkit.block.CraftBlock.notchToBlockFace(enumdirection1));
+                 world.getServer().getPluginManager().callEvent(event);
+ 
+@@ -171,9 +186,16 @@ public class BlockFlowing extends BlockFluids {
+             }
+             // Antarctic end
+         }
++        // Antarctic end
+ 
+     }
+ 
++    // Antarctic start - wave-0 traversability predicate matching getFlowDirections
++    private boolean canHorizontallySpreadInto(IBlockData dataY) {
++        return !this.blocksFlow(dataY) && (dataY.getMaterial() != this.material || ((Integer) dataY.get(BlockFlowing.LEVEL)).intValue() > 0);
++    }
++    // Antarctic end
++
+     // Paper start
+     // Antarctic - same check as before (CraftWorld.isChunkLoaded -> ChunkProviderServer.isLoaded) without needing a CraftBlock
+     private boolean canFlowTo(World world, BlockPosition source, EnumDirection direction) {

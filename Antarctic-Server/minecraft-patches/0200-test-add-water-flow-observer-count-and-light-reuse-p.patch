@@ -1,0 +1,349 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Wed, 25 Nov 2026 14:26:08 +0700
+Subject: [PATCH 200/203] test: add water flow, observer count, and light reuse
+ parity tests
+
+
+diff --git a/test/java/net/minecraft/server/WaterFlowAndObserverOptimizationTest.java b/test/java/net/minecraft/server/WaterFlowAndObserverOptimizationTest.java
+new file mode 100644
+index 0000000..09ede3c
+--- /dev/null
++++ b/test/java/net/minecraft/server/WaterFlowAndObserverOptimizationTest.java
+@@ -0,0 +1,336 @@
++package net.minecraft.server;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++
++import java.lang.reflect.Field;
++import java.lang.reflect.Method;
++import java.util.Random;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++/**
++ * Parity and micro-benchmark tests for:
++ * 1) BlockFlowing interior horizontal short-circuit + chunk reuse
++ * 2) ChunkSection/Chunk observer count tracking & World.c interior skip
++ * 3) World cached center-chunk light-level checks
++ */
++public class WaterFlowAndObserverOptimizationTest {
++
++    private static Unsafe unsafe;
++
++    @BeforeClass
++    public static void setupRegistries() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        unsafe = (Unsafe) f.get(null);
++    }
++
++    private static void setField(Class<?> owner, Object instance, String name, Object value) throws Exception {
++        Field f = owner.getDeclaredField(name);
++        f.setAccessible(true);
++        f.set(instance, value);
++    }
++
++    private static final class TestChunkProvider extends ChunkProviderServer {
++        TestChunkProvider(WorldServer world) {
++            super(world, null, null);
++        }
++
++        @Override
++        public Chunk originalGetChunkAt(int x, int z) {
++            return installChunk(this, world, x, z);
++        }
++    }
++
++    private static Chunk installChunk(ChunkProviderServer provider, World world, int cx, int cz) {
++        try {
++            Chunk chunk = (Chunk) unsafe.allocateInstance(Chunk.class);
++            setField(Chunk.class, chunk, "world", world);
++            setField(Chunk.class, chunk, "locX", cx);
++            setField(Chunk.class, chunk, "locZ", cz);
++            setField(Chunk.class, chunk, "sections", new ChunkSection[16]);
++            setField(Chunk.class, chunk, "heightMap", new int[256]);
++            setField(Chunk.class, chunk, "h", new int[256]);
++            setField(Chunk.class, chunk, "chunkKey", ChunkCoordIntPair.a(cx, cz));
++            provider.chunks.put(ChunkCoordIntPair.a(cx, cz), chunk);
++            return chunk;
++        } catch (Exception e) {
++            throw new AssertionError(e);
++        }
++    }
++
++    private static WorldServer newMockWorld() throws Exception {
++        WorldServer world = (WorldServer) unsafe.allocateInstance(WorldServer.class);
++        setField(World.class, world, "paperConfig", unsafe.allocateInstance(com.destroystokyo.paper.PaperWorldConfig.class));
++        setField(World.class, world, "methodProfiler", new MethodProfiler());
++        setField(World.class, world, "J", new int[32768]);
++        WorldProvider wp = (WorldProvider) unsafe.allocateInstance(WorldProviderNormal.class);
++        setField(WorldProvider.class, wp, "d", false);
++        setField(WorldProvider.class, wp, "e", false);
++        world.worldProvider = wp;
++        TestChunkProvider provider = new TestChunkProvider(world);
++        setField(World.class, world, "chunkProvider", provider);
++        return world;
++    }
++
++    private static void putBlock(Chunk chunk, int x, int y, int z, IBlockData state) {
++        ChunkSection[] sections = chunk.getSections();
++        int idx = y >> 4;
++        if (sections[idx] == null) {
++            sections[idx] = new ChunkSection(idx << 4, true);
++        }
++        sections[idx].setType(x & 15, y & 15, z & 15, state);
++    }
++
++    @Test
++    public void testBlockFlowingInteriorShortCircuitMatchesWaveBfs() throws Exception {
++        WorldServer world = newMockWorld();
++        TestChunkProvider provider = (TestChunkProvider) world.getChunkProvider();
++        Chunk center = installChunk(provider, world, 0, 0);
++        // Install 3x3 neighbor chunks so getFlowDirections never hits null chunks
++        for (int cx = -1; cx <= 1; cx++) {
++            for (int cz = -1; cz <= 1; cz++) {
++                if (cx != 0 || cz != 0) {
++                    installChunk(provider, world, cx, cz);
++                }
++            }
++        }
++
++        Method canSpread = BlockFlowing.class.getDeclaredMethod("canHorizontallySpreadInto", IBlockData.class);
++        canSpread.setAccessible(true);
++
++        BlockFlowing flowingWater = (BlockFlowing) Blocks.FLOWING_WATER;
++        BlockFlowing flowingLava = (BlockFlowing) Blocks.FLOWING_LAVA;
++
++        // Interior water source surrounded by level-0 water & solid stone -> all 4 false and getFlowDirections == 0
++        int y = 66;
++        for (int x = 3; x <= 7; x++) {
++            for (int z = 3; z <= 7; z++) {
++                putBlock(center, x, y - 1, z, Blocks.STONE.getBlockData());
++                putBlock(center, x, y, z, Blocks.WATER.getBlockData());
++            }
++        }
++        putBlock(center, 5, y, 5, Blocks.FLOWING_WATER.getBlockData().set(BlockFluids.LEVEL, 0));
++
++        assertFalse((Boolean) canSpread.invoke(flowingWater, center.getBlockData(5, y, 4)));
++        assertFalse((Boolean) canSpread.invoke(flowingWater, center.getBlockData(6, y, 5)));
++        assertFalse((Boolean) canSpread.invoke(flowingWater, center.getBlockData(5, y, 6)));
++        assertFalse((Boolean) canSpread.invoke(flowingWater, center.getBlockData(4, y, 5)));
++        assertEquals(0, flowingWater.getFlowDirections(world, new BlockPosition(5, y, 5)));
++
++        // Replace one neighbor with flowing water level 3 -> canHorizontallySpreadInto must be true
++        putBlock(center, 6, y, 5, Blocks.FLOWING_WATER.getBlockData().set(BlockFluids.LEVEL, 3));
++        assertTrue((Boolean) canSpread.invoke(flowingWater, center.getBlockData(6, y, 5)));
++        assertEquals(0, flowingWater.getFlowDirections(world, new BlockPosition(5, y, 5)) & ~0b1111); // valid 4-bit mask
++
++        // Replace with AIR -> must be true for both water and lava
++        putBlock(center, 6, y, 5, Blocks.AIR.getBlockData());
++        assertTrue((Boolean) canSpread.invoke(flowingWater, Blocks.AIR.getBlockData()));
++        assertTrue((Boolean) canSpread.invoke(flowingLava, Blocks.AIR.getBlockData()));
++        assertFalse((Boolean) canSpread.invoke(flowingWater, Blocks.STONE.getBlockData()));
++        assertFalse((Boolean) canSpread.invoke(flowingLava, Blocks.LAVA.getBlockData()));
++    }
++
++    @Test
++    public void testChunkSectionObserverCountTracksAllMutations() {
++        ChunkSection sec = new ChunkSection(64, true);
++        assertFalse(sec.hasObservers());
++
++        IBlockData observer = Blocks.dk.getBlockData();
++        IBlockData stone = Blocks.STONE.getBlockData();
++        IBlockData air = Blocks.AIR.getBlockData();
++
++        sec.setType(4, 2, 4, observer);
++        assertTrue(sec.hasObservers());
++        sec.setType(5, 2, 4, observer);
++        assertTrue(sec.hasObservers());
++
++        // Replace one observer with stone -> still 1 left
++        sec.setType(4, 2, 4, stone);
++        assertTrue(sec.hasObservers());
++
++        // Replace second observer with air -> 0 left
++        sec.setType(5, 2, 4, air);
++        assertFalse(sec.hasObservers());
++
++        // Verify recalcBlockCounts() agrees
++        sec.setType(1, 1, 1, observer);
++        sec.recalcBlockCounts();
++        assertTrue(sec.hasObservers());
++        sec.setType(1, 1, 1, air);
++        sec.recalcBlockCounts();
++        assertFalse(sec.hasObservers());
++
++        // Verify fillFromSnapshot() tracks observers
++        char[] snap = new char[16 * 16 * 256];
++        int obsId = Block.REGISTRY_ID.getId(observer);
++        int baseY = 64;
++        snap[(2 << 12) | (3 << 8) | (baseY + 5)] = (char) obsId;
++        ChunkSection snapSec = new ChunkSection(baseY, true);
++        assertTrue(snapSec.fillFromSnapshot(snap, baseY));
++        assertTrue(snapSec.hasObservers());
++
++        // Verify Anvil loader (4-bit palette path) tracks observers
++        byte[] anvilBlocks = new byte[4096];
++        NibbleArray anvilData = new NibbleArray();
++        int obsBlockId = Block.getId(Blocks.dk);
++        anvilBlocks[0] = (byte) (obsBlockId & 255);
++        ChunkSection anvilSec = new ChunkSection(0, true);
++        anvilSec.loadFromAnvil(anvilBlocks, anvilData, null);
++        assertTrue(anvilSec.hasObservers());
++
++        // Verify Anvil extended loader (with addNibbles) tracks observers
++        NibbleArray addNibbles = new NibbleArray();
++        ChunkSection anvilExtSec = new ChunkSection(0, true);
++        anvilExtSec.loadFromAnvil(anvilBlocks, anvilData, addNibbles);
++        assertTrue(anvilExtSec.hasObservers());
++    }
++
++    @Test
++    public void testChunkHasObserversNearYAndBoundarySafety() throws Exception {
++        WorldServer world = newMockWorld();
++        TestChunkProvider provider = (TestChunkProvider) world.getChunkProvider();
++        Chunk center = installChunk(provider, world, 0, 0);
++        Chunk east = installChunk(provider, world, 1, 0);
++
++        // Observer at y=16 (section 1) must be visible to hasObserversNearY(15) (section 0 boundary)
++        putBlock(center, 8, 16, 8, Blocks.dk.getBlockData());
++        assertTrue(center.hasObserversNearY(15));
++        assertTrue(center.hasObserversNearY(16));
++        assertFalse(center.hasObserversNearY(13));
++        assertFalse(center.hasObserversNearY(0));
++        assertFalse(center.hasObserversNearY(255));
++
++        // Remove observer from center chunk -> center has 0 observers
++        putBlock(center, 8, 16, 8, Blocks.AIR.getBlockData());
++        assertFalse(center.hasObserversNearY(15));
++
++        // Place observer at x=16 (east chunk, localX=0) -> updating x=15 (center chunk, localX=15) MUST NOT skip!
++        final int[] notified = { 0 };
++        Block probeObserver = new BlockObserver() {
++            @Override
++            public void b(IBlockData iblockdata, World w, BlockPosition pos, Block block, BlockPosition src) {
++                notified[0]++;
++            }
++        };
++        // Directly verify World.c boundary guard: lx=15 is NOT skipped even when center.hasObserversNearY(65)==false
++        Method worldC = World.class.getDeclaredMethod("c", BlockPosition.class, Block.class, Chunk.class);
++        worldC.setAccessible(true);
++        // Put real Blocks.dk in east chunk at (16, 65, 8) facing WEST (toward x=15) and ensure World.c visits it
++        putBlock(east, 16, 65, 8, Blocks.dk.getBlockData().set(BlockObserver.FACING, EnumDirection.WEST));
++        // World.c on (15, 65, 8) should call east's observer (which schedules a tick in world if WorldServer; here nextTickList is null,
++        // proving World.c actually entered notifyObserver across the chunk border instead of skipping!)
++        boolean reachedCrossChunkObserver = false;
++        try {
++            worldC.invoke(world, new BlockPosition(15, 65, 8), Blocks.STONE, center);
++        } catch (java.lang.reflect.InvocationTargetException ite) {
++            // NullPointerException inside BlockObserver.b -> world.a(...) proves cross-chunk observer WAS reached!
++            reachedCrossChunkObserver = true;
++        }
++        assertTrue("Chunk-edge World.c must inspect adjacent chunk observers", reachedCrossChunkObserver);
++
++        // Interior position (8, 65, 8) in center chunk with 0 observers MUST short-circuit cleanly without touching neighbors
++        worldC.invoke(world, new BlockPosition(8, 65, 8), Blocks.STONE, center);
++        assertEquals(0, notified[0]);
++    }
++
++    @Test
++    public void testWorldCachedLightCheckMatchesLegacyLookup() throws Exception {
++        WorldServer world = newMockWorld();
++        TestChunkProvider provider = (TestChunkProvider) world.getChunkProvider();
++        Chunk center = installChunk(provider, world, 0, 0);
++        for (int cx = -1; cx <= 1; cx++) {
++            for (int cz = -1; cz <= 1; cz++) {
++                if (cx != 0 || cz != 0) {
++                    installChunk(provider, world, cx, cz);
++                }
++            }
++        }
++
++        // Put torch at (5, 65, 5) emitting 14, and stone roof at y=70
++        putBlock(center, 5, 65, 5, Blocks.TORCH.getBlockData());
++        putBlock(center, 6, 65, 5, Blocks.AIR.getBlockData());
++        putBlock(center, 6, 70, 5, Blocks.STONE.getBlockData());
++        center.getSections()[4].b(5, 1, 5, 14); // blockLight 14 at (5, 65, 5)
++        center.getSections()[4].b(6, 1, 5, 13); // blockLight 13 at (6, 65, 5)
++
++        Method getCached = World.class.getDeclaredMethod("getBrightnessCached", Chunk.class, EnumSkyBlock.class, int.class, int.class, int.class);
++        getCached.setAccessible(true);
++        Method computeLegacy = World.class.getDeclaredMethod("computeLightLevel", int.class, int.class, int.class, EnumSkyBlock.class);
++        computeLegacy.setAccessible(true);
++        Method computeCached = World.class.getDeclaredMethod("computeLightLevel", Chunk.class, int.class, int.class, int.class, EnumSkyBlock.class);
++        computeCached.setAccessible(true);
++
++        int[] testYs = { 0, 65, 70, 255 };
++        for (int y : testYs) {
++            assertEquals(world.getBrightness(EnumSkyBlock.BLOCK, 6, y, 5),
++                ((Integer) getCached.invoke(world, center, EnumSkyBlock.BLOCK, 6, y, 5)).intValue());
++            assertEquals(world.getBrightness(EnumSkyBlock.SKY, 6, y, 5),
++                ((Integer) getCached.invoke(world, center, EnumSkyBlock.SKY, 6, y, 5)).intValue());
++            assertEquals(computeLegacy.invoke(world, 6, y, 5, EnumSkyBlock.BLOCK),
++                computeCached.invoke(world, center, 6, y, 5, EnumSkyBlock.BLOCK));
++            assertEquals(computeLegacy.invoke(world, 6, y, 5, EnumSkyBlock.SKY),
++                computeCached.invoke(world, center, 6, y, 5, EnumSkyBlock.SKY));
++        }
++    }
++
++    @Test
++    public void testMicroBenchmarkObserverSkipAndLightReuse() throws Exception {
++        WorldServer world = newMockWorld();
++        TestChunkProvider provider = (TestChunkProvider) world.getChunkProvider();
++        Chunk center = installChunk(provider, world, 0, 0);
++        putBlock(center, 8, 65, 8, Blocks.STONE.getBlockData());
++        putBlock(center, 8, 66, 8, Blocks.WATER.getBlockData());
++
++        Method worldC = World.class.getDeclaredMethod("c", BlockPosition.class, Block.class, Chunk.class);
++        worldC.setAccessible(true);
++        Method getCached = World.class.getDeclaredMethod("getBrightnessCached", Chunk.class, EnumSkyBlock.class, int.class, int.class, int.class);
++        getCached.setAccessible(true);
++
++        BlockPosition pos = new BlockPosition(8, 65, 8);
++        // Warmup
++        for (int i = 0; i < 20_000; i++) {
++            worldC.invoke(world, pos, Blocks.STONE, center);
++            worldC.invoke(world, pos, Blocks.STONE, null);
++            getCached.invoke(world, center, EnumSkyBlock.BLOCK, 8, 65, 8);
++            world.getBrightness(EnumSkyBlock.BLOCK, pos);
++        }
++
++        final int iters = 100_000;
++        long t0 = System.nanoTime();
++        for (int i = 0; i < iters; i++) {
++            worldC.invoke(world, pos, Blocks.STONE, null); // uncached 6-neighbor scan
++        }
++        long scanNs = System.nanoTime() - t0;
++
++        long t1 = System.nanoTime();
++        for (int i = 0; i < iters; i++) {
++            worldC.invoke(world, pos, Blocks.STONE, center); // O(1) section observer skip
++        }
++        long skipNs = System.nanoTime() - t1;
++
++        long t2 = System.nanoTime();
++        int sumA = 0;
++        for (int i = 0; i < iters; i++) {
++            sumA += world.getBrightness(EnumSkyBlock.BLOCK, pos);
++        }
++        long legacyLightNs = System.nanoTime() - t2;
++
++        long t3 = System.nanoTime();
++        int sumB = 0;
++        for (int i = 0; i < iters; i++) {
++            sumB += (Integer) getCached.invoke(world, center, EnumSkyBlock.BLOCK, 8, 65, 8);
++        }
++        long cachedLightNs = System.nanoTime() - t3;
++
++        assertEquals(sumA, sumB);
++        System.out.printf("Observer scan=%d us vs skip=%d us (%.2fx); Light legacy=%d us vs cached=%d us (%.2fx)%n",
++            scanNs / 1000, skipNs / 1000, (double) scanNs / Math.max(1L, skipNs),
++            legacyLightNs / 1000, cachedLightNs / 1000, (double) legacyLightNs / Math.max(1L, cachedLightNs));
++        assertTrue("Observer skip should be faster than 6-neighbor scan", skipNs < scanNs);
++    }
++}

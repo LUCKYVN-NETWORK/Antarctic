@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Wed, 25 Nov 2026 15:14:57 +0700
+Subject: [PATCH 201/203] perf: pool BlockPosition in World.hasBlockRayHit
+
+
+diff --git a/main/java/net/minecraft/server/World.java b/main/java/net/minecraft/server/World.java
+index 2b68146..9ef4c1f 100644
+--- a/main/java/net/minecraft/server/World.java
++++ b/main/java/net/minecraft/server/World.java
+@@ -3566,9 +3566,10 @@ public abstract class World implements IBlockAccess {
+             return false;
+         }
+ 
+-        BlockPosition.MutableBlockPosition mutablePos = null;
++        BlockPosition.PooledBlockPosition mutablePos = null;
+         Vec3D endVec = null;
+ 
++        try {
+         if (i1 >= 0 && i1 < 256 && l >= -30000000 && l < 30000000 && j1 >= -30000000 && j1 < 30000000) {
+             ChunkSection sec = cachedChunk.getSections()[i1 >> 4];
+             if (sec != Chunk.a) {
+@@ -3576,9 +3577,9 @@ public abstract class World implements IBlockAccess {
+                 Block block = iblockdata.getBlock();
+                 if (block != Blocks.AIR && !(block instanceof BlockFluids) && block != Blocks.FIRE && block != Blocks.PISTON_EXTENSION && block.a(iblockdata, false)) {
+                     if (mutablePos == null) {
+-                        mutablePos = new BlockPosition.MutableBlockPosition(l, i1, j1);
++                        mutablePos = BlockPosition.PooledBlockPosition.e(l, i1, j1);
+                     } else {
+-                        mutablePos.c(l, i1, j1);
++                        mutablePos.f(l, i1, j1);
+                     }
+                     if (!(block instanceof BlockStairs) && iblockdata.e(this, mutablePos) == Block.j) {
+                         if (rayHitsUnitCube(curX - l, curY - i1, curZ - j1, endX - l, endY - i1, endZ - j1)) {
+@@ -3706,9 +3707,9 @@ public abstract class World implements IBlockAccess {
+             Block block1 = iblockdata1.getBlock();
+             if (block1 != Blocks.AIR && !(block1 instanceof BlockFluids) && block1 != Blocks.FIRE && block1 != Blocks.PISTON_EXTENSION && block1.a(iblockdata1, false)) {
+                 if (mutablePos == null) {
+-                    mutablePos = new BlockPosition.MutableBlockPosition(l, i1, j1);
++                    mutablePos = BlockPosition.PooledBlockPosition.e(l, i1, j1);
+                 } else {
+-                    mutablePos.c(l, i1, j1);
++                    mutablePos.f(l, i1, j1);
+                 }
+                 if (!(block1 instanceof BlockStairs) && iblockdata1.e(this, mutablePos) == Block.j) {
+                     if (rayHitsUnitCube(curX - l, curY - i1, curZ - j1, endX - l, endY - i1, endZ - j1)) {
+@@ -3725,6 +3726,11 @@ public abstract class World implements IBlockAccess {
+             }
+         }
+         return false;
++        } finally {
++            if (mutablePos != null) {
++                mutablePos.t();
++            }
++        }
+     }
+ 
+     private static boolean rayHitsUnitCube(double sx, double sy, double sz, double ex, double ey, double ez) {
