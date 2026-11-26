@@ -5,6 +5,11 @@
  * Full decompiled NMS sources remain separate, ignored reference material.
  */
 
+plugins {
+    // Only the ShadowJar task type is used (see serverJar below), so the plugin's own tasks stay off.
+    id 'com.gradleup.shadow' version '8.3.6' apply false
+}
+
 dependencies {
     api project(':Antarctic-API')
 
@@ -53,25 +58,26 @@ jar {
     archiveClassifier = 'slim'
 }
 
-tasks.register('serverJar', Jar) {
-    group = 'build'
-    description = 'Builds the standalone runnable Antarctic server JAR archive with dependencies and mapped NMS classes.'
+def serverJarAttributes = [
+    // log4j-api is a multi-release jar; Gradle's fat jar drops the flag,
+    // which makes JDK 9+ pick the Java-8 StackLocator and crash at startup.
+    'Multi-Release': 'true',
+    'Main-Class': 'org.bukkit.craftbukkit.Main',
+    'Implementation-Title': 'Antarctic-Server',
+    'Implementation-Version': project.version,
+    'Specification-Title': 'Bukkit',
+    'Specification-Version': project.version,
+    'Specification-Vendor': 'PaperMC / Antarctic',
+    'Implementation-Vendor': 'Antarctic'
+]
+
+// Intermediate fat jar with the merge rules; kept out of build/libs so it is never released.
+def unrelocatedServerJar = tasks.register('unrelocatedServerJar', Jar) {
+    description = 'Merges the server, API, dependencies and mapped NMS classes before relocation.'
     archiveBaseName = 'Antarctic-Server'
-    archiveClassifier = ''
-    manifest {
-        attributes(
-            // log4j-api is a multi-release jar; Gradle's fat jar drops the flag,
-            // which makes JDK 9+ pick the Java-8 StackLocator and crash at startup.
-            'Multi-Release': 'true',
-            'Main-Class': 'org.bukkit.craftbukkit.Main',
-            'Implementation-Title': 'Antarctic-Server',
-            'Implementation-Version': project.version,
-            'Specification-Title': 'Bukkit',
-            'Specification-Version': project.version,
-            'Specification-Vendor': 'PaperMC / Antarctic',
-            'Implementation-Vendor': 'Antarctic'
-        )
-    }
+    archiveClassifier = 'unrelocated'
+    destinationDirectory = layout.buildDirectory.dir('unrelocated')
+    manifest { attributes(serverJarAttributes) }
     from sourceSets.main.output
     from project(':Antarctic-API').sourceSets.main.output
     dependsOn ':Antarctic-API:jar', 'classes', configurations.runtimeClasspath
@@ -108,4 +114,21 @@ tasks.register('serverJar', Jar) {
     }
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
     exclude 'META-INF/*.SF', 'META-INF/*.DSA', 'META-INF/*.RSA'
+}
+
+// Same relocations as upstream CraftBukkit's shade step. Plugins read the NMS version
+// from these package names and reflect on net.minecraft.server.v1_12_R1.* directly.
+tasks.register('serverJar', com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar) {
+    group = 'build'
+    description = 'Builds the standalone runnable Antarctic server JAR archive with dependencies and mapped NMS classes.'
+    archiveBaseName = 'Antarctic-Server'
+    archiveClassifier = ''
+    configurations = []
+    manifest { attributes(serverJarAttributes) }
+    from(zipTree(unrelocatedServerJar.flatMap { it.archiveFile }))
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    relocate('org.bukkit.craftbukkit', 'org.bukkit.craftbukkit.v1_12_R1') {
+        exclude 'org.bukkit.craftbukkit.Main*'
+    }
+    relocate 'net.minecraft.server', 'net.minecraft.server.v1_12_R1'
 }
