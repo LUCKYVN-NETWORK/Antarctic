@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Sat, 17 Oct 2026 16:02:09 +0700
-Subject: [PATCH 007/203] Harden Antarctic configuration loading
+Subject: [PATCH 007/204] Harden Antarctic configuration loading
 
 - Reject invalid YAML without overwriting it and create missing parent directories through Bukkit
 - Exclude persistence from reflective option loading and keep comments in a standard YAML header

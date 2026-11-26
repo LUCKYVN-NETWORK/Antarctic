@@ -1,0 +1,127 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Thu, 26 Nov 2026 14:47:54 +0700
+Subject: [PATCH 204/204] fix: expose modcount on enumprotocol trackingbimap
+ for protocollib
+
+ProtocolLib's MapContainer reflects an int modCount (HashBiMap contract) on each EnumProtocol packet map and failed onLoad without it.
+
+diff --git a/main/java/net/minecraft/server/EnumProtocol.java b/main/java/net/minecraft/server/EnumProtocol.java
+index f60f1c0..b65f009 100644
+--- a/main/java/net/minecraft/server/EnumProtocol.java
++++ b/main/java/net/minecraft/server/EnumProtocol.java
+@@ -236,6 +236,9 @@ public enum EnumProtocol {
+         private final int dirOrdinal;
+         private final BiMap<Integer, Class<? extends Packet<?>>> delegate;
+         private BiMap<Class<? extends Packet<?>>, Integer> inverseView;
++        // Antarctic - ProtocolLib's MapContainer reflects an int "modCount" (HashBiMap contract) to detect registry edits
++        // Plain int: registration happens at class init and ProtocolLib polls from the main thread
++        private int modCount;
+ 
+         TrackingBiMap(int dirOrdinal, BiMap<Integer, Class<? extends Packet<?>>> delegate) {
+             this.dirOrdinal = dirOrdinal;
+@@ -248,6 +251,7 @@ public enum EnumProtocol {
+         }
+ 
+         private void invalidateSlot(Object key) {
++            this.modCount++; // Antarctic - ProtocolLib change detection
+             if (key instanceof Integer) {
+                 int id = ((Integer) key).intValue();
+                 Supplier<? extends Packet<?>>[] row = EnumProtocol.this.supplierTable.get(this.dirOrdinal);
+@@ -260,6 +264,7 @@ public enum EnumProtocol {
+         }
+ 
+         private void invalidateAll() {
++            this.modCount++; // Antarctic - ProtocolLib change detection
+             EnumProtocol.this.supplierTable.set(this.dirOrdinal, null);
+         }
+ 
+diff --git a/test/java/net/minecraft/server/ProtocolAndChunkMapInvalidationTest.java b/test/java/net/minecraft/server/ProtocolAndChunkMapInvalidationTest.java
+index 95def5a..1d47a0f 100644
+--- a/test/java/net/minecraft/server/ProtocolAndChunkMapInvalidationTest.java
++++ b/test/java/net/minecraft/server/ProtocolAndChunkMapInvalidationTest.java
+@@ -98,6 +98,84 @@ public class ProtocolAndChunkMapInvalidationTest {
+         }
+     }
+ 
++    /** Looks up an int "modCount" field up the class hierarchy, the way ProtocolLib's MapContainer does. */
++    private static Field findModCount(Object map) {
++        for (Class<?> c = map.getClass(); c != null; c = c.getSuperclass()) {
++            for (Field f : c.getDeclaredFields()) {
++                if (f.getName().equals("modCount") && f.getType() == int.class) {
++                    f.setAccessible(true);
++                    return f;
++                }
++            }
++        }
++        return null;
++    }
++
++    private static void assertModCountBumped(Object map, Field modCount, String what, Runnable mutation) throws Exception {
++        int before = modCount.getInt(map);
++        mutation.run();
++        Assert.assertNotEquals(what + " must change modCount", before, modCount.getInt(map));
++    }
++
++    @Test
++    @SuppressWarnings("unchecked")
++    public void testEnumProtocolPacketMapsExposeModCountForProtocolLib() throws Exception {
++        Field hField = EnumProtocol.class.getDeclaredField("h");
++        hField.setAccessible(true);
++        Field tableField = EnumProtocol.class.getDeclaredField("supplierTable");
++        tableField.setAccessible(true);
++
++        for (EnumProtocol proto : EnumProtocol.values()) {
++            Map<EnumProtocolDirection, BiMap<Integer, Class<? extends Packet<?>>>> h =
++                    (Map<EnumProtocolDirection, BiMap<Integer, Class<? extends Packet<?>>>>) hField.get(proto);
++            for (BiMap<Integer, Class<? extends Packet<?>>> map : h.values()) {
++                Assert.assertNotNull("No int modCount on packet map of " + proto, findModCount(map));
++            }
++        }
++
++        EnumProtocol proto = EnumProtocol.HANDSHAKING;
++        Map<EnumProtocolDirection, BiMap<Integer, Class<? extends Packet<?>>>> h =
++                (Map<EnumProtocolDirection, BiMap<Integer, Class<? extends Packet<?>>>>) hField.get(proto);
++        BiMap<Integer, Class<? extends Packet<?>>> map = h.get(EnumProtocolDirection.SERVERBOUND);
++        AtomicReferenceArray<Supplier<? extends Packet<?>>[]> table =
++                (AtomicReferenceArray<Supplier<? extends Packet<?>>[]>) tableField.get(proto);
++        int dirIdx = EnumProtocolDirection.SERVERBOUND.ordinal();
++        BiMap<Integer, Class<? extends Packet<?>>> snapshotMap = HashBiMap.create(map);
++        Supplier<? extends Packet<?>>[] snapshotRow = table.get(dirIdx) != null ? table.get(dirIdx).clone() : null;
++        Field modCount = findModCount(map);
++        Class<? extends Packet<?>> packet = PacketHandshakingInSetProtocol.class;
++
++        try {
++            assertModCountBumped(map, modCount, "forcePut", () -> map.forcePut(99, packet));
++            assertModCountBumped(map, modCount, "remove", () -> map.remove(99));
++            assertModCountBumped(map, modCount, "put", () -> map.put(0, packet));
++            assertModCountBumped(map, modCount, "keySet().remove", () -> map.keySet().remove(0));
++            map.put(0, packet);
++            assertModCountBumped(map, modCount, "values().removeIf", () -> map.values().removeIf(v -> v == packet));
++            map.put(0, packet);
++            assertModCountBumped(map, modCount, "entrySet().iterator().remove", () -> {
++                Iterator<Map.Entry<Integer, Class<? extends Packet<?>>>> it = map.entrySet().iterator();
++                it.next();
++                it.remove();
++            });
++            assertModCountBumped(map, modCount, "clear", () -> map.clear());
++            assertModCountBumped(map, modCount, "putAll", () -> map.putAll(snapshotMap));
++            assertModCountBumped(map, modCount, "inverse().forcePut", () -> map.inverse().forcePut(packet, 98));
++            assertModCountBumped(map, modCount, "inverse().remove", () -> map.inverse().remove(packet));
++            assertModCountBumped(map, modCount, "inverse().put", () -> map.inverse().put(packet, 0));
++
++            int before = modCount.getInt(map);
++            map.get(0);
++            map.inverse().get(packet);
++            map.containsValue(packet);
++            Assert.assertEquals("Reads must not change modCount", before, modCount.getInt(map));
++        } finally {
++            map.clear();
++            map.putAll(snapshotMap);
++            table.set(dirIdx, snapshotRow);
++        }
++    }
++
+     private static Chunk createStubChunk(int cx, int cz) throws Exception {
+         Chunk c = (Chunk) unsafe.allocateInstance(Chunk.class);
+         unsafe.putLong(c, unsafe.objectFieldOffset(Chunk.class.getDeclaredField("chunkKey")), ChunkCoordIntPair.a(cx, cz));
