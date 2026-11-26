@@ -132,3 +132,49 @@ tasks.register('serverJar', com.github.jengelman.gradle.plugins.shadow.tasks.Sha
     }
     relocate 'net.minecraft.server', 'net.minecraft.server.v1_12_R1'
 }
+
+// Guards the layout plugins depend on; runs after every serverJar, so CI and releases are covered.
+tasks.register('verifyServerJar') {
+    group = 'verification'
+    description = 'Fails if the server jar lost its v1_12_R1 relocation, version resource or manifest entries.'
+    def serverJarFile = tasks.named('serverJar').flatMap { it.archiveFile }
+    def expectedVersion = project.version.toString()
+    inputs.file(serverJarFile)
+    doLast {
+        def problems = []
+        new java.util.zip.ZipFile(serverJarFile.get().asFile).withCloseable { zip ->
+            def classes = zip.entries().collect { it.name }.findAll { it.endsWith('.class') }
+            ['org/bukkit/craftbukkit/v1_12_R1/CraftServer.class',
+             'net/minecraft/server/v1_12_R1/MinecraftServer.class',
+             'org/bukkit/craftbukkit/Main.class'].each {
+                if (zip.getEntry(it) == null) problems << "missing ${it}"
+            }
+            def unrelocated = classes.findAll {
+                (it.startsWith('org/bukkit/craftbukkit/') && !it.startsWith('org/bukkit/craftbukkit/v1_12_R1/')
+                        && !(it ==~ /org\/bukkit\/craftbukkit\/Main(\$.*)?\.class/)) ||
+                (it.startsWith('net/minecraft/server/') && !it.startsWith('net/minecraft/server/v1_12_R1/'))
+            }
+            if (unrelocated) problems << "${unrelocated.size()} unrelocated classes, e.g. ${unrelocated.take(3)}"
+
+            def pom = zip.getEntry('META-INF/maven/com.destroystokyo.paper/paper-api/pom.properties')
+            def version = null
+            if (pom != null) {
+                def properties = new Properties()
+                zip.getInputStream(pom).withCloseable { properties.load(it) }
+                version = properties.getProperty('version')
+            }
+            if (version != expectedVersion) problems << "paper-api pom.properties version is ${version}, expected ${expectedVersion}"
+
+            def manifest = zip.getInputStream(zip.getEntry('META-INF/MANIFEST.MF')).withCloseable { new java.util.jar.Manifest(it) }
+            ['Main-Class': 'org.bukkit.craftbukkit.Main', 'Multi-Release': 'true'].each { key, value ->
+                def actual = manifest.mainAttributes.getValue(key)
+                if (actual != value) problems << "manifest ${key} is ${actual}, expected ${value}"
+            }
+        }
+        if (problems) {
+            throw new GradleException('Server jar verification failed:\n - ' + problems.join('\n - '))
+        }
+        logger.lifecycle('Server jar layout verified.')
+    }
+}
+tasks.named('serverJar') { finalizedBy 'verifyServerJar' }
