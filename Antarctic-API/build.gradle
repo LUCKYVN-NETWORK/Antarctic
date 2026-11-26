@@ -22,6 +22,22 @@ dependencies {
     testImplementation 'org.hamcrest:hamcrest-library:1.3'
 }
 
+// CraftBukkit's Versioning reads Bukkit.getBukkitVersion() from the resource Maven used to generate.
+// Without it the server reports "Unknown-Version" and plugins that parse the version fail to enable.
+def generatePomProperties = tasks.register('generatePomProperties') {
+    def outputDir = layout.buildDirectory.dir('generated/pomProperties')
+    def apiVersion = project.version.toString()
+    inputs.property('version', apiVersion)
+    outputs.dir(outputDir)
+    doLast {
+        def file = outputDir.get().file('META-INF/maven/com.destroystokyo.paper/paper-api/pom.properties').asFile
+        file.parentFile.mkdirs()
+        // No timestamp comment: the archives must stay reproducible.
+        file.text = ['groupId=com.destroystokyo.paper', 'artifactId=paper-api', "version=${apiVersion}", ''].join('\n')
+    }
+}
+sourceSets.main.resources.srcDir(generatePomProperties)
+
 jar {
     archiveBaseName = 'Antarctic-API'
     manifest {

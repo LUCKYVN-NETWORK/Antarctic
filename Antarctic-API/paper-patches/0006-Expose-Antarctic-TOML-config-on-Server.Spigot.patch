@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Dreeam <61569423+Dreeam-qwq@users.noreply.github.com>
 Date: Sun, 18 Oct 2026 02:31:59 +0700
-Subject: [PATCH 6/9] Expose Antarctic TOML config on Server.Spigot
+Subject: [PATCH 06/10] Expose Antarctic TOML config on Server.Spigot
 
 - Add Server.Spigot#getAntarcticTomlConfig returning the Night-Config CommentedFileConfig
 - Ported from Leaf Config v2 (Winds-Studio/Leaf, GPL-3.0-only)

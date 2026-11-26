@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Thu, 26 Nov 2026 14:55:05 +0700
+Subject: [PATCH 10/10] build: generate paper-api pom properties for bukkit
+ version
+
+
+diff --git a/test/java/org/bukkit/PomPropertiesResourceTest.java b/test/java/org/bukkit/PomPropertiesResourceTest.java
+new file mode 100644
+index 0000000..c678c7f
+--- /dev/null
++++ b/test/java/org/bukkit/PomPropertiesResourceTest.java
+@@ -0,0 +1,24 @@
++package org.bukkit;
++
++import java.io.InputStream;
++import java.util.Properties;
++import org.junit.Assert;
++import org.junit.Test;
++
++/**
++ * CraftBukkit's Versioning reads the Bukkit version from this Maven resource. Plugins parse the result,
++ * so a build that does not ship it makes them see "Unknown-Version".
++ */
++public class PomPropertiesResourceTest {
++
++    @Test
++    public void paperApiPomPropertiesCarriesTheBukkitVersion() throws Exception {
++        try (InputStream stream = Bukkit.class.getClassLoader()
++                .getResourceAsStream("META-INF/maven/com.destroystokyo.paper/paper-api/pom.properties")) {
++            Assert.assertNotNull("paper-api pom.properties is missing", stream);
++            Properties properties = new Properties();
++            properties.load(stream);
++            Assert.assertEquals("1.12.2-R0.1-SNAPSHOT", properties.getProperty("version"));
++        }
++    }
++}
