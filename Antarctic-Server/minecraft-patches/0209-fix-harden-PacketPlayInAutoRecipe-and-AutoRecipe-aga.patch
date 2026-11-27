@@ -1,0 +1,587 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Fri, 27 Nov 2026 10:34:12 +0700
+Subject: [PATCH 209/209] fix: harden PacketPlayInAutoRecipe and AutoRecipe
+ against illegal states
+
+
+diff --git a/main/java/net/minecraft/server/AutoRecipe.java b/main/java/net/minecraft/server/AutoRecipe.java
+new file mode 100644
+index 0000000..30ab097
+--- /dev/null
++++ b/main/java/net/minecraft/server/AutoRecipe.java
+@@ -0,0 +1,288 @@
++package net.minecraft.server;
++
++import it.unimi.dsi.fastutil.ints.IntArrayList;
++import it.unimi.dsi.fastutil.ints.IntList;
++import it.unimi.dsi.fastutil.ints.IntListIterator;
++import java.util.List;
++import javax.annotation.Nullable;
++import org.apache.logging.log4j.LogManager;
++import org.apache.logging.log4j.Logger;
++
++public class AutoRecipe {
++
++    private final Logger a = LogManager.getLogger();
++    private final AutoRecipeStackManager b = new AutoRecipeStackManager();
++    private EntityPlayer c;
++    private IRecipe d;
++    private boolean e;
++    private InventoryCraftResult f;
++    private InventoryCrafting g;
++    private List<Slot> h;
++
++    public AutoRecipe() {}
++
++    public void a(EntityPlayer entityplayer, @Nullable IRecipe irecipe, boolean flag) {
++        if (irecipe != null && entityplayer.F().b(irecipe)) {
++            this.c = entityplayer;
++            this.d = irecipe;
++            this.e = flag;
++            this.h = entityplayer.activeContainer.slots;
++            Container container = entityplayer.activeContainer;
++
++            this.f = null;
++            this.g = null;
++            if (container instanceof ContainerWorkbench) {
++                this.f = ((ContainerWorkbench) container).resultInventory;
++                this.g = ((ContainerWorkbench) container).craftInventory;
++            } else if (container instanceof ContainerPlayer) {
++                this.f = ((ContainerPlayer) container).resultInventory;
++                this.g = ((ContainerPlayer) container).craftInventory;
++            }
++
++            if (this.f != null && this.g != null) {
++                if (this.c() || entityplayer.z()) {
++                    this.b.a();
++                    entityplayer.inventory.a(this.b, false);
++                    this.g.a(this.b);
++                    if (this.b.a(irecipe, (IntList) null)) {
++                        this.b();
++                    } else {
++                        this.a();
++                        entityplayer.playerConnection.sendPacket(new PacketPlayOutAutoRecipe(entityplayer.activeContainer.windowId, irecipe));
++                    }
++
++                    entityplayer.inventory.update();
++                    entityplayer.activeContainer.b();
++                }
++            }
++        }
++    }
++
++    private boolean a() {
++        PlayerInventory playerinventory = this.c.inventory;
++
++        for (int i = 0; i < this.g.getSize(); ++i) {
++            ItemStack itemstack = this.g.getItem(i);
++
++            if (!itemstack.isEmpty()) {
++                while (itemstack.getCount() > 0) {
++                    int j = playerinventory.firstPartial(itemstack);
++
++                    if (j == -1) {
++                        j = playerinventory.getFirstEmptySlotIndex();
++                    }
++
++                    if (j == -1) {
++                        return false;
++                    }
++
++                    ItemStack itemstack1 = itemstack.cloneItemStack();
++
++                    itemstack1.setCount(1);
++                    if (!playerinventory.c(j, itemstack1)) {
++                        return false;
++                    }
++                    this.g.splitStack(i, 1);
++                }
++            }
++        }
++
++        this.g.clear();
++        this.f.clear();
++        return true;
++    }
++
++    private void b() {
++        boolean flag = this.d.a(this.g, this.c.world);
++        int i = this.b.b(this.d, (IntList) null);
++
++        if (flag) {
++            boolean flag1 = true;
++
++            for (int j = 0; j < this.g.getSize(); ++j) {
++                ItemStack itemstack = this.g.getItem(j);
++
++                if (!itemstack.isEmpty() && Math.min(i, itemstack.getMaxStackSize()) > itemstack.getCount()) {
++                    flag1 = false;
++                }
++            }
++
++            if (flag1) {
++                return;
++            }
++        }
++
++        int k = this.a(i, flag);
++        IntArrayList intarraylist = new IntArrayList();
++
++        if (this.b.a(this.d, intarraylist, k)) {
++            int l = k;
++            IntListIterator intlistiterator = intarraylist.iterator();
++
++            while (intlistiterator.hasNext()) {
++                int i1 = ((Integer) intlistiterator.next()).intValue();
++                int j1 = AutoRecipeStackManager.b(i1).getMaxStackSize();
++
++                if (j1 < l) {
++                    l = j1;
++                }
++            }
++
++            if (this.b.a(this.d, intarraylist, l)) {
++                if (this.a()) {
++                    this.a(l, intarraylist);
++                }
++            }
++        }
++    }
++
++    private int a(int i, boolean flag) {
++        int j = 1;
++
++        if (this.e) {
++            j = i;
++        } else if (flag) {
++            j = 64;
++
++            for (int k = 0; k < this.g.getSize(); ++k) {
++                ItemStack itemstack = this.g.getItem(k);
++
++                if (!itemstack.isEmpty() && j > itemstack.getCount()) {
++                    j = itemstack.getCount();
++                }
++            }
++
++            if (j < 64) {
++                ++j;
++            }
++        }
++
++        return j;
++    }
++
++    private void a(int i, IntList intlist) {
++        int j = this.g.j();
++        int k = this.g.i();
++
++        if (this.d instanceof ShapedRecipes) {
++            ShapedRecipes shapedrecipes = (ShapedRecipes) this.d;
++
++            j = shapedrecipes.f();
++            k = shapedrecipes.g();
++        }
++
++        int l = 1;
++        IntListIterator intlistiterator = intlist.iterator();
++
++        for (int i1 = 0; i1 < this.g.j() && k != i1; ++i1) {
++            for (int j1 = 0; j1 < this.g.i(); ++j1) {
++                if (j == j1 || !intlistiterator.hasNext()) {
++                    l += this.g.j() - j1;
++                    break;
++                }
++
++                Slot slot = (Slot) this.h.get(l);
++                ItemStack itemstack = AutoRecipeStackManager.b(((Integer) intlistiterator.next()).intValue());
++
++                if (itemstack.isEmpty()) {
++                    ++l;
++                } else {
++                    for (int k1 = 0; k1 < i; ++k1) {
++                        this.a(slot, itemstack);
++                    }
++
++                    ++l;
++                }
++            }
++
++            if (!intlistiterator.hasNext()) {
++                break;
++            }
++        }
++
++    }
++
++    private void a(Slot slot, ItemStack itemstack) {
++        PlayerInventory playerinventory = this.c.inventory;
++        int i = playerinventory.c(itemstack);
++
++        if (i != -1) {
++            ItemStack itemstack1 = playerinventory.getItem(i).cloneItemStack();
++
++            if (!itemstack1.isEmpty()) {
++                if (itemstack1.getCount() > 1) {
++                    playerinventory.splitStack(i, 1);
++                } else {
++                    playerinventory.splitWithoutUpdate(i);
++                }
++
++                itemstack1.setCount(1);
++                if (slot.getItem().isEmpty()) {
++                    slot.set(itemstack1);
++                } else {
++                    slot.getItem().add(1);
++                }
++
++            }
++        }
++    }
++
++    private boolean c() {
++        PlayerInventory playerinventory = this.c.inventory;
++        int invSize = playerinventory.items.size();
++        int[] simulatedCounts = new int[invSize];
++        int emptySlots = 0;
++
++        for (int s = 0; s < invSize; ++s) {
++            ItemStack invStack = playerinventory.items.get(s);
++            if (invStack.isEmpty()) {
++                ++emptySlots;
++            } else {
++                simulatedCounts[s] = invStack.getCount();
++            }
++        }
++        ItemStack offhand = playerinventory.extraSlots.get(0);
++        int offhandCount = offhand.isEmpty() ? 0 : offhand.getCount();
++        int invMaxStack = playerinventory.getMaxStackSize();
++
++        for (int i = 0; i < this.g.getSize(); ++i) {
++            ItemStack gridStack = this.g.getItem(i);
++            if (gridStack.isEmpty()) {
++                continue;
++            }
++            int remaining = gridStack.getCount();
++            int maxStack = Math.min(gridStack.getMaxStackSize(), invMaxStack);
++
++            if (gridStack.isStackable()) {
++                if (!offhand.isEmpty() && offhandCount < maxStack
++                        && offhand.getItem() == gridStack.getItem()
++                        && (!offhand.usesData() || offhand.getData() == gridStack.getData())
++                        && ItemStack.equals(offhand, gridStack)) {
++                    int add = Math.min(remaining, maxStack - offhandCount);
++                    offhandCount += add;
++                    remaining -= add;
++                }
++                for (int s = 0; s < invSize && remaining > 0; ++s) {
++                    ItemStack invStack = playerinventory.items.get(s);
++                    if (!invStack.isEmpty() && simulatedCounts[s] < maxStack
++                            && invStack.getItem() == gridStack.getItem()
++                            && (!invStack.usesData() || invStack.getData() == gridStack.getData())
++                            && ItemStack.equals(invStack, gridStack)) {
++                        int add = Math.min(remaining, maxStack - simulatedCounts[s]);
++                        simulatedCounts[s] += add;
++                        remaining -= add;
++                    }
++                }
++            }
++
++            while (remaining > 0) {
++                if (--emptySlots < 0) {
++                    return false;
++                }
++                remaining -= Math.min(remaining, maxStack);
++            }
++        }
++
++        return true;
++    }
++}
+diff --git a/main/java/net/minecraft/server/PlayerConnection.java b/main/java/net/minecraft/server/PlayerConnection.java
+index 559a95e..14f9456 100644
+--- a/main/java/net/minecraft/server/PlayerConnection.java
++++ b/main/java/net/minecraft/server/PlayerConnection.java
+@@ -2217,9 +2217,18 @@ public class PlayerConnection implements PacketListenerPlayIn, ITickable {
+ 
+     public void a(PacketPlayInAutoRecipe packetplayinautorecipe) {
+         PlayerConnectionUtils.ensureMainThread(packetplayinautorecipe, this, this.player.x());
++        if (this.player.isFrozen()) {
++            return;
++        }
+         this.player.resetIdleTimer();
+-        if (!this.player.isSpectator() && this.player.activeContainer.windowId == packetplayinautorecipe.a() && this.player.activeContainer.c(this.player)) {
++        if (!this.player.dead
++                && !this.player.isSpectator()
++                && this.player.activeContainer.windowId == packetplayinautorecipe.a()
++                && this.player.activeContainer.c(this.player)
++                && this.player.activeContainer.canUse(this.player)) {
+             this.H.a(this.player, packetplayinautorecipe.b(), packetplayinautorecipe.c());
++        } else if (!this.player.dead) {
++            this.player.updateInventory(this.player.activeContainer);
+         }
+     }
+ 
+diff --git a/test/java/net/minecraft/server/AutoRecipeGuardTest.java b/test/java/net/minecraft/server/AutoRecipeGuardTest.java
+new file mode 100644
+index 0000000..1fa5702
+--- /dev/null
++++ b/test/java/net/minecraft/server/AutoRecipeGuardTest.java
+@@ -0,0 +1,256 @@
++package net.minecraft.server;
++
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++import java.lang.reflect.Field;
++import java.lang.reflect.Method;
++import java.util.ArrayList;
++import java.util.List;
++
++import static org.junit.Assert.*;
++
++public class AutoRecipeGuardTest {
++
++    private static Unsafe UNSAFE;
++
++    @BeforeClass
++    public static void setupTest() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        UNSAFE = (Unsafe) f.get(null);
++    }
++
++    private static final class RecordingPlayerConnection extends PlayerConnection {
++        final List<Packet<?>> sentPackets = new ArrayList<>();
++        boolean disconnected = false;
++
++        RecordingPlayerConnection() throws Exception {
++            super(null, null, null);
++        }
++
++        @Override
++        public void sendPacket(Packet<?> packet) {
++            this.sentPackets.add(packet);
++        }
++
++        @Override
++        public void disconnect(String s) {
++            this.disconnected = true;
++        }
++
++        @Override
++        public void disconnect(IChatBaseComponent ichatbasecomponent) {
++            this.disconnected = true;
++        }
++    }
++
++    private static final class DummyWorld extends WorldServer {
++        DummyWorld() {
++            super(null, null, null, 0, null, null, null);
++        }
++        @Override
++        public boolean isMainThread() {
++            return true;
++        }
++    }
++
++    private static EntityPlayer createMockPlayer(RecordingPlayerConnection conn, boolean creative) throws Exception {
++        DummyWorld world = (DummyWorld) UNSAFE.allocateInstance(DummyWorld.class);
++        Field csField = World.class.getDeclaredField("isClientSide");
++        csField.setAccessible(true);
++        csField.setBoolean(world, true);
++        world.worldData = new WorldData();
++        world.worldProvider = new WorldProviderNormal();
++        EntityPlayer player = (EntityPlayer) UNSAFE.allocateInstance(EntityPlayer.class);
++        player.world = world;
++        player.playerConnection = conn;
++        org.bukkit.craftbukkit.entity.CraftPlayer craftPlayer =
++                (org.bukkit.craftbukkit.entity.CraftPlayer) UNSAFE.allocateInstance(org.bukkit.craftbukkit.entity.CraftPlayer.class);
++        Field entityField = org.bukkit.craftbukkit.entity.CraftEntity.class.getDeclaredField("entity");
++        entityField.setAccessible(true);
++        entityField.set(craftPlayer, player);
++        Field cpHealth = org.bukkit.craftbukkit.entity.CraftPlayer.class.getDeclaredField("health");
++        cpHealth.setAccessible(true);
++        cpHealth.setDouble(craftPlayer, 20.0D);
++        Field beField = Entity.class.getDeclaredField("bukkitEntity");
++        beField.setAccessible(true);
++        beField.set(player, craftPlayer);
++        DataWatcher dw = new DataWatcher(player);
++        dw.register(EntityLiving.HEALTH, 20.0F);
++        Field dwField = Entity.class.getDeclaredField("datawatcher");
++        dwField.setAccessible(true);
++        dwField.set(player, dw);
++        player.abilities = new PlayerAbilities();
++        player.abilities.canInstantlyBuild = creative;
++        PlayerInteractManager pim = (PlayerInteractManager) UNSAFE.allocateInstance(PlayerInteractManager.class);
++        Field gmField = PlayerInteractManager.class.getDeclaredField("gamemode");
++        gmField.setAccessible(true);
++        gmField.set(pim, EnumGamemode.SURVIVAL);
++        Field pimField = EntityPlayer.class.getDeclaredField("playerInteractManager");
++        pimField.setAccessible(true);
++        pimField.set(player, pim);
++        player.inventory = new PlayerInventory(player);
++        ContainerPlayer container = new ContainerPlayer(player.inventory, true, player);
++        container.windowId = 1;
++        player.defaultContainer = container;
++        player.activeContainer = container;
++        return player;
++    }
++
++    private static void setupAutoRecipe(AutoRecipe ar, EntityPlayer player, ContainerPlayer container) throws Exception {
++        Field cField = AutoRecipe.class.getDeclaredField("c");
++        cField.setAccessible(true);
++        cField.set(ar, player);
++        Field gField = AutoRecipe.class.getDeclaredField("g");
++        gField.setAccessible(true);
++        gField.set(ar, container.craftInventory);
++        Field fField = AutoRecipe.class.getDeclaredField("f");
++        fField.setAccessible(true);
++        fField.set(ar, container.resultInventory);
++    }
++
++    @Test
++    public void testCumulativeCapacityRejectsMultiSlotOverflow() throws Exception {
++        RecordingPlayerConnection conn = (RecordingPlayerConnection) UNSAFE.allocateInstance(RecordingPlayerConnection.class);
++        EntityPlayer player = createMockPlayer(conn, false);
++        ContainerPlayer container = (ContainerPlayer) player.activeContainer;
++
++        // Fill 35 of 36 inventory slots with unstackable swords; leave 1 empty slot (slot 35)
++        for (int i = 0; i < 35; i++) {
++            player.inventory.items.set(i, new ItemStack(Items.IRON_SWORD, 1));
++        }
++
++        // Put 2 distinct items in crafting grid: only 1 empty slot exists, so cumulative clear must NOT run!
++        container.craftInventory.setItem(0, new ItemStack(Items.DIAMOND, 1));
++        container.craftInventory.setItem(1, new ItemStack(Items.EMERALD, 1));
++
++        AutoRecipe ar = new AutoRecipe();
++        setupAutoRecipe(ar, player, container);
++
++        Method cMethod = AutoRecipe.class.getDeclaredMethod("c");
++        cMethod.setAccessible(true);
++        assertFalse("Cumulative capacity check must reject 2 items when only 1 empty slot exists",
++                (Boolean) cMethod.invoke(ar));
++
++        // Verify a() aborts cleanly without passing j == -1 or losing items
++        Method aMethod = AutoRecipe.class.getDeclaredMethod("a");
++        aMethod.setAccessible(true);
++        boolean cleared = (Boolean) aMethod.invoke(ar);
++        assertFalse(cleared);
++        // Diamond moved to slot 35, emerald stayed safely in grid slot 1 (total: 1 diamond + 1 emerald, 0 loss, 0 dupe)
++        assertEquals(Items.DIAMOND, player.inventory.items.get(35).getItem());
++        assertTrue(container.craftInventory.getItem(0).isEmpty());
++        assertEquals(Items.EMERALD, container.craftInventory.getItem(1).getItem());
++        assertEquals(1, container.craftInventory.getItem(1).getCount());
++    }
++
++    @Test
++    public void testCumulativeCapacityAllowsPartialStackMerge() throws Exception {
++        RecordingPlayerConnection conn = (RecordingPlayerConnection) UNSAFE.allocateInstance(RecordingPlayerConnection.class);
++        EntityPlayer player = createMockPlayer(conn, false);
++        ContainerPlayer container = (ContainerPlayer) player.activeContainer;
++
++        // All 36 slots occupied, slot 0 has 32 cobblestone
++        player.inventory.items.set(0, new ItemStack(Blocks.COBBLESTONE, 32));
++        for (int i = 1; i < 36; i++) {
++            player.inventory.items.set(i, new ItemStack(Items.IRON_SWORD, 1));
++        }
++        container.craftInventory.setItem(0, new ItemStack(Blocks.COBBLESTONE, 10));
++
++        AutoRecipe ar = new AutoRecipe();
++        setupAutoRecipe(ar, player, container);
++
++        Method cMethod = AutoRecipe.class.getDeclaredMethod("c");
++        cMethod.setAccessible(true);
++        assertTrue((Boolean) cMethod.invoke(ar));
++
++        Method aMethod = AutoRecipe.class.getDeclaredMethod("a");
++        aMethod.setAccessible(true);
++        assertTrue((Boolean) aMethod.invoke(ar));
++        assertEquals(42, player.inventory.items.get(0).getCount());
++        assertTrue(container.craftInventory.getItem(0).isEmpty());
++    }
++
++    @Test
++    public void testPacketPlayInAutoRecipeRejectsIllegalStatesWithoutKick() throws Exception {
++        RecordingPlayerConnection conn = (RecordingPlayerConnection) UNSAFE.allocateInstance(RecordingPlayerConnection.class);
++        Field sentField = RecordingPlayerConnection.class.getDeclaredField("sentPackets");
++        sentField.setAccessible(true);
++        sentField.set(conn, new ArrayList<Packet<?>>());
++        Field nmField = PlayerConnection.class.getDeclaredField("networkManager");
++        nmField.setAccessible(true);
++        nmField.set(conn, new NetworkManager(EnumProtocolDirection.SERVERBOUND) {
++            @Override
++            public boolean isConnected() {
++                return !conn.disconnected;
++            }
++        });
++        EntityPlayer player = createMockPlayer(conn, false);
++        conn.player = player;
++
++        // Track whether AutoRecipe.a(...) is invoked by using a dummy subclass in PlayerConnection.H
++        final boolean[] autoRecipeCalled = new boolean[1];
++        AutoRecipe spy = new AutoRecipe() {
++            @Override
++            public void a(EntityPlayer ep, IRecipe recipe, boolean flag) {
++                autoRecipeCalled[0] = true;
++            }
++        };
++        Field hField = PlayerConnection.class.getDeclaredField("H");
++        hField.setAccessible(true);
++        hField.set(conn, spy);
++
++        // Build a synthetic PacketPlayInAutoRecipe with windowId=99 (mismatch)
++        PacketPlayInAutoRecipe badWindow = (PacketPlayInAutoRecipe) UNSAFE.allocateInstance(PacketPlayInAutoRecipe.class);
++        Field winField = PacketPlayInAutoRecipe.class.getDeclaredField("a");
++        winField.setAccessible(true);
++        winField.setInt(badWindow, 99);
++
++        // Invoke real PlayerConnection.a(PacketPlayInAutoRecipe) with mismatched windowId -> cancelled & resynced, no kick
++        conn.a(badWindow);
++        assertFalse(autoRecipeCalled[0]);
++        assertFalse(conn.disconnected);
++        assertFalse("Expected resync packet on windowId mismatch; isFrozen=" + player.isFrozen()
++                + ", isDisconnected=" + conn.isDisconnected() + ", sent=" + conn.sentPackets.size(),
++                conn.sentPackets.isEmpty());
++
++        // Dead player state -> blocked with no kick and no AutoRecipe call
++        conn.sentPackets.clear();
++        winField.setInt(badWindow, 1);
++        player.dead = true;
++        conn.a(badWindow);
++        assertFalse(autoRecipeCalled[0]);
++        assertFalse(conn.disconnected);
++    }
++
++    @Test
++    public void testAutoRecipeCumulativeCheckPerformance() throws Exception {
++        RecordingPlayerConnection conn = (RecordingPlayerConnection) UNSAFE.allocateInstance(RecordingPlayerConnection.class);
++        EntityPlayer player = createMockPlayer(conn, false);
++        ContainerPlayer container = (ContainerPlayer) player.activeContainer;
++        for (int i = 0; i < 36; i++) {
++            player.inventory.items.set(i, new ItemStack(Blocks.COBBLESTONE, 32));
++        }
++        for (int i = 0; i < 4; i++) {
++            container.craftInventory.setItem(i, new ItemStack(Blocks.COBBLESTONE, 16));
++        }
++        AutoRecipe ar = new AutoRecipe();
++        setupAutoRecipe(ar, player, container);
++        Method cMethod = AutoRecipe.class.getDeclaredMethod("c");
++        cMethod.setAccessible(true);
++
++        for (int i = 0; i < 1000; i++) {
++            assertTrue((Boolean) cMethod.invoke(ar));
++        }
++        long t0 = System.nanoTime();
++        for (int i = 0; i < 10000; i++) {
++            assertTrue((Boolean) cMethod.invoke(ar));
++        }
++        long elapsedNs = System.nanoTime() - t0;
++        System.out.printf("[B1 Perf] 10000x AutoRecipe.c() cumulative capacity check: %d us%n", elapsedNs / 1000L);
++        assertTrue("Expected < 200ms for 10,000 checks, got " + (elapsedNs / 1_000_000L) + "ms", elapsedNs < 200_000_000L);
++    }
++}
