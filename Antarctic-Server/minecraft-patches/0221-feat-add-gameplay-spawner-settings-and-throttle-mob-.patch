@@ -1,0 +1,640 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Fri, 27 Nov 2026 12:57:01 +0700
+Subject: [PATCH 221/221] feat: add gameplay spawner-settings and
+ throttle-mob-spawning configs
+
+
+diff --git a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+index 1e4b4b4..12a61b5 100644
+--- a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
++++ b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+@@ -12,6 +12,7 @@ import com.destroystokyo.paper.config.toml.modules.gameplay.ChunkOverloadDupe;
+ import com.destroystokyo.paper.config.toml.modules.gameplay.Collisions;
+ import com.destroystokyo.paper.config.toml.modules.gameplay.MergeChecks;
+ import com.destroystokyo.paper.config.toml.modules.gameplay.Player;
++import com.destroystokyo.paper.config.toml.modules.gameplay.SpawnerSettings;
+ import com.destroystokyo.paper.config.toml.modules.misc.Privacy;
+ import com.destroystokyo.paper.config.toml.modules.misc.Rebrand;
+ import com.destroystokyo.paper.config.toml.modules.network.Deflate;
+@@ -63,7 +64,7 @@ public final class AntarcticTomlConfig {
+             new Deflate(),
+             new VirtualThreads(), new AsyncPlayerDataSaving(),
+             new Pathfinder(), new Suffocation(), new Projectiles(), new ArmourStands(), new WorldBorder(), new ChunkLoading(), new MobSpawning(), new Dab(), new FarmAiCulling(), new EntityPhysicsGuard(), new DontSaveEntity(), new SunBurn(), new Rails(), new Redstone(), new RedstoneGuard(), new Physics(), new Lighting(),
+-            new MergeChecks(), new ChunkOverloadDupe(), new Collisions(), new Player(),
++            new MergeChecks(), new ChunkOverloadDupe(), new Collisions(), new Player(), new SpawnerSettings(),
+             new MapDecorations(), new Books(), new VanillaBugFix());
+     private static final YamlConfiguration yamlFacade = new YamlConfiguration();
+     private static File configFile = new File("antarctic.toml");
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/gameplay/SpawnerSettings.java b/main/java/com/destroystokyo/paper/config/toml/modules/gameplay/SpawnerSettings.java
+new file mode 100644
+index 0000000..16d106e
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/gameplay/SpawnerSettings.java
+@@ -0,0 +1,60 @@
++package com.destroystokyo.paper.config.toml.modules.gameplay;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++
++public class SpawnerSettings implements IConfigModule {
++
++    @ConfigInfo(
++        baseName = "enabled",
++        comments = "Enable custom mob spawner check toggles and overrides. Default false preserves exact vanilla 1.12.2 spawner behavior."
++    )
++    public static boolean enabled = false;
++
++    @ConfigInfo(baseName = "check-for-nearby-players", comments = "Require a nearby player within requiredPlayerRange to tick the spawner. Default true.")
++    public static boolean checkForNearbyPlayers = true;
++
++    @ConfigInfo(baseName = "check-for-max-nearby-entities", comments = "Enforce maxNearbyEntities cap around the spawner. Default true.")
++    public static boolean checkForMaxNearbyEntities = true;
++
++    @ConfigInfo(baseName = "check-for-light-level", comments = "Enforce light-level spawn checks for spawner-created monsters. Default true.")
++    public static boolean checkForLightLevel = true;
++
++    @ConfigInfo(baseName = "check-for-block-collision", comments = "Enforce block/entity collision checks at the spawner spawn position. Default true.")
++    public static boolean checkForBlockCollision = true;
++
++    @ConfigInfo(baseName = "check-for-water", comments = "Disallow spawner placement inside liquid blocks for land mobs. Default true.")
++    public static boolean checkForWater = true;
++
++    @ConfigInfo(baseName = "check-for-spawn-rules", comments = "Enforce EntityInsentient.P() spawn rule checks on spawner mobs. Default true.")
++    public static boolean checkForSpawnRules = true;
++
++    @ConfigInfo(baseName = "min-spawn-delay-override", comments = "Override spawner minSpawnDelay when >= 0 (default -1 = use spawner NBT).")
++    public static int minSpawnDelayOverride = -1;
++
++    @ConfigInfo(baseName = "max-spawn-delay-override", comments = "Override spawner maxSpawnDelay when >= 0 (default -1 = use spawner NBT).")
++    public static int maxSpawnDelayOverride = -1;
++
++    @ConfigInfo(baseName = "spawn-count-override", comments = "Override spawner spawnCount when > 0 (default -1 = use spawner NBT).")
++    public static int spawnCountOverride = -1;
++
++    @ConfigInfo(baseName = "max-nearby-entities-override", comments = "Override spawner maxNearbyEntities when >= 0 (default -1 = use spawner NBT).")
++    public static int maxNearbyEntitiesOverride = -1;
++
++    @ConfigInfo(baseName = "required-player-range-override", comments = "Override spawner requiredPlayerRange when > 0 (default -1 = use spawner NBT).")
++    public static int requiredPlayerRangeOverride = -1;
++
++    @ConfigInfo(baseName = "spawn-range-override", comments = "Override spawner spawnRange when > 0 (default -1 = use spawner NBT).")
++    public static int spawnRangeOverride = -1;
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.GAMEPLAY;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "spawner-settings";
++    }
++}
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/MobSpawning.java b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/MobSpawning.java
+index 21c803e..93a022d 100644
+--- a/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/MobSpawning.java
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/MobSpawning.java
+@@ -62,6 +62,56 @@ public class MobSpawning implements IConfigModule {
+     )
+     public static int perPlayerMobCountRadiusChunks = 0;
+ 
++    @ConfigInfo(
++        baseName = "throttle-mob-spawning.enabled",
++        comments = "Throttle natural mob spawning attempts in chunks with repeated failed spawn attempts per EnumCreatureType. Default false."
++    )
++    public static boolean throttleMobSpawningEnabled = false;
++
++    @ConfigInfo(baseName = "throttle-mob-spawning.monster.min-failed-attempts", comments = "Minimum consecutive failed MONSTER spawn attempts in a chunk before throttling. Default 8.")
++    public static int throttleMonsterMinFailedAttempts = 8;
++
++    @ConfigInfo(baseName = "throttle-mob-spawning.monster.spawn-chance", comments = "Percentage chance (1-100) to attempt MONSTER spawning once throttled. Default 25.")
++    public static int throttleMonsterSpawnChance = 25;
++
++    @ConfigInfo(baseName = "throttle-mob-spawning.creature.min-failed-attempts", comments = "Minimum consecutive failed CREATURE spawn attempts in a chunk before throttling. Default 8.")
++    public static int throttleCreatureMinFailedAttempts = 8;
++
++    @ConfigInfo(baseName = "throttle-mob-spawning.creature.spawn-chance", comments = "Percentage chance (1-100) to attempt CREATURE spawning once throttled. Default 25.")
++    public static int throttleCreatureSpawnChance = 25;
++
++    @ConfigInfo(baseName = "throttle-mob-spawning.ambient.min-failed-attempts", comments = "Minimum consecutive failed AMBIENT spawn attempts in a chunk before throttling. Default 8.")
++    public static int throttleAmbientMinFailedAttempts = 8;
++
++    @ConfigInfo(baseName = "throttle-mob-spawning.ambient.spawn-chance", comments = "Percentage chance (1-100) to attempt AMBIENT spawning once throttled. Default 25.")
++    public static int throttleAmbientSpawnChance = 25;
++
++    @ConfigInfo(baseName = "throttle-mob-spawning.water-creature.min-failed-attempts", comments = "Minimum consecutive failed WATER_CREATURE spawn attempts in a chunk before throttling. Default 8.")
++    public static int throttleWaterCreatureMinFailedAttempts = 8;
++
++    @ConfigInfo(baseName = "throttle-mob-spawning.water-creature.spawn-chance", comments = "Percentage chance (1-100) to attempt WATER_CREATURE spawning once throttled. Default 25.")
++    public static int throttleWaterCreatureSpawnChance = 25;
++
++    public static int getThrottleMinFailedAttempts(int categoryOrd) {
++        switch (categoryOrd) {
++            case 0: return throttleMonsterMinFailedAttempts;
++            case 1: return throttleCreatureMinFailedAttempts;
++            case 2: return throttleAmbientMinFailedAttempts;
++            case 3: return throttleWaterCreatureMinFailedAttempts;
++            default: return 8;
++        }
++    }
++
++    public static int getThrottleSpawnChance(int categoryOrd) {
++        switch (categoryOrd) {
++            case 0: return throttleMonsterSpawnChance;
++            case 1: return throttleCreatureSpawnChance;
++            case 2: return throttleAmbientSpawnChance;
++            case 3: return throttleWaterCreatureSpawnChance;
++            default: return 25;
++        }
++    }
++
+     public static int getPrecheckLightMode() {
+         String mode = precheckLightMode;
+         if (mode == "single-roll") {
+@@ -139,5 +189,13 @@ public class MobSpawning implements IConfigModule {
+                 "optimizations.mob-spawning.per-player-mob-count-radius-chunks must be >= 0, got: " + perPlayerMobCountRadiusChunks
+             );
+         }
++        throttleMonsterMinFailedAttempts = Math.max(1, throttleMonsterMinFailedAttempts);
++        throttleCreatureMinFailedAttempts = Math.max(1, throttleCreatureMinFailedAttempts);
++        throttleAmbientMinFailedAttempts = Math.max(1, throttleAmbientMinFailedAttempts);
++        throttleWaterCreatureMinFailedAttempts = Math.max(1, throttleWaterCreatureMinFailedAttempts);
++        throttleMonsterSpawnChance = Math.max(1, Math.min(100, throttleMonsterSpawnChance));
++        throttleCreatureSpawnChance = Math.max(1, Math.min(100, throttleCreatureSpawnChance));
++        throttleAmbientSpawnChance = Math.max(1, Math.min(100, throttleAmbientSpawnChance));
++        throttleWaterCreatureSpawnChance = Math.max(1, Math.min(100, throttleWaterCreatureSpawnChance));
+     }
+ }
+diff --git a/main/java/net/minecraft/server/Chunk.java b/main/java/net/minecraft/server/Chunk.java
+index c45e6bd..61bec5a 100644
+--- a/main/java/net/minecraft/server/Chunk.java
++++ b/main/java/net/minecraft/server/Chunk.java
+@@ -90,6 +90,24 @@ public class Chunk {
+     private static final EnumCreatureType[] CREATURE_TYPES = EnumCreatureType.values();
+     public final int[] antarcticCreatureCounts = new int[CREATURE_TYPES.length];
+     private boolean antarcticCountsInWorld = false;
++    private int[] antarcticFailedSpawnAttempts;
++
++    public int getFailedSpawnAttempts(int categoryOrd) {
++        return this.antarcticFailedSpawnAttempts != null ? this.antarcticFailedSpawnAttempts[categoryOrd] : 0;
++    }
++
++    public void recordFailedSpawnAttempt(int categoryOrd) {
++        if (this.antarcticFailedSpawnAttempts == null) {
++            this.antarcticFailedSpawnAttempts = new int[CREATURE_TYPES.length];
++        }
++        ++this.antarcticFailedSpawnAttempts[categoryOrd];
++    }
++
++    public void resetFailedSpawnAttempts(int categoryOrd) {
++        if (this.antarcticFailedSpawnAttempts != null) {
++            this.antarcticFailedSpawnAttempts[categoryOrd] = 0;
++        }
++    }
+ 
+     public int getCreatureCount(EnumCreatureType type) {
+         return this.antarcticCreatureCounts[type.ordinal()];
+diff --git a/main/java/net/minecraft/server/MobSpawnerAbstract.java b/main/java/net/minecraft/server/MobSpawnerAbstract.java
+index 71fb158..718377a 100644
+--- a/main/java/net/minecraft/server/MobSpawnerAbstract.java
++++ b/main/java/net/minecraft/server/MobSpawnerAbstract.java
+@@ -73,9 +73,17 @@ public abstract class MobSpawnerAbstract {
+     }
+ 
+     private boolean h() {
++        if (com.destroystokyo.paper.config.toml.modules.gameplay.SpawnerSettings.enabled
++                && !com.destroystokyo.paper.config.toml.modules.gameplay.SpawnerSettings.checkForNearbyPlayers) {
++            return true;
++        }
+         BlockPosition blockposition = this.b();
++        int range = (com.destroystokyo.paper.config.toml.modules.gameplay.SpawnerSettings.enabled
++                && com.destroystokyo.paper.config.toml.modules.gameplay.SpawnerSettings.requiredPlayerRangeOverride > 0)
++                ? com.destroystokyo.paper.config.toml.modules.gameplay.SpawnerSettings.requiredPlayerRangeOverride
++                : this.requiredPlayerRange;
+ 
+-        return this.a().isPlayerNearby((double) blockposition.getX() + 0.5D, (double) blockposition.getY() + 0.5D, (double) blockposition.getZ() + 0.5D, (double) this.requiredPlayerRange);
++        return this.a().isPlayerNearby((double) blockposition.getX() + 0.5D, (double) blockposition.getY() + 0.5D, (double) blockposition.getZ() + 0.5D, (double) range);
+     }
+ 
+     public void c() {
+@@ -121,7 +129,11 @@ public abstract class MobSpawnerAbstract {
+                     this.spawnDelay -= tickDelay; // Paper
+                     return;
+                 }
+-                if (this.spawnCount <= 0) {
++                final boolean spawnerSettingsEnabled = com.destroystokyo.paper.config.toml.modules.gameplay.SpawnerSettings.enabled;
++                final int effectiveSpawnCount = (spawnerSettingsEnabled && com.destroystokyo.paper.config.toml.modules.gameplay.SpawnerSettings.spawnCountOverride > 0)
++                        ? com.destroystokyo.paper.config.toml.modules.gameplay.SpawnerSettings.spawnCountOverride
++                        : this.spawnCount;
++                if (effectiveSpawnCount <= 0) {
+                     return;
+                 }
+ 
+@@ -134,11 +146,18 @@ public abstract class MobSpawnerAbstract {
+                     return;
+                 }
+                 Class<? extends Entity> entityClass = this.cachedEntityClass;
++                final int effectiveSpawnRange = (spawnerSettingsEnabled && com.destroystokyo.paper.config.toml.modules.gameplay.SpawnerSettings.spawnRangeOverride > 0)
++                        ? com.destroystokyo.paper.config.toml.modules.gameplay.SpawnerSettings.spawnRangeOverride
++                        : this.spawnRange;
++                final boolean checkMaxNearby = !spawnerSettingsEnabled || com.destroystokyo.paper.config.toml.modules.gameplay.SpawnerSettings.checkForMaxNearbyEntities;
++                final int effectiveMaxNearby = (spawnerSettingsEnabled && com.destroystokyo.paper.config.toml.modules.gameplay.SpawnerSettings.maxNearbyEntitiesOverride >= 0)
++                        ? com.destroystokyo.paper.config.toml.modules.gameplay.SpawnerSettings.maxNearbyEntitiesOverride
++                        : this.maxNearbyEntities;
+                 boolean hasPreSpawnListeners = com.destroystokyo.paper.event.entity.PreCreatureSpawnEvent.getHandlerList().getRegisteredListeners().length != 0;
+                 org.bukkit.entity.EntityType type = hasPreSpawnListeners ? org.bukkit.entity.EntityType.fromName(mobName.getKey()) : null;
+-                AxisAlignedBB spawnerBox = (new AxisAlignedBB((double) blockposition.getX(), (double) blockposition.getY(), (double) blockposition.getZ(), (double) (blockposition.getX() + 1), (double) (blockposition.getY() + 1), (double) (blockposition.getZ() + 1))).g((double) this.spawnRange);
++                AxisAlignedBB spawnerBox = (new AxisAlignedBB((double) blockposition.getX(), (double) blockposition.getY(), (double) blockposition.getZ(), (double) (blockposition.getX() + 1), (double) (blockposition.getY() + 1), (double) (blockposition.getZ() + 1))).g((double) effectiveSpawnRange);
+                 // Fast early cap exit before any loop work when no PreCreatureSpawnEvent listeners are registered
+-                if (!hasPreSpawnListeners && entityClass != null && world.countEntities(entityClass, spawnerBox, IEntitySelector.e, this.maxNearbyEntities) >= this.maxNearbyEntities) {
++                if (checkMaxNearby && !hasPreSpawnListeners && entityClass != null && world.countEntities(entityClass, spawnerBox, IEntitySelector.e, effectiveMaxNearby) >= effectiveMaxNearby) {
+                     this.i();
+                     return;
+                 }
+@@ -146,13 +165,16 @@ public abstract class MobSpawnerAbstract {
+ 
+                 boolean flag = false;
+                 final int precheckMode = com.destroystokyo.paper.config.toml.modules.optimizations.MobSpawning.getPrecheckLightMode();
++                final boolean allowPrecheck = !spawnerSettingsEnabled
++                        || (com.destroystokyo.paper.config.toml.modules.gameplay.SpawnerSettings.checkForLightLevel
++                            && com.destroystokyo.paper.config.toml.modules.gameplay.SpawnerSettings.checkForSpawnRules);
+ 
+-                for (int i = 0; i < this.spawnCount; ++i) {
++                for (int i = 0; i < effectiveSpawnCount; ++i) {
+                     NBTTagList nbttaglist = nbttagcompound.getList("Pos", 6);
+                     int j = nbttaglist.size();
+-                    double d3 = j >= 1 ? nbttaglist.f(0) : (double) blockposition.getX() + (world.random.nextDouble() - world.random.nextDouble()) * (double) this.spawnRange + 0.5D;
++                    double d3 = j >= 1 ? nbttaglist.f(0) : (double) blockposition.getX() + (world.random.nextDouble() - world.random.nextDouble()) * (double) effectiveSpawnRange + 0.5D;
+                     double d4 = j >= 2 ? nbttaglist.f(1) : (double) (blockposition.getY() + world.random.nextInt(3) - 1);
+-                    double d5 = j >= 3 ? nbttaglist.f(2) : (double) blockposition.getZ() + (world.random.nextDouble() - world.random.nextDouble()) * (double) this.spawnRange + 0.5D;
++                    double d5 = j >= 3 ? nbttaglist.f(2) : (double) blockposition.getZ() + (world.random.nextDouble() - world.random.nextDouble()) * (double) effectiveSpawnRange + 0.5D;
+                     // Paper start - preserve PreCreatureSpawnEvent firing order when listeners are registered
+                     if (type != null) {
+                         com.destroystokyo.paper.event.entity.PreCreatureSpawnEvent event;
+@@ -171,12 +193,13 @@ public abstract class MobSpawnerAbstract {
+                     }
+                     // Paper end
+                     // Antarctic start - check maxNearbyEntities and precheck spawn BEFORE NBT deserialization & 14.9 KiB entity construction
+-                    if (entityClass != null && world.countEntities(entityClass, spawnerBox, IEntitySelector.e, this.maxNearbyEntities) >= this.maxNearbyEntities) {
++                    if (checkMaxNearby && entityClass != null && world.countEntities(entityClass, spawnerBox, IEntitySelector.e, effectiveMaxNearby) >= effectiveMaxNearby) {
+                         this.i();
+                         return;
+                     }
+                     int precheckResult = SpawnerCreature.PRECHECK_RESULT_PASS;
+-                    if (precheckMode != com.destroystokyo.paper.config.toml.modules.optimizations.MobSpawning.PRECHECK_OFF
++                    if (allowPrecheck
++                            && precheckMode != com.destroystokyo.paper.config.toml.modules.optimizations.MobSpawning.PRECHECK_OFF
+                             && entityClass != null
+                             && EntityInsentient.class.isAssignableFrom(entityClass)
+                             && (entityClass != EntitySlime.class || world.getWorldData().getType() != WorldType.FLAT)) {
+@@ -201,10 +224,10 @@ public abstract class MobSpawnerAbstract {
+                         return;
+                     }
+ 
+-                    if (entityClass == null) {
+-                        int k = world.countEntities(entity.getClass(), spawnerBox, IEntitySelector.e, this.maxNearbyEntities);
++                    if (checkMaxNearby && entityClass == null) {
++                        int k = world.countEntities(entity.getClass(), spawnerBox, IEntitySelector.e, effectiveMaxNearby);
+ 
+-                        if (k >= this.maxNearbyEntities) {
++                        if (k >= effectiveMaxNearby) {
+                             this.i();
+                             return;
+                         }
+@@ -216,7 +239,7 @@ public abstract class MobSpawnerAbstract {
+                     if (precheckResult == SpawnerCreature.PRECHECK_RESULT_PASS_LIGHT_PRECHECKED && entity instanceof EntityMonster) {
+                         ((EntityMonster) entity).antarcticLightPrechecked = true;
+                     }
+-                    if (entityinsentient == null || entityinsentient.P() && entityinsentient.canSpawn()) {
++                    if (entityinsentient == null || canSpawnerPlaceEntity(entityinsentient)) {
+                         if (this.spawnData.b().d() == 1 && this.spawnData.b().hasKeyOfType("id", 8) && entity instanceof EntityInsentient) {
+                             ((EntityInsentient) entity).prepare(world.D(new BlockPosition(entity)), (GroupDataEntity) null);
+                         }
+@@ -257,13 +280,49 @@ public abstract class MobSpawnerAbstract {
+         }
+     }
+ 
++    private static boolean canSpawnerPlaceEntity(EntityInsentient entityinsentient) {
++        if (!com.destroystokyo.paper.config.toml.modules.gameplay.SpawnerSettings.enabled) {
++            return entityinsentient.P() && entityinsentient.canSpawn();
++        }
++        if (!com.destroystokyo.paper.config.toml.modules.gameplay.SpawnerSettings.checkForLightLevel && entityinsentient instanceof EntityMonster) {
++            ((EntityMonster) entityinsentient).antarcticLightPrechecked = true;
++        }
++        if (com.destroystokyo.paper.config.toml.modules.gameplay.SpawnerSettings.checkForSpawnRules && !entityinsentient.P()) {
++            return false;
++        }
++        if (com.destroystokyo.paper.config.toml.modules.gameplay.SpawnerSettings.checkForBlockCollision
++                && com.destroystokyo.paper.config.toml.modules.gameplay.SpawnerSettings.checkForWater) {
++            return entityinsentient.canSpawn();
++        }
++        AxisAlignedBB bb = entityinsentient.getBoundingBox();
++        World w = entityinsentient.world;
++        if (com.destroystokyo.paper.config.toml.modules.gameplay.SpawnerSettings.checkForWater && w.containsLiquid(bb)) {
++            return false;
++        }
++        if (com.destroystokyo.paper.config.toml.modules.gameplay.SpawnerSettings.checkForBlockCollision
++                && (!w.getCubes(entityinsentient, bb).isEmpty() || !w.a(bb, entityinsentient))) {
++            return false;
++        }
++        return true;
++    }
++
+     private void i() {
+-        if (this.maxSpawnDelay <= this.minSpawnDelay) {
+-            this.spawnDelay = this.minSpawnDelay;
++        int minDelay = this.minSpawnDelay;
++        int maxDelay = this.maxSpawnDelay;
++        if (com.destroystokyo.paper.config.toml.modules.gameplay.SpawnerSettings.enabled) {
++            if (com.destroystokyo.paper.config.toml.modules.gameplay.SpawnerSettings.minSpawnDelayOverride >= 0) {
++                minDelay = com.destroystokyo.paper.config.toml.modules.gameplay.SpawnerSettings.minSpawnDelayOverride;
++            }
++            if (com.destroystokyo.paper.config.toml.modules.gameplay.SpawnerSettings.maxSpawnDelayOverride >= 0) {
++                maxDelay = com.destroystokyo.paper.config.toml.modules.gameplay.SpawnerSettings.maxSpawnDelayOverride;
++            }
++        }
++        if (maxDelay <= minDelay) {
++            this.spawnDelay = minDelay;
+         } else {
+-            int i = this.maxSpawnDelay - this.minSpawnDelay;
++            int i = maxDelay - minDelay;
+ 
+-            this.spawnDelay = this.minSpawnDelay + this.a().random.nextInt(i);
++            this.spawnDelay = minDelay + this.a().random.nextInt(i);
+         }
+ 
+         if (!this.mobs.isEmpty()) {
+diff --git a/main/java/net/minecraft/server/SpawnerCreature.java b/main/java/net/minecraft/server/SpawnerCreature.java
+index 61c1aa2..ccd55ab 100644
+--- a/main/java/net/minecraft/server/SpawnerCreature.java
++++ b/main/java/net/minecraft/server/SpawnerCreature.java
+@@ -558,6 +558,12 @@ public final class SpawnerCreature {
+                             if (originChunk == null) {
+                                 continue;
+                             }
++                            if (MobSpawning.throttleMobSpawningEnabled && shouldThrottleChunkSpawn(originChunk, categoryOrd, worldserver.random)) {
++                                continue;
++                            }
++                            boolean chunkSpawned = false;
++                            boolean abortedByEvent = false;
++                            try {
+                             // Antarctic start - inline getRandomPosition using heightMap directly (zero BlockPosition allocations)
+                             int localX = worldserver.random.nextInt(16);
+                             int localZ = worldserver.random.nextInt(16);
+@@ -631,6 +637,7 @@ public final class SpawnerCreature {
+                                                                         );
+                                                                         if (!event.callEvent()) {
+                                                                             if (event.shouldAbortSpawn()) {
++                                                                                abortedByEvent = true;
+                                                                                 continue label120;
+                                                                             }
+                                                                             j1 += l2;
+@@ -668,6 +675,10 @@ public final class SpawnerCreature {
+                                                                         // CraftBukkit start
+                                                                         if (worldserver.addEntity(entityinsentient, SpawnReason.NATURAL)) {
+                                                                             ++l2;
++                                                                            chunkSpawned = true;
++                                                                            if (MobSpawning.throttleMobSpawningEnabled) {
++                                                                                originChunk.resetFailedSpawnAttempts(categoryOrd);
++                                                                            }
+                                                                             if (perPlayerMobSpawns) {
+                                                                                 if (this.recordLocalMobSpawnAndCheckCap(spawnChunkX, spawnChunkZ, categoryOrd, limit, localCapRadius)) {
+                                                                                     continue label120;
+@@ -704,6 +715,11 @@ public final class SpawnerCreature {
+                                     }
+                                 }
+                             }
++                            } finally {
++                                if (MobSpawning.throttleMobSpawningEnabled && !chunkSpawned && !abortedByEvent) {
++                                    originChunk.recordFailedSpawnAttempt(categoryOrd);
++                                }
++                            }
+                         }
+                     }
+                 }
+@@ -713,6 +729,18 @@ public final class SpawnerCreature {
+         }
+     }
+ 
++    static boolean shouldThrottleChunkSpawn(Chunk chunk, int categoryOrd, Random random) {
++        if (!MobSpawning.throttleMobSpawningEnabled || chunk == null) {
++            return false;
++        }
++        int minFailed = MobSpawning.getThrottleMinFailedAttempts(categoryOrd);
++        if (chunk.getFailedSpawnAttempts(categoryOrd) < minFailed) {
++            return false;
++        }
++        int chance = MobSpawning.getThrottleSpawnChance(categoryOrd);
++        return random.nextInt(100) >= chance;
++    }
++
+     private static BlockPosition getRandomPosition(World world, int i, int j) {
+         Chunk chunk = world.getChunkAt(i, j);
+         int k = i * 16 + world.random.nextInt(16);
+diff --git a/test/java/net/minecraft/server/SpawnerAndMobThrottleConfigTest.java b/test/java/net/minecraft/server/SpawnerAndMobThrottleConfigTest.java
+new file mode 100644
+index 0000000..3007982
+--- /dev/null
++++ b/test/java/net/minecraft/server/SpawnerAndMobThrottleConfigTest.java
+@@ -0,0 +1,199 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.PaperWorldConfig;
++import com.destroystokyo.paper.config.toml.modules.gameplay.SpawnerSettings;
++import com.destroystokyo.paper.config.toml.modules.optimizations.MobSpawning;
++import org.junit.After;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++import java.lang.reflect.Field;
++import java.util.Random;
++
++import static org.junit.Assert.*;
++
++public class SpawnerAndMobThrottleConfigTest {
++
++    private static Unsafe UNSAFE;
++
++    private final boolean prevSpawnerEnabled = SpawnerSettings.enabled;
++    private final boolean prevNearbyPlayers = SpawnerSettings.checkForNearbyPlayers;
++    private final boolean prevMaxNearby = SpawnerSettings.checkForMaxNearbyEntities;
++    private final int prevMinDelay = SpawnerSettings.minSpawnDelayOverride;
++    private final int prevMaxDelay = SpawnerSettings.maxSpawnDelayOverride;
++    private final int prevReqRange = SpawnerSettings.requiredPlayerRangeOverride;
++
++    private final boolean prevThrottleEnabled = MobSpawning.throttleMobSpawningEnabled;
++    private final int prevMonsterMinFailed = MobSpawning.throttleMonsterMinFailedAttempts;
++    private final int prevMonsterChance = MobSpawning.throttleMonsterSpawnChance;
++
++    @BeforeClass
++    public static void init() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        UNSAFE = (Unsafe) f.get(null);
++    }
++
++    @After
++    public void restoreConfig() {
++        SpawnerSettings.enabled = prevSpawnerEnabled;
++        SpawnerSettings.checkForNearbyPlayers = prevNearbyPlayers;
++        SpawnerSettings.checkForMaxNearbyEntities = prevMaxNearby;
++        SpawnerSettings.minSpawnDelayOverride = prevMinDelay;
++        SpawnerSettings.maxSpawnDelayOverride = prevMaxDelay;
++        SpawnerSettings.requiredPlayerRangeOverride = prevReqRange;
++        MobSpawning.throttleMobSpawningEnabled = prevThrottleEnabled;
++        MobSpawning.throttleMonsterMinFailedAttempts = prevMonsterMinFailed;
++        MobSpawning.throttleMonsterSpawnChance = prevMonsterChance;
++    }
++
++    private static final class MockWorld extends World {
++        boolean playerNearbyResult = false;
++        double lastRequestedRange = -1.0D;
++
++        MockWorld() throws Exception {
++            super(null, null, null, null, false, null, null);
++        }
++
++        @Override
++        protected IChunkProvider n() {
++            return null;
++        }
++
++        @Override
++        protected boolean isChunkLoaded(int i, int j, boolean flag) {
++            return false;
++        }
++
++        @Override
++        public boolean isPlayerNearby(double d0, double d1, double d2, double d3) {
++            this.lastRequestedRange = d3;
++            return this.playerNearbyResult;
++        }
++    }
++
++    private static MockWorld newMockWorld() throws Exception {
++        MockWorld world = (MockWorld) UNSAFE.allocateInstance(MockWorld.class);
++        Field randField = World.class.getDeclaredField("random");
++        randField.setAccessible(true);
++        randField.set(world, new Random(123L));
++        PaperWorldConfig pwc = (PaperWorldConfig) UNSAFE.allocateInstance(PaperWorldConfig.class);
++        pwc.mobSpawnerTickRate = 1;
++        Field pwcField = World.class.getDeclaredField("paperConfig");
++        pwcField.setAccessible(true);
++        pwcField.set(world, pwc);
++        return world;
++    }
++
++    @Test
++    public void testSpawnerSettingsVanillaParityAndOverrides() throws Exception {
++        MockWorld world = newMockWorld();
++        MobSpawnerAbstract spawner = new MobSpawnerAbstract() {
++            @Override
++            public void a(int i) {}
++
++            @Override
++            public World a() {
++                return world;
++            }
++
++            @Override
++            public BlockPosition b() {
++                return new BlockPosition(0, 64, 0);
++            }
++        };
++        spawner.requiredPlayerRange = 16;
++        spawner.spawnDelay = 0;
++        spawner.minSpawnDelay = 200;
++        spawner.maxSpawnDelay = 800;
++
++        // Vanilla mode (enabled = false): no player nearby -> does not tick/reset delay
++        SpawnerSettings.enabled = false;
++        SpawnerSettings.checkForNearbyPlayers = false;
++        SpawnerSettings.requiredPlayerRangeOverride = 64;
++        world.playerNearbyResult = false;
++        spawner.c();
++        assertEquals(0, spawner.spawnDelay);
++        assertEquals(16.0D, world.lastRequestedRange, 0.001D);
++
++        // Enabled with requiredPlayerRangeOverride = 48
++        SpawnerSettings.enabled = true;
++        SpawnerSettings.checkForNearbyPlayers = true;
++        SpawnerSettings.requiredPlayerRangeOverride = 48;
++        spawner.c();
++        assertEquals(48.0D, world.lastRequestedRange, 0.001D);
++
++        // Enabled with checkForNearbyPlayers = false & delay overrides -> ticks without player and applies override delay
++        SpawnerSettings.checkForNearbyPlayers = false;
++        SpawnerSettings.minSpawnDelayOverride = 20;
++        SpawnerSettings.maxSpawnDelayOverride = 20;
++        spawner.spawnDelay = -1;
++        // Invoke private i() via reflection to verify delay override cleanly
++        java.lang.reflect.Method resetMethod = MobSpawnerAbstract.class.getDeclaredMethod("i");
++        resetMethod.setAccessible(true);
++        resetMethod.invoke(spawner);
++        assertEquals(20, spawner.spawnDelay);
++    }
++
++    @Test
++    public void testChunkFailedSpawnAttemptCounterAndThrottle() throws Exception {
++        // UNSAFE-allocated chunk stays null-safe
++        Chunk chunk = (Chunk) UNSAFE.allocateInstance(Chunk.class);
++        int monsterOrd = EnumCreatureType.MONSTER.ordinal();
++        assertEquals(0, chunk.getFailedSpawnAttempts(monsterOrd));
++
++        MobSpawning.throttleMobSpawningEnabled = true;
++        MobSpawning.throttleMonsterMinFailedAttempts = 4;
++        MobSpawning.throttleMonsterSpawnChance = 25;
++
++        Random rng = new Random(42L);
++        for (int i = 0; i < 3; i++) {
++            chunk.recordFailedSpawnAttempt(monsterOrd);
++            assertFalse(SpawnerCreature.shouldThrottleChunkSpawn(chunk, monsterOrd, rng));
++        }
++
++        // 4th failure hits threshold -> ~75% of attempts should throttle
++        chunk.recordFailedSpawnAttempt(monsterOrd);
++        assertEquals(4, chunk.getFailedSpawnAttempts(monsterOrd));
++        int throttled = 0;
++        for (int i = 0; i < 1000; i++) {
++            if (SpawnerCreature.shouldThrottleChunkSpawn(chunk, monsterOrd, rng)) {
++                throttled++;
++            }
++        }
++        assertTrue("Expected ~750 throttled out of 1000, got " + throttled, throttled > 650 && throttled < 850);
++
++        // Reset on successful spawn restores immediate attempts
++        chunk.resetFailedSpawnAttempts(monsterOrd);
++        assertEquals(0, chunk.getFailedSpawnAttempts(monsterOrd));
++        assertFalse(SpawnerCreature.shouldThrottleChunkSpawn(chunk, monsterOrd, rng));
++
++        // Disabled -> never throttles
++        for (int i = 0; i < 10; i++) {
++            chunk.recordFailedSpawnAttempt(monsterOrd);
++        }
++        MobSpawning.throttleMobSpawningEnabled = false;
++        assertFalse(SpawnerCreature.shouldThrottleChunkSpawn(chunk, monsterOrd, rng));
++    }
++
++    @Test
++    public void testThrottleHelperZeroOverheadBenchmark() throws Exception {
++        Chunk chunk = (Chunk) UNSAFE.allocateInstance(Chunk.class);
++        int monsterOrd = EnumCreatureType.MONSTER.ordinal();
++        Random rng = new Random(99L);
++        MobSpawning.throttleMobSpawningEnabled = false;
++
++        int count = 0;
++        long t0 = System.nanoTime();
++        for (int i = 0; i < 100_000; i++) {
++            if (SpawnerCreature.shouldThrottleChunkSpawn(chunk, monsterOrd, rng)) {
++                count++;
++            }
++        }
++        long elapsedNs = System.nanoTime() - t0;
++        assertEquals(0, count);
++        System.out.printf("F1_BENCH disabled_100k_ns=%d%n", elapsedNs);
++    }
++}
