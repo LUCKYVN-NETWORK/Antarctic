@@ -1,0 +1,678 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Fri, 27 Nov 2026 13:39:05 +0700
+Subject: [PATCH 225/225] feat: add Tier 2 misc world save disable, username
+ validation, ABI-safe 5s TPS, and GUI rebrand
+
+
+diff --git a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+index c9ff10f..40618f0 100644
+--- a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
++++ b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+@@ -17,8 +17,11 @@ import com.destroystokyo.paper.config.toml.modules.gameplay.Player;
+ import com.destroystokyo.paper.config.toml.modules.gameplay.SpawnerSettings;
+ import com.destroystokyo.paper.config.toml.modules.gameplay.Tripwire;
+ import com.destroystokyo.paper.config.toml.modules.gameplay.World;
++import com.destroystokyo.paper.config.toml.modules.misc.DisableWorldDataSaving;
+ import com.destroystokyo.paper.config.toml.modules.misc.Privacy;
+ import com.destroystokyo.paper.config.toml.modules.misc.Rebrand;
++import com.destroystokyo.paper.config.toml.modules.misc.Tps;
++import com.destroystokyo.paper.config.toml.modules.misc.VanillaUsernameCheck;
+ import com.destroystokyo.paper.config.toml.modules.network.Deflate;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.ArmourStands;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.ChunkLoading;
+@@ -69,7 +72,7 @@ public final class AntarcticTomlConfig {
+ 
+     private static final Logger LOGGER = LogManager.getLogger();
+     private static final List<IConfigModule> MODULES = List.of(
+-            new Rebrand(), new Privacy(),
++            new Rebrand(), new Privacy(), new DisableWorldDataSaving(), new VanillaUsernameCheck(), new Tps(),
+             new Deflate(),
+             new VirtualThreads(), new AsyncPlayerDataSaving(),
+             new Pathfinder(), new Suffocation(), new Projectiles(), new ArmourStands(), new WorldBorder(), new ChunkLoading(), new MobSpawning(), new Dab(), new FarmAiCulling(), new EntityPhysicsGuard(), new DontSaveEntity(), new EntityGoal(), new ReducePackets(), new Growth(), new Hopper(), new Inventory(), new SunBurn(), new Rails(), new Redstone(), new RedstoneGuard(), new Physics(), new Lighting(),
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/misc/DisableWorldDataSaving.java b/main/java/com/destroystokyo/paper/config/toml/modules/misc/DisableWorldDataSaving.java
+new file mode 100644
+index 0000000..fd44a94
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/misc/DisableWorldDataSaving.java
+@@ -0,0 +1,53 @@
++package com.destroystokyo.paper.config.toml.modules.misc;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++import com.electronwill.nightconfig.core.file.CommentedFileConfig;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Set;
++
++public class DisableWorldDataSaving implements IConfigModule {
++
++    @ConfigInfo(
++        baseName = "worlds",
++        comments = "List of world names for which disk chunk/level data saving is disabled. Default empty []."
++    )
++    public static List<String> worlds = new ArrayList<String>();
++
++    private static volatile Set<String> disabledWorldSet = Collections.emptySet();
++
++    public static boolean isDisabled(String worldName) {
++        if (worldName == null || worldName.isEmpty()) {
++            return false;
++        }
++        Set<String> set = disabledWorldSet;
++        if (!set.isEmpty()) {
++            return set.contains(worldName);
++        }
++        List<String> list = worlds;
++        return list != null && !list.isEmpty() && list.contains(worldName);
++    }
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.MISC;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "disable-world-data-saving";
++    }
++
++    @Override
++    public void onLoaded(CommentedFileConfig config) {
++        if (worlds == null || worlds.isEmpty()) {
++            disabledWorldSet = Collections.emptySet();
++        } else {
++            disabledWorldSet = Collections.unmodifiableSet(new HashSet<String>(worlds));
++        }
++    }
++}
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/misc/Rebrand.java b/main/java/com/destroystokyo/paper/config/toml/modules/misc/Rebrand.java
+index 56458cc..b41a14f 100644
+--- a/main/java/com/destroystokyo/paper/config/toml/modules/misc/Rebrand.java
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/misc/Rebrand.java
+@@ -9,6 +9,9 @@ public class Rebrand implements IConfigModule {
+     @ConfigInfo(baseName = "server-mod-name", comments = "The server brand name sent to clients in the F3 debug screen.")
+     public static String serverModName = "Antarctic";
+ 
++    @ConfigInfo(baseName = "server-gui-name", comments = "Window title used for the dedicated server Swing GUI.")
++    public static String serverGuiName = "Antarctic Console";
++
+     @Override
+     public EnumConfigCategory getCategory() {
+         return EnumConfigCategory.MISC;
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/misc/Tps.java b/main/java/com/destroystokyo/paper/config/toml/modules/misc/Tps.java
+new file mode 100644
+index 0000000..1d0748e
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/misc/Tps.java
+@@ -0,0 +1,24 @@
++package com.destroystokyo.paper.config.toml.modules.misc;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++
++public class Tps implements IConfigModule {
++
++    @ConfigInfo(
++        baseName = "include-5s-in-tps-command",
++        comments = "Include the 5-second rolling TPS average in /tps output while keeping Bukkit.getTPS() strictly double[3] for 1.12.2 plugin ABI compatibility. Default false."
++    )
++    public static boolean include5sInTpsCommand = false;
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.MISC;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "tps";
++    }
++}
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/misc/VanillaUsernameCheck.java b/main/java/com/destroystokyo/paper/config/toml/modules/misc/VanillaUsernameCheck.java
+new file mode 100644
+index 0000000..747a230
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/misc/VanillaUsernameCheck.java
+@@ -0,0 +1,87 @@
++package com.destroystokyo.paper.config.toml.modules.misc;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++import com.electronwill.nightconfig.core.file.CommentedFileConfig;
++import java.util.regex.Pattern;
++
++public class VanillaUsernameCheck implements IConfigModule {
++
++    @ConfigInfo(baseName = "remove-all-check", comments = "Disable username character validation on login (use with caution). Default false.")
++    public static boolean removeAllCheck = false;
++
++    @ConfigInfo(baseName = "use-regex", comments = "Validate login usernames against the configured regex instead of vanilla ASCII bounds. Default false.")
++    public static boolean useRegex = false;
++
++    @ConfigInfo(baseName = "regex", comments = "Regex used when use-regex is enabled. Default ^[a-zA-Z0-9_.]*$.")
++    public static String regex = "^[a-zA-Z0-9_.]*$";
++
++    @ConfigInfo(baseName = "enforce-skull", comments = "Reject malformed skull owner names before profile lookup so 1.12.2 clients are never kicked. Default true.")
++    public static boolean enforceSkull = true;
++
++    private static volatile String compiledRegexSource;
++    private static volatile Pattern compiledPattern;
++
++    private static Pattern getPattern() {
++        String src = regex != null ? regex : "^[a-zA-Z0-9_.]*$";
++        Pattern pat = compiledPattern;
++        if (pat == null || !src.equals(compiledRegexSource)) {
++            pat = Pattern.compile(src);
++            compiledRegexSource = src;
++            compiledPattern = pat;
++        }
++        return pat;
++    }
++
++    public static boolean isValidUsername(String name) {
++        if (name == null || name.isEmpty()) {
++            return false;
++        }
++        if (removeAllCheck) {
++            return true;
++        }
++        if (name.length() > 16) {
++            return false;
++        }
++        if (useRegex) {
++            return getPattern().matcher(name).matches();
++        }
++        return isVanillaAscii(name);
++    }
++
++    public static boolean isValidSkullName(String name) {
++        if (!enforceSkull) {
++            return true;
++        }
++        if (name == null || name.isEmpty() || name.length() > 16) {
++            return false;
++        }
++        return isVanillaAscii(name);
++    }
++
++    private static boolean isVanillaAscii(String name) {
++        for (int i = 0, len = name.length(); i < len; ++i) {
++            char c = name.charAt(i);
++            if (c <= 32 || c >= 127) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.MISC;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "vanilla-username-check";
++    }
++
++    @Override
++    public void onLoaded(CommentedFileConfig config) {
++        getPattern();
++    }
++}
+diff --git a/main/java/net/minecraft/server/ChunkProviderServer.java b/main/java/net/minecraft/server/ChunkProviderServer.java
+index fe51d59..df3496e 100644
+--- a/main/java/net/minecraft/server/ChunkProviderServer.java
++++ b/main/java/net/minecraft/server/ChunkProviderServer.java
+@@ -592,6 +592,10 @@ public class ChunkProviderServer implements IChunkProvider {
+     }
+ 
+     public boolean a(boolean flag) {
++        if (this.world.savingDisabled || (this.world.worldData != null
++                && com.destroystokyo.paper.config.toml.modules.misc.DisableWorldDataSaving.isDisabled(this.world.worldData.getName()))) {
++            return true;
++        }
+         int i = 0;
+ 
+         // CraftBukkit start
+diff --git a/main/java/net/minecraft/server/LoginListener.java b/main/java/net/minecraft/server/LoginListener.java
+index e9ee8f1..5d543a5 100644
+--- a/main/java/net/minecraft/server/LoginListener.java
++++ b/main/java/net/minecraft/server/LoginListener.java
+@@ -206,6 +206,10 @@ public class LoginListener implements PacketLoginInListener, ITickable {
+     public void a(PacketLoginInStart packetlogininstart) {
+         Validate.validState(this.g == LoginListener.EnumProtocolState.HELLO, "Unexpected hello packet", new Object[0]);
+         this.i = packetlogininstart.a();
++        if (!com.destroystokyo.paper.config.toml.modules.misc.VanillaUsernameCheck.isValidUsername(this.i != null ? this.i.getName() : null)) {
++            this.disconnect("Invalid username!");
++            return;
++        }
+         if (this.server.getOnlineMode() && !this.networkManager.isLocal()) {
+             this.g = LoginListener.EnumProtocolState.KEY;
+             this.networkManager.sendPacket(new PacketLoginOutEncryptionBegin("", this.server.O().getPublic(), this.e));
+diff --git a/main/java/net/minecraft/server/MinecraftServer.java b/main/java/net/minecraft/server/MinecraftServer.java
+index a309310..28abd5d 100644
+--- a/main/java/net/minecraft/server/MinecraftServer.java
++++ b/main/java/net/minecraft/server/MinecraftServer.java
+@@ -577,6 +577,7 @@ public abstract class MinecraftServer implements ICommandListener, Runnable, IAs
+     public static final long TICK_TIME = SEC_IN_NANO / TPS;
+     private static final long MAX_CATCHUP_BUFFER = TICK_TIME * TPS * 60L;
+     private static final int SAMPLE_INTERVAL = 20;
++    public final RollingAverage tps5s = new RollingAverage(5);
+     public final RollingAverage tps1 = new RollingAverage(60);
+     public final RollingAverage tps5 = new RollingAverage(60 * 5);
+     public final RollingAverage tps15 = new RollingAverage(60 * 15);
+@@ -660,6 +661,7 @@ public abstract class MinecraftServer implements ICommandListener, Runnable, IAs
+                     {
+                         final long diff = curTime - tickSection;
+                         double currentTps = 1E9 / diff * SAMPLE_INTERVAL;
++                        tps5s.add(currentTps, diff);
+                         tps1.add(currentTps, diff);
+                         tps5.add(currentTps, diff);
+                         tps15.add(currentTps, diff);
+diff --git a/main/java/net/minecraft/server/ServerGUI.java b/main/java/net/minecraft/server/ServerGUI.java
+new file mode 100644
+index 0000000..6eab22c
+--- /dev/null
++++ b/main/java/net/minecraft/server/ServerGUI.java
+@@ -0,0 +1,169 @@
++package net.minecraft.server;
++
++import com.mojang.util.QueueLogAppender;
++import java.awt.BorderLayout;
++import java.awt.Component;
++import java.awt.Dimension;
++import java.awt.Font;
++import java.awt.event.ActionEvent;
++import java.awt.event.ActionListener;
++import java.awt.event.FocusAdapter;
++import java.awt.event.FocusEvent;
++import java.awt.event.WindowAdapter;
++import java.awt.event.WindowEvent;
++import javax.swing.JComponent;
++import javax.swing.JFrame;
++import javax.swing.JPanel;
++import javax.swing.JScrollBar;
++import javax.swing.JScrollPane;
++import javax.swing.JTextArea;
++import javax.swing.JTextField;
++import javax.swing.SwingUtilities;
++import javax.swing.UIManager;
++import javax.swing.border.EtchedBorder;
++import javax.swing.border.TitledBorder;
++import javax.swing.text.AttributeSet;
++import javax.swing.text.BadLocationException;
++import javax.swing.text.Document;
++import org.apache.logging.log4j.LogManager;
++import org.apache.logging.log4j.Logger;
++
++public class ServerGUI extends JComponent {
++
++    private static final Font a = new Font("Monospaced", 0, 12);
++    private static final Logger b = LogManager.getLogger();
++    private final DedicatedServer c;
++
++    public static void a(final DedicatedServer dedicatedserver) {
++        try {
++            UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
++        } catch (Exception exception) {
++            ;
++        }
++
++        ServerGUI servergui = new ServerGUI(dedicatedserver);
++        JFrame jframe = new JFrame(com.destroystokyo.paper.config.toml.modules.misc.Rebrand.serverGuiName);
++
++        jframe.add(servergui);
++        jframe.pack();
++        jframe.setLocationRelativeTo((Component) null);
++        jframe.setVisible(true);
++        jframe.addWindowListener(new WindowAdapter() {
++            public void windowClosing(WindowEvent windowevent) {
++                dedicatedserver.safeShutdown();
++
++                while (!dedicatedserver.isStopped()) {
++                    try {
++                        Thread.sleep(100L);
++                    } catch (InterruptedException interruptedexception) {
++                        interruptedexception.printStackTrace();
++                    }
++                }
++
++                System.exit(0);
++            }
++        });
++    }
++
++    public ServerGUI(DedicatedServer dedicatedserver) {
++        this.c = dedicatedserver;
++        this.setPreferredSize(new Dimension(854, 480));
++        this.setLayout(new BorderLayout());
++
++        try {
++            this.add(this.c(), "Center");
++            this.add(this.a(), "West");
++        } catch (Exception exception) {
++            ServerGUI.b.error("Couldn't build server GUI", exception);
++        }
++
++    }
++
++    private JComponent a() throws Exception {
++        JPanel jpanel = new JPanel(new BorderLayout());
++
++        jpanel.add(new GuiStatsComponent(this.c), "North");
++        jpanel.add(this.b(), "Center");
++        jpanel.setBorder(new TitledBorder(new EtchedBorder(), "Stats"));
++        return jpanel;
++    }
++
++    private JComponent b() throws Exception {
++        PlayerListBox playerlistbox = new PlayerListBox(this.c);
++        JScrollPane jscrollpane = new JScrollPane(playerlistbox, 22, 30);
++
++        jscrollpane.setBorder(new TitledBorder(new EtchedBorder(), "Players"));
++        return jscrollpane;
++    }
++
++    private JComponent c() throws Exception {
++        JPanel jpanel = new JPanel(new BorderLayout());
++        final JTextArea jtextarea = new JTextArea();
++        final JScrollPane jscrollpane = new JScrollPane(jtextarea, 22, 30);
++
++        jtextarea.setEditable(false);
++        jtextarea.setFont(ServerGUI.a);
++        final JTextField jtextfield = new JTextField();
++
++        jtextfield.addActionListener(new ActionListener() {
++            public void actionPerformed(ActionEvent actionevent) {
++                String s = jtextfield.getText().trim();
++
++                if (!s.isEmpty()) {
++                    ServerGUI.this.c.issueCommand(s, ServerGUI.this.c);
++                }
++
++                jtextfield.setText("");
++            }
++        });
++        jtextarea.addFocusListener(new FocusAdapter() {
++            public void focusGained(FocusEvent focusevent) {}
++        });
++        jpanel.add(jscrollpane, "Center");
++        jpanel.add(jtextfield, "South");
++        jpanel.setBorder(new TitledBorder(new EtchedBorder(), "Log and chat"));
++        Thread thread = new Thread(new Runnable() {
++            public void run() {
++                String s;
++
++                while ((s = QueueLogAppender.getNextLogEvent("ServerGuiConsole")) != null) {
++                    ServerGUI.this.a(jtextarea, jscrollpane, s);
++                }
++
++            }
++        });
++
++        thread.setDaemon(true);
++        thread.start();
++        return jpanel;
++    }
++
++    public void a(final JTextArea jtextarea, final JScrollPane jscrollpane, final String s) {
++        if (!SwingUtilities.isEventDispatchThread()) {
++            SwingUtilities.invokeLater(new Runnable() {
++                public void run() {
++                    ServerGUI.this.a(jtextarea, jscrollpane, s);
++                }
++            });
++        } else {
++            Document document = jtextarea.getDocument();
++            JScrollBar jscrollbar = jscrollpane.getVerticalScrollBar();
++            boolean flag = false;
++
++            if (jscrollpane.getViewport().getView() == jtextarea) {
++                flag = (double) jscrollbar.getValue() + jscrollbar.getSize().getHeight() + (double) (ServerGUI.a.getSize() * 4) > (double) jscrollbar.getMaximum();
++            }
++
++            try {
++                document.insertString(document.getLength(), s, (AttributeSet) null);
++            } catch (BadLocationException badlocationexception) {
++                ;
++            }
++
++            if (flag) {
++                jscrollbar.setValue(Integer.MAX_VALUE);
++            }
++
++        }
++    }
++}
+diff --git a/main/java/net/minecraft/server/TileEntitySkull.java b/main/java/net/minecraft/server/TileEntitySkull.java
+index ef8320c..c0a9437 100644
+--- a/main/java/net/minecraft/server/TileEntitySkull.java
++++ b/main/java/net/minecraft/server/TileEntitySkull.java
+@@ -196,6 +196,10 @@ public class TileEntitySkull extends TileEntity /*implements ITickable*/ { // Pa
+     // Spigot start - Support async lookups
+     public static Future<GameProfile> b(final GameProfile gameprofile, final Predicate<GameProfile> callback, boolean sync) {
+         if (gameprofile != null && !UtilColor.b(gameprofile.getName())) {
++            if (!com.destroystokyo.paper.config.toml.modules.misc.VanillaUsernameCheck.isValidSkullName(gameprofile.getName())) {
++                callback.apply(gameprofile);
++                return Futures.immediateFuture(gameprofile);
++            }
+             if (gameprofile.isComplete() && gameprofile.getProperties().containsKey("textures")) {
+                 callback.apply(gameprofile);
+             } else if (MinecraftServer.getServer() == null) {
+diff --git a/main/java/net/minecraft/server/WorldServer.java b/main/java/net/minecraft/server/WorldServer.java
+index a36315c..cd462a9 100644
+--- a/main/java/net/minecraft/server/WorldServer.java
++++ b/main/java/net/minecraft/server/WorldServer.java
+@@ -1155,6 +1155,10 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+     }
+ 
+     public void save(boolean flag, @Nullable IProgressUpdate iprogressupdate) throws ExceptionWorldConflict {
++        if (this.worldData != null && com.destroystokyo.paper.config.toml.modules.misc.DisableWorldDataSaving.isDisabled(this.worldData.getName())) {
++            this.savingDisabled = true;
++            return;
++        }
+         ChunkProviderServer chunkproviderserver = this.getChunkProviderServer();
+ 
+         if (chunkproviderserver.e()) {
+diff --git a/main/java/org/spigotmc/TicksPerSecondCommand.java b/main/java/org/spigotmc/TicksPerSecondCommand.java
+index 6d21c32..c5c4708 100644
+--- a/main/java/org/spigotmc/TicksPerSecondCommand.java
++++ b/main/java/org/spigotmc/TicksPerSecondCommand.java
+@@ -25,17 +25,26 @@ public class TicksPerSecondCommand extends Command
+ 
+         // Paper start - Further improve tick handling
+         double[] tps = org.bukkit.Bukkit.getTPS();
+-        String[] tpsAvg = new String[tps.length];
+-
+-        for ( int i = 0; i < tps.length; i++) {
+-            tpsAvg[i] = format( tps[i] );
+-        }
+-        sender.sendMessage( ChatColor.GOLD + "TPS from last 1m, 5m, 15m: " + org.apache.commons.lang.StringUtils.join(tpsAvg, ", "));
++        double tps5s = com.destroystokyo.paper.config.toml.modules.misc.Tps.include5sInTpsCommand
++                ? net.minecraft.server.MinecraftServer.getServer().tps5s.getAverage()
++                : 20.0D;
++        sender.sendMessage(buildTpsMessage(tps, tps5s));
+         // Paper end
+ 
+         return true;
+     }
+ 
++    static String buildTpsMessage(double[] tps, double tps5s) {
++        String[] tpsAvg = new String[tps.length];
++        for (int i = 0; i < tps.length; i++) {
++            tpsAvg[i] = format(tps[i]);
++        }
++        if (com.destroystokyo.paper.config.toml.modules.misc.Tps.include5sInTpsCommand) {
++            return ChatColor.GOLD + "TPS from last 5s, 1m, 5m, 15m: " + format(tps5s) + ", " + org.apache.commons.lang.StringUtils.join(tpsAvg, ", ");
++        }
++        return ChatColor.GOLD + "TPS from last 1m, 5m, 15m: " + org.apache.commons.lang.StringUtils.join(tpsAvg, ", ");
++    }
++
+     private static String format(double tps) // Paper - Made static
+     {
+         return ( ( tps > 18.0 ) ? ChatColor.GREEN : ( tps > 16.0 ) ? ChatColor.YELLOW : ChatColor.RED ).toString()
+diff --git a/test/java/net/minecraft/server/Tier2MiscConfigTest.java b/test/java/net/minecraft/server/Tier2MiscConfigTest.java
+new file mode 100644
+index 0000000..bc6e0c0
+--- /dev/null
++++ b/test/java/net/minecraft/server/Tier2MiscConfigTest.java
+@@ -0,0 +1,137 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.config.toml.modules.misc.DisableWorldDataSaving;
++import com.destroystokyo.paper.config.toml.modules.misc.Rebrand;
++import com.destroystokyo.paper.config.toml.modules.misc.Tps;
++import com.destroystokyo.paper.config.toml.modules.misc.VanillaUsernameCheck;
++import com.google.common.base.Predicate;
++import com.mojang.authlib.GameProfile;
++import org.spigotmc.TicksPerSecondCommandAccess;
++import org.junit.After;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.UUID;
++
++import static org.junit.Assert.*;
++
++public class Tier2MiscConfigTest {
++
++    private static Unsafe UNSAFE;
++
++    private final List<String> prevWorlds = new ArrayList<>(DisableWorldDataSaving.worlds);
++    private final boolean prevRemoveAll = VanillaUsernameCheck.removeAllCheck;
++    private final boolean prevUseRegex = VanillaUsernameCheck.useRegex;
++    private final String prevRegex = VanillaUsernameCheck.regex;
++    private final boolean prevEnforceSkull = VanillaUsernameCheck.enforceSkull;
++    private final boolean prevInclude5s = Tps.include5sInTpsCommand;
++    private final String prevGuiName = Rebrand.serverGuiName;
++
++    @BeforeClass
++    public static void init() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        UNSAFE = (Unsafe) f.get(null);
++    }
++
++    @After
++    public void restoreConfig() {
++        DisableWorldDataSaving.worlds = new ArrayList<>(prevWorlds);
++        new DisableWorldDataSaving().onLoaded(null);
++        VanillaUsernameCheck.removeAllCheck = prevRemoveAll;
++        VanillaUsernameCheck.useRegex = prevUseRegex;
++        VanillaUsernameCheck.regex = prevRegex;
++        VanillaUsernameCheck.enforceSkull = prevEnforceSkull;
++        new VanillaUsernameCheck().onLoaded(null);
++        Tps.include5sInTpsCommand = prevInclude5s;
++        Rebrand.serverGuiName = prevGuiName;
++    }
++
++    @Test
++    public void testAbiSafeTpsAndCommandFormatting() throws Exception {
++        MinecraftServer server = (MinecraftServer) UNSAFE.allocateInstance(DedicatedServer.class);
++        Field rtField = MinecraftServer.class.getDeclaredField("recentTps");
++        rtField.setAccessible(true);
++        rtField.set(server, new double[3]);
++
++        double[] tps = new double[] { 20.0D, 19.8D, 19.5D };
++
++        Tps.include5sInTpsCommand = false;
++        assertEquals(3, server.recentTps.length);
++        String msgOff = TicksPerSecondCommandAccess.buildTpsMessage(tps, 18.5D);
++        assertTrue(msgOff.contains("TPS from last 1m, 5m, 15m:"));
++        assertFalse(msgOff.contains("5s,"));
++
++        Tps.include5sInTpsCommand = true;
++        assertEquals(3, server.recentTps.length);
++        String msgOn = TicksPerSecondCommandAccess.buildTpsMessage(tps, 18.5D);
++        assertTrue(msgOn.contains("TPS from last 5s, 1m, 5m, 15m:"));
++        assertTrue(msgOn.contains("18.5"));
++    }
++
++    @Test
++    public void testUsernameValidationAndSkullEnforcement() {
++        VanillaUsernameCheck.removeAllCheck = false;
++        VanillaUsernameCheck.useRegex = false;
++        assertTrue(VanillaUsernameCheck.isValidUsername("Notch_123"));
++        assertFalse(VanillaUsernameCheck.isValidUsername("Bad Name"));
++        assertFalse(VanillaUsernameCheck.isValidUsername("TooLongUsername17"));
++        assertFalse(VanillaUsernameCheck.isValidUsername(""));
++        assertFalse(VanillaUsernameCheck.isValidUsername(null));
++
++        VanillaUsernameCheck.useRegex = true;
++        VanillaUsernameCheck.regex = "^[a-zA-Z0-9_.]{3,16}$";
++        assertTrue(VanillaUsernameCheck.isValidUsername("Player.1"));
++        assertFalse(VanillaUsernameCheck.isValidUsername("ab"));
++
++        VanillaUsernameCheck.removeAllCheck = true;
++        assertTrue(VanillaUsernameCheck.isValidUsername("Any Name With Spaces!"));
++
++        // Skull check + TileEntitySkull.b() skip
++        VanillaUsernameCheck.enforceSkull = true;
++        assertFalse(VanillaUsernameCheck.isValidSkullName("Bad Skull Name"));
++        final GameProfile[] callbackResult = new GameProfile[1];
++        GameProfile badProfile = new GameProfile((UUID) null, "Bad Skull Name");
++        TileEntitySkull.b(badProfile, new Predicate<GameProfile>() {
++            @Override
++            public boolean apply(GameProfile input) {
++                callbackResult[0] = input;
++                return false;
++            }
++        }, false);
++        assertSame(badProfile, callbackResult[0]);
++    }
++
++    @Test
++    public void testDisableWorldDataSavingAndRebrandDefault() throws Exception {
++        assertEquals("Antarctic Console", Rebrand.serverGuiName);
++
++        DisableWorldDataSaving.worlds = List.of("world_nether");
++        new DisableWorldDataSaving().onLoaded(null);
++        assertTrue(DisableWorldDataSaving.isDisabled("world_nether"));
++        assertFalse(DisableWorldDataSaving.isDisabled("world"));
++
++        WorldServer ws = (WorldServer) UNSAFE.allocateInstance(WorldServer.class);
++        WorldData wd = new WorldData() {};
++        wd.a("world_nether");
++        Field wdField = World.class.getDeclaredField("worldData");
++        wdField.setAccessible(true);
++        wdField.set(ws, wd);
++
++        // Should return early without touching null chunkProvider/dataManager and mark savingDisabled = true
++        ws.save(true, null);
++        assertTrue(ws.savingDisabled);
++
++        ChunkProviderServer cps = (ChunkProviderServer) UNSAFE.allocateInstance(ChunkProviderServer.class);
++        Field worldField = ChunkProviderServer.class.getDeclaredField("world");
++        worldField.setAccessible(true);
++        worldField.set(cps, ws);
++        // Should return true immediately without NPE on null chunkLoader
++        assertTrue(cps.a(true));
++    }
++}
+diff --git a/test/java/org/spigotmc/TicksPerSecondCommandAccess.java b/test/java/org/spigotmc/TicksPerSecondCommandAccess.java
+new file mode 100644
+index 0000000..6a729db
+--- /dev/null
++++ b/test/java/org/spigotmc/TicksPerSecondCommandAccess.java
+@@ -0,0 +1,9 @@
++package org.spigotmc;
++
++public final class TicksPerSecondCommandAccess {
++    private TicksPerSecondCommandAccess() {}
++
++    public static String buildTpsMessage(double[] tps, double tps5s) {
++        return TicksPerSecondCommand.buildTpsMessage(tps, tps5s);
++    }
++}
