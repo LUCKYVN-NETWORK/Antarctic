@@ -1,0 +1,630 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Fri, 27 Nov 2026 11:11:13 +0700
+Subject: [PATCH 211/211] fix: validate WindowClick bounds and guard BlockDig
+ drop or swap in containers
+
+
+diff --git a/main/java/net/minecraft/server/Container.java b/main/java/net/minecraft/server/Container.java
+index 3a488ce..fbbc5dd 100644
+--- a/main/java/net/minecraft/server/Container.java
++++ b/main/java/net/minecraft/server/Container.java
+@@ -141,7 +141,7 @@ public abstract class Container {
+                     this.d();
+                 }
+             } else if (this.g == 1) {
+-                Slot slot = i < this.slots.size() ? this.slots.get(i) : null; // Paper - Ensure drag in bounds
++                Slot slot = i >= 0 && i < this.slots.size() ? this.slots.get(i) : null; // Paper - Ensure drag in bounds
+ 
+                 itemstack1 = playerinventory.getCarried();
+                 if (slot != null && a(slot, itemstack1, true) && slot.isAllowed(itemstack1) && (this.dragType == 2 || itemstack1.getCount() > this.h.size()) && this.b(slot)) {
+@@ -239,7 +239,7 @@ public abstract class Container {
+                         }
+                     }
+                 } else if (inventoryclicktype == InventoryClickType.QUICK_MOVE) {
+-                    if (i < 0) {
++                    if (i < 0 || i >= this.slots.size()) {
+                         return ItemStack.a;
+                     }
+ 
+@@ -252,7 +252,7 @@ public abstract class Container {
+                         itemstack = itemstack2.cloneItemStack();
+                     }
+                 } else {
+-                    if (i < 0) {
++                    if (i < 0 || i >= this.slots.size()) {
+                         return ItemStack.a;
+                     }
+ 
+@@ -330,7 +330,7 @@ public abstract class Container {
+                         // CraftBukkit end
+                     }
+                 }
+-            } else if (inventoryclicktype == InventoryClickType.SWAP && j >= 0 && j < 9) {
++            } else if (inventoryclicktype == InventoryClickType.SWAP && j >= 0 && j < 9 && i >= 0 && i < this.slots.size()) {
+                 slot2 = (Slot) this.slots.get(i);
+                 itemstack2 = playerinventory.getItem(j);
+                 itemstack1 = slot2.getItem();
+@@ -367,21 +367,21 @@ public abstract class Container {
+                         }
+                     }
+                 }
+-            } else if (inventoryclicktype == InventoryClickType.CLONE && entityhuman.abilities.canInstantlyBuild && playerinventory.getCarried().isEmpty() && i >= 0) {
++            } else if (inventoryclicktype == InventoryClickType.CLONE && entityhuman.abilities.canInstantlyBuild && playerinventory.getCarried().isEmpty() && i >= 0 && i < this.slots.size()) {
+                 slot2 = (Slot) this.slots.get(i);
+                 if (slot2 != null && slot2.hasItem()) {
+                     itemstack2 = slot2.getItem().cloneItemStack();
+                     itemstack2.setCount(itemstack2.getMaxStackSize());
+                     playerinventory.setCarried(itemstack2);
+                 }
+-            } else if (inventoryclicktype == InventoryClickType.THROW && playerinventory.getCarried().isEmpty() && i >= 0) {
++            } else if (inventoryclicktype == InventoryClickType.THROW && playerinventory.getCarried().isEmpty() && i >= 0 && i < this.slots.size()) {
+                 slot2 = (Slot) this.slots.get(i);
+                 if (slot2 != null && slot2.hasItem() && slot2.isAllowed(entityhuman)) {
+                     itemstack2 = slot2.a(j == 0 ? 1 : slot2.getItem().getCount());
+                     slot2.a(entityhuman, itemstack2);
+                     entityhuman.drop(itemstack2, true);
+                 }
+-            } else if (inventoryclicktype == InventoryClickType.PICKUP_ALL && i >= 0) {
++            } else if (inventoryclicktype == InventoryClickType.PICKUP_ALL && i >= 0 && i < this.slots.size()) {
+                 slot2 = (Slot) this.slots.get(i);
+                 itemstack2 = playerinventory.getCarried();
+                 if (!itemstack2.isEmpty() && (slot2 == null || !slot2.hasItem() || !slot2.isAllowed(entityhuman))) {
+diff --git a/main/java/net/minecraft/server/PlayerConnection.java b/main/java/net/minecraft/server/PlayerConnection.java
+index 14f9456..0cd42ca 100644
+--- a/main/java/net/minecraft/server/PlayerConnection.java
++++ b/main/java/net/minecraft/server/PlayerConnection.java
+@@ -948,6 +948,16 @@ public class PlayerConnection implements PacketListenerPlayIn, ITickable {
+         this.player.playerConnection.sendPacket(new PacketPlayOutPosition(d0, d1, d2, f, f1, set, this.teleportAwait));
+     }
+ 
++    private boolean rejectBlockDigInventoryAction() {
++        if (this.player.dead || this.player.activeContainer != this.player.defaultContainer || !this.player.inventory.getCarried().isEmpty()) {
++            if (!this.player.dead) {
++                this.player.updateInventory(this.player.activeContainer);
++            }
++            return true;
++        }
++        return false;
++    }
++
+     public void a(PacketPlayInBlockDig packetplayinblockdig) {
+         PlayerConnectionUtils.ensureMainThread(packetplayinblockdig, this, this.player.x());
+         if (this.player.isFrozen()) return; // CraftBukkit
+@@ -957,7 +967,7 @@ public class PlayerConnection implements PacketListenerPlayIn, ITickable {
+         this.player.resetIdleTimer();
+         switch (packetplayinblockdig.c()) {
+         case SWAP_HELD_ITEMS:
+-            if (!this.player.isSpectator()) {
++            if (!this.player.isSpectator() && !this.rejectBlockDigInventoryAction()) {
+                 ItemStack itemstack = this.player.b(EnumHand.OFF_HAND);
+ 
+                 // CraftBukkit start
+@@ -975,7 +985,7 @@ public class PlayerConnection implements PacketListenerPlayIn, ITickable {
+             return;
+ 
+         case DROP_ITEM:
+-            if (!this.player.isSpectator()) {
++            if (!this.player.isSpectator() && !this.rejectBlockDigInventoryAction()) {
+                 // limit how quickly items can be dropped
+                 // If the ticks aren't the same then the count starts from 0 and we update the lastDropTick.
+                 if (this.lastDropTick != MinecraftServer.currentTick) {
+@@ -997,7 +1007,14 @@ public class PlayerConnection implements PacketListenerPlayIn, ITickable {
+             return;
+ 
+         case DROP_ALL_ITEMS:
+-            if (!this.player.isSpectator()) {
++            if (!this.player.isSpectator() && !this.rejectBlockDigInventoryAction()) {
++                if (this.lastDropTick != MinecraftServer.currentTick) {
++                    this.dropCount = 0;
++                    this.lastDropTick = MinecraftServer.currentTick;
++                } else if (++this.dropCount >= 20) {
++                    this.player.updateInventory(this.player.activeContainer);
++                    return;
++                }
+                 this.player.a(true);
+             }
+ 
+@@ -1899,10 +1916,25 @@ public class PlayerConnection implements PacketListenerPlayIn, ITickable {
+         this.player.r();
+     }
+ 
++    private void rejectWindowClickAndResync(PacketPlayInWindowClick packetplayinwindowclick) {
++        if (this.player.dead) {
++            this.player.playerConnection.sendPacket(new PacketPlayOutTransaction(packetplayinwindowclick.a(), packetplayinwindowclick.d(), false));
++            return;
++        }
++        this.k.a(this.player.activeContainer.windowId, Short.valueOf(packetplayinwindowclick.d()));
++        this.player.playerConnection.sendPacket(new PacketPlayOutTransaction(packetplayinwindowclick.a(), packetplayinwindowclick.d(), false));
++        this.player.activeContainer.a(this.player, false);
++        this.player.updateInventory(this.player.activeContainer);
++    }
++
+     public void a(PacketPlayInWindowClick packetplayinwindowclick) {
+         PlayerConnectionUtils.ensureMainThread(packetplayinwindowclick, this, this.player.x());
+         if (this.player.isFrozen()) return; // CraftBukkit
+         this.player.resetIdleTimer();
++        if (this.player.dead) {
++            this.rejectWindowClickAndResync(packetplayinwindowclick);
++            return;
++        }
+         if (this.player.activeContainer.windowId == packetplayinwindowclick.a() && this.player.activeContainer.c(this.player) && this.player.activeContainer.canUse(this.player)) { // CraftBukkit
+             boolean cancelled = this.player.isSpectator(); // CraftBukkit - see below if
+             // Dionysus Start - AntiBook Crasher
+@@ -1922,7 +1954,16 @@ public class PlayerConnection implements PacketListenerPlayIn, ITickable {
+                 this.player.a(this.player.activeContainer, nonnulllist);
+             } else {
+                 // CraftBukkit start - Call InventoryClickEvent
+-                if (packetplayinwindowclick.b() < -1 && packetplayinwindowclick.b() != -999) {
++                final int rawSlot = packetplayinwindowclick.b();
++                final int button = packetplayinwindowclick.c();
++                final InventoryClickType clickType = packetplayinwindowclick.f();
++                final int slotCount = this.player.activeContainer.slots.size();
++                if (clickType == null
++                        || rawSlot >= slotCount
++                        || (rawSlot < 0 && rawSlot != -999 && rawSlot != -1)
++                        || (clickType == InventoryClickType.SWAP && (rawSlot < 0 || button < 0 || button >= 9))
++                        || (clickType == InventoryClickType.QUICK_CRAFT && Container.c(button) == 1 && rawSlot < 0)) {
++                    this.rejectWindowClickAndResync(packetplayinwindowclick);
+                     return;
+                 }
+ 
+diff --git a/test/java/net/minecraft/server/WindowClickAndBlockDigGuardTest.java b/test/java/net/minecraft/server/WindowClickAndBlockDigGuardTest.java
+new file mode 100644
+index 0000000..6b2c525
+--- /dev/null
++++ b/test/java/net/minecraft/server/WindowClickAndBlockDigGuardTest.java
+@@ -0,0 +1,453 @@
++package net.minecraft.server;
++
++import org.bukkit.craftbukkit.entity.CraftEntity;
++import org.bukkit.craftbukkit.entity.CraftPlayer;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.List;
++
++import static org.junit.Assert.*;
++
++public class WindowClickAndBlockDigGuardTest {
++
++    private static Unsafe UNSAFE;
++    private static int prevItemDirtyTicks;
++
++    @BeforeClass
++    public static void setupTest() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        UNSAFE = (Unsafe) f.get(null);
++        prevItemDirtyTicks = org.spigotmc.SpigotConfig.itemDirtyTicks;
++        if (org.spigotmc.SpigotConfig.itemDirtyTicks <= 0) {
++            org.spigotmc.SpigotConfig.itemDirtyTicks = 20;
++        }
++    }
++
++    @org.junit.AfterClass
++    public static void teardownTest() {
++        org.spigotmc.SpigotConfig.itemDirtyTicks = prevItemDirtyTicks;
++    }
++
++    private static final class RecordingPlayerConnection extends PlayerConnection {
++        final List<Packet<?>> sentPackets = new ArrayList<>();
++        boolean disconnected = false;
++
++        RecordingPlayerConnection() throws Exception {
++            super(null, null, null);
++        }
++
++        @Override
++        public void sendPacket(Packet<?> packet) {
++            this.sentPackets.add(packet);
++        }
++
++        @Override
++        public void disconnect(String s) {
++            this.disconnected = true;
++        }
++
++        @Override
++        public void disconnect(IChatBaseComponent ichatbasecomponent) {
++            this.disconnected = true;
++        }
++    }
++
++    private static final class DummyNetworkManager extends NetworkManager {
++        DummyNetworkManager() {
++            super(EnumProtocolDirection.SERVERBOUND);
++        }
++
++        @Override
++        public boolean isConnected() {
++            return true;
++        }
++    }
++
++    private static final class DummyWorld extends WorldServer {
++        DummyWorld() {
++            super(null, null, null, 0, null, null, null);
++        }
++
++        @Override
++        public boolean isMainThread() {
++            return true;
++        }
++    }
++
++    private static final class DummyMinecraftServer extends MinecraftServer {
++        final DummyWorld world;
++
++        DummyMinecraftServer(DummyWorld world) {
++            super(null, null, null, null, null, null, null);
++            this.world = world;
++        }
++
++        @Override
++        public WorldServer getWorldServer(int i) {
++            return this.world;
++        }
++
++        @Override
++        public boolean isMainThread() {
++            return true;
++        }
++
++        @Override
++        public boolean init() {
++            return true;
++        }
++
++        @Override
++        public boolean getSpawnMonsters() {
++            return false;
++        }
++
++        @Override
++        public EnumGamemode getGamemode() {
++            return EnumGamemode.SURVIVAL;
++        }
++
++        @Override
++        public EnumDifficulty getDifficulty() {
++            return EnumDifficulty.NORMAL;
++        }
++
++        @Override
++        public boolean isHardcore() {
++            return false;
++        }
++
++        @Override
++        public int q() {
++            return 4;
++        }
++
++        @Override
++        public boolean r() {
++            return false;
++        }
++
++        @Override
++        public boolean s() {
++            return false;
++        }
++
++        @Override
++        public String a(EnumGamemode gamemode, boolean flag) {
++            return "";
++        }
++
++        @Override
++        public PropertyManager getPropertyManager() {
++            return null;
++        }
++
++        @Override
++        public boolean getGenerateStructures() {
++            return false;
++        }
++
++        @Override
++        public boolean aa() {
++            return false;
++        }
++
++        @Override
++        public boolean af() {
++            return false;
++        }
++
++        @Override
++        public boolean getEnableCommandBlock() {
++            return false;
++        }
++    }
++
++    private static EntityPlayer createMockPlayer(RecordingPlayerConnection conn, DummyWorld world) throws Exception {
++        EntityPlayer player = (EntityPlayer) UNSAFE.allocateInstance(EntityPlayer.class);
++        player.world = world;
++        player.playerConnection = conn;
++        CraftPlayer craftPlayer = (CraftPlayer) UNSAFE.allocateInstance(CraftPlayer.class);
++        Field entityField = CraftEntity.class.getDeclaredField("entity");
++        entityField.setAccessible(true);
++        entityField.set(craftPlayer, player);
++        Field cpHealth = CraftPlayer.class.getDeclaredField("health");
++        cpHealth.setAccessible(true);
++        cpHealth.setDouble(craftPlayer, 20.0D);
++        Field beField = Entity.class.getDeclaredField("bukkitEntity");
++        beField.setAccessible(true);
++        beField.set(player, craftPlayer);
++        DataWatcher dw = new DataWatcher(player);
++        dw.register(EntityLiving.HEALTH, 20.0F);
++        Field dwField = Entity.class.getDeclaredField("datawatcher");
++        dwField.setAccessible(true);
++        dwField.set(player, dw);
++        player.abilities = new PlayerAbilities();
++        PlayerInteractManager pim = (PlayerInteractManager) UNSAFE.allocateInstance(PlayerInteractManager.class);
++        Field gmField = PlayerInteractManager.class.getDeclaredField("gamemode");
++        gmField.setAccessible(true);
++        gmField.set(pim, EnumGamemode.SURVIVAL);
++        Field pimField = EntityPlayer.class.getDeclaredField("playerInteractManager");
++        pimField.setAccessible(true);
++        pimField.set(player, pim);
++        player.inventory = new PlayerInventory(player);
++        ContainerPlayer container = new ContainerPlayer(player.inventory, true, player);
++        container.windowId = 0;
++        player.defaultContainer = container;
++        player.activeContainer = container;
++        return player;
++    }
++
++    private static RecordingPlayerConnection createConnection() throws Exception {
++        DummyWorld world = (DummyWorld) UNSAFE.allocateInstance(DummyWorld.class);
++        Field csField = World.class.getDeclaredField("isClientSide");
++        csField.setAccessible(true);
++        csField.setBoolean(world, true);
++        world.worldData = new WorldData();
++        world.worldProvider = new WorldProviderNormal();
++        Field uField = World.class.getDeclaredField("u");
++        uField.setAccessible(true);
++        uField.set(world, java.util.Collections.emptyList());
++
++        DummyMinecraftServer server = (DummyMinecraftServer) UNSAFE.allocateInstance(DummyMinecraftServer.class);
++        Field wField = DummyMinecraftServer.class.getDeclaredField("world");
++        wField.setAccessible(true);
++        wField.set(server, world);
++
++        RecordingPlayerConnection conn = (RecordingPlayerConnection) UNSAFE.allocateInstance(RecordingPlayerConnection.class);
++        Field spField = RecordingPlayerConnection.class.getDeclaredField("sentPackets");
++        spField.setAccessible(true);
++        spField.set(conn, new ArrayList<>());
++        Field kField = PlayerConnection.class.getDeclaredField("k");
++        kField.setAccessible(true);
++        kField.set(conn, new IntHashMap<>());
++        Field msField = PlayerConnection.class.getDeclaredField("minecraftServer");
++        msField.setAccessible(true);
++        msField.set(conn, server);
++        Field nmField = PlayerConnection.class.getDeclaredField("networkManager");
++        nmField.setAccessible(true);
++        nmField.set(conn, UNSAFE.allocateInstance(DummyNetworkManager.class));
++
++        EntityPlayer player = createMockPlayer(conn, world);
++        conn.player = player;
++        return conn;
++    }
++
++    private static PacketPlayInWindowClick windowClick(int windowId, int slot, int button, short actionId, InventoryClickType type) throws Exception {
++        PacketPlayInWindowClick pkt = new PacketPlayInWindowClick();
++        Field a = PacketPlayInWindowClick.class.getDeclaredField("a");
++        Field b = PacketPlayInWindowClick.class.getDeclaredField("slot");
++        Field c = PacketPlayInWindowClick.class.getDeclaredField("button");
++        Field d = PacketPlayInWindowClick.class.getDeclaredField("d");
++        Field e = PacketPlayInWindowClick.class.getDeclaredField("item");
++        Field f = PacketPlayInWindowClick.class.getDeclaredField("shift");
++        a.setAccessible(true);
++        b.setAccessible(true);
++        c.setAccessible(true);
++        d.setAccessible(true);
++        e.setAccessible(true);
++        f.setAccessible(true);
++        a.setInt(pkt, windowId);
++        b.setInt(pkt, slot);
++        c.setInt(pkt, button);
++        d.setShort(pkt, actionId);
++        e.set(pkt, ItemStack.a);
++        f.set(pkt, type);
++        return pkt;
++    }
++
++    private static PacketPlayInBlockDig blockDig(PacketPlayInBlockDig.EnumPlayerDigType action) throws Exception {
++        PacketPlayInBlockDig pkt = new PacketPlayInBlockDig();
++        Field a = PacketPlayInBlockDig.class.getDeclaredField("a");
++        Field b = PacketPlayInBlockDig.class.getDeclaredField("b");
++        Field c = PacketPlayInBlockDig.class.getDeclaredField("c");
++        a.setAccessible(true);
++        b.setAccessible(true);
++        c.setAccessible(true);
++        a.set(pkt, BlockPosition.ZERO);
++        b.set(pkt, EnumDirection.UP);
++        c.set(pkt, action);
++        return pkt;
++    }
++
++    private static void assertRejectedAndUnlockedCleanly(RecordingPlayerConnection conn, short actionId) throws Exception {
++        assertFalse("Soft-rejected packet must not disconnect player", conn.disconnected);
++        boolean foundRejectTxn = false;
++        for (Packet<?> p : conn.sentPackets) {
++            if (p instanceof PacketPlayOutTransaction) {
++                Field bField = PacketPlayOutTransaction.class.getDeclaredField("b");
++                Field cField = PacketPlayOutTransaction.class.getDeclaredField("c");
++                bField.setAccessible(true);
++                cField.setAccessible(true);
++                if (bField.getShort(p) == actionId && !cField.getBoolean(p)) {
++                    foundRejectTxn = true;
++                }
++            }
++        }
++        assertTrue("Must send PacketPlayOutTransaction(accepted=false) for actionId " + actionId, foundRejectTxn);
++        assertFalse("Container must be locked before client ack", conn.player.activeContainer.c(conn.player));
++
++        PacketPlayInTransaction ack = new PacketPlayInTransaction();
++        Field ta = PacketPlayInTransaction.class.getDeclaredField("a");
++        Field tb = PacketPlayInTransaction.class.getDeclaredField("b");
++        Field tc = PacketPlayInTransaction.class.getDeclaredField("c");
++        ta.setAccessible(true);
++        tb.setAccessible(true);
++        tc.setAccessible(true);
++        ta.setInt(ack, conn.player.activeContainer.windowId);
++        tb.setShort(ack, actionId);
++        tc.setBoolean(ack, false);
++        conn.a(ack);
++        assertTrue("Client PacketPlayInTransaction ack must unlock container", conn.player.activeContainer.c(conn.player));
++    }
++
++    @Test
++    public void testIllegalWindowClickStatesAreSoftRejectedAndUnlocked() throws Exception {
++        RecordingPlayerConnection conn = createConnection();
++        int size = conn.player.activeContainer.slots.size();
++
++        // Out-of-bounds upper slot
++        conn.a(windowClick(0, size, 0, (short) 10, InventoryClickType.PICKUP));
++        assertRejectedAndUnlockedCleanly(conn, (short) 10);
++        conn.sentPackets.clear();
++
++        // Illegal negative slot (-2)
++        conn.a(windowClick(0, -2, 0, (short) 11, InventoryClickType.PICKUP));
++        assertRejectedAndUnlockedCleanly(conn, (short) 11);
++        conn.sentPackets.clear();
++
++        // SWAP with negative slot or out-of-range hotbar button
++        conn.a(windowClick(0, -1, 0, (short) 12, InventoryClickType.SWAP));
++        assertRejectedAndUnlockedCleanly(conn, (short) 12);
++        conn.sentPackets.clear();
++
++        conn.a(windowClick(0, 9, 9, (short) 13, InventoryClickType.SWAP));
++        assertRejectedAndUnlockedCleanly(conn, (short) 13);
++        conn.sentPackets.clear();
++
++        conn.a(windowClick(0, 9, -1, (short) 14, InventoryClickType.SWAP));
++        assertRejectedAndUnlockedCleanly(conn, (short) 14);
++        conn.sentPackets.clear();
++
++        // QUICK_CRAFT phase 1 with negative slot (-1 and -999)
++        conn.a(windowClick(0, -1, 1, (short) 15, InventoryClickType.QUICK_CRAFT));
++        assertRejectedAndUnlockedCleanly(conn, (short) 15);
++        conn.sentPackets.clear();
++
++        conn.a(windowClick(0, -999, 1, (short) 16, InventoryClickType.QUICK_CRAFT));
++        assertRejectedAndUnlockedCleanly(conn, (short) 16);
++        conn.sentPackets.clear();
++
++        // Dead player click: resync transaction(false) without disconnect or NPE
++        conn.player.dead = true;
++        conn.a(windowClick(0, 9, 0, (short) 17, InventoryClickType.PICKUP));
++        assertFalse(conn.disconnected);
++        assertFalse(conn.sentPackets.isEmpty());
++    }
++
++    @Test
++    public void testContainerDirectBoundsAndLegitimateClientClicks() throws Exception {
++        RecordingPlayerConnection conn = createConnection();
++        ContainerPlayer container = (ContainerPlayer) conn.player.activeContainer;
++
++        // Direct Container.a bounds safety (no IndexOutOfBoundsException)
++        assertEquals(ItemStack.a, container.a(-1, 1, InventoryClickType.QUICK_CRAFT, conn.player));
++        assertEquals(ItemStack.a, container.a(999, 1, InventoryClickType.QUICK_CRAFT, conn.player));
++        assertEquals(ItemStack.a, container.a(-1, 0, InventoryClickType.SWAP, conn.player));
++        assertEquals(ItemStack.a, container.a(999, 0, InventoryClickType.SWAP, conn.player));
++        assertEquals(ItemStack.a, container.a(999, 0, InventoryClickType.PICKUP, conn.player));
++        assertEquals(ItemStack.a, container.a(999, 0, InventoryClickType.QUICK_MOVE, conn.player));
++
++        // Legitimate QUICK_CRAFT phase 0 (-999) and phase 1 (valid slot) pass PlayerConnection guard
++        conn.player.inventory.setCarried(new ItemStack(Items.DIAMOND, 4));
++        conn.a(windowClick(0, -999, 0, (short) 20, InventoryClickType.QUICK_CRAFT));
++        assertTrue("Valid QUICK_CRAFT phase 0 must keep container unlocked", container.c(conn.player));
++        conn.a(windowClick(0, 9, 1, (short) 21, InventoryClickType.QUICK_CRAFT));
++        assertTrue("Valid QUICK_CRAFT phase 1 must keep container unlocked", container.c(conn.player));
++    }
++
++    @Test
++    public void testBlockDigDropAndSwapGuardedInContainersAndCarriedCursor() throws Exception {
++        RecordingPlayerConnection conn = createConnection();
++        conn.player.inventory.setItem(0, new ItemStack(Items.DIAMOND, 10));
++        conn.player.a(EnumHand.OFF_HAND, new ItemStack(Items.EMERALD, 1));
++
++        // 1. Non-default container open -> DROP_ITEM, DROP_ALL_ITEMS, SWAP_HELD_ITEMS soft-cancelled
++        ContainerChest chestContainer = new ContainerChest(conn.player.inventory, new InventorySubcontainer("Chest", false, 27), conn.player);
++        chestContainer.windowId = 2;
++        conn.player.activeContainer = chestContainer;
++
++        conn.a(blockDig(PacketPlayInBlockDig.EnumPlayerDigType.DROP_ITEM));
++        conn.a(blockDig(PacketPlayInBlockDig.EnumPlayerDigType.DROP_ALL_ITEMS));
++        conn.a(blockDig(PacketPlayInBlockDig.EnumPlayerDigType.SWAP_HELD_ITEMS));
++
++        assertFalse("Open-container BlockDig guard must not kick player", conn.disconnected);
++        assertEquals(10, conn.player.inventory.getItem(0).getCount());
++        assertEquals(Items.EMERALD, conn.player.b(EnumHand.OFF_HAND).getItem());
++        assertFalse("Must send inventory resync packets", conn.sentPackets.isEmpty());
++        conn.sentPackets.clear();
++
++        // 2. Default container but carried cursor non-empty -> soft-cancelled
++        conn.player.activeContainer = conn.player.defaultContainer;
++        conn.player.inventory.setCarried(new ItemStack(Items.GOLD_INGOT, 1));
++        conn.a(blockDig(PacketPlayInBlockDig.EnumPlayerDigType.DROP_ITEM));
++        conn.a(blockDig(PacketPlayInBlockDig.EnumPlayerDigType.DROP_ALL_ITEMS));
++        conn.a(blockDig(PacketPlayInBlockDig.EnumPlayerDigType.SWAP_HELD_ITEMS));
++        assertFalse(conn.disconnected);
++        assertEquals(10, conn.player.inventory.getItem(0).getCount());
++        assertFalse(conn.sentPackets.isEmpty());
++        conn.sentPackets.clear();
++
++        // 3. Dead player -> soft-cancelled without resync spam or kick
++        conn.player.inventory.setCarried(ItemStack.a);
++        conn.player.dead = true;
++        conn.a(blockDig(PacketPlayInBlockDig.EnumPlayerDigType.DROP_ALL_ITEMS));
++        assertFalse(conn.disconnected);
++        assertEquals(10, conn.player.inventory.getItem(0).getCount());
++        conn.player.dead = false;
++
++        // 4. DROP_ALL_ITEMS >= 20/tick soft-throttled without kick
++        Field ldtField = PlayerConnection.class.getDeclaredField("lastDropTick");
++        Field dcField = PlayerConnection.class.getDeclaredField("dropCount");
++        ldtField.setAccessible(true);
++        dcField.setAccessible(true);
++        ldtField.setInt(conn, MinecraftServer.currentTick);
++        dcField.setInt(conn, 20);
++        conn.a(blockDig(PacketPlayInBlockDig.EnumPlayerDigType.DROP_ALL_ITEMS));
++        assertFalse("DROP_ALL_ITEMS rate-limit must soft-cancel without kicking", conn.disconnected);
++        assertEquals(10, conn.player.inventory.getItem(0).getCount());
++        assertFalse(conn.sentPackets.isEmpty());
++    }
++
++    @Test
++    public void testValidWindowClickBoundsCheckEfficiency() throws Exception {
++        RecordingPlayerConnection conn = createConnection();
++        ContainerPlayer container = (ContainerPlayer) conn.player.activeContainer;
++        int slotCount = container.slots.size();
++
++        int accepted = 0;
++        long start = System.nanoTime();
++        for (int i = 0; i < 50_000; i++) {
++            int rawSlot = i % slotCount;
++            int button = 0;
++            InventoryClickType clickType = InventoryClickType.PICKUP;
++            boolean reject = clickType == null
++                    || rawSlot >= slotCount
++                    || (rawSlot < 0 && rawSlot != -999 && rawSlot != -1)
++                    || (clickType == InventoryClickType.SWAP && (rawSlot < 0 || button < 0 || button >= 9))
++                    || (clickType == InventoryClickType.QUICK_CRAFT && Container.c(button) == 1 && rawSlot < 0);
++            if (!reject) {
++                accepted++;
++            }
++        }
++        long elapsedMs = (System.nanoTime() - start) / 1_000_000L;
++        assertEquals(50_000, accepted);
++        assertTrue("50k bounds checks took too long: " + elapsedMs + " ms", elapsedMs < 20L);
++    }
++}
