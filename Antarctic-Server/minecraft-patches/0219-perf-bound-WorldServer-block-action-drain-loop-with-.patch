@@ -1,0 +1,552 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Fri, 27 Nov 2026 12:30:28 +0700
+Subject: [PATCH 219/219] perf: bound WorldServer block-action drain loop with
+ next-tick deferral
+
+
+diff --git a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+index 4a0e655..1e4b4b4 100644
+--- a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
++++ b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+@@ -28,6 +28,7 @@ import com.destroystokyo.paper.config.toml.modules.optimizations.Suffocation;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Physics;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Rails;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Redstone;
++import com.destroystokyo.paper.config.toml.modules.optimizations.RedstoneGuard;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Lighting;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.SunBurn;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.WorldBorder;
+@@ -61,7 +62,7 @@ public final class AntarcticTomlConfig {
+             new Rebrand(), new Privacy(),
+             new Deflate(),
+             new VirtualThreads(), new AsyncPlayerDataSaving(),
+-            new Pathfinder(), new Suffocation(), new Projectiles(), new ArmourStands(), new WorldBorder(), new ChunkLoading(), new MobSpawning(), new Dab(), new FarmAiCulling(), new EntityPhysicsGuard(), new DontSaveEntity(), new SunBurn(), new Rails(), new Redstone(), new Physics(), new Lighting(),
++            new Pathfinder(), new Suffocation(), new Projectiles(), new ArmourStands(), new WorldBorder(), new ChunkLoading(), new MobSpawning(), new Dab(), new FarmAiCulling(), new EntityPhysicsGuard(), new DontSaveEntity(), new SunBurn(), new Rails(), new Redstone(), new RedstoneGuard(), new Physics(), new Lighting(),
+             new MergeChecks(), new ChunkOverloadDupe(), new Collisions(), new Player(),
+             new MapDecorations(), new Books(), new VanillaBugFix());
+     private static final YamlConfiguration yamlFacade = new YamlConfiguration();
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/RedstoneGuard.java b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/RedstoneGuard.java
+new file mode 100644
+index 0000000..7bc3788
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/RedstoneGuard.java
+@@ -0,0 +1,50 @@
++package com.destroystokyo.paper.config.toml.modules.optimizations;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++import com.electronwill.nightconfig.core.file.CommentedFileConfig;
++
++public class RedstoneGuard implements IConfigModule {
++
++    @ConfigInfo(
++        baseName = "enabled",
++        comments = "Enable bounded block-action draining and per-chunk redstone lag-machine guardrails. Default false preserves exact vanilla 1.12.2 behavior."
++    )
++    public static boolean enabled = false;
++
++    @ConfigInfo(
++        baseName = "max-block-actions-per-tick",
++        comments = "Maximum block actions (pistons, note blocks, chests) executed per world per tick before deferring excess to the next tick. Default 4096."
++    )
++    public static int maxBlockActionsPerTick = 4096;
++
++    @ConfigInfo(
++        baseName = "max-block-actions-per-chunk-per-tick",
++        comments = "Maximum block actions executed per chunk per tick before deferring that chunk's remaining actions to the next tick. Default 256."
++    )
++    public static int maxBlockActionsPerChunkPerTick = 256;
++
++    @ConfigInfo(
++        baseName = "max-noteblock-deferred-per-chunk",
++        comments = "Maximum deferred NoteBlock actions queued per chunk before dropping redundant NoteBlock backlog overflow (never drops pistons). Default 1024."
++    )
++    public static int maxNoteBlockDeferredPerChunk = 1024;
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.OPTIMIZATIONS;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "redstone-guard";
++    }
++
++    @Override
++    public void onLoaded(CommentedFileConfig config) {
++        maxBlockActionsPerTick = Math.max(1, maxBlockActionsPerTick);
++        maxBlockActionsPerChunkPerTick = Math.max(1, maxBlockActionsPerChunkPerTick);
++        maxNoteBlockDeferredPerChunk = Math.max(0, maxNoteBlockDeferredPerChunk);
++    }
++}
+diff --git a/main/java/net/minecraft/server/WorldServer.java b/main/java/net/minecraft/server/WorldServer.java
+index fa5f097..fe73452 100644
+--- a/main/java/net/minecraft/server/WorldServer.java
++++ b/main/java/net/minecraft/server/WorldServer.java
+@@ -61,6 +61,8 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+     protected final VillageSiege siegeManager = new VillageSiege(this);
+     private final it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet<BlockActionData>[] U = new it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet[] { new it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet<BlockActionData>(), new it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet<BlockActionData>()};
+     private int V;
++    private it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap antarcticBlockActionChunkCounts; // Antarctic
++    private it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap antarcticDeferredNoteCounts; // Antarctic
+     private final java.util.ArrayDeque<NextTickListEntry> W = new java.util.ArrayDeque<NextTickListEntry>(); // Antarctic - O(1) FIFO drain instead of O(n) ArrayList head shifts
+     private final me.stella.antarctic.collection.MultiplicitySet<NextTickListEntry> currentTickBatch = new me.stella.antarctic.collection.MultiplicitySet<NextTickListEntry>(); // Antarctic - O(1) mirror of W for isBlockTickPending checks
+     private final BlockPosition.MutableBlockPosition antarcticTickProbePos = new BlockPosition.MutableBlockPosition(); // Antarctic - zero-alloc tick probe
+@@ -1380,20 +1382,138 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+         return explosion;
+     }
+ 
++    private it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap getAntarcticBlockActionChunkCounts() {
++        if (this.antarcticBlockActionChunkCounts == null) {
++            this.antarcticBlockActionChunkCounts = new it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap();
++        }
++        return this.antarcticBlockActionChunkCounts;
++    }
++
++    private it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap getAntarcticDeferredNoteCounts() {
++        if (this.antarcticDeferredNoteCounts == null) {
++            this.antarcticDeferredNoteCounts = new it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap();
++        }
++        return this.antarcticDeferredNoteCounts;
++    }
++
++    private static void decrementDeferredNoteCount(it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap map, long chunkKey) {
++        if (map == null) {
++            return;
++        }
++        int prev = map.get(chunkKey);
++        if (prev > 1) {
++            map.put(chunkKey, prev - 1);
++        } else if (prev == 1) {
++            map.remove(chunkKey);
++        }
++    }
++
++    private List<BlockActionData> deferBlockAction(List<BlockActionData> deferred, BlockActionData data, long chunkKey, boolean isNote, int maxNoteDeferred) {
++        if (isNote) {
++            it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap deferredNotes = this.getAntarcticDeferredNoteCounts();
++            if (deferredNotes.get(chunkKey) >= maxNoteDeferred) {
++                return deferred;
++            }
++            deferredNotes.addTo(chunkKey, 1);
++        }
++        if (deferred == null) {
++            deferred = new ArrayList<BlockActionData>();
++        }
++        deferred.add(data);
++        return deferred;
++    }
++
+     public void playBlockAction(BlockPosition blockposition, Block block, int i, int j) {
++        if (!com.destroystokyo.paper.config.toml.modules.optimizations.RedstoneGuard.enabled) {
++            this.U[this.V].add(new BlockActionData(blockposition, block, i, j));
++            return;
++        }
++        if (block == Blocks.NOTEBLOCK) {
++            it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap deferredNotes = this.getAntarcticDeferredNoteCounts();
++            long chunkKey = ChunkCoordIntPair.a(blockposition.getX() >> 4, blockposition.getZ() >> 4);
++            if (deferredNotes.get(chunkKey) >= com.destroystokyo.paper.config.toml.modules.optimizations.RedstoneGuard.maxNoteBlockDeferredPerChunk) {
++                return;
++            }
++            if (this.U[this.V].add(new BlockActionData(blockposition, block, i, j))) {
++                deferredNotes.addTo(chunkKey, 1);
++            }
++            return;
++        }
+         this.U[this.V].add(new BlockActionData(blockposition, block, i, j));
+     }
+ 
++    void drainBlockActions() {
++        this.aq();
++    }
++
+     private void aq() {
++        if (!com.destroystokyo.paper.config.toml.modules.optimizations.RedstoneGuard.enabled) {
++            while (!this.U[this.V].isEmpty()) {
++                int i = this.V;
++
++                this.V ^= 1;
++                Iterator iterator = this.U[i].iterator();
++
++                while (iterator.hasNext()) {
++                    BlockActionData blockactiondata = (BlockActionData) iterator.next();
++
++                    if (this.a(blockactiondata)) {
++                        // CraftBukkit - this.worldProvider.dimension -> this.dimension, // Paper - dimension -> world
++                        this.server.getPlayerList().sendPacketNearby((EntityHuman) null, (double) blockactiondata.a().getX(), (double) blockactiondata.a().getY(), (double) blockactiondata.a().getZ(), 64.0D, this, new PacketPlayOutBlockAction(blockactiondata.a(), blockactiondata.d(), blockactiondata.b(), blockactiondata.c()));
++                    }
++                }
++
++                this.U[i].clear();
++            }
++            return;
++        }
++
++        final int maxTotal = com.destroystokyo.paper.config.toml.modules.optimizations.RedstoneGuard.maxBlockActionsPerTick;
++        final int maxPerChunk = com.destroystokyo.paper.config.toml.modules.optimizations.RedstoneGuard.maxBlockActionsPerChunkPerTick;
++        final int maxNoteDeferred = com.destroystokyo.paper.config.toml.modules.optimizations.RedstoneGuard.maxNoteBlockDeferredPerChunk;
++        final it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap chunkCounts = this.getAntarcticBlockActionChunkCounts();
++        chunkCounts.clear();
++        final it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap deferredNotes = this.antarcticDeferredNoteCounts;
++        int executedTotal = 0;
++        List<BlockActionData> deferred = null;
++        boolean hitTotalCap = false;
++
+         while (!this.U[this.V].isEmpty()) {
+             int i = this.V;
+ 
+             this.V ^= 1;
+-            Iterator iterator = this.U[i].iterator();
++            Iterator<BlockActionData> iterator = this.U[i].iterator();
+ 
+             while (iterator.hasNext()) {
+-                BlockActionData blockactiondata = (BlockActionData) iterator.next();
++                BlockActionData blockactiondata = iterator.next();
++                boolean isNote = blockactiondata.d() == Blocks.NOTEBLOCK;
++                long chunkKey = ChunkCoordIntPair.a(blockactiondata.a().getX() >> 4, blockactiondata.a().getZ() >> 4);
++                if (isNote) {
++                    decrementDeferredNoteCount(deferredNotes, chunkKey);
++                }
++
++                if (executedTotal >= maxTotal) {
++                    hitTotalCap = true;
++                    deferred = this.deferBlockAction(deferred, blockactiondata, chunkKey, isNote, maxNoteDeferred);
++                    while (iterator.hasNext()) {
++                        BlockActionData rem = iterator.next();
++                        boolean remNote = rem.d() == Blocks.NOTEBLOCK;
++                        long remChunkKey = ChunkCoordIntPair.a(rem.a().getX() >> 4, rem.a().getZ() >> 4);
++                        if (remNote) {
++                            decrementDeferredNoteCount(deferredNotes, remChunkKey);
++                        }
++                        deferred = this.deferBlockAction(deferred, rem, remChunkKey, remNote, maxNoteDeferred);
++                    }
++                    break;
++                }
++
++                if (chunkCounts.get(chunkKey) >= maxPerChunk) {
++                    deferred = this.deferBlockAction(deferred, blockactiondata, chunkKey, isNote, maxNoteDeferred);
++                    continue;
++                }
+ 
++                executedTotal++;
++                chunkCounts.addTo(chunkKey, 1);
+                 if (this.a(blockactiondata)) {
+                     // CraftBukkit - this.worldProvider.dimension -> this.dimension, // Paper - dimension -> world
+                     this.server.getPlayerList().sendPacketNearby((EntityHuman) null, (double) blockactiondata.a().getX(), (double) blockactiondata.a().getY(), (double) blockactiondata.a().getZ(), 64.0D, this, new PacketPlayOutBlockAction(blockactiondata.a(), blockactiondata.d(), blockactiondata.b(), blockactiondata.c()));
+@@ -1401,8 +1521,27 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+             }
+ 
+             this.U[i].clear();
++            if (hitTotalCap) {
++                break;
++            }
+         }
+ 
++        if (deferred != null && !deferred.isEmpty()) {
++            int other = this.V ^ 1;
++            it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet<BlockActionData> nextSet = this.U[other];
++            for (int idx = 0, len = deferred.size(); idx < len; ++idx) {
++                BlockActionData data = deferred.get(idx);
++                if (!nextSet.add(data) && data.d() == Blocks.NOTEBLOCK) {
++                    decrementDeferredNoteCount(this.antarcticDeferredNoteCounts, ChunkCoordIntPair.a(data.a().getX() >> 4, data.a().getZ() >> 4));
++                }
++            }
++            if (!this.U[this.V].isEmpty()) {
++                nextSet.addAll(this.U[this.V]);
++                this.U[this.V].clear();
++            }
++            this.V = other;
++        }
++        chunkCounts.clear();
+     }
+ 
+     private boolean a(BlockActionData blockactiondata) {
+diff --git a/test/java/net/minecraft/server/BlockActionGuardTest.java b/test/java/net/minecraft/server/BlockActionGuardTest.java
+new file mode 100644
+index 0000000..f98af1c
+--- /dev/null
++++ b/test/java/net/minecraft/server/BlockActionGuardTest.java
+@@ -0,0 +1,280 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.config.toml.modules.optimizations.RedstoneGuard;
++import it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet;
++import org.junit.After;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.List;
++
++import static org.junit.Assert.*;
++
++public class BlockActionGuardTest {
++
++    private static Unsafe UNSAFE;
++
++    private boolean prevEnabled = RedstoneGuard.enabled;
++    private int prevMaxTotal = RedstoneGuard.maxBlockActionsPerTick;
++    private int prevMaxPerChunk = RedstoneGuard.maxBlockActionsPerChunkPerTick;
++    private int prevMaxNoteDeferred = RedstoneGuard.maxNoteBlockDeferredPerChunk;
++
++    @BeforeClass
++    public static void init() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        UNSAFE = (Unsafe) f.get(null);
++    }
++
++    @After
++    public void restoreConfig() {
++        RedstoneGuard.enabled = prevEnabled;
++        RedstoneGuard.maxBlockActionsPerTick = prevMaxTotal;
++        RedstoneGuard.maxBlockActionsPerChunkPerTick = prevMaxPerChunk;
++        RedstoneGuard.maxNoteBlockDeferredPerChunk = prevMaxNoteDeferred;
++    }
++
++    private static final class RecordingBlock extends Block {
++        final List<Integer> executedIds = new ArrayList<>();
++        int pingPongRemaining = 0;
++
++        RecordingBlock() {
++            super(Material.STONE);
++        }
++
++        @Override
++        public boolean a(IBlockData iblockdata, World world, BlockPosition pos, int id, int param) {
++            executedIds.add(param);
++            if (pingPongRemaining > 0) {
++                pingPongRemaining--;
++                world.playBlockAction(pos.up(), this, id, param + 1);
++            }
++            return true;
++        }
++    }
++
++    private static final class MockPlayerList extends PlayerList {
++        final List<PacketPlayOutBlockAction> sentPackets = new ArrayList<>();
++
++        MockPlayerList() throws Exception {
++            super(null);
++        }
++
++        @Override
++        public void sendPacketNearby(EntityHuman entityhuman, double d0, double d1, double d2, double d3, WorldServer world, Packet<?> packet) {
++            if (packet instanceof PacketPlayOutBlockAction) {
++                sentPackets.add((PacketPlayOutBlockAction) packet);
++            }
++        }
++    }
++
++    private static final class MockMinecraftServer extends MinecraftServer {
++        final MockPlayerList mockPlayerList;
++
++        MockMinecraftServer(MockPlayerList playerList) {
++            super(null, null, null, null, null, null, null);
++            this.mockPlayerList = playerList;
++        }
++
++        @Override
++        public PlayerList getPlayerList() {
++            return mockPlayerList;
++        }
++
++        @Override public boolean init() { return true; }
++        @Override public boolean getSpawnMonsters() { return false; }
++        @Override public EnumGamemode getGamemode() { return EnumGamemode.SURVIVAL; }
++        @Override public EnumDifficulty getDifficulty() { return EnumDifficulty.NORMAL; }
++        @Override public boolean isHardcore() { return false; }
++        @Override public int q() { return 4; }
++        @Override public boolean r() { return false; }
++        @Override public boolean s() { return false; }
++        @Override public String a(EnumGamemode gamemode, boolean flag) { return ""; }
++        @Override public PropertyManager getPropertyManager() { return null; }
++        @Override public boolean getGenerateStructures() { return false; }
++        @Override public boolean aa() { return false; }
++        @Override public boolean af() { return false; }
++        @Override public boolean getEnableCommandBlock() { return false; }
++    }
++
++    private static final class TestWorldServer extends WorldServer {
++        IBlockData forcedBlockData;
++        MockPlayerList mockPlayerList;
++
++        TestWorldServer() {
++            super(null, null, null, 0, null, null, null);
++        }
++
++        @Override
++        public IBlockData getType(BlockPosition blockposition) {
++            return forcedBlockData;
++        }
++    }
++
++    private static TestWorldServer newTestWorld(IBlockData blockData) throws Exception {
++        TestWorldServer world = (TestWorldServer) UNSAFE.allocateInstance(TestWorldServer.class);
++        world.forcedBlockData = blockData;
++
++        MockPlayerList playerList = (MockPlayerList) UNSAFE.allocateInstance(MockPlayerList.class);
++        Field packetsField = MockPlayerList.class.getDeclaredField("sentPackets");
++        packetsField.setAccessible(true);
++        packetsField.set(playerList, new ArrayList<PacketPlayOutBlockAction>());
++        world.mockPlayerList = playerList;
++
++        MockMinecraftServer server = (MockMinecraftServer) UNSAFE.allocateInstance(MockMinecraftServer.class);
++        Field mplField = MockMinecraftServer.class.getDeclaredField("mockPlayerList");
++        mplField.setAccessible(true);
++        mplField.set(server, playerList);
++
++        Field serverField = WorldServer.class.getDeclaredField("server");
++        serverField.setAccessible(true);
++        serverField.set(world, server);
++
++        Field uField = WorldServer.class.getDeclaredField("U");
++        uField.setAccessible(true);
++        uField.set(world, new ObjectLinkedOpenHashSet[] {
++            new ObjectLinkedOpenHashSet<BlockActionData>(),
++            new ObjectLinkedOpenHashSet<BlockActionData>()
++        });
++
++        Field vField = WorldServer.class.getDeclaredField("V");
++        vField.setAccessible(true);
++        vField.setInt(world, 0);
++
++        return world;
++    }
++
++    @Test
++    public void testVanillaParityWhenDisabled() throws Exception {
++        RedstoneGuard.enabled = false;
++        RecordingBlock block = new RecordingBlock();
++        TestWorldServer world = newTestWorld(block.getBlockData());
++
++        for (int i = 0; i < 10; i++) {
++            world.playBlockAction(new BlockPosition(i, 64, 0), block, 0, i);
++        }
++        world.drainBlockActions();
++
++        assertEquals(10, block.executedIds.size());
++        for (int i = 0; i < 10; i++) {
++            assertEquals(Integer.valueOf(i), block.executedIds.get(i));
++        }
++        assertEquals(10, world.mockPlayerList.sentPackets.size());
++    }
++
++    @Test
++    public void testIntraTickPingPongBoundedAndDeferred() throws Exception {
++        RedstoneGuard.enabled = true;
++        RedstoneGuard.maxBlockActionsPerTick = 50;
++        RedstoneGuard.maxBlockActionsPerChunkPerTick = 1000;
++
++        RecordingBlock block = new RecordingBlock();
++        block.pingPongRemaining = 120;
++        TestWorldServer world = newTestWorld(block.getBlockData());
++
++        world.playBlockAction(new BlockPosition(0, 64, 0), block, 0, 0);
++        world.drainBlockActions();
++        assertEquals(50, block.executedIds.size());
++
++        world.drainBlockActions();
++        assertEquals(100, block.executedIds.size());
++
++        world.drainBlockActions();
++        assertEquals(121, block.executedIds.size());
++    }
++
++    @Test
++    public void testPerChunkFairnessAndNextTickFifoCompletion() throws Exception {
++        RedstoneGuard.enabled = true;
++        RedstoneGuard.maxBlockActionsPerTick = 100;
++        RedstoneGuard.maxBlockActionsPerChunkPerTick = 4;
++
++        RecordingBlock block = new RecordingBlock();
++        TestWorldServer world = newTestWorld(block.getBlockData());
++
++        // 20 actions in chunk (0, 0), 4 actions in chunk (1, 0)
++        for (int i = 0; i < 20; i++) {
++            world.playBlockAction(new BlockPosition(i & 15, 64 + (i >> 4), 0), block, 0, i);
++        }
++        for (int i = 0; i < 4; i++) {
++            world.playBlockAction(new BlockPosition(16 + i, 64, 0), block, 0, 100 + i);
++        }
++
++        // Tick 1: 4 from chunk A + all 4 from chunk B
++        world.drainBlockActions();
++        assertEquals(8, block.executedIds.size());
++        assertEquals(List.of(0, 1, 2, 3, 100, 101, 102, 103), block.executedIds);
++
++        // Drain remaining 16 actions from chunk A across 4 more ticks in strict FIFO order
++        for (int t = 0; t < 4; t++) {
++            world.drainBlockActions();
++        }
++        assertEquals(24, block.executedIds.size());
++        for (int i = 4; i < 20; i++) {
++            assertEquals(Integer.valueOf(i), block.executedIds.get(4 + i));
++        }
++    }
++
++    @Test
++    public void testNoteBlockBacklogCapNeverDropsPistons() throws Exception {
++        RedstoneGuard.enabled = true;
++        RedstoneGuard.maxBlockActionsPerTick = 10;
++        RedstoneGuard.maxBlockActionsPerChunkPerTick = 10;
++        RedstoneGuard.maxNoteBlockDeferredPerChunk = 32;
++
++        RecordingBlock pistonLike = new RecordingBlock();
++        TestWorldServer world = newTestWorld(pistonLike.getBlockData());
++
++        for (int i = 0; i < 200; i++) {
++            world.playBlockAction(new BlockPosition(i & 15, 64 + (i >> 4), 0), Blocks.NOTEBLOCK, 0, i % 25);
++        }
++        for (int i = 0; i < 15; i++) {
++            world.playBlockAction(new BlockPosition(i, 80, 0), pistonLike, 0, i);
++        }
++
++        Field uField = WorldServer.class.getDeclaredField("U");
++        uField.setAccessible(true);
++        Field vField = WorldServer.class.getDeclaredField("V");
++        vField.setAccessible(true);
++        ObjectLinkedOpenHashSet<?>[] queues = (ObjectLinkedOpenHashSet<?>[]) uField.get(world);
++        int activeIdx = vField.getInt(world);
++        // 32 note blocks capped + 15 piston-like actions preserved = 47 total queued
++        assertEquals(47, queues[activeIdx].size());
++
++        for (int t = 0; t < 6; t++) {
++            world.drainBlockActions();
++        }
++        assertEquals(15, pistonLike.executedIds.size());
++    }
++
++    @Test
++    public void testPingPongStressBenchmark() throws Exception {
++        RecordingBlock block = new RecordingBlock();
++        TestWorldServer world = newTestWorld(block.getBlockData());
++
++        RedstoneGuard.enabled = false;
++        block.pingPongRemaining = 10000;
++        world.playBlockAction(new BlockPosition(0, 64, 0), block, 0, 0);
++        long t0 = System.nanoTime();
++        world.drainBlockActions();
++        long unguardedNs = System.nanoTime() - t0;
++        assertEquals(10001, block.executedIds.size());
++
++        block.executedIds.clear();
++        RedstoneGuard.enabled = true;
++        RedstoneGuard.maxBlockActionsPerTick = 4096;
++        RedstoneGuard.maxBlockActionsPerChunkPerTick = 4096;
++        block.pingPongRemaining = 10000;
++        world.playBlockAction(new BlockPosition(0, 64, 0), block, 0, 0);
++        long t1 = System.nanoTime();
++        world.drainBlockActions();
++        long guardedTickNs = System.nanoTime() - t1;
++        assertEquals(4096, block.executedIds.size());
++
++        System.out.printf("E1_BENCH unguarded_10001_ns=%d guarded_tick1_4096_ns=%d%n", unguardedNs, guardedTickNs);
++    }
++}
