@@ -1,0 +1,409 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Fri, 27 Nov 2026 11:24:37 +0700
+Subject: [PATCH 212/212] fix: guard UseItem NoCom chunk load and add
+ max-use-item-distance config
+
+
+diff --git a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+index e274eb0..0873d23 100644
+--- a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
++++ b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+@@ -11,6 +11,7 @@ import com.destroystokyo.paper.config.toml.modules.fixes.VanillaBugFix;
+ import com.destroystokyo.paper.config.toml.modules.gameplay.ChunkOverloadDupe;
+ import com.destroystokyo.paper.config.toml.modules.gameplay.Collisions;
+ import com.destroystokyo.paper.config.toml.modules.gameplay.MergeChecks;
++import com.destroystokyo.paper.config.toml.modules.gameplay.Player;
+ import com.destroystokyo.paper.config.toml.modules.misc.Privacy;
+ import com.destroystokyo.paper.config.toml.modules.misc.Rebrand;
+ import com.destroystokyo.paper.config.toml.modules.network.Deflate;
+@@ -57,7 +58,7 @@ public final class AntarcticTomlConfig {
+             new Deflate(),
+             new VirtualThreads(), new AsyncPlayerDataSaving(),
+             new Pathfinder(), new Suffocation(), new Projectiles(), new ArmourStands(), new WorldBorder(), new ChunkLoading(), new MobSpawning(), new SunBurn(), new Rails(), new Redstone(), new Physics(), new Lighting(),
+-            new MergeChecks(), new ChunkOverloadDupe(), new Collisions(),
++            new MergeChecks(), new ChunkOverloadDupe(), new Collisions(), new Player(),
+             new MapDecorations(), new Books(), new VanillaBugFix());
+     private static final YamlConfiguration yamlFacade = new YamlConfiguration();
+     private static File configFile = new File("antarctic.toml");
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/gameplay/Player.java b/main/java/com/destroystokyo/paper/config/toml/modules/gameplay/Player.java
+new file mode 100644
+index 0000000..7648a4c
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/gameplay/Player.java
+@@ -0,0 +1,21 @@
++package com.destroystokyo.paper.config.toml.modules.gameplay;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++
++public class Player implements IConfigModule {
++
++    @ConfigInfo(baseName = "max-use-item-distance", comments = "Maximum distance (in blocks) for UseItem block-change resync packets. Prevents NoCom remote chunk loading. Set <= 0 to disable distance cap. Default 8.0.")
++    public static double maxUseItemDistance = 8.0D;
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.GAMEPLAY;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "player";
++    }
++}
+diff --git a/main/java/net/minecraft/server/PlayerConnection.java b/main/java/net/minecraft/server/PlayerConnection.java
+index 0cd42ca..3eae194 100644
+--- a/main/java/net/minecraft/server/PlayerConnection.java
++++ b/main/java/net/minecraft/server/PlayerConnection.java
+@@ -1126,8 +1126,18 @@ public class PlayerConnection implements PacketListenerPlayIn, ITickable {
+             this.player.playerInteractManager.a(this.player, worldserver, itemstack, enumhand, blockposition, enumdirection, packetplayinuseitem.d(), packetplayinuseitem.e(), packetplayinuseitem.f());
+         }
+ 
+-        this.player.playerConnection.sendPacket(new PacketPlayOutBlockChange(worldserver, blockposition));
+-        this.player.playerConnection.sendPacket(new PacketPlayOutBlockChange(worldserver, blockposition.shift(enumdirection)));
++        double maxDist = com.destroystokyo.paper.config.toml.modules.gameplay.Player.maxUseItemDistance;
++        boolean withinDist = maxDist <= 0.0D
++                || this.player.d((double) blockposition.getX() + 0.5D, (double) blockposition.getY() + 0.5D, (double) blockposition.getZ() + 0.5D) <= maxDist * maxDist;
++        if (withinDist) {
++            if (worldserver.isLoaded(blockposition)) {
++                this.player.playerConnection.sendPacket(new PacketPlayOutBlockChange(worldserver, blockposition));
++            }
++            BlockPosition shifted = blockposition.shift(enumdirection);
++            if (worldserver.isLoaded(shifted)) {
++                this.player.playerConnection.sendPacket(new PacketPlayOutBlockChange(worldserver, shifted));
++            }
++        }
+     }
+ 
+     public void a(PacketPlayInBlockPlace packetplayinblockplace) {
+diff --git a/test/java/net/minecraft/server/UseItemNoComGuardTest.java b/test/java/net/minecraft/server/UseItemNoComGuardTest.java
+new file mode 100644
+index 0000000..682c708
+--- /dev/null
++++ b/test/java/net/minecraft/server/UseItemNoComGuardTest.java
+@@ -0,0 +1,323 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.config.toml.modules.gameplay.Player;
++import org.junit.After;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.List;
++
++import static org.junit.Assert.*;
++
++public class UseItemNoComGuardTest {
++
++    private static Unsafe UNSAFE;
++    private static double defaultMaxDist;
++
++    @BeforeClass
++    public static void setupTest() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        UNSAFE = (Unsafe) f.get(null);
++        defaultMaxDist = Player.maxUseItemDistance;
++    }
++
++    @After
++    public void restoreConfig() {
++        Player.maxUseItemDistance = defaultMaxDist;
++    }
++
++    private static final class DummyNetworkManager extends NetworkManager {
++        DummyNetworkManager() {
++            super(EnumProtocolDirection.SERVERBOUND);
++        }
++
++        @Override
++        public boolean isConnected() {
++            return true;
++        }
++    }
++
++    private static final class RecordingPlayerConnection extends PlayerConnection {
++        final List<Packet<?>> sentPackets = new ArrayList<>();
++        boolean disconnected = false;
++
++        RecordingPlayerConnection() throws Exception {
++            super(null, null, null);
++        }
++
++        @Override
++        public void sendPacket(Packet<?> packet) {
++            this.sentPackets.add(packet);
++        }
++
++        @Override
++        public void disconnect(String s) {
++            this.disconnected = true;
++        }
++
++        @Override
++        public void disconnect(IChatBaseComponent ichatbasecomponent) {
++            this.disconnected = true;
++        }
++    }
++
++    private static final class TrackingWorld extends WorldServer {
++        boolean loaded = false;
++        int isLoadedCalls = 0;
++        int getTypeCalls = 0;
++
++        TrackingWorld() {
++            super(null, null, null, 0, null, null, null);
++        }
++
++        @Override
++        public boolean isMainThread() {
++            return true;
++        }
++
++        @Override
++        public boolean isLoaded(BlockPosition blockposition) {
++            isLoadedCalls++;
++            return loaded;
++        }
++
++        @Override
++        public IBlockData getType(BlockPosition blockposition) {
++            getTypeCalls++;
++            return Blocks.STONE.getBlockData();
++        }
++    }
++
++    private static final class DummyMinecraftServer extends MinecraftServer {
++        TrackingWorld world;
++
++        DummyMinecraftServer() {
++            super(null, null, null, null, null, null, null);
++        }
++
++        @Override
++        public WorldServer getWorldServer(int i) {
++            return this.world;
++        }
++
++        @Override
++        public int getMaxBuildHeight() {
++            return 256;
++        }
++
++        @Override
++        public boolean isMainThread() {
++            return true;
++        }
++
++        @Override
++        public PropertyManager getPropertyManager() {
++            return null;
++        }
++
++        @Override
++        public boolean init() {
++            return true;
++        }
++
++        @Override
++        public boolean getGenerateStructures() {
++            return false;
++        }
++
++        @Override
++        public EnumGamemode getGamemode() {
++            return EnumGamemode.SURVIVAL;
++        }
++
++        @Override
++        public EnumDifficulty getDifficulty() {
++            return EnumDifficulty.NORMAL;
++        }
++
++        @Override
++        public boolean isHardcore() {
++            return false;
++        }
++
++        @Override
++        public int q() {
++            return 4;
++        }
++
++        @Override
++        public boolean r() {
++            return false;
++        }
++
++        @Override
++        public boolean s() {
++            return false;
++        }
++
++        @Override
++        public boolean aa() {
++            return false;
++        }
++
++        @Override
++        public boolean af() {
++            return false;
++        }
++
++        @Override
++        public boolean getEnableCommandBlock() {
++            return false;
++        }
++
++        @Override
++        public String a(EnumGamemode gamemode, boolean flag) {
++            return "";
++        }
++    }
++
++    private static RecordingPlayerConnection createConnection(TrackingWorld world) throws Exception {
++        Field csField = World.class.getDeclaredField("isClientSide");
++        csField.setAccessible(true);
++        csField.setBoolean(world, true);
++        world.worldData = new WorldData();
++        world.worldProvider = new WorldProviderNormal();
++
++        DummyMinecraftServer server = (DummyMinecraftServer) UNSAFE.allocateInstance(DummyMinecraftServer.class);
++        server.world = world;
++
++        RecordingPlayerConnection conn = (RecordingPlayerConnection) UNSAFE.allocateInstance(RecordingPlayerConnection.class);
++        Field spField = RecordingPlayerConnection.class.getDeclaredField("sentPackets");
++        spField.setAccessible(true);
++        spField.set(conn, new ArrayList<>());
++        Field msField = PlayerConnection.class.getDeclaredField("minecraftServer");
++        msField.setAccessible(true);
++        msField.set(conn, server);
++        Field nmField = PlayerConnection.class.getDeclaredField("networkManager");
++        nmField.setAccessible(true);
++        nmField.set(conn, UNSAFE.allocateInstance(DummyNetworkManager.class));
++        Field llpField = PlayerConnection.class.getDeclaredField("lastLimitedPacket");
++        llpField.setAccessible(true);
++        llpField.setLong(conn, -1L);
++        Field tpField = PlayerConnection.class.getDeclaredField("teleportPos");
++        tpField.setAccessible(true);
++        // Set teleportPos non-null to isolate the BlockChange resync path cleanly without WorldBorder/InteractManager setup
++        tpField.set(conn, new Vec3D(0.0D, 64.0D, 0.0D));
++
++        EntityPlayer player = (EntityPlayer) UNSAFE.allocateInstance(EntityPlayer.class);
++        player.world = world;
++        player.playerConnection = conn;
++        player.locX = 0.0D;
++        player.locY = 64.0D;
++        player.locZ = 0.0D;
++        org.bukkit.craftbukkit.entity.CraftPlayer craftPlayer =
++                (org.bukkit.craftbukkit.entity.CraftPlayer) UNSAFE.allocateInstance(org.bukkit.craftbukkit.entity.CraftPlayer.class);
++        Field entityField = org.bukkit.craftbukkit.entity.CraftEntity.class.getDeclaredField("entity");
++        entityField.setAccessible(true);
++        entityField.set(craftPlayer, player);
++        Field cpHealth = org.bukkit.craftbukkit.entity.CraftPlayer.class.getDeclaredField("health");
++        cpHealth.setAccessible(true);
++        cpHealth.setDouble(craftPlayer, 20.0D);
++        Field beField = Entity.class.getDeclaredField("bukkitEntity");
++        beField.setAccessible(true);
++        beField.set(player, craftPlayer);
++        DataWatcher dw = new DataWatcher(player);
++        dw.register(EntityLiving.HEALTH, 20.0F);
++        Field dwField = Entity.class.getDeclaredField("datawatcher");
++        dwField.setAccessible(true);
++        dwField.set(player, dw);
++        player.inventory = new PlayerInventory(player);
++        conn.player = player;
++        return conn;
++    }
++
++    private static PacketPlayInUseItem useItemPacket(int x, int y, int z, EnumDirection face, long timestamp) throws Exception {
++        PacketPlayInUseItem pkt = new PacketPlayInUseItem();
++        Field a = PacketPlayInUseItem.class.getDeclaredField("a");
++        Field b = PacketPlayInUseItem.class.getDeclaredField("b");
++        Field c = PacketPlayInUseItem.class.getDeclaredField("c");
++        a.setAccessible(true);
++        b.setAccessible(true);
++        c.setAccessible(true);
++        a.set(pkt, new BlockPosition(x, y, z));
++        b.set(pkt, face);
++        c.set(pkt, EnumHand.MAIN_HAND);
++        pkt.timestamp = timestamp;
++        return pkt;
++    }
++
++    @Test
++    public void testOutOfRangeUseItemLoadsZeroChunksAndEmitsZeroPackets() throws Exception {
++        TrackingWorld world = (TrackingWorld) UNSAFE.allocateInstance(TrackingWorld.class);
++        world.loaded = true;
++        RecordingPlayerConnection conn = createConnection(world);
++
++        conn.a(useItemPacket(100000, 64, 100000, EnumDirection.UP, 1000L));
++        assertFalse("Out-of-range UseItem must not kick player", conn.disconnected);
++        assertEquals("Out-of-range UseItem must not probe loaded chunks", 0, world.isLoadedCalls);
++        assertEquals("Out-of-range UseItem must not call getType", 0, world.getTypeCalls);
++        assertTrue("Out-of-range UseItem must emit 0 packets", conn.sentPackets.isEmpty());
++    }
++
++    @Test
++    public void testInRangeLoadedAndUnloadedResyncBehavior() throws Exception {
++        TrackingWorld world = (TrackingWorld) UNSAFE.allocateInstance(TrackingWorld.class);
++        RecordingPlayerConnection conn = createConnection(world);
++
++        // In-range but unloaded -> 0 packets, 0 getType calls
++        world.loaded = false;
++        conn.a(useItemPacket(2, 64, 2, EnumDirection.UP, 1000L));
++        assertEquals(2, world.isLoadedCalls);
++        assertEquals(0, world.getTypeCalls);
++        assertTrue(conn.sentPackets.isEmpty());
++
++        // In-range and loaded -> 2 PacketPlayOutBlockChange resync packets
++        world.loaded = true;
++        world.isLoadedCalls = 0;
++        conn.a(useItemPacket(2, 64, 2, EnumDirection.UP, 2000L));
++        assertEquals(2, world.isLoadedCalls);
++        assertEquals(2, world.getTypeCalls);
++        assertEquals(2, conn.sentPackets.size());
++        assertTrue(conn.sentPackets.get(0) instanceof PacketPlayOutBlockChange);
++        assertTrue(conn.sentPackets.get(1) instanceof PacketPlayOutBlockChange);
++
++        // Config <= 0 disables distance cap while still honoring isLoaded
++        Player.maxUseItemDistance = -1.0D;
++        conn.sentPackets.clear();
++        world.loaded = false;
++        conn.a(useItemPacket(50000, 64, 50000, EnumDirection.UP, 3000L));
++        assertTrue("Unloaded remote block must still emit 0 packets when distance cap disabled", conn.sentPackets.isEmpty());
++        world.loaded = true;
++        conn.a(useItemPacket(50000, 64, 50000, EnumDirection.UP, 4000L));
++        assertEquals("Loaded remote block must emit resync when distance cap <= 0", 2, conn.sentPackets.size());
++    }
++
++    @Test
++    public void testOutOfRangeRejectionEfficiency() throws Exception {
++        TrackingWorld world = (TrackingWorld) UNSAFE.allocateInstance(TrackingWorld.class);
++        world.loaded = true;
++        RecordingPlayerConnection conn = createConnection(world);
++        PacketPlayInUseItem pkt = useItemPacket(100000, 64, 100000, EnumDirection.UP, 1000L);
++
++        long ts = 10_000L;
++        for (int i = 0; i < 5_000; i++) {
++            pkt.timestamp = (ts += 1000L);
++            conn.a(pkt);
++        }
++
++        long start = System.nanoTime();
++        for (int i = 0; i < 50_000; i++) {
++            pkt.timestamp = (ts += 1000L);
++            conn.a(pkt);
++        }
++        long elapsedMs = (System.nanoTime() - start) / 1_000_000L;
++        assertEquals(0, world.getTypeCalls);
++        assertTrue(conn.sentPackets.isEmpty());
++        assertTrue("50k NoCom rejections took too long: " + elapsedMs + " ms", elapsedMs < 100L);
++    }
++}
