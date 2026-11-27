@@ -2,11 +2,11 @@
   <br />
   <img src="public/images/antarctic.png" alt="Antarctic Logo" width="150" />
   <h1>Antarctic</h1>
-  <p><strong>A modern, low-latency Paper <code>1.12.2</code> overhaul engineered for Java 21</strong></p>
+  <p><strong>A modern, low-latency Paper <code>1.12.2</code> overhaul engineered for Java 21+</strong></p>
 
   <p>
     <a href="https://www.minecraft.net/"><img src="https://img.shields.io/badge/Minecraft-1.12.2-38bdf8?style=for-the-badge&logo=minecraft&logoColor=white" alt="Minecraft 1.12.2" /></a>
-    <a href="https://adoptium.net/"><img src="https://img.shields.io/badge/Java-21_LTS-6366f1?style=for-the-badge&logo=openjdk&logoColor=white" alt="Java 21 LTS" /></a>
+    <a href="https://adoptium.net/"><img src="https://img.shields.io/badge/Java-21%2B-6366f1?style=for-the-badge&logo=openjdk&logoColor=white" alt="Java 21+" /></a>
     <a href="https://gradle.org/"><img src="https://img.shields.io/badge/Gradle-8.14.3-8b5cf6?style=for-the-badge&logo=gradle&logoColor=white" alt="Gradle 8.14.3" /></a>
     <a href="LICENSE.md"><img src="https://img.shields.io/badge/License-GPL--3.0_%7C_MIT-10b981?style=for-the-badge" alt="License" /></a>
   </p>
@@ -22,7 +22,10 @@
 
 ---
 
-**Antarctic** is a high-performance Paper `1.12.2` server fork rebuilt for **Java 21**. It targets main-thread tick latency, heap allocation churn, and legacy concurrency bottlenecks using lock-free data structures, cache-friendly primitive pipelines, and simulation-tested vanilla parity — while preserving `1.12.2` client, Anvil storage, and Bukkit/Paper plugin compatibility.
+**Antarctic** is a high-performance Paper `1.12.2` server fork rebuilt for **Java 21+**. It targets main-thread tick latency, heap allocation churn, and legacy concurrency bottlenecks using lock-free data structures, cache-friendly primitive pipelines, and simulation-tested vanilla parity — while preserving `1.12.2` client, Anvil storage, and Bukkit/Paper plugin compatibility.
+
+> [!IMPORTANT]
+> **Java 21+ Required:** Unlike vanilla and upstream Paper `1.12.2`, Antarctic is compiled with `--release 21` and **requires Java 21 or newer (Java 21+)** at runtime. Older JVMs (Java 8, 11, 17) are not supported.
 
 ---
 
@@ -45,7 +48,7 @@
       <p>Combines an intrusive-heap <code>ChunkIndexedTreeSet</code>, wave-BFS fluid propagation, O(1) chunk-indexed <code>EntityTracker</code> queries, flat-array <code>PathfinderGoalSelector</code>, optional <strong>Alternate Current</strong> redstone, and optimized powered-rail propagation.</p>
     </td>
     <td width="50%" valign="top">
-      <h3>&#128737; Vanilla Parity &amp; Java 21 Runtime</h3>
+      <h3>&#128737; Vanilla Parity &amp; Java 21+ Runtime</h3>
       <p>Attempts to preserve vanilla movement, suffocation, redstone, and mob-spawning logic as faithfully as possible through automated logic simulations, with virtual-thread auth/chat executors (<code>ReentrantLock</code>), TOML tuning, and exploit hardening.</p>
     </td>
   </tr>
@@ -114,7 +117,8 @@
 
 ## Quick Start &amp; Building from Source
 
-**Prerequisites:** **JDK 21** (`JAVA_HOME`), **JDK 8** (`JAVA8_HOME`, first-time `setupSources` only), **Git**, **Python 3**, and **Bash** (Git Bash on Windows).
+- **Runtime Requirement:** **Java 21+** (`java -jar Antarctic-b<year>.<month>.jar`). Older Java versions (8 / 11 / 17) will fail to start.
+- **Build Prerequisites:** **JDK 21+** (`JAVA_HOME`), **JDK 8** (`JAVA8_HOME`, first-time `setupSources` decompile/remap only), **Git**, **Python 3**, and **Bash** (Git Bash on Windows).
 
 ```bash
 # 1. Clone the repository (dev branch)
