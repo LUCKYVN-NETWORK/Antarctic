@@ -60,7 +60,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: antarctic-${{ github.ref_name }}
-          path: Antarctic-Server/build/libs/*.jar
+          path: Antarctic-Server/build/libs/Antarctic-b*.jar
 
       - name: Create GitHub release
         if: startsWith(github.ref, 'refs/tags/')
@@ -70,4 +70,4 @@ jobs:
           gh release create "${{ github.ref_name }}" \
             --title "Antarctic ${{ github.ref_name }}" \
             --generate-notes \
-            Antarctic-Server/build/libs/*.jar
+            Antarctic-Server/build/libs/Antarctic-b*.jar

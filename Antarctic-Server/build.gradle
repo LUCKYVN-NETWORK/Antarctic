@@ -121,8 +121,8 @@ def unrelocatedServerJar = tasks.register('unrelocatedServerJar', Jar) {
 tasks.register('serverJar', com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar) {
     group = 'build'
     description = 'Builds the standalone runnable Antarctic server JAR archive with dependencies and mapped NMS classes.'
-    archiveBaseName = 'Antarctic-Server'
-    archiveClassifier = ''
+    // Release naming: Antarctic-b<year>.<month>.jar, stamped with the build date.
+    archiveFileName = "Antarctic-b${java.time.YearMonth.now().format(java.time.format.DateTimeFormatter.ofPattern('yyyy.MM'))}.jar"
     configurations = []
     manifest { attributes(serverJarAttributes) }
     from(zipTree(unrelocatedServerJar.flatMap { it.archiveFile }))

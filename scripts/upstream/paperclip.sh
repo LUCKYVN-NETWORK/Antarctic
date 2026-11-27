@@ -5,18 +5,13 @@ set -e
 basedir="$(cd "$1" && pwd -P)"
 workdir="$basedir/work"
 mcver=$(cat "$workdir/BuildData/info.json" | grep minecraftVersion | cut -d '"' -f 4)
-paperjar="$basedir/Antarctic-Server/build/libs/Antarctic-Server-$mcver-R0.1-SNAPSHOT.jar"
-if [ ! -f "$paperjar" ]; then
-    paperjar="$basedir/Antarctic-Server/build/libs/Antarctic-Server.jar"
-fi
-if [ ! -f "$paperjar" ]; then
-    for f in "$basedir/Antarctic-Server/build/libs/"*.jar; do
-        if [ -f "$f" ] && [[ "$f" != *-sources.jar ]]; then
-            paperjar="$f"
-            break
-        fi
-    done
-fi
+paperjar=""
+# Globs expand in order, so the last match is the newest Antarctic-b<year>.<month>.jar.
+for f in "$basedir/Antarctic-Server/build/libs/"Antarctic-b*.jar; do
+    if [ -f "$f" ]; then
+        paperjar="$f"
+    fi
+done
 if [ ! -f "$paperjar" ]; then
     paperjar="$basedir/Paper-Server/target/paper-$mcver.jar"
 fi

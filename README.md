@@ -128,7 +128,7 @@ cd Antarctic
 ./gradlew buildServerJar
 ```
 
-The runnable server archive is emitted to `Antarctic-Server/build/libs/Antarctic-Server-1.12.2-R0.1-SNAPSHOT.jar`.
+The runnable server archive is emitted to `Antarctic-Server/build/libs/Antarctic-b<year>.<month>.jar` (stamped with the build date, e.g. `Antarctic-b2026.11.jar`).
 
 <details>
 <summary><strong>Contributor Patch Workflow</strong></summary>
