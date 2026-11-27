@@ -1,0 +1,507 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Fri, 27 Nov 2026 09:36:56 +0700
+Subject: [PATCH 205/205] perf: bound EntityLiving and EntityArmorStand entity
+ push scans
+
+
+diff --git a/main/java/net/minecraft/server/Chunk.java b/main/java/net/minecraft/server/Chunk.java
+index 461a199..c45dece 100644
+--- a/main/java/net/minecraft/server/Chunk.java
++++ b/main/java/net/minecraft/server/Chunk.java
+@@ -1294,13 +1294,14 @@ public class Chunk {
+         return selfPush != ScoreboardTeamBase.EnumTeamPush.HIDE_FOR_OTHER_TEAMS && targetPush != ScoreboardTeamBase.EnumTeamPush.HIDE_FOR_OTHER_TEAMS || sameTeam;
+     }
+ 
+-    void collectPushableEntities(EntityLiving self, AxisAlignedBB axisalignedbb, @Nullable ScoreboardTeamBase selfTeam, ScoreboardTeamBase.EnumTeamPush selfPush, boolean isClientSide, List<Entity> out) {
++    boolean collectPushableEntities(EntityLiving self, AxisAlignedBB axisalignedbb, @Nullable ScoreboardTeamBase selfTeam, ScoreboardTeamBase.EnumTeamPush selfPush, boolean isClientSide, List<Entity> out, int maxCollected, int maxNonPassengerCramming, @Nullable int[] countsOut) {
+         int i = MathHelper.floor((axisalignedbb.b - 2.0D) / 16.0D);
+         int j = MathHelper.floor((axisalignedbb.e + 2.0D) / 16.0D);
+ 
+         i = MathHelper.clamp(i, 0, this.entitySlices.length - 1);
+         j = MathHelper.clamp(j, 0, this.entitySlices.length - 1);
+ 
++        int nonPassengerCount = countsOut != null ? countsOut[1] : 0;
+         for (int k = i; k <= j; ++k) {
+             List<Entity> slice = this.entitySlices[k];
+             for (int idx = 0, len = slice.size(); idx < len; ++idx) {
+@@ -1308,7 +1309,18 @@ public class Chunk {
+ 
+                 if (entity1.getBoundingBox().c(axisalignedbb) && entity1 != self) {
+                     if (isEntityPushable(entity1, selfTeam, selfPush, isClientSide)) {
+-                        out.add(entity1);
++                        if (countsOut != null) {
++                            countsOut[0]++;
++                            if (!entity1.isPassenger()) {
++                                nonPassengerCount = ++countsOut[1];
++                            }
++                        }
++                        if (out.size() < maxCollected) {
++                            out.add(entity1);
++                        }
++                        if (out.size() >= maxCollected && (maxNonPassengerCramming <= 0 || nonPassengerCount >= maxNonPassengerCramming)) {
++                            return true;
++                        }
+                     }
+ 
+                     Entity[] aentity = entity1.bb();
+@@ -1316,13 +1328,25 @@ public class Chunk {
+                         for (int m = 0, alen = aentity.length; m < alen; ++m) {
+                             Entity entity2 = aentity[m];
+                             if (entity2 != self && entity2.getBoundingBox().c(axisalignedbb) && isEntityPushable(entity2, selfTeam, selfPush, isClientSide)) {
+-                                out.add(entity2);
++                                if (countsOut != null) {
++                                    countsOut[0]++;
++                                    if (!entity2.isPassenger()) {
++                                        nonPassengerCount = ++countsOut[1];
++                                    }
++                                }
++                                if (out.size() < maxCollected) {
++                                    out.add(entity2);
++                                }
++                                if (out.size() >= maxCollected && (maxNonPassengerCramming <= 0 || nonPassengerCount >= maxNonPassengerCramming)) {
++                                    return true;
++                                }
+                             }
+                         }
+                     }
+                 }
+             }
+         }
++        return false;
+     }
+ 
+     private static final class MergeScratch {
+diff --git a/main/java/net/minecraft/server/EntityArmorStand.java b/main/java/net/minecraft/server/EntityArmorStand.java
+index e30dddd..e4f5609 100644
+--- a/main/java/net/minecraft/server/EntityArmorStand.java
++++ b/main/java/net/minecraft/server/EntityArmorStand.java
+@@ -317,7 +317,11 @@ public class EntityArmorStand extends EntityLiving {
+             return;
+         }
+         // Leaf end
+-        List list = this.world.getEntities(this, this.getBoundingBox(), EntityArmorStand.bx);
++        AxisAlignedBB bb = this.getBoundingBox();
++        if (!this.world.hasAnyHardCollidableInBounds(bb)) {
++            return;
++        }
++        List list = this.world.getEntities(this, bb, EntityArmorStand.bx);
+ 
+         for (int i = 0; i < list.size(); ++i) {
+             Entity entity = (Entity) list.get(i);
+diff --git a/main/java/net/minecraft/server/EntityLiving.java b/main/java/net/minecraft/server/EntityLiving.java
+index 587373d..7d24d18 100644
+--- a/main/java/net/minecraft/server/EntityLiving.java
++++ b/main/java/net/minecraft/server/EntityLiving.java
+@@ -2273,6 +2273,8 @@ public abstract class EntityLiving extends Entity {
+ 
+     private static final ThreadLocal<java.util.ArrayList<Entity>> PUSH_SCRATCH =
+             ThreadLocal.withInitial(() -> new java.util.ArrayList<Entity>(16));
++    private static final ThreadLocal<int[]> PUSH_COUNTS =
++            ThreadLocal.withInitial(() -> new int[2]);
+     private static final ThreadLocal<boolean[]> PUSH_IN_USE =
+             ThreadLocal.withInitial(() -> new boolean[1]);
+ 
+@@ -2288,43 +2290,43 @@ public abstract class EntityLiving extends Entity {
+             return;
+         }
+ 
++        int maxCramming = this.world.getGameRules().getMaxEntityCramming();
++        int maxCollisions = this.world.paperConfig.maxCollisionsPerEntity;
++        if (maxCollisions <= 0 && maxCramming <= 0) {
++            return;
++        }
++        int nextNumCollisions = Math.max(0, this.numCollisions - maxCollisions);
++        int remainingPushes = Math.max(0, maxCollisions - nextNumCollisions);
++
+         boolean[] inUse = PUSH_IN_USE.get();
+         boolean usingScratch = !inUse[0];
+         java.util.ArrayList<Entity> list;
++        int[] counts;
+         if (usingScratch) {
+             inUse[0] = true;
+             list = PUSH_SCRATCH.get();
++            counts = PUSH_COUNTS.get();
++            counts[0] = 0;
++            counts[1] = 0;
+         } else {
+             list = new java.util.ArrayList<Entity>(16);
++            counts = new int[2];
+         }
+ 
+         try {
+-            this.world.collectPushableEntities(this, this.getBoundingBox(), selfTeam, selfPush, list);
+-
+-            int size = list.size();
+-            if (size > 0) {
+-                int i = this.world.getGameRules().getMaxEntityCramming();
+-                int j;
+-
+-                if (i > 0 && size > i - 1 && this.random.nextInt(4) == 0) {
+-                    j = 0;
++            this.world.collectPushableEntities(this, this.getBoundingBox(), selfTeam, selfPush, list, remainingPushes, maxCramming, counts);
+ 
+-                    for (int k = 0; k < size; ++k) {
+-                        if (!list.get(k).isPassenger()) {
+-                            ++j;
+-                        }
+-                    }
+-
+-                    if (j > i - 1) {
+-                        this.damageEntity(DamageSource.CRAMMING, 6.0F);
+-                    }
++            int totalPushable = counts[0];
++            if (totalPushable > 0) {
++                if (maxCramming > 0 && totalPushable > maxCramming - 1 && this.random.nextInt(4) == 0 && counts[1] > maxCramming - 1) {
++                    this.damageEntity(DamageSource.CRAMMING, 6.0F);
+                 }
+ 
+-                numCollisions = Math.max(0, numCollisions - world.paperConfig.maxCollisionsPerEntity); // Paper
+-                for (j = 0; j < size && numCollisions < world.paperConfig.maxCollisionsPerEntity; ++j) { // Paper
++                this.numCollisions = nextNumCollisions;
++                for (int j = 0, pushSize = list.size(); j < pushSize && this.numCollisions < maxCollisions; ++j) { // Paper
+                     Entity entity = list.get(j);
+                     entity.numCollisions++; // Paper
+-                    numCollisions++; // Paper
++                    this.numCollisions++; // Paper
+ 
+                     this.C(entity);
+                 }
+diff --git a/main/java/net/minecraft/server/World.java b/main/java/net/minecraft/server/World.java
+index 9ef4c1f..d9060a7 100644
+--- a/main/java/net/minecraft/server/World.java
++++ b/main/java/net/minecraft/server/World.java
+@@ -4462,6 +4462,10 @@ public abstract class World implements IBlockAccess {
+     }
+ 
+     void collectPushableEntities(EntityLiving self, AxisAlignedBB axisalignedbb, @Nullable ScoreboardTeamBase selfTeam, ScoreboardTeamBase.EnumTeamPush selfPush, List<Entity> out) {
++        this.collectPushableEntities(self, axisalignedbb, selfTeam, selfPush, out, Integer.MAX_VALUE, 0, null);
++    }
++
++    void collectPushableEntities(EntityLiving self, AxisAlignedBB axisalignedbb, @Nullable ScoreboardTeamBase selfTeam, ScoreboardTeamBase.EnumTeamPush selfPush, List<Entity> out, int maxCollected, int maxNonPassengerCramming, int[] countsOut) {
+         int i = MathHelper.floor((axisalignedbb.a - 2.0D) / 16.0D);
+         int j = MathHelper.floor((axisalignedbb.d + 2.0D) / 16.0D);
+         int k = MathHelper.floor((axisalignedbb.c - 2.0D) / 16.0D);
+@@ -4470,11 +4474,34 @@ public abstract class World implements IBlockAccess {
+         for (int i1 = i; i1 <= j; ++i1) {
+             for (int j1 = k; j1 <= l; ++j1) {
+                 Chunk chunk = this.getChunkIfLoaded(i1, j1);
++                if (chunk != null && chunk.collectPushableEntities(self, axisalignedbb, selfTeam, selfPush, this.isClientSide, out, maxCollected, maxNonPassengerCramming, countsOut)) {
++                    return;
++                }
++            }
++        }
++    }
++
++    boolean hasAnyHardCollidableInBounds(AxisAlignedBB axisalignedbb) {
++        int minChunkX = MathHelper.floor((axisalignedbb.a - 2.0D) / 16.0D);
++        int maxChunkX = MathHelper.floor((axisalignedbb.d + 2.0D) / 16.0D);
++        int minChunkZ = MathHelper.floor((axisalignedbb.c - 2.0D) / 16.0D);
++        int maxChunkZ = MathHelper.floor((axisalignedbb.f + 2.0D) / 16.0D);
++        int minSlice = MathHelper.clamp(MathHelper.floor((axisalignedbb.b - 2.0D) / 16.0D), 0, 15);
++        int maxSlice = MathHelper.clamp(MathHelper.floor((axisalignedbb.e + 2.0D) / 16.0D), 0, 15);
++
++        for (int cx = minChunkX; cx <= maxChunkX; ++cx) {
++            for (int cz = minChunkZ; cz <= maxChunkZ; ++cz) {
++                Chunk chunk = this.getChunkIfLoaded(cx, cz);
+                 if (chunk != null) {
+-                    chunk.collectPushableEntities(self, axisalignedbb, selfTeam, selfPush, this.isClientSide, out);
++                    for (int sliceY = minSlice; sliceY <= maxSlice; ++sliceY) {
++                        if (chunk.hardCollidableCounts[sliceY] > 0) {
++                            return true;
++                        }
++                    }
+                 }
+             }
+         }
++        return false;
+     }
+ 
+     // Antarctic start - zero-allocation early-exit count matching a(Class, AxisAlignedBB, Predicate).size()
+diff --git a/test/java/net/minecraft/server/EntityPushBoundParityTest.java b/test/java/net/minecraft/server/EntityPushBoundParityTest.java
+new file mode 100644
+index 0000000..a1a4499
+--- /dev/null
++++ b/test/java/net/minecraft/server/EntityPushBoundParityTest.java
+@@ -0,0 +1,281 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.PaperWorldConfig;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.List;
++
++import static org.junit.Assert.*;
++
++public class EntityPushBoundParityTest {
++
++    private static Unsafe UNSAFE;
++    private static int nextEntityId = 10000;
++
++    @BeforeClass
++    public static void setup() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        UNSAFE = (Unsafe) f.get(null);
++    }
++
++    private static final class TestWorld extends World {
++        final Chunk chunk;
++
++        TestWorld(Chunk chunk) {
++            super(null, new WorldData(), new WorldProviderNormal(), new MethodProfiler(), false, null, null);
++            this.chunk = chunk;
++        }
++
++        @Override
++        protected IChunkProvider n() {
++            return null;
++        }
++
++        @Override
++        protected boolean isChunkLoaded(int i, int j, boolean flag) {
++            return i == 0 && j == 0;
++        }
++
++        @Override
++        public Chunk getChunkIfLoaded(int i, int j) {
++            return (i == 0 && j == 0) ? this.chunk : null;
++        }
++    }
++
++    private static TestWorld createTestWorld() throws Exception {
++        Chunk chunk = (Chunk) UNSAFE.allocateInstance(Chunk.class);
++        Field secField = Chunk.class.getDeclaredField("sections");
++        secField.setAccessible(true);
++        ChunkSection[] sections = new ChunkSection[16];
++        for (int s = 0; s < 16; ++s) {
++            sections[s] = new ChunkSection(s << 4, true);
++        }
++        secField.set(chunk, sections);
++
++        Field slicesField = Chunk.class.getDeclaredField("entitySlices");
++        slicesField.setAccessible(true);
++        @SuppressWarnings("unchecked")
++        List<Entity>[] slices = new List[16];
++        for (int s = 0; s < 16; ++s) {
++            slices[s] = new ArrayList<>();
++        }
++        slicesField.set(chunk, slices);
++
++        for (String fn : new String[]{"hardCollidableCounts", "itemCounts", "inventoryEntityCounts", "itemFrameCounts"}) {
++            Field f = Chunk.class.getDeclaredField(fn);
++            f.setAccessible(true);
++            f.set(chunk, new int[16]);
++        }
++        Field ec = Chunk.class.getDeclaredField("entityCounts");
++        ec.setAccessible(true);
++        ec.set(chunk, new co.aikar.util.Counter<String>());
++        Field ect = Chunk.class.getDeclaredField("entityCount");
++        ect.setAccessible(true);
++        ect.set(chunk, new gnu.trove.map.hash.TObjectIntHashMap<Class>());
++        Field acc = Chunk.class.getDeclaredField("antarcticCreatureCounts");
++        acc.setAccessible(true);
++        acc.set(chunk, new int[EnumCreatureType.values().length]);
++
++        TestWorld world = (TestWorld) UNSAFE.allocateInstance(TestWorld.class);
++        Field cf = TestWorld.class.getDeclaredField("chunk");
++        cf.setAccessible(true);
++        cf.set(world, chunk);
++        Field wc = Chunk.class.getDeclaredField("world");
++        wc.setAccessible(true);
++        wc.set(chunk, world);
++        Field pwc = World.class.getDeclaredField("paperConfig");
++        pwc.setAccessible(true);
++        PaperWorldConfig config = (PaperWorldConfig) UNSAFE.allocateInstance(PaperWorldConfig.class);
++        config.maxCollisionsPerEntity = 8;
++        pwc.set(world, config);
++        Field cpField = World.class.getDeclaredField("chunkProvider");
++        cpField.setAccessible(true);
++        cpField.set(world, new IChunkProvider() {
++            @Override public Chunk getLoadedChunkAt(int i, int j) { return (i == 0 && j == 0) ? chunk : null; }
++            @Override public Chunk getChunkAt(int i, int j) { return (i == 0 && j == 0) ? chunk : null; }
++            @Override public boolean unloadChunks() { return false; }
++            @Override public String getName() { return "TestChunkProvider"; }
++            @Override public boolean e(int i, int j) { return i == 0 && j == 0; }
++        });
++        return world;
++    }
++
++    private static EntityZombie createMob(World world, double x, double y, double z, boolean passenger) throws Exception {
++        EntityZombie e = (EntityZombie) UNSAFE.allocateInstance(EntityZombie.class);
++        e.h(nextEntityId++);
++        e.world = world;
++        e.locX = x;
++        e.locY = y;
++        e.locZ = z;
++        e.a(new AxisAlignedBB(x - 0.3, y, z - 0.3, x + 0.3, y + 1.95, z + 0.3));
++        DataWatcher dw = new DataWatcher(e);
++        dw.register(EntityLiving.HEALTH, 20.0F);
++        Field dwField = Entity.class.getDeclaredField("datawatcher");
++        dwField.setAccessible(true);
++        dwField.set(e, dw);
++        e.collides = true;
++        if (passenger) {
++            Field vehicleField = Entity.class.getDeclaredField("au");
++            vehicleField.setAccessible(true);
++            vehicleField.set(e, createDummyStand(world, x, y, z));
++        }
++        return e;
++    }
++
++    private static EntityArmorStand createDummyStand(World world, double x, double y, double z) throws Exception {
++        EntityArmorStand stand = (EntityArmorStand) UNSAFE.allocateInstance(EntityArmorStand.class);
++        stand.h(nextEntityId++);
++        stand.world = world;
++        stand.locX = x;
++        stand.locY = y;
++        stand.locZ = z;
++        stand.a(new AxisAlignedBB(x - 0.25, y, z - 0.25, x + 0.25, y + 1.975, z + 0.25));
++        return stand;
++    }
++
++    private static EntityMinecartRideable createMinecart(World world, double x, double y, double z) throws Exception {
++        EntityMinecartRideable cart = (EntityMinecartRideable) UNSAFE.allocateInstance(EntityMinecartRideable.class);
++        cart.h(nextEntityId++);
++        cart.world = world;
++        cart.locX = x;
++        cart.locY = y;
++        cart.locZ = z;
++        cart.a(new AxisAlignedBB(x - 0.49, y, z - 0.49, x + 0.49, y + 0.7, z + 0.49));
++        return cart;
++    }
++
++    @Test
++    public void testBoundedPushParityAndPassengerExclusion() throws Exception {
++        TestWorld world = createTestWorld();
++        EntityZombie self = createMob(world, 8.0, 64.0, 8.0, false);
++        world.chunk.a(self);
++
++        List<Entity> expectedAll = new ArrayList<>();
++        for (int i = 0; i < 24; i++) {
++            EntityZombie passenger = createMob(world, 8.0, 64.0, 8.0, true);
++            world.chunk.a(passenger);
++            expectedAll.add(passenger);
++        }
++
++        List<Entity> bounded = new ArrayList<>();
++        int[] counts = new int[2];
++        world.collectPushableEntities(self, self.getBoundingBox(), null, ScoreboardTeamBase.EnumTeamPush.ALWAYS, bounded, 8, 24, counts);
++
++        assertEquals(8, bounded.size());
++        assertEquals(expectedAll.subList(0, 8), bounded);
++        assertEquals(24, counts[0]);
++        assertEquals(0, counts[1]);
++
++        // Add 24 non-passenger mobs: cramming threshold (counts[1] >= 24) must trigger cleanly
++        for (int i = 0; i < 24; i++) {
++            EntityZombie standing = createMob(world, 8.0, 64.0, 8.0, false);
++            world.chunk.a(standing);
++        }
++        bounded.clear();
++        counts[0] = 0;
++        counts[1] = 0;
++        world.collectPushableEntities(self, self.getBoundingBox(), null, ScoreboardTeamBase.EnumTeamPush.ALWAYS, bounded, 8, 24, counts);
++        assertEquals(8, bounded.size());
++        assertEquals(24, counts[1]);
++    }
++
++    @Test
++    public void testHardCollidableBoundsAndArmorStandSkip() throws Exception {
++        TestWorld world = createTestWorld();
++        for (int i = 0; i < 500; i++) {
++            world.chunk.a(createDummyStand(world, 8.0, 64.0, 8.0));
++        }
++
++        AxisAlignedBB probeBox = new AxisAlignedBB(7.75, 64.0, 7.75, 8.25, 65.975, 8.25);
++        assertFalse(world.hasAnyHardCollidableInBounds(probeBox));
++
++        EntityMinecartRideable cart = createMinecart(world, 8.0, 64.0, 8.0);
++        world.chunk.a(cart);
++        assertTrue(world.hasAnyHardCollidableInBounds(probeBox));
++
++        world.chunk.b(cart);
++        assertFalse(world.hasAnyHardCollidableInBounds(probeBox));
++    }
++
++    @Test
++    public void testBoundedPushAndArmorStandPerformance() throws Exception {
++        TestWorld world = createTestWorld();
++        EntityZombie self = createMob(world, 8.0, 64.0, 8.0, false);
++        world.chunk.a(self);
++        for (int i = 0; i < 1000; i++) {
++            world.chunk.a(createMob(world, 8.0, 64.0, 8.0, false));
++        }
++
++        List<Entity> out = new ArrayList<>(16);
++        int[] counts = new int[2];
++
++        // Warmup
++        for (int i = 0; i < 500; i++) {
++            out.clear();
++            counts[0] = 0;
++            counts[1] = 0;
++            world.collectPushableEntities(self, self.getBoundingBox(), null, ScoreboardTeamBase.EnumTeamPush.ALWAYS, out, 8, 24, counts);
++            out.clear();
++            world.collectPushableEntities(self, self.getBoundingBox(), null, ScoreboardTeamBase.EnumTeamPush.ALWAYS, out);
++        }
++
++        long t0 = System.nanoTime();
++        for (int i = 0; i < 2000; i++) {
++            out.clear();
++            counts[0] = 0;
++            counts[1] = 0;
++            world.collectPushableEntities(self, self.getBoundingBox(), null, ScoreboardTeamBase.EnumTeamPush.ALWAYS, out, 8, 24, counts);
++            assertEquals(8, out.size());
++        }
++        long boundedNs = System.nanoTime() - t0;
++
++        long t1 = System.nanoTime();
++        for (int i = 0; i < 2000; i++) {
++            out.clear();
++            world.collectPushableEntities(self, self.getBoundingBox(), null, ScoreboardTeamBase.EnumTeamPush.ALWAYS, out);
++        }
++        long unboundedNs = System.nanoTime() - t1;
++
++        // Armor stand skip benchmark on 2,000 stands
++        TestWorld standWorld = createTestWorld();
++        for (int i = 0; i < 2000; i++) {
++            standWorld.chunk.a(createDummyStand(standWorld, 8.0, 64.0, 8.0));
++        }
++        Field bxField = EntityArmorStand.class.getDeclaredField("bx");
++        bxField.setAccessible(true);
++        @SuppressWarnings("unchecked")
++        com.google.common.base.Predicate<? super Entity> minecartPred = (com.google.common.base.Predicate<? super Entity>) bxField.get(null);
++        AxisAlignedBB standBb = new AxisAlignedBB(7.75, 64.0, 7.75, 8.25, 65.975, 8.25);
++        for (int i = 0; i < 500; i++) {
++            standWorld.hasAnyHardCollidableInBounds(standBb);
++            standWorld.getEntities(null, standBb, minecartPred);
++        }
++
++        long s0 = System.nanoTime();
++        for (int i = 0; i < 2000; i++) {
++            assertFalse(standWorld.hasAnyHardCollidableInBounds(standBb));
++        }
++        long standFastNs = System.nanoTime() - s0;
++
++        long s1 = System.nanoTime();
++        for (int i = 0; i < 2000; i++) {
++            standWorld.getEntities(null, standBb, minecartPred);
++        }
++        long standScanNs = System.nanoTime() - s1;
++
++        double pushSpeedup = (double) unboundedNs / Math.max(1L, boundedNs);
++        double standSpeedup = (double) standScanNs / Math.max(1L, standFastNs);
++        System.out.printf("[A1 Perf] Push bounded=%d us vs unbounded=%d us (%.1fx) | ArmorStand skip=%d us vs scan=%d us (%.1fx)%n",
++                boundedNs / 1000L, unboundedNs / 1000L, pushSpeedup,
++                standFastNs / 1000L, standScanNs / 1000L, standSpeedup);
++
++        assertTrue("Expected >= 3x push speedup, got " + pushSpeedup, pushSpeedup >= 3.0);
++        assertTrue("Expected >= 10x armor-stand skip speedup, got " + standSpeedup, standSpeedup >= 10.0);
++    }
++}
