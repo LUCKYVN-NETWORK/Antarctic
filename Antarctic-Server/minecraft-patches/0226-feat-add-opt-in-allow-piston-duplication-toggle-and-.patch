@@ -1,0 +1,357 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Fri, 27 Nov 2026 13:54:20 +0700
+Subject: [PATCH 226/226] feat: add opt-in allow-piston-duplication toggle and
+ dead HeldItemSlot guard
+
+
+diff --git a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+index 40618f0..0890b1b 100644
+--- a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
++++ b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+@@ -7,6 +7,7 @@ import com.destroystokyo.paper.config.toml.modules.concurrency.AsyncPlayerDataSa
+ import com.destroystokyo.paper.config.toml.modules.concurrency.VirtualThreads;
+ import com.destroystokyo.paper.config.toml.modules.fixes.Books;
+ import com.destroystokyo.paper.config.toml.modules.fixes.MapDecorations;
++import com.destroystokyo.paper.config.toml.modules.fixes.PistonDuplication;
+ import com.destroystokyo.paper.config.toml.modules.fixes.VanillaBugFix;
+ import com.destroystokyo.paper.config.toml.modules.gameplay.ChunkOverloadDupe;
+ import com.destroystokyo.paper.config.toml.modules.gameplay.Collisions;
+@@ -77,7 +78,7 @@ public final class AntarcticTomlConfig {
+             new VirtualThreads(), new AsyncPlayerDataSaving(),
+             new Pathfinder(), new Suffocation(), new Projectiles(), new ArmourStands(), new WorldBorder(), new ChunkLoading(), new MobSpawning(), new Dab(), new FarmAiCulling(), new EntityPhysicsGuard(), new DontSaveEntity(), new EntityGoal(), new ReducePackets(), new Growth(), new Hopper(), new Inventory(), new SunBurn(), new Rails(), new Redstone(), new RedstoneGuard(), new Physics(), new Lighting(),
+             new MergeChecks(), new ChunkOverloadDupe(), new Collisions(), new Player(), new SpawnerSettings(), new Knockback(), new DeathItemDropKnockback(), new World(), new Tripwire(),
+-            new MapDecorations(), new Books(), new VanillaBugFix());
++            new MapDecorations(), new Books(), new VanillaBugFix(), new PistonDuplication());
+     private static final YamlConfiguration yamlFacade = new YamlConfiguration();
+     private static File configFile = new File("antarctic.toml");
+     private static CommentedFileConfig configFileInstance;
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/fixes/PistonDuplication.java b/main/java/com/destroystokyo/paper/config/toml/modules/fixes/PistonDuplication.java
+new file mode 100644
+index 0000000..da3320b
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/fixes/PistonDuplication.java
+@@ -0,0 +1,24 @@
++package com.destroystokyo.paper.config.toml.modules.fixes;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++
++public class PistonDuplication implements IConfigModule {
++
++    @ConfigInfo(
++        baseName = "allow-piston-duplication",
++        comments = "Allow vanilla 1.12.2 piston rail/carpet/TNT self-duplication mechanics. Default true for 1.12.2 technical parity; set false to re-verify block state snapshots during piston moves."
++    )
++    public static boolean allowPistonDuplication = true;
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.FIXES;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "piston-duplication";
++    }
++}
+diff --git a/main/java/net/minecraft/server/BlockPiston.java b/main/java/net/minecraft/server/BlockPiston.java
+index e1bfc83..3dc029b 100644
+--- a/main/java/net/minecraft/server/BlockPiston.java
++++ b/main/java/net/minecraft/server/BlockPiston.java
+@@ -358,9 +358,15 @@ public class BlockPiston extends BlockDirectional {
+             BlockPosition blockposition2;
+             IBlockData iblockdata;
+ 
++            final boolean preventDupe = !com.destroystokyo.paper.config.toml.modules.fixes.PistonDuplication.allowPistonDuplication;
+             for (k = list1.size() - 1; k >= 0; --k) {
+                 blockposition2 = (BlockPosition) list1.get(k);
+                 iblockdata = world.getType(blockposition2);
++                if (preventDupe && iblockdata.getMaterial() == Material.AIR) {
++                    --j;
++                    aiblockdata[j] = Blocks.AIR.getBlockData();
++                    continue;
++                }
+                 iblockdata.getBlock().b(world, blockposition2, iblockdata, 0);
+                 world.setTypeAndData(blockposition2, Blocks.AIR.getBlockData(), 4);
+                 --j;
+@@ -370,6 +376,11 @@ public class BlockPiston extends BlockDirectional {
+             for (k = list.size() - 1; k >= 0; --k) {
+                 blockposition2 = (BlockPosition) list.get(k);
+                 iblockdata = world.getType(blockposition2);
++                if (preventDupe && !iblockdata.equals(arraylist.get(k))) {
++                    --j;
++                    aiblockdata[j] = Blocks.AIR.getBlockData();
++                    continue;
++                }
+                 world.setTypeAndData(blockposition2, Blocks.AIR.getBlockData(), 2);
+                 blockposition2 = blockposition2.shift(enumdirection1);
+                 world.setTypeAndData(blockposition2, Blocks.PISTON_EXTENSION.getBlockData().set(BlockPiston.FACING, enumdirection), 4);
+diff --git a/main/java/net/minecraft/server/PlayerConnection.java b/main/java/net/minecraft/server/PlayerConnection.java
+index b46d04b..526236b 100644
+--- a/main/java/net/minecraft/server/PlayerConnection.java
++++ b/main/java/net/minecraft/server/PlayerConnection.java
+@@ -1349,6 +1349,10 @@ public class PlayerConnection implements PacketListenerPlayIn, ITickable {
+     public void a(PacketPlayInHeldItemSlot packetplayinhelditemslot) {
+         PlayerConnectionUtils.ensureMainThread(packetplayinhelditemslot, this, this.player.x());
+         if (this.player.isFrozen()) return; // CraftBukkit
++        if (this.player.dead) {
++            this.sendPacket(new PacketPlayOutHeldItemSlot(this.player.inventory.itemInHandIndex));
++            return;
++        }
+         if (packetplayinhelditemslot.a() >= 0 && packetplayinhelditemslot.a() < PlayerInventory.getHotbarSize()) {
+             PlayerItemHeldEvent event = new PlayerItemHeldEvent(this.getPlayer(), this.player.inventory.itemInHandIndex, packetplayinhelditemslot.a());
+             this.server.getPluginManager().callEvent(event);
+diff --git a/test/java/net/minecraft/server/PistonDupeAndHeldSlotTest.java b/test/java/net/minecraft/server/PistonDupeAndHeldSlotTest.java
+new file mode 100644
+index 0000000..ce66201
+--- /dev/null
++++ b/test/java/net/minecraft/server/PistonDupeAndHeldSlotTest.java
+@@ -0,0 +1,246 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.antixray.ChunkPacketBlockController;
++import com.destroystokyo.paper.config.toml.modules.fixes.PistonDuplication;
++import org.junit.After;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++import java.lang.reflect.Field;
++import java.lang.reflect.Method;
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++
++import static org.junit.Assert.*;
++
++public class PistonDupeAndHeldSlotTest {
++
++    private static Unsafe UNSAFE;
++
++    private final boolean prevAllowDupe = PistonDuplication.allowPistonDuplication;
++
++    @BeforeClass
++    public static void init() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        UNSAFE = (Unsafe) f.get(null);
++    }
++
++    @After
++    public void restoreConfig() {
++        PistonDuplication.allowPistonDuplication = prevAllowDupe;
++    }
++
++    private static final class MockWorld extends WorldServer {
++        Map<BlockPosition, IBlockData> blocks;
++        Map<BlockPosition, TileEntity> tileEntities;
++        WorldBorder border;
++
++        MockWorld() throws Exception {
++            super(null, null, null, 0, null, null, null);
++        }
++
++        @Override
++        protected IChunkProvider n() {
++            return null;
++        }
++
++        @Override
++        protected boolean isChunkLoaded(int i, int j, boolean flag) {
++            return true;
++        }
++
++        @Override
++        public IBlockData getType(BlockPosition pos) {
++            return blocks.getOrDefault(pos, Blocks.AIR.getBlockData());
++        }
++
++        @Override
++        public boolean setTypeAndData(BlockPosition pos, IBlockData data, int flags) {
++            blocks.put(pos.h(), data);
++            return true;
++        }
++
++        @Override
++        public boolean isEmpty(BlockPosition pos) {
++            return getType(pos).getMaterial() == Material.AIR;
++        }
++
++        @Override
++        public void setTileEntity(BlockPosition pos, TileEntity te) {
++            tileEntities.put(pos.h(), te);
++        }
++
++        @Override
++        public TileEntity getTileEntity(BlockPosition pos) {
++            return tileEntities.get(pos);
++        }
++
++        @Override
++        public WorldBorder getWorldBorder() {
++            return border;
++        }
++
++        public void applyPhysics(BlockPosition pos, Block block, boolean flag) {}
++
++        @Override
++        public boolean isMainThread() {
++            return true;
++        }
++    }
++
++    private static MockWorld newMockWorld() throws Exception {
++        MockWorld world = (MockWorld) UNSAFE.allocateInstance(MockWorld.class);
++        world.blocks = new HashMap<>();
++        world.tileEntities = new HashMap<>();
++        world.border = new WorldBorder();
++        Field cpcField = World.class.getDeclaredField("chunkPacketBlockController");
++        cpcField.setAccessible(true);
++        cpcField.set(world, new ChunkPacketBlockController() {});
++        return world;
++    }
++
++    @Test
++    public void testPistonNormalPushParityInBothModes() throws Exception {
++        Method pushMethod = BlockPiston.class.getDeclaredMethod("a", World.class, BlockPosition.class, EnumDirection.class, boolean.class);
++        pushMethod.setAccessible(true);
++
++        for (boolean allow : new boolean[] { true, false }) {
++            PistonDuplication.allowPistonDuplication = allow;
++            MockWorld world = newMockWorld();
++            BlockPosition pistonPos = new BlockPosition(0, 64, 0);
++            BlockPosition stonePos = new BlockPosition(1, 64, 0);
++            BlockPosition destPos = new BlockPosition(2, 64, 0);
++            world.blocks.put(pistonPos, Blocks.PISTON.getBlockData().set(BlockPiston.FACING, EnumDirection.EAST).set(BlockPiston.EXTENDED, Boolean.FALSE));
++            world.blocks.put(stonePos, Blocks.STONE.getBlockData());
++
++            assertTrue((Boolean) pushMethod.invoke(Blocks.PISTON, world, pistonPos, EnumDirection.EAST, true));
++            assertEquals(Blocks.PISTON_EXTENSION, world.blocks.get(destPos).getBlock());
++            assertTrue(world.tileEntities.get(destPos) instanceof TileEntityPiston);
++        }
++    }
++
++    @Test
++    public void testPistonMidPushMutationBlockedWhenDisallowed() throws Exception {
++        Method pushMethod = BlockPiston.class.getDeclaredMethod("a", World.class, BlockPosition.class, EnumDirection.class, boolean.class);
++        pushMethod.setAccessible(true);
++
++        final BlockPosition movedPos = new BlockPosition(1, 64, 0);
++        final BlockPosition brokenPos = new BlockPosition(2, 64, 0);
++        final BlockPosition destMovedPos = new BlockPosition(2, 64, 0);
++
++        // Breakable block whose dropNaturally mutates movedPos to AIR mid-push (simulating rail/carpet/TNT pop-off dupe)
++        Block mutatingBreakable = new Block(Material.PLANT) {
++            @Override
++            public void dropNaturally(World world, BlockPosition pos, IBlockData data, float f, int fortune) {
++                world.setTypeAndData(movedPos, Blocks.AIR.getBlockData(), 2);
++            }
++
++            @Override
++            public EnumPistonReaction h(IBlockData data) {
++                return EnumPistonReaction.DESTROY;
++            }
++        };
++
++        // 1. allowPistonDuplication = true (vanilla): still creates TileEntityPiston at destMovedPos
++        PistonDuplication.allowPistonDuplication = true;
++        MockWorld vanillaWorld = newMockWorld();
++        BlockPosition pistonPos = new BlockPosition(0, 64, 0);
++        vanillaWorld.blocks.put(pistonPos, Blocks.PISTON.getBlockData().set(BlockPiston.FACING, EnumDirection.EAST));
++        vanillaWorld.blocks.put(movedPos, Blocks.STONE.getBlockData());
++        vanillaWorld.blocks.put(brokenPos, mutatingBreakable.getBlockData());
++        assertTrue((Boolean) pushMethod.invoke(Blocks.PISTON, vanillaWorld, pistonPos, EnumDirection.EAST, true));
++        assertTrue(vanillaWorld.tileEntities.get(destMovedPos) instanceof TileEntityPiston);
++
++        // 2. allowPistonDuplication = false: detects movedPos != snapshot and skips creating duplicate TileEntityPiston
++        PistonDuplication.allowPistonDuplication = false;
++        MockWorld guardedWorld = newMockWorld();
++        guardedWorld.blocks.put(pistonPos, Blocks.PISTON.getBlockData().set(BlockPiston.FACING, EnumDirection.EAST));
++        guardedWorld.blocks.put(movedPos, Blocks.STONE.getBlockData());
++        guardedWorld.blocks.put(brokenPos, mutatingBreakable.getBlockData());
++        assertTrue((Boolean) pushMethod.invoke(Blocks.PISTON, guardedWorld, pistonPos, EnumDirection.EAST, true));
++        assertNull(guardedWorld.tileEntities.get(destMovedPos));
++    }
++
++    private static final class DummyMinecraftServer extends MinecraftServer {
++        DummyMinecraftServer() { super(null, null, null, null, null, null, null); }
++        @Override public boolean isMainThread() { return true; }
++        @Override public boolean init() { return true; }
++        @Override public boolean getSpawnMonsters() { return false; }
++        @Override public EnumGamemode getGamemode() { return EnumGamemode.SURVIVAL; }
++        @Override public EnumDifficulty getDifficulty() { return EnumDifficulty.NORMAL; }
++        @Override public boolean isHardcore() { return false; }
++        @Override public int q() { return 4; }
++        @Override public boolean r() { return false; }
++        @Override public boolean s() { return false; }
++        @Override public String a(EnumGamemode gamemode, boolean flag) { return ""; }
++        @Override public PropertyManager getPropertyManager() { return null; }
++        @Override public boolean getGenerateStructures() { return false; }
++        @Override public boolean aa() { return false; }
++        @Override public boolean af() { return false; }
++        @Override public boolean getEnableCommandBlock() { return false; }
++    }
++
++    @Test
++    public void testDeadHeldItemSlotGuardResyncsWithoutKick() throws Exception {
++        final List<Packet<?>> sent = new ArrayList<>();
++        final boolean[] disconnected = { false };
++
++        EntityPlayer player = (EntityPlayer) UNSAFE.allocateInstance(EntityPlayer.class);
++        player.world = newMockWorld();
++        player.inventory = new PlayerInventory(player);
++        player.inventory.itemInHandIndex = 3;
++        player.dead = true;
++        org.bukkit.craftbukkit.entity.CraftPlayer cp = (org.bukkit.craftbukkit.entity.CraftPlayer) UNSAFE.allocateInstance(org.bukkit.craftbukkit.entity.CraftPlayer.class);
++        Field cpHealthField = org.bukkit.craftbukkit.entity.CraftPlayer.class.getDeclaredField("health");
++        cpHealthField.setAccessible(true);
++        cpHealthField.setDouble(cp, 20.0D);
++        Field beField = Entity.class.getDeclaredField("bukkitEntity");
++        beField.setAccessible(true);
++        beField.set(player, cp);
++        DataWatcher dw = new DataWatcher(player);
++        Field healthKeyField = EntityLiving.class.getDeclaredField("HEALTH");
++        healthKeyField.setAccessible(true);
++        dw.register((DataWatcherObject<Float>) healthKeyField.get(null), 20.0F);
++        Field dwField = Entity.class.getDeclaredField("datawatcher");
++        dwField.setAccessible(true);
++        dwField.set(player, dw);
++
++        PlayerConnection conn = new PlayerConnection(
++                (DummyMinecraftServer) UNSAFE.allocateInstance(DummyMinecraftServer.class),
++                new NetworkManager(EnumProtocolDirection.SERVERBOUND) {
++                    @Override
++                    public boolean isConnected() {
++                        return true;
++                    }
++                },
++                player
++        ) {
++            @Override
++            public void sendPacket(Packet<?> packet) {
++                sent.add(packet);
++            }
++
++            @Override
++            public void disconnect(String s) {
++                disconnected[0] = true;
++            }
++        };
++
++        PacketPlayInHeldItemSlot pkt = (PacketPlayInHeldItemSlot) UNSAFE.allocateInstance(PacketPlayInHeldItemSlot.class);
++        Field slotField = PacketPlayInHeldItemSlot.class.getDeclaredField("itemInHandIndex");
++        slotField.setAccessible(true);
++        slotField.setInt(pkt, 7);
++
++        conn.a(pkt);
++
++        assertEquals(3, player.inventory.itemInHandIndex);
++        assertFalse(disconnected[0]);
++        assertEquals(1, sent.size());
++        assertTrue(sent.get(0) instanceof PacketPlayOutHeldItemSlot);
++    }
++}
