@@ -1,0 +1,342 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Fri, 27 Nov 2026 11:41:31 +0700
+Subject: [PATCH 214/214] fix: guard SetCreativeSlot BlockEntityTag chunk load
+ and CloseWindow windowId
+
+
+diff --git a/main/java/net/minecraft/server/PacketPlayInCloseWindow.java b/main/java/net/minecraft/server/PacketPlayInCloseWindow.java
+index 4dfb6c0..098b1fb 100644
+--- a/main/java/net/minecraft/server/PacketPlayInCloseWindow.java
++++ b/main/java/net/minecraft/server/PacketPlayInCloseWindow.java
+@@ -14,6 +14,10 @@ public class PacketPlayInCloseWindow implements Packet<PacketListenerPlayIn> {
+     }
+     // CraftBukkit end
+ 
++    public int getWindowId() {
++        return this.id;
++    }
++
+     public void a(PacketListenerPlayIn packetlistenerplayin) {
+         packetlistenerplayin.a(this);
+     }
+diff --git a/main/java/net/minecraft/server/PlayerConnection.java b/main/java/net/minecraft/server/PlayerConnection.java
+index 4262808..b46d04b 100644
+--- a/main/java/net/minecraft/server/PlayerConnection.java
++++ b/main/java/net/minecraft/server/PlayerConnection.java
+@@ -1921,6 +1921,10 @@ public class PlayerConnection implements PacketListenerPlayIn, ITickable {
+         PlayerConnectionUtils.ensureMainThread(packetplayinclosewindow, this, this.player.x());
+ 
+         if (this.player.isFrozen()) return; // CraftBukkit
++        if (this.player.activeContainer != this.player.defaultContainer
++                && packetplayinclosewindow.getWindowId() != this.player.activeContainer.windowId) {
++            return;
++        }
+         CraftEventFactory.handleInventoryCloseEvent(this.player, org.bukkit.event.inventory.InventoryCloseEvent.Reason.PLAYER); // CraftBukkit // Paper
+ 
+         this.player.r();
+@@ -2296,6 +2300,7 @@ public class PlayerConnection implements PacketListenerPlayIn, ITickable {
+ 
+     public void a(PacketPlayInSetCreativeSlot packetplayinsetcreativeslot) {
+         PlayerConnectionUtils.ensureMainThread(packetplayinsetcreativeslot, this, this.player.x());
++        if (this.player.isFrozen() || this.player.dead) return;
+         if (this.player.playerInteractManager.isCreative()) {
+             boolean flag = packetplayinsetcreativeslot.a() < 0;
+             ItemStack itemstack = packetplayinsetcreativeslot.getItemStack();
+@@ -2305,15 +2310,22 @@ public class PlayerConnection implements PacketListenerPlayIn, ITickable {
+ 
+                 if (nbttagcompound.hasKey("x") && nbttagcompound.hasKey("y") && nbttagcompound.hasKey("z")) {
+                     BlockPosition blockposition = new BlockPosition(nbttagcompound.getInt("x"), nbttagcompound.getInt("y"), nbttagcompound.getInt("z"));
+-                    TileEntity tileentity = this.player.world.getTileEntity(blockposition);
++                    if (this.player.world.isLoaded(blockposition)
++                            && this.player.d((double) blockposition.getX() + 0.5D, (double) blockposition.getY() + 0.5D, (double) blockposition.getZ() + 0.5D) <= 64.0D) {
++                        TileEntity tileentity = this.player.world.getTileEntity(blockposition);
+ 
+-                    if (tileentity != null) {
+-                        NBTTagCompound nbttagcompound1 = tileentity.save(new NBTTagCompound());
++                        if (tileentity != null) {
++                            NBTTagCompound nbttagcompound1 = tileentity.save(new NBTTagCompound());
+ 
+-                        nbttagcompound1.remove("x");
+-                        nbttagcompound1.remove("y");
+-                        nbttagcompound1.remove("z");
+-                        itemstack.a("BlockEntityTag", (NBTBase) nbttagcompound1);
++                            nbttagcompound1.remove("x");
++                            nbttagcompound1.remove("y");
++                            nbttagcompound1.remove("z");
++                            itemstack.a("BlockEntityTag", (NBTBase) nbttagcompound1);
++                        }
++                    } else {
++                        nbttagcompound.remove("x");
++                        nbttagcompound.remove("y");
++                        nbttagcompound.remove("z");
+                     }
+                 }
+             }
+diff --git a/test/java/net/minecraft/server/CreativeAndCloseWindowGuardTest.java b/test/java/net/minecraft/server/CreativeAndCloseWindowGuardTest.java
+new file mode 100644
+index 0000000..80056a1
+--- /dev/null
++++ b/test/java/net/minecraft/server/CreativeAndCloseWindowGuardTest.java
+@@ -0,0 +1,261 @@
++package net.minecraft.server;
++
++import org.bukkit.craftbukkit.entity.CraftEntity;
++import org.bukkit.craftbukkit.entity.CraftPlayer;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.List;
++
++import static org.junit.Assert.*;
++
++public class CreativeAndCloseWindowGuardTest {
++
++    private static Unsafe UNSAFE;
++
++    @BeforeClass
++    public static void setupTest() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        UNSAFE = (Unsafe) f.get(null);
++    }
++
++    private static final class DummyNetworkManager extends NetworkManager {
++        DummyNetworkManager() {
++            super(EnumProtocolDirection.SERVERBOUND);
++        }
++
++        @Override
++        public boolean isConnected() {
++            return true;
++        }
++    }
++
++    private static final class RecordingPlayerConnection extends PlayerConnection {
++        final List<Packet<?>> sentPackets = new ArrayList<>();
++        boolean disconnected = false;
++
++        RecordingPlayerConnection() throws Exception {
++            super(null, null, null);
++        }
++
++        @Override
++        public void sendPacket(Packet<?> packet) {
++            this.sentPackets.add(packet);
++        }
++
++        @Override
++        public void disconnect(String s) {
++            this.disconnected = true;
++        }
++
++        @Override
++        public void disconnect(IChatBaseComponent ichatbasecomponent) {
++            this.disconnected = true;
++        }
++    }
++
++    private static final class TrackingWorld extends WorldServer {
++        boolean loaded = false;
++        int isLoadedCalls = 0;
++        int getTileEntityCalls = 0;
++        TileEntity tileToReturn = null;
++
++        TrackingWorld() {
++            super(null, null, null, 0, null, null, null);
++        }
++
++        @Override
++        public boolean isMainThread() {
++            return true;
++        }
++
++        @Override
++        public boolean isLoaded(BlockPosition blockposition) {
++            isLoadedCalls++;
++            return loaded;
++        }
++
++        @Override
++        public TileEntity getTileEntity(BlockPosition blockposition) {
++            getTileEntityCalls++;
++            return tileToReturn;
++        }
++    }
++
++    private static RecordingPlayerConnection createConnection(TrackingWorld world) throws Exception {
++        Field csField = World.class.getDeclaredField("isClientSide");
++        csField.setAccessible(true);
++        csField.setBoolean(world, true);
++        world.worldData = new WorldData();
++        world.worldProvider = new WorldProviderNormal();
++        Field uField = World.class.getDeclaredField("u");
++        uField.setAccessible(true);
++        uField.set(world, Collections.emptyList());
++
++        RecordingPlayerConnection conn = (RecordingPlayerConnection) UNSAFE.allocateInstance(RecordingPlayerConnection.class);
++        Field spField = RecordingPlayerConnection.class.getDeclaredField("sentPackets");
++        spField.setAccessible(true);
++        spField.set(conn, new ArrayList<>());
++        Field nmField = PlayerConnection.class.getDeclaredField("networkManager");
++        nmField.setAccessible(true);
++        nmField.set(conn, UNSAFE.allocateInstance(DummyNetworkManager.class));
++
++        EntityPlayer player = (EntityPlayer) UNSAFE.allocateInstance(EntityPlayer.class);
++        player.world = world;
++        player.playerConnection = conn;
++        player.locX = 0.0D;
++        player.locY = 64.0D;
++        player.locZ = 0.0D;
++        CraftPlayer craftPlayer = (CraftPlayer) UNSAFE.allocateInstance(CraftPlayer.class);
++        Field entityField = CraftEntity.class.getDeclaredField("entity");
++        entityField.setAccessible(true);
++        entityField.set(craftPlayer, player);
++        Field cpHealth = CraftPlayer.class.getDeclaredField("health");
++        cpHealth.setAccessible(true);
++        cpHealth.setDouble(craftPlayer, 20.0D);
++        Field beField = Entity.class.getDeclaredField("bukkitEntity");
++        beField.setAccessible(true);
++        beField.set(player, craftPlayer);
++        DataWatcher dw = new DataWatcher(player);
++        dw.register(EntityLiving.HEALTH, 20.0F);
++        Field dwField = Entity.class.getDeclaredField("datawatcher");
++        dwField.setAccessible(true);
++        dwField.set(player, dw);
++        PlayerInteractManager pim = (PlayerInteractManager) UNSAFE.allocateInstance(PlayerInteractManager.class);
++        Field gmField = PlayerInteractManager.class.getDeclaredField("gamemode");
++        gmField.setAccessible(true);
++        gmField.set(pim, EnumGamemode.CREATIVE);
++        Field pimField = EntityPlayer.class.getDeclaredField("playerInteractManager");
++        pimField.setAccessible(true);
++        pimField.set(player, pim);
++        player.inventory = new PlayerInventory(player);
++        ContainerPlayer container = new ContainerPlayer(player.inventory, true, player);
++        container.windowId = 0;
++        player.defaultContainer = container;
++        player.activeContainer = container;
++        conn.player = player;
++        return conn;
++    }
++
++    private static PacketPlayInSetCreativeSlot creativeSlotPacket(int slot, ItemStack stack) throws Exception {
++        PacketPlayInSetCreativeSlot pkt = new PacketPlayInSetCreativeSlot();
++        Field slotField = PacketPlayInSetCreativeSlot.class.getDeclaredField("slot");
++        Field itemField = PacketPlayInSetCreativeSlot.class.getDeclaredField("b");
++        slotField.setAccessible(true);
++        itemField.setAccessible(true);
++        slotField.setInt(pkt, slot);
++        itemField.set(pkt, stack);
++        return pkt;
++    }
++
++    private static ItemStack chestWithBlockEntityCoords(int x, int y, int z) {
++        ItemStack stack = new ItemStack(Item.getItemOf(Blocks.CHEST), 1);
++        NBTTagCompound root = new NBTTagCompound();
++        NBTTagCompound be = new NBTTagCompound();
++        be.setInt("x", x);
++        be.setInt("y", y);
++        be.setInt("z", z);
++        root.set("BlockEntityTag", be);
++        stack.setTag(root);
++        return stack;
++    }
++
++    @Test
++    public void testSetCreativeSlotGuardsRemoteAndUnloadedBlockEntityTagAndDeadPlayer() throws Exception {
++        TrackingWorld world = (TrackingWorld) UNSAFE.allocateInstance(TrackingWorld.class);
++        RecordingPlayerConnection conn = createConnection(world);
++
++        // 1. Out-of-range BlockEntityTag -> 0 getTileEntity calls, x/y/z stripped
++        world.loaded = true;
++        ItemStack farStack = chestWithBlockEntityCoords(50000, 64, 50000);
++        conn.a(creativeSlotPacket(0, farStack));
++        assertEquals("Out-of-range BlockEntityTag must not call getTileEntity", 0, world.getTileEntityCalls);
++        NBTTagCompound strippedFar = farStack.getTag().getCompound("BlockEntityTag");
++        assertFalse(strippedFar.hasKey("x"));
++        assertFalse(strippedFar.hasKey("y"));
++        assertFalse(strippedFar.hasKey("z"));
++
++        // 2. In-range but unloaded -> 0 getTileEntity calls, x/y/z stripped
++        world.loaded = false;
++        ItemStack unloadedStack = chestWithBlockEntityCoords(2, 64, 2);
++        conn.a(creativeSlotPacket(0, unloadedStack));
++        assertEquals(0, world.getTileEntityCalls);
++        NBTTagCompound strippedUnloaded = unloadedStack.getTag().getCompound("BlockEntityTag");
++        assertFalse(strippedUnloaded.hasKey("x"));
++        assertFalse(strippedUnloaded.hasKey("y"));
++        assertFalse(strippedUnloaded.hasKey("z"));
++
++        // 3. In-range and loaded -> copies TileEntity NBT without x/y/z
++        world.loaded = true;
++        TileEntityChest chest = new TileEntityChest();
++        chest.setCustomName("SecretChest");
++        world.tileToReturn = chest;
++        ItemStack loadedStack = chestWithBlockEntityCoords(2, 64, 2);
++        conn.a(creativeSlotPacket(0, loadedStack));
++        assertEquals(1, world.getTileEntityCalls);
++        NBTTagCompound copied = loadedStack.getTag().getCompound("BlockEntityTag");
++        assertEquals("SecretChest", copied.getString("CustomName"));
++        assertFalse(copied.hasKey("x"));
++
++        // 4. Dead player -> returns immediately without probing world
++        world.isLoadedCalls = 0;
++        world.getTileEntityCalls = 0;
++        conn.player.dead = true;
++        conn.a(creativeSlotPacket(0, chestWithBlockEntityCoords(2, 64, 2)));
++        assertEquals(0, world.isLoadedCalls);
++        assertEquals(0, world.getTileEntityCalls);
++    }
++
++    @Test
++    public void testCloseWindowIgnoresStaleWindowId() throws Exception {
++        TrackingWorld world = (TrackingWorld) UNSAFE.allocateInstance(TrackingWorld.class);
++        RecordingPlayerConnection conn = createConnection(world);
++
++        assertEquals(0, new PacketPlayInCloseWindow(0).getWindowId());
++        assertEquals(2, new PacketPlayInCloseWindow(2).getWindowId());
++
++        ContainerChest chest = new ContainerChest(conn.player.inventory, new InventorySubcontainer("Chest", false, 27), conn.player);
++        chest.windowId = 2;
++        conn.player.activeContainer = chest;
++
++        // Stale close packet for previous windowId=1 must be ignored cleanly
++        conn.a(new PacketPlayInCloseWindow(1));
++        assertSame("Stale CloseWindow must not close active container", chest, conn.player.activeContainer);
++        assertFalse(conn.disconnected);
++    }
++
++    @Test
++    public void testCreativeAndCloseWindowGuardEfficiency() throws Exception {
++        TrackingWorld world = (TrackingWorld) UNSAFE.allocateInstance(TrackingWorld.class);
++        world.loaded = true;
++        RecordingPlayerConnection conn = createConnection(world);
++
++        ContainerChest chest = new ContainerChest(conn.player.inventory, new InventorySubcontainer("Chest", false, 27), conn.player);
++        chest.windowId = 2;
++        conn.player.activeContainer = chest;
++
++        PacketPlayInCloseWindow staleClose = new PacketPlayInCloseWindow(1);
++        ItemStack farStack = chestWithBlockEntityCoords(50000, 64, 50000);
++        PacketPlayInSetCreativeSlot farCreative = creativeSlotPacket(0, farStack);
++
++        for (int i = 0; i < 5_000; i++) {
++            conn.a(staleClose);
++            conn.a(farCreative);
++        }
++
++        long start = System.nanoTime();
++        for (int i = 0; i < 50_000; i++) {
++            conn.a(staleClose);
++            conn.a(farCreative);
++        }
++        long elapsedMs = (System.nanoTime() - start) / 1_000_000L;
++        assertEquals(0, world.getTileEntityCalls);
++        assertTrue("50k C3 guard checks took too long: " + elapsedMs + " ms", elapsedMs < 150L);
++    }
++}
