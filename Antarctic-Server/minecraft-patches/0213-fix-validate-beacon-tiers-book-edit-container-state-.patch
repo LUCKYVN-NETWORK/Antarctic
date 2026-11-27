@@ -1,0 +1,533 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Fri, 27 Nov 2026 11:35:35 +0700
+Subject: [PATCH 213/213] fix: validate beacon tiers, book edit container
+ state, and merchant reach
+
+
+diff --git a/main/java/net/minecraft/server/ContainerMerchant.java b/main/java/net/minecraft/server/ContainerMerchant.java
+index 8dc071e..1bde6b4 100644
+--- a/main/java/net/minecraft/server/ContainerMerchant.java
++++ b/main/java/net/minecraft/server/ContainerMerchant.java
+@@ -58,7 +58,19 @@ public class ContainerMerchant extends Container {
+     }
+ 
+     public boolean canUse(EntityHuman entityhuman) {
+-        return this.merchant.getTrader() == entityhuman;
++        if (this.merchant.getTrader() != entityhuman) {
++            return false;
++        }
++        if (this.merchant instanceof Entity) {
++            Entity entity = (Entity) this.merchant;
++            if (!entity.valid || !entity.isAlive()) {
++                return false;
++            }
++            if (this.checkReachable && (entity.world != entityhuman.world || entity.h((Entity) entityhuman) > 64.0D)) {
++                return false;
++            }
++        }
++        return true;
+     }
+ 
+     public ItemStack shiftClick(EntityHuman entityhuman, int i) {
+diff --git a/main/java/net/minecraft/server/PlayerConnection.java b/main/java/net/minecraft/server/PlayerConnection.java
+index 3eae194..4262808 100644
+--- a/main/java/net/minecraft/server/PlayerConnection.java
++++ b/main/java/net/minecraft/server/PlayerConnection.java
+@@ -2583,6 +2583,12 @@ public class PlayerConnection implements PacketListenerPlayIn, ITickable {
+         ItemStack itemstack1;
+ 
+         if ("MC|BEdit".equals(s)) {
++            if (this.player.isFrozen() || this.player.dead || this.player.activeContainer != this.player.defaultContainer) {
++                if (!this.player.dead) {
++                    this.player.updateInventory(this.player.activeContainer);
++                }
++                return;
++            }
+             // CraftBukkit start
+             if (this.lastBookTick + 20 > MinecraftServer.currentTick) {
+                 this.disconnect("Book edited too quickly!");
+@@ -2619,6 +2625,12 @@ public class PlayerConnection implements PacketListenerPlayIn, ITickable {
+             String s1;
+ 
+             if ("MC|BSign".equals(s)) {
++                if (this.player.isFrozen() || this.player.dead || this.player.activeContainer != this.player.defaultContainer) {
++                    if (!this.player.dead) {
++                        this.player.updateInventory(this.player.activeContainer);
++                    }
++                    return;
++                }
+                 // CraftBukkit start
+                 if (this.lastBookTick + 20 > MinecraftServer.currentTick) {
+                     this.disconnect("Book edited too quickly!");
+@@ -2666,11 +2678,14 @@ public class PlayerConnection implements PacketListenerPlayIn, ITickable {
+                     IllegalPacketEvent.process(player.getBukkitEntity(), "InvalidBookSign", "Invalid book data!", exception1); // Paper
+                 }
+             } else if ("MC|TrSel".equals(s)) {
++                if (this.player.isFrozen() || this.player.dead) {
++                    return;
++                }
+                 try {
+                     int j = packetplayincustompayload.b().readInt();
+                     Container container = this.player.activeContainer;
+ 
+-                    if (container instanceof ContainerMerchant) {
++                    if (j >= 0 && container instanceof ContainerMerchant && container.canUse(this.player)) {
+                         ((ContainerMerchant) container).d(j);
+                     }
+                 } catch (Exception exception2) {
+@@ -2798,7 +2813,7 @@ public class PlayerConnection implements PacketListenerPlayIn, ITickable {
+                     int k;
+ 
+                     if ("MC|Beacon".equals(s)) {
+-                        if (this.player.activeContainer instanceof ContainerBeacon) {
++                        if (!this.player.isFrozen() && !this.player.dead && this.player.activeContainer instanceof ContainerBeacon && this.player.activeContainer.canUse(this.player)) {
+                             try {
+                                 packetdataserializer = packetplayincustompayload.b();
+                                 k = packetdataserializer.readInt();
+@@ -2807,8 +2822,12 @@ public class PlayerConnection implements PacketListenerPlayIn, ITickable {
+                                 Slot slot = containerbeacon.getSlot(0);
+ 
+                                 if (slot.hasItem()) {
+-                                    slot.a(1);
+                                     IInventory iinventory = containerbeacon.e();
++                                    if (!TileEntityBeacon.isValidTierSelection(iinventory.getProperty(0), k, l)) {
++                                        this.player.updateInventory(this.player.activeContainer);
++                                        return;
++                                    }
++                                    slot.a(1);
+ 
+                                     iinventory.setProperty(1, k);
+                                     iinventory.setProperty(2, l);
+@@ -2819,7 +2838,7 @@ public class PlayerConnection implements PacketListenerPlayIn, ITickable {
+                             }
+                         }
+                     } else if ("MC|ItemName".equals(s)) {
+-                        if (this.player.activeContainer instanceof ContainerAnvil) {
++                        if (!this.player.isFrozen() && !this.player.dead && this.player.activeContainer instanceof ContainerAnvil && this.player.activeContainer.canUse(this.player)) {
+                             ContainerAnvil containeranvil = (ContainerAnvil) this.player.activeContainer;
+ 
+                             if (packetplayincustompayload.b() != null && packetplayincustompayload.b().readableBytes() >= 1) {
+diff --git a/main/java/net/minecraft/server/TileEntityBeacon.java b/main/java/net/minecraft/server/TileEntityBeacon.java
+index a3a4dab..71c9420 100644
+--- a/main/java/net/minecraft/server/TileEntityBeacon.java
++++ b/main/java/net/minecraft/server/TileEntityBeacon.java
+@@ -324,6 +324,41 @@ public class TileEntityBeacon extends TileEntityContainer implements ITickable,
+         return TileEntityBeacon.f.contains(mobeffectlist) ? mobeffectlist : null;
+     }
+ 
++    static boolean isValidTierSelection(int levels, int primaryId, int secondaryId) {
++        if (levels <= 0) {
++            return false;
++        }
++        MobEffectList primary = f(primaryId);
++        if (primary == null) {
++            return false;
++        }
++        int maxPrimaryRow = Math.min(levels, 3);
++        boolean primaryAllowed = false;
++        for (int row = 0; row < maxPrimaryRow; ++row) {
++            MobEffectList[] rowEffects = TileEntityBeacon.a[row];
++            for (int col = 0; col < rowEffects.length; ++col) {
++                if (rowEffects[col] == primary) {
++                    primaryAllowed = true;
++                    break;
++                }
++            }
++            if (primaryAllowed) {
++                break;
++            }
++        }
++        if (!primaryAllowed) {
++            return false;
++        }
++        if (secondaryId <= 0) {
++            return true;
++        }
++        if (levels < 4) {
++            return false;
++        }
++        MobEffectList secondary = f(secondaryId);
++        return secondary != null && (secondary == primary || secondary == MobEffects.REGENERATION);
++    }
++
+     public void load(NBTTagCompound nbttagcompound) {
+         super.load(nbttagcompound);
+         // Craftbukkit start - persist manually set non-default beacon effects (SPIGOT-3598)
+diff --git a/main/java/org/bukkit/craftbukkit/event/CraftEventFactory.java b/main/java/org/bukkit/craftbukkit/event/CraftEventFactory.java
+index 6bf5e59..788d3f6 100644
+--- a/main/java/org/bukkit/craftbukkit/event/CraftEventFactory.java
++++ b/main/java/org/bukkit/craftbukkit/event/CraftEventFactory.java
+@@ -1024,7 +1024,11 @@ public class CraftEventFactory {
+ 
+             // Client will have updated its idea of the book item; we need to overwrite that
+             Slot slot = player.activeContainer.getSlot(player.inventory, itemInHandIndex);
+-            player.playerConnection.sendPacket(new PacketPlayOutSetSlot(player.activeContainer.windowId, slot.rawSlotIndex, itemInHand));
++            if (slot != null) {
++                player.playerConnection.sendPacket(new PacketPlayOutSetSlot(player.activeContainer.windowId, slot.rawSlotIndex, itemInHand));
++            } else {
++                player.updateInventory(player.activeContainer);
++            }
+         }
+     }
+ 
+diff --git a/test/java/net/minecraft/server/CustomPayloadGuardTest.java b/test/java/net/minecraft/server/CustomPayloadGuardTest.java
+new file mode 100644
+index 0000000..feb8cf8
+--- /dev/null
++++ b/test/java/net/minecraft/server/CustomPayloadGuardTest.java
+@@ -0,0 +1,354 @@
++package net.minecraft.server;
++
++import io.netty.buffer.Unpooled;
++import org.bukkit.craftbukkit.entity.CraftEntity;
++import org.bukkit.craftbukkit.entity.CraftPlayer;
++import org.junit.AfterClass;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.List;
++
++import static org.junit.Assert.*;
++
++public class CustomPayloadGuardTest {
++
++    private static Unsafe UNSAFE;
++    private static int prevItemDirtyTicks;
++
++    @BeforeClass
++    public static void setupTest() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        UNSAFE = (Unsafe) f.get(null);
++        prevItemDirtyTicks = org.spigotmc.SpigotConfig.itemDirtyTicks;
++        if (org.spigotmc.SpigotConfig.itemDirtyTicks <= 0) {
++            org.spigotmc.SpigotConfig.itemDirtyTicks = 20;
++        }
++    }
++
++    @AfterClass
++    public static void teardownTest() {
++        org.spigotmc.SpigotConfig.itemDirtyTicks = prevItemDirtyTicks;
++    }
++
++    private static final class DummyNetworkManager extends NetworkManager {
++        DummyNetworkManager() {
++            super(EnumProtocolDirection.SERVERBOUND);
++        }
++
++        @Override
++        public boolean isConnected() {
++            return true;
++        }
++    }
++
++    private static final class RecordingPlayerConnection extends PlayerConnection {
++        final List<Packet<?>> sentPackets = new ArrayList<>();
++        boolean disconnected = false;
++
++        RecordingPlayerConnection() throws Exception {
++            super(null, null, null);
++        }
++
++        @Override
++        public void sendPacket(Packet<?> packet) {
++            this.sentPackets.add(packet);
++        }
++
++        @Override
++        public void disconnect(String s) {
++            this.disconnected = true;
++        }
++
++        @Override
++        public void disconnect(IChatBaseComponent ichatbasecomponent) {
++            this.disconnected = true;
++        }
++    }
++
++    private static final class DummyWorld extends WorldServer {
++        DummyWorld() {
++            super(null, null, null, 0, null, null, null);
++        }
++
++        @Override
++        public boolean isMainThread() {
++            return true;
++        }
++    }
++
++    private static DummyWorld createWorld() throws Exception {
++        DummyWorld world = (DummyWorld) UNSAFE.allocateInstance(DummyWorld.class);
++        Field csField = World.class.getDeclaredField("isClientSide");
++        csField.setAccessible(true);
++        csField.setBoolean(world, true);
++        world.worldData = new WorldData();
++        world.worldProvider = new WorldProviderNormal();
++        Field uField = World.class.getDeclaredField("u");
++        uField.setAccessible(true);
++        uField.set(world, Collections.emptyList());
++        return world;
++    }
++
++    private static RecordingPlayerConnection createConnection(DummyWorld world) throws Exception {
++        RecordingPlayerConnection conn = (RecordingPlayerConnection) UNSAFE.allocateInstance(RecordingPlayerConnection.class);
++        Field spField = RecordingPlayerConnection.class.getDeclaredField("sentPackets");
++        spField.setAccessible(true);
++        spField.set(conn, new ArrayList<>());
++        Field nmField = PlayerConnection.class.getDeclaredField("networkManager");
++        nmField.setAccessible(true);
++        nmField.set(conn, UNSAFE.allocateInstance(DummyNetworkManager.class));
++
++        EntityPlayer player = (EntityPlayer) UNSAFE.allocateInstance(EntityPlayer.class);
++        player.world = world;
++        player.playerConnection = conn;
++        player.locX = 0.0D;
++        player.locY = 64.0D;
++        player.locZ = 0.0D;
++        CraftPlayer craftPlayer = (CraftPlayer) UNSAFE.allocateInstance(CraftPlayer.class);
++        Field entityField = CraftEntity.class.getDeclaredField("entity");
++        entityField.setAccessible(true);
++        entityField.set(craftPlayer, player);
++        Field cpHealth = CraftPlayer.class.getDeclaredField("health");
++        cpHealth.setAccessible(true);
++        cpHealth.setDouble(craftPlayer, 20.0D);
++        Field beField = Entity.class.getDeclaredField("bukkitEntity");
++        beField.setAccessible(true);
++        beField.set(player, craftPlayer);
++        DataWatcher dw = new DataWatcher(player);
++        dw.register(EntityLiving.HEALTH, 20.0F);
++        Field dwField = Entity.class.getDeclaredField("datawatcher");
++        dwField.setAccessible(true);
++        dwField.set(player, dw);
++        player.inventory = new PlayerInventory(player);
++        ContainerPlayer container = new ContainerPlayer(player.inventory, true, player);
++        container.windowId = 0;
++        player.defaultContainer = container;
++        player.activeContainer = container;
++        conn.player = player;
++        return conn;
++    }
++
++    private static PacketPlayInCustomPayload customPayload(String channel, byte[] bytes) throws Exception {
++        PacketDataSerializer buf = new PacketDataSerializer(Unpooled.wrappedBuffer(bytes));
++        PacketPlayInCustomPayload pkt = new PacketPlayInCustomPayload();
++        Field a = PacketPlayInCustomPayload.class.getDeclaredField("a");
++        Field b = PacketPlayInCustomPayload.class.getDeclaredField("b");
++        a.setAccessible(true);
++        b.setAccessible(true);
++        a.set(pkt, channel);
++        b.set(pkt, buf);
++        return pkt;
++    }
++
++    @Test
++    public void testBeaconTierValidationAndPacketGuard() throws Exception {
++        assertFalse(TileEntityBeacon.isValidTierSelection(0, MobEffectList.getId(MobEffects.FASTER_MOVEMENT), 0));
++        assertTrue(TileEntityBeacon.isValidTierSelection(1, MobEffectList.getId(MobEffects.FASTER_MOVEMENT), 0));
++        assertTrue(TileEntityBeacon.isValidTierSelection(1, MobEffectList.getId(MobEffects.FASTER_DIG), 0));
++        assertFalse("Tier 1 beacon must reject Strength", TileEntityBeacon.isValidTierSelection(1, MobEffectList.getId(MobEffects.INCREASE_DAMAGE), 0));
++        assertFalse("Tier 1 beacon must reject secondary Regen", TileEntityBeacon.isValidTierSelection(1, MobEffectList.getId(MobEffects.FASTER_MOVEMENT), MobEffectList.getId(MobEffects.REGENERATION)));
++        assertTrue("Tier 4 must accept Speed II", TileEntityBeacon.isValidTierSelection(4, MobEffectList.getId(MobEffects.FASTER_MOVEMENT), MobEffectList.getId(MobEffects.FASTER_MOVEMENT)));
++        assertTrue("Tier 4 must accept Speed + Regen", TileEntityBeacon.isValidTierSelection(4, MobEffectList.getId(MobEffects.FASTER_MOVEMENT), MobEffectList.getId(MobEffects.REGENERATION)));
++        assertFalse("Regen cannot be primary effect", TileEntityBeacon.isValidTierSelection(4, MobEffectList.getId(MobEffects.REGENERATION), 0));
++        assertFalse("Invalid potion effect must be rejected", TileEntityBeacon.isValidTierSelection(4, MobEffectList.getId(MobEffects.LEVITATION), 0));
++
++        // SPIGOT-3598: TileEntityBeacon.load(NBT) must preserve manually set non-default effects
++        TileEntityBeacon loadedBeacon = new TileEntityBeacon();
++        NBTTagCompound tag = new NBTTagCompound();
++        tag.setInt("Levels", 1);
++        tag.setInt("Primary", MobEffectList.getId(MobEffects.INCREASE_DAMAGE));
++        tag.setInt("Secondary", MobEffectList.getId(MobEffects.REGENERATION));
++        loadedBeacon.load(tag);
++        assertEquals(MobEffects.INCREASE_DAMAGE, loadedBeacon.primaryEffect);
++        assertEquals(MobEffects.REGENERATION, loadedBeacon.secondaryEffect);
++
++        // MC|Beacon packet guard
++        DummyWorld world = createWorld();
++        RecordingPlayerConnection conn = createConnection(world);
++        TileEntityBeacon beacon = new TileEntityBeacon() {
++            @Override
++            public boolean a(EntityHuman human) {
++                return true;
++            }
++        };
++        beacon.setProperty(0, 1);
++        beacon.setItem(0, new ItemStack(Items.EMERALD, 1));
++        ContainerBeacon containerBeacon = new ContainerBeacon(conn.player.inventory, beacon);
++        containerBeacon.windowId = 3;
++        conn.player.activeContainer = containerBeacon;
++
++        PacketDataSerializer badBuf = new PacketDataSerializer(Unpooled.buffer());
++        badBuf.writeInt(MobEffectList.getId(MobEffects.INCREASE_DAMAGE));
++        badBuf.writeInt(0);
++        byte[] badBytes = new byte[badBuf.readableBytes()];
++        badBuf.readBytes(badBytes);
++        conn.a(customPayload("MC|Beacon", badBytes));
++        assertFalse(conn.disconnected);
++        assertEquals("Rejected MC|Beacon must not consume payment item", 1, beacon.getItem(0).getCount());
++        assertNull(beacon.primaryEffect);
++        assertFalse("Rejected MC|Beacon must send resync", conn.sentPackets.isEmpty());
++
++        PacketDataSerializer goodBuf = new PacketDataSerializer(Unpooled.buffer());
++        goodBuf.writeInt(MobEffectList.getId(MobEffects.FASTER_MOVEMENT));
++        goodBuf.writeInt(0);
++        byte[] goodBytes = new byte[goodBuf.readableBytes()];
++        goodBuf.readBytes(goodBytes);
++        conn.a(customPayload("MC|Beacon", goodBytes));
++        assertTrue("Valid MC|Beacon must consume payment item", beacon.getItem(0).isEmpty());
++        assertEquals(MobEffects.FASTER_MOVEMENT, beacon.primaryEffect);
++    }
++
++    @Test
++    public void testBookEditAndSignRequireDefaultContainerAndAlive() throws Exception {
++        DummyWorld world = createWorld();
++        RecordingPlayerConnection conn = createConnection(world);
++        ContainerChest chest = new ContainerChest(conn.player.inventory, new InventorySubcontainer("Chest", false, 27), conn.player);
++        chest.windowId = 4;
++        conn.player.activeContainer = chest;
++
++        Field lbtField = PlayerConnection.class.getDeclaredField("lastBookTick");
++        lbtField.setAccessible(true);
++        lbtField.setInt(conn, -999);
++
++        conn.a(customPayload("MC|BEdit", new byte[0]));
++        assertFalse(conn.disconnected);
++        assertFalse("Non-default container MC|BEdit must send resync", conn.sentPackets.isEmpty());
++        assertEquals("Non-default container MC|BEdit must abort before lastBookTick", -999, lbtField.getInt(conn));
++
++        conn.sentPackets.clear();
++        conn.player.activeContainer = conn.player.defaultContainer;
++        conn.player.dead = true;
++        conn.a(customPayload("MC|BSign", new byte[0]));
++        assertFalse(conn.disconnected);
++        assertTrue("Dead player MC|BSign must return cleanly without resync spam", conn.sentPackets.isEmpty());
++    }
++
++    @Test
++    public void testContainerMerchantReachAndVirtualMerchantAndTrSel() throws Exception {
++        DummyWorld worldA = createWorld();
++        DummyWorld worldB = createWorld();
++        RecordingPlayerConnection conn = createConnection(worldA);
++        EntityPlayer player = conn.player;
++
++        // 1. Virtual non-Entity IMerchant works cleanly
++        IMerchant virtualMerchant = new IMerchant() {
++            private EntityHuman trader = player;
++            @Override public void setTradingPlayer(EntityHuman h) { trader = h; }
++            @Override public EntityHuman getTrader() { return trader; }
++            @Override public MerchantRecipeList getOffers(EntityHuman h) { return new MerchantRecipeList(); }
++            @Override public void a(MerchantRecipe r) {}
++            @Override public void a(ItemStack s) {}
++            @Override public IChatBaseComponent getScoreboardDisplayName() { return new ChatComponentText("Virtual"); }
++            @Override public World u_() { return worldA; }
++            @Override public BlockPosition v_() { return BlockPosition.ZERO; }
++        };
++        ContainerMerchant virtualContainer = new ContainerMerchant(player.inventory, virtualMerchant, worldA);
++        assertTrue("Virtual non-Entity merchant must remain usable", virtualContainer.canUse(player));
++
++        // 2. Real EntityVillager enforces valid, alive, world, reach
++        EntityVillager villager = (EntityVillager) UNSAFE.allocateInstance(EntityVillager.class);
++        villager.world = worldA;
++        villager.valid = true;
++        villager.dead = false;
++        villager.locX = 2.0D;
++        villager.locY = 64.0D;
++        villager.locZ = 0.0D;
++        DataWatcher vdw = new DataWatcher(villager);
++        vdw.register(EntityLiving.HEALTH, 20.0F);
++        Field vdwField = Entity.class.getDeclaredField("datawatcher");
++        vdwField.setAccessible(true);
++        vdwField.set(villager, vdw);
++        villager.setTradingPlayer(player);
++        ContainerMerchant villagerContainer = new ContainerMerchant(player.inventory, villager, worldA);
++        assertTrue(villagerContainer.canUse(player));
++
++        villager.valid = false;
++        assertFalse(villagerContainer.canUse(player));
++        villager.valid = true;
++
++        villager.dead = true;
++        assertFalse(villagerContainer.canUse(player));
++        villager.dead = false;
++
++        villager.world = worldB;
++        assertFalse(villagerContainer.canUse(player));
++        villager.world = worldA;
++
++        villager.locX = 10.0D;
++        assertFalse(villagerContainer.canUse(player));
++
++        // checkReachable = false honors remote plugin merchant while still enforcing alive/valid
++        villagerContainer.checkReachable = false;
++        assertTrue("checkReachable=false must allow remote plugin merchant", villagerContainer.canUse(player));
++        villager.dead = true;
++        assertFalse("checkReachable=false must still reject dead merchant", villagerContainer.canUse(player));
++        villager.dead = false;
++
++        // 3. MC|TrSel rejects negative trade index
++        villager.locX = 2.0D;
++        villagerContainer.checkReachable = true;
++        villagerContainer.windowId = 5;
++        player.activeContainer = villagerContainer;
++        PacketDataSerializer trBuf = new PacketDataSerializer(Unpooled.buffer());
++        trBuf.writeInt(-1);
++        byte[] trBytes = new byte[trBuf.readableBytes()];
++        trBuf.readBytes(trBytes);
++        conn.a(customPayload("MC|TrSel", trBytes));
++        assertFalse(conn.disconnected);
++    }
++
++    @Test
++    public void testAnvilItemNameRequiresCanUseAndAlive() throws Exception {
++        DummyWorld world = createWorld();
++        RecordingPlayerConnection conn = createConnection(world);
++        ContainerAnvil anvil = new ContainerAnvil(conn.player.inventory, world, BlockPosition.ZERO, conn.player) {
++            @Override
++            public boolean canUse(EntityHuman human) {
++                return false;
++            }
++
++            @Override
++            public void e() {
++            }
++        };
++        anvil.windowId = 6;
++        Field renameField = ContainerAnvil.class.getDeclaredField("renameText");
++        renameField.setAccessible(true);
++        renameField.set(anvil, "Initial");
++        conn.player.activeContainer = anvil;
++
++        PacketDataSerializer buf = new PacketDataSerializer(Unpooled.buffer());
++        buf.a("HackedName");
++        byte[] bytes = new byte[buf.readableBytes()];
++        buf.readBytes(bytes);
++        conn.a(customPayload("MC|ItemName", bytes));
++
++        assertEquals("Initial", renameField.get(anvil));
++    }
++
++    @Test
++    public void testBeaconValidationEfficiency() {
++        int idSpeed = MobEffectList.getId(MobEffects.FASTER_MOVEMENT);
++        int idRegen = MobEffectList.getId(MobEffects.REGENERATION);
++        for (int i = 0; i < 5_000; i++) {
++            TileEntityBeacon.isValidTierSelection(4, idSpeed, idRegen);
++        }
++        int valid = 0;
++        long start = System.nanoTime();
++        for (int i = 0; i < 50_000; i++) {
++            if (TileEntityBeacon.isValidTierSelection(4, idSpeed, idRegen)) {
++                valid++;
++            }
++        }
++        long elapsedMs = (System.nanoTime() - start) / 1_000_000L;
++        assertEquals(50_000, valid);
++        assertTrue("50k beacon tier checks took too long: " + elapsedMs + " ms", elapsedMs < 50L);
++    }
++}
