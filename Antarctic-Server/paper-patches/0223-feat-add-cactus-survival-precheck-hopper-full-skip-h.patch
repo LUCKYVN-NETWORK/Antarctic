@@ -1,0 +1,594 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Fri, 27 Nov 2026 13:21:04 +0700
+Subject: [PATCH 223/223] feat: add cactus survival precheck, hopper full skip,
+ hand-only item tick, and virtual thread toggles
+
+
+diff --git a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+index ac617d6..4ecb284 100644
+--- a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
++++ b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+@@ -23,6 +23,9 @@ import com.destroystokyo.paper.config.toml.modules.optimizations.DontSaveEntity;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.EntityGoal;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.EntityPhysicsGuard;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.FarmAiCulling;
++import com.destroystokyo.paper.config.toml.modules.optimizations.Growth;
++import com.destroystokyo.paper.config.toml.modules.optimizations.Hopper;
++import com.destroystokyo.paper.config.toml.modules.optimizations.Inventory;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.MobSpawning;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Pathfinder;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Projectiles;
+@@ -65,7 +68,7 @@ public final class AntarcticTomlConfig {
+             new Rebrand(), new Privacy(),
+             new Deflate(),
+             new VirtualThreads(), new AsyncPlayerDataSaving(),
+-            new Pathfinder(), new Suffocation(), new Projectiles(), new ArmourStands(), new WorldBorder(), new ChunkLoading(), new MobSpawning(), new Dab(), new FarmAiCulling(), new EntityPhysicsGuard(), new DontSaveEntity(), new EntityGoal(), new ReducePackets(), new SunBurn(), new Rails(), new Redstone(), new RedstoneGuard(), new Physics(), new Lighting(),
++            new Pathfinder(), new Suffocation(), new Projectiles(), new ArmourStands(), new WorldBorder(), new ChunkLoading(), new MobSpawning(), new Dab(), new FarmAiCulling(), new EntityPhysicsGuard(), new DontSaveEntity(), new EntityGoal(), new ReducePackets(), new Growth(), new Hopper(), new Inventory(), new SunBurn(), new Rails(), new Redstone(), new RedstoneGuard(), new Physics(), new Lighting(),
+             new MergeChecks(), new ChunkOverloadDupe(), new Collisions(), new Player(), new SpawnerSettings(),
+             new MapDecorations(), new Books(), new VanillaBugFix());
+     private static final YamlConfiguration yamlFacade = new YamlConfiguration();
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/concurrency/VirtualThreads.java b/main/java/com/destroystokyo/paper/config/toml/modules/concurrency/VirtualThreads.java
+index 94c7857..1cdb451 100644
+--- a/main/java/com/destroystokyo/paper/config/toml/modules/concurrency/VirtualThreads.java
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/concurrency/VirtualThreads.java
+@@ -3,6 +3,7 @@ package com.destroystokyo.paper.config.toml.modules.concurrency;
+ import com.destroystokyo.paper.config.toml.EnumConfigCategory;
+ import com.destroystokyo.paper.config.toml.IConfigModule;
+ import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++import com.destroystokyo.paper.config.toml.annotations.HotReloadUnsupported;
+ 
+ public class VirtualThreads implements IConfigModule {
+ 
+@@ -12,6 +13,14 @@ public class VirtualThreads implements IConfigModule {
+     @ConfigInfo(baseName = "chat-executor", comments = "Use OpenJDK 21 virtual threads for asynchronous player chat processing.")
+     public static boolean chatExecutor = true;
+ 
++    @HotReloadUnsupported
++    @ConfigInfo(baseName = "bukkit-async-scheduler", comments = "Use OpenJDK 21 virtual threads for Bukkit async scheduler tasks (opt-in false to avoid carrier pinning on legacy synchronized plugins).")
++    public static boolean bukkitAsyncScheduler = false;
++
++    @HotReloadUnsupported
++    @ConfigInfo(baseName = "profile-lookup", comments = "Use OpenJDK 21 virtual threads for TileEntitySkull profile/skin lookups. Default false.")
++    public static boolean profileLookup = false;
++
+     @Override
+     public EnumConfigCategory getCategory() {
+         return EnumConfigCategory.CONCURRENCY;
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/Growth.java b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/Growth.java
+new file mode 100644
+index 0000000..b7623cd
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/Growth.java
+@@ -0,0 +1,24 @@
++package com.destroystokyo.paper.config.toml.modules.optimizations;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++
++public class Growth implements IConfigModule {
++
++    @ConfigInfo(
++        baseName = "cactus-check-survival",
++        comments = "Pre-check whether a growing cactus can survive at the target block before placing and immediately breaking it (avoids block/light churn). Default false."
++    )
++    public static boolean cactusCheckSurvival = false;
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.OPTIMIZATIONS;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "growth";
++    }
++}
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/Hopper.java b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/Hopper.java
+new file mode 100644
+index 0000000..f647c67
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/Hopper.java
+@@ -0,0 +1,30 @@
++package com.destroystokyo.paper.config.toml.modules.optimizations;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++import com.electronwill.nightconfig.core.file.CommentedFileConfig;
++
++public class Hopper implements IConfigModule {
++
++    @ConfigInfo(
++        baseName = "throttle-when-full-skip-ticks",
++        comments = "Cooldown ticks applied when a hopper fails to push/pull into a full container (when paper.yml cooldown-hopper-when-full is enabled). Default 8 (Paper parity; 0 falls back to spigot.hopper-transfer)."
++    )
++    public static int throttleWhenFullSkipTicks = 8;
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.OPTIMIZATIONS;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "hopper";
++    }
++
++    @Override
++    public void onLoaded(CommentedFileConfig config) {
++        throttleWhenFullSkipTicks = Math.max(0, throttleWhenFullSkipTicks);
++    }
++}
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/Inventory.java b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/Inventory.java
+new file mode 100644
+index 0000000..19a79aa
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/Inventory.java
+@@ -0,0 +1,24 @@
++package com.destroystokyo.paper.config.toml.modules.optimizations;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++
++public class Inventory implements IConfigModule {
++
++    @ConfigInfo(
++        baseName = "only-tick-items-in-hand",
++        comments = "Only run per-tick Item.a() updates on the player's mainhand and offhand items (preserves ItemWorldMap updates). Default false."
++    )
++    public static boolean onlyTickItemsInHand = false;
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.OPTIMIZATIONS;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "inventory";
++    }
++}
+diff --git a/main/java/net/minecraft/server/BlockCactus.java b/main/java/net/minecraft/server/BlockCactus.java
+index d8fb87f..fd585da 100644
+--- a/main/java/net/minecraft/server/BlockCactus.java
++++ b/main/java/net/minecraft/server/BlockCactus.java
+@@ -32,6 +32,21 @@ public class BlockCactus extends Block {
+                 int j = ((Integer) iblockdata.get(BlockCactus.AGE)).intValue();
+ 
+                 if (j >= (byte) range(3, ((100.0F / world.spigotConfig.cactusModifier) * 15) + 0.5F, 15)) { // Spigot
++                    if (com.destroystokyo.paper.config.toml.modules.optimizations.Growth.cactusCheckSurvival && !this.b(world, blockposition1)) {
++                        if (org.bukkit.event.block.BlockGrowEvent.getHandlerList().getRegisteredListeners().length != 0) {
++                            org.bukkit.block.Block block = world.getWorld().getBlockAt(blockposition1.getX(), blockposition1.getY(), blockposition1.getZ());
++                            org.bukkit.block.BlockState state = block.getState();
++                            state.setType(org.bukkit.Material.CACTUS);
++                            org.bukkit.event.block.BlockGrowEvent event = new org.bukkit.event.block.BlockGrowEvent(block, state);
++                            world.getServer().getPluginManager().callEvent(event);
++                            if (event.isCancelled()) {
++                                return;
++                            }
++                        }
++                        world.setTypeAndData(blockposition, iblockdata.set(BlockCactus.AGE, Integer.valueOf(0)), 4);
++                        this.b(world, blockposition1, this.getBlockData(), 0);
++                        return;
++                    }
+                     // world.setTypeUpdate(blockposition1, this.getBlockData()); // CraftBukkit
+                     IBlockData iblockdata1 = iblockdata.set(BlockCactus.AGE, Integer.valueOf(0));
+ 
+diff --git a/main/java/net/minecraft/server/PlayerInventory.java b/main/java/net/minecraft/server/PlayerInventory.java
+index fd25796..b487c89 100644
+--- a/main/java/net/minecraft/server/PlayerInventory.java
++++ b/main/java/net/minecraft/server/PlayerInventory.java
+@@ -291,6 +291,21 @@ public class PlayerInventory implements IInventory {
+     }
+ 
+     public void n() {
++        if (com.destroystokyo.paper.config.toml.modules.optimizations.Inventory.onlyTickItemsInHand) {
++            if (this.itemInHandIndex >= 0 && this.itemInHandIndex < this.items.size()) {
++                ItemStack main = (ItemStack) this.items.get(this.itemInHandIndex);
++                if (!main.isEmpty()) {
++                    main.a(this.player.world, this.player, this.itemInHandIndex, true);
++                }
++            }
++            if (!this.extraSlots.isEmpty()) {
++                ItemStack offhand = (ItemStack) this.extraSlots.get(0);
++                if (!offhand.isEmpty()) {
++                    offhand.a(this.player.world, this.player, 0, false);
++                }
++            }
++            return;
++        }
+         Iterator iterator = this.f.iterator();
+ 
+         while (iterator.hasNext()) {
+diff --git a/main/java/net/minecraft/server/TileEntityHopper.java b/main/java/net/minecraft/server/TileEntityHopper.java
+index 0750653..0dea9ac 100644
+--- a/main/java/net/minecraft/server/TileEntityHopper.java
++++ b/main/java/net/minecraft/server/TileEntityHopper.java
+@@ -227,7 +227,7 @@ public class TileEntityHopper extends TileEntityLootable implements IHopper, ITi
+             }
+         }
+         if (foundItem && world.paperConfig.cooldownHopperWhenFull) { // Inventory was full - cooldown
+-            this.setCooldown(world.spigotConfig.hopperTransfer);
++            cooldownHopperWhenFull(this);
+         }
+         return false;
+     }
+@@ -265,7 +265,7 @@ public class TileEntityHopper extends TileEntityLootable implements IHopper, ITi
+         origItemStack.setCount(origCount);
+ 
+         if (world.paperConfig.cooldownHopperWhenFull) {
+-            cooldownHopper(ihopper);
++            cooldownHopperWhenFull(ihopper);
+         }
+ 
+         return false;
+@@ -334,6 +334,19 @@ public class TileEntityHopper extends TileEntityLootable implements IHopper, ITi
+         }
+     }
+ 
++    static void cooldownHopperWhenFull(IHopper hopper) {
++        int skipTicks = com.destroystokyo.paper.config.toml.modules.optimizations.Hopper.throttleWhenFullSkipTicks;
++        if (skipTicks <= 0) {
++            cooldownHopper(hopper);
++            return;
++        }
++        if (hopper instanceof TileEntityHopper) {
++            ((TileEntityHopper) hopper).setCooldown(skipTicks);
++        } else if (hopper instanceof EntityMinecartHopper) {
++            ((EntityMinecartHopper) hopper).setCooldown(Math.max(1, skipTicks / 2));
++        }
++    }
++
+     // Paper end
+     private boolean s() {
+         IInventory iinventory = this.I();
+diff --git a/main/java/net/minecraft/server/TileEntitySkull.java b/main/java/net/minecraft/server/TileEntitySkull.java
+index dd26658..ef8320c 100644
+--- a/main/java/net/minecraft/server/TileEntitySkull.java
++++ b/main/java/net/minecraft/server/TileEntitySkull.java
+@@ -34,11 +34,18 @@ public class TileEntitySkull extends TileEntity /*implements ITickable*/ { // Pa
+     private static UserCache j;
+     private static MinecraftSessionService k;
+     // Spigot start
+-    public static final ExecutorService executor = Executors.newFixedThreadPool(3,
+-            new ThreadFactoryBuilder()
+-                    .setNameFormat("Head Conversion Thread - %1$d")
+-                    .build()
+-    );
++    public static final ExecutorService executor = createSkullExecutor();
++
++    static ExecutorService createSkullExecutor() {
++        if (com.destroystokyo.paper.config.toml.modules.concurrency.VirtualThreads.profileLookup) {
++            return Executors.newThreadPerTaskExecutor(Thread.ofVirtual().name("Head Conversion Virtual Thread - ", 0).factory());
++        }
++        return Executors.newFixedThreadPool(3,
++                new ThreadFactoryBuilder()
++                        .setNameFormat("Head Conversion Thread - %1$d")
++                        .build()
++        );
++    }
+     public static final LoadingCache<String, GameProfile> skinCache = CacheBuilder.newBuilder()
+             .maximumSize( 5000 )
+             .expireAfterAccess( 60, TimeUnit.MINUTES )
+diff --git a/main/java/org/bukkit/craftbukkit/scheduler/CraftAsyncScheduler.java b/main/java/org/bukkit/craftbukkit/scheduler/CraftAsyncScheduler.java
+index eaf8692..5423e33 100644
+--- a/main/java/org/bukkit/craftbukkit/scheduler/CraftAsyncScheduler.java
++++ b/main/java/org/bukkit/craftbukkit/scheduler/CraftAsyncScheduler.java
+@@ -24,6 +24,7 @@
+ package org.bukkit.craftbukkit.scheduler;
+ 
+ import com.destroystokyo.paper.ServerSchedulerReportingWrapper;
++import com.destroystokyo.paper.config.toml.modules.concurrency.VirtualThreads;
+ import com.google.common.util.concurrent.ThreadFactoryBuilder;
+ import org.bukkit.plugin.Plugin;
+ 
+@@ -31,6 +32,7 @@ import java.util.ArrayList;
+ import java.util.Iterator;
+ import java.util.List;
+ import java.util.concurrent.Executor;
++import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Executors;
+ import java.util.concurrent.SynchronousQueue;
+ import java.util.concurrent.ThreadPoolExecutor;
+@@ -38,17 +40,25 @@ import java.util.concurrent.TimeUnit;
+ 
+ public class CraftAsyncScheduler extends CraftScheduler {
+ 
+-    private final ThreadPoolExecutor executor = new ThreadPoolExecutor(
+-            4, Integer.MAX_VALUE,30L, TimeUnit.SECONDS, new SynchronousQueue<>(),
+-            new ThreadFactoryBuilder().setNameFormat("Craft Scheduler Thread - %1$d").build());
++    private final ExecutorService executor = createExecutor();
+     private final Executor management = Executors.newSingleThreadExecutor(new ThreadFactoryBuilder()
+             .setNameFormat("Craft Async Scheduler Management Thread").build());
+     private final List<CraftTask> temp = new ArrayList<>();
+ 
++    static ExecutorService createExecutor() {
++        if (VirtualThreads.bukkitAsyncScheduler) {
++            return Executors.newThreadPerTaskExecutor(Thread.ofVirtual().name("Craft Scheduler Virtual Thread - ", 0).factory());
++        }
++        ThreadPoolExecutor pool = new ThreadPoolExecutor(
++                4, Integer.MAX_VALUE, 30L, TimeUnit.SECONDS, new SynchronousQueue<>(),
++                new ThreadFactoryBuilder().setNameFormat("Craft Scheduler Thread - %1$d").build());
++        pool.allowCoreThreadTimeOut(true);
++        pool.prestartAllCoreThreads();
++        return pool;
++    }
++
+     CraftAsyncScheduler() {
+         super(true);
+-        executor.allowCoreThreadTimeOut(true);
+-        executor.prestartAllCoreThreads();
+     }
+ 
+     @Override
+diff --git a/test/java/net/minecraft/server/Tier1OptimizationsConfigTest.java b/test/java/net/minecraft/server/Tier1OptimizationsConfigTest.java
+new file mode 100644
+index 0000000..f84d5f1
+--- /dev/null
++++ b/test/java/net/minecraft/server/Tier1OptimizationsConfigTest.java
+@@ -0,0 +1,245 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.PaperWorldConfig;
++import com.destroystokyo.paper.config.toml.modules.concurrency.VirtualThreads;
++import com.destroystokyo.paper.config.toml.modules.optimizations.Growth;
++import com.destroystokyo.paper.config.toml.modules.optimizations.Hopper;
++import com.destroystokyo.paper.config.toml.modules.optimizations.Inventory;
++import org.bukkit.craftbukkit.scheduler.CraftAsyncSchedulerAccess;
++import org.junit.After;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import org.spigotmc.SpigotWorldConfig;
++import sun.misc.Unsafe;
++
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Random;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Future;
++
++import static org.junit.Assert.*;
++
++public class Tier1OptimizationsConfigTest {
++
++    private static Unsafe UNSAFE;
++
++    private final boolean prevCactusCheck = Growth.cactusCheckSurvival;
++    private final int prevHopperSkip = Hopper.throttleWhenFullSkipTicks;
++    private final boolean prevOnlyInHand = Inventory.onlyTickItemsInHand;
++    private final boolean prevBukkitVirtual = VirtualThreads.bukkitAsyncScheduler;
++    private final boolean prevProfileVirtual = VirtualThreads.profileLookup;
++
++    @BeforeClass
++    public static void init() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        UNSAFE = (Unsafe) f.get(null);
++    }
++
++    @After
++    public void restoreConfig() {
++        Growth.cactusCheckSurvival = prevCactusCheck;
++        Hopper.throttleWhenFullSkipTicks = prevHopperSkip;
++        Inventory.onlyTickItemsInHand = prevOnlyInHand;
++        VirtualThreads.bukkitAsyncScheduler = prevBukkitVirtual;
++        VirtualThreads.profileLookup = prevProfileVirtual;
++    }
++
++    private static final class MockWorld extends World {
++        final Map<BlockPosition, IBlockData> blocks = new HashMap<>();
++        final List<Entity> addedEntities = new ArrayList<>();
++
++        MockWorld() throws Exception {
++            super(null, null, null, null, false, null, null);
++        }
++
++        @Override
++        protected IChunkProvider n() {
++            return null;
++        }
++
++        @Override
++        protected boolean isChunkLoaded(int i, int j, boolean flag) {
++            return true;
++        }
++
++        @Override
++        public IBlockData getType(BlockPosition pos) {
++            return blocks.getOrDefault(pos, Blocks.AIR.getBlockData());
++        }
++
++        @Override
++        public boolean setTypeAndData(BlockPosition pos, IBlockData data, int flags) {
++            blocks.put(pos.h(), data);
++            return true;
++        }
++
++        @Override
++        public boolean isEmpty(BlockPosition pos) {
++            return getType(pos).getMaterial() == Material.AIR;
++        }
++
++        @Override
++        public boolean addEntity(Entity entity) {
++            addedEntities.add(entity);
++            return true;
++        }
++    }
++
++    private static MockWorld newMockWorld() throws Exception {
++        MockWorld world = (MockWorld) UNSAFE.allocateInstance(MockWorld.class);
++        Field bField = MockWorld.class.getDeclaredField("blocks");
++        bField.setAccessible(true);
++        bField.set(world, new HashMap<BlockPosition, IBlockData>());
++        Field aeField = MockWorld.class.getDeclaredField("addedEntities");
++        aeField.setAccessible(true);
++        aeField.set(world, new ArrayList<Entity>());
++
++        Field randField = World.class.getDeclaredField("random");
++        randField.setAccessible(true);
++        randField.set(world, new Random(7L));
++
++        WorldData wd = new WorldData() {};
++        Field wdField = World.class.getDeclaredField("worldData");
++        wdField.setAccessible(true);
++        wdField.set(world, wd);
++
++        Field wpField = World.class.getDeclaredField("worldProvider");
++        wpField.setAccessible(true);
++        wpField.set(world, new WorldProviderNormal());
++
++        PaperWorldConfig pwc = (PaperWorldConfig) UNSAFE.allocateInstance(PaperWorldConfig.class);
++        pwc.cactusMaxHeight = 3;
++        Field pwcField = World.class.getDeclaredField("paperConfig");
++        pwcField.setAccessible(true);
++        pwcField.set(world, pwc);
++
++        SpigotWorldConfig swc = (SpigotWorldConfig) UNSAFE.allocateInstance(SpigotWorldConfig.class);
++        swc.cactusModifier = 100;
++        swc.hopperTransfer = 8;
++        Field swcField = World.class.getDeclaredField("spigotConfig");
++        swcField.setAccessible(true);
++        swcField.set(world, swc);
++
++        return world;
++    }
++
++    @Test
++    public void testCactusSurvivalPrecheckDropsWithoutPlacing() throws Exception {
++        Growth.cactusCheckSurvival = true;
++        MockWorld world = newMockWorld();
++        BlockPosition cactusPos = new BlockPosition(0, 64, 0);
++        BlockPosition upPos = cactusPos.up();
++        world.blocks.put(cactusPos.down(), Blocks.SAND.getBlockData());
++        IBlockData age15 = Blocks.CACTUS.getBlockData().set(BlockCactus.AGE, 15);
++        world.blocks.put(cactusPos, age15);
++        // Solid stone adjacent to upPos -> cactus cannot survive at upPos
++        world.blocks.put(upPos.north(), Blocks.STONE.getBlockData());
++
++        Blocks.CACTUS.b(world, cactusPos, age15, world.random);
++
++        // Parent age reset to 0, upPos stayed AIR (never placed), cactus item dropped
++        assertEquals(Integer.valueOf(0), world.blocks.get(cactusPos).get(BlockCactus.AGE));
++        assertEquals(Blocks.AIR, world.blocks.getOrDefault(upPos, Blocks.AIR.getBlockData()).getBlock());
++        assertEquals(1, world.addedEntities.size());
++        assertTrue(world.addedEntities.get(0) instanceof EntityItem);
++    }
++
++    @Test
++    public void testHopperFullSkipTicksConfig() throws Exception {
++        MockWorld world = newMockWorld();
++        world.spigotConfig.hopperTransfer = 12;
++
++        TileEntityHopper hopper = new TileEntityHopper();
++        hopper.a(world);
++        Field cdField = TileEntityHopper.class.getDeclaredField("f");
++        cdField.setAccessible(true);
++
++        Hopper.throttleWhenFullSkipTicks = 8;
++        TileEntityHopper.cooldownHopperWhenFull(hopper);
++        assertEquals(8, cdField.getInt(hopper));
++
++        Hopper.throttleWhenFullSkipTicks = 20;
++        TileEntityHopper.cooldownHopperWhenFull(hopper);
++        assertEquals(20, cdField.getInt(hopper));
++
++        Hopper.throttleWhenFullSkipTicks = 0;
++        TileEntityHopper.cooldownHopperWhenFull(hopper);
++        assertEquals(12, cdField.getInt(hopper));
++    }
++
++    @Test
++    public void testPlayerInventoryOnlyTickItemsInHand() throws Exception {
++        final List<String> ticked = new ArrayList<>();
++        Item recordingItem = new Item() {
++            @Override
++            public void a(ItemStack itemstack, World world, Entity entity, int slot, boolean selected) {
++                ticked.add(slot + ":" + selected);
++            }
++        };
++
++        EntityPlayer player = (EntityPlayer) UNSAFE.allocateInstance(EntityPlayer.class);
++        PlayerInventory inv = new PlayerInventory(player);
++        inv.itemInHandIndex = 2;
++        inv.setItem(0, new ItemStack(recordingItem)); // hotbar 0 (not selected)
++        inv.setItem(2, new ItemStack(recordingItem)); // mainhand (selected)
++        inv.setItem(10, new ItemStack(recordingItem)); // main inventory
++        inv.extraSlots.set(0, new ItemStack(recordingItem)); // offhand
++
++        Inventory.onlyTickItemsInHand = false;
++        ticked.clear();
++        inv.n();
++        assertEquals(4, ticked.size());
++
++        Inventory.onlyTickItemsInHand = true;
++        ticked.clear();
++        inv.n();
++        assertEquals(List.of("2:true", "0:false"), ticked);
++    }
++
++    @Test
++    public void testVirtualThreadsTogglesForSchedulerAndProfileLookup() throws Exception {
++        // Test TileEntitySkull.createSkullExecutor()
++        VirtualThreads.profileLookup = false;
++        ExecutorService skullPlatform = TileEntitySkull.createSkullExecutor();
++        try {
++            Future<Boolean> f = skullPlatform.submit(() -> Thread.currentThread().isVirtual());
++            assertFalse(f.get());
++        } finally {
++            skullPlatform.shutdownNow();
++        }
++
++        VirtualThreads.profileLookup = true;
++        ExecutorService skullVirtual = TileEntitySkull.createSkullExecutor();
++        try {
++            Future<Boolean> f = skullVirtual.submit(() -> Thread.currentThread().isVirtual());
++            assertTrue(f.get());
++        } finally {
++            skullVirtual.shutdownNow();
++        }
++
++        // Test CraftAsyncScheduler.createExecutor() via package-private bridge
++        VirtualThreads.bukkitAsyncScheduler = false;
++        ExecutorService asyncPlatform = CraftAsyncSchedulerAccess.createExecutor();
++        try {
++            Future<Boolean> f = asyncPlatform.submit(() -> Thread.currentThread().isVirtual());
++            assertFalse(f.get());
++        } finally {
++            asyncPlatform.shutdownNow();
++        }
++
++        VirtualThreads.bukkitAsyncScheduler = true;
++        ExecutorService asyncVirtual = CraftAsyncSchedulerAccess.createExecutor();
++        try {
++            Future<Boolean> f = asyncVirtual.submit(() -> Thread.currentThread().isVirtual());
++            assertTrue(f.get());
++        } finally {
++            asyncVirtual.shutdownNow();
++        }
++    }
++}
+diff --git a/test/java/org/bukkit/craftbukkit/scheduler/CraftAsyncSchedulerAccess.java b/test/java/org/bukkit/craftbukkit/scheduler/CraftAsyncSchedulerAccess.java
+new file mode 100644
+index 0000000..135f7cb
+--- /dev/null
++++ b/test/java/org/bukkit/craftbukkit/scheduler/CraftAsyncSchedulerAccess.java
+@@ -0,0 +1,11 @@
++package org.bukkit.craftbukkit.scheduler;
++
++import java.util.concurrent.ExecutorService;
++
++public final class CraftAsyncSchedulerAccess {
++    private CraftAsyncSchedulerAccess() {}
++
++    public static ExecutorService createExecutor() {
++        return CraftAsyncScheduler.createExecutor();
++    }
++}
