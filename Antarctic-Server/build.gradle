@@ -56,8 +56,8 @@ jar {
 tasks.register('serverJar', Jar) {
     group = 'build'
     description = 'Builds the standalone runnable Antarctic server JAR archive with dependencies and mapped NMS classes.'
-    archiveBaseName = 'Antarctic-Server'
-    archiveClassifier = ''
+    // Release naming: Antarctic-b<year>.<month>.jar, stamped with the build date.
+    archiveFileName = "Antarctic-b${java.time.YearMonth.now().format(java.time.format.DateTimeFormatter.ofPattern('yyyy.MM'))}.jar"
     manifest {
         attributes(
             // log4j-api is a multi-release jar; Gradle's fat jar drops the flag,
