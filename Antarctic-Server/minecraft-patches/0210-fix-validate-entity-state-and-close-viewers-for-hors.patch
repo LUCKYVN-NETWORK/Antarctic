@@ -1,0 +1,493 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Fri, 27 Nov 2026 10:59:43 +0700
+Subject: [PATCH 210/210] fix: validate entity state and close viewers for
+ horse and minecart containers
+
+
+diff --git a/main/java/net/minecraft/server/ContainerHorse.java b/main/java/net/minecraft/server/ContainerHorse.java
+index 1f2d0a5..03696ba 100644
+--- a/main/java/net/minecraft/server/ContainerHorse.java
++++ b/main/java/net/minecraft/server/ContainerHorse.java
+@@ -9,6 +9,7 @@ public class ContainerHorse extends Container {
+ 
+     private final IInventory a;
+     private final EntityHorseAbstract f;
++    private final boolean openedWithChest;
+ 
+     // CraftBukkit start
+     org.bukkit.craftbukkit.inventory.CraftInventoryView bukkitEntity;
+@@ -28,6 +29,7 @@ public class ContainerHorse extends Container {
+         // CraftBukkit end
+         this.a = iinventory1;
+         this.f = entityhorseabstract;
++        this.openedWithChest = entityhorseabstract instanceof EntityHorseChestedAbstract && ((EntityHorseChestedAbstract) entityhorseabstract).isCarryingChest();
+         boolean flag = true;
+ 
+         iinventory1.startOpen(entityhuman);
+@@ -71,7 +73,17 @@ public class ContainerHorse extends Container {
+     }
+ 
+     public boolean canUse(EntityHuman entityhuman) {
+-        return this.a.a(entityhuman) && this.f.isAlive() && this.f.g((Entity) entityhuman) < 8.0F;
++        if (!this.a.a(entityhuman)
++                || !this.f.valid
++                || !this.f.isAlive()
++                || this.f.inventoryChest != this.a
++                || (this.openedWithChest && !((EntityHorseChestedAbstract) this.f).isCarryingChest())) {
++            return false;
++        }
++        if (!this.checkReachable) {
++            return true;
++        }
++        return this.f.world == entityhuman.world && this.f.h((Entity) entityhuman) < 64.0D;
+     }
+ 
+     public ItemStack shiftClick(EntityHuman entityhuman, int i) {
+diff --git a/main/java/net/minecraft/server/EntityHorseAbstract.java b/main/java/net/minecraft/server/EntityHorseAbstract.java
+index dcc3923..c68f863 100644
+--- a/main/java/net/minecraft/server/EntityHorseAbstract.java
++++ b/main/java/net/minecraft/server/EntityHorseAbstract.java
+@@ -213,8 +213,19 @@ public abstract class EntityHorseAbstract extends EntityAnimal implements IInven
+         return 2;
+     }
+ 
++    void closeChestViewers() {
++        if (this.inventoryChest != null && !this.inventoryChest.transaction.isEmpty()) {
++            for (org.bukkit.entity.HumanEntity viewer : new java.util.ArrayList<org.bukkit.entity.HumanEntity>(this.inventoryChest.transaction)) {
++                viewer.closeInventory();
++            }
++        }
++    }
++
+     public void loadChest() {
+         InventoryHorseChest inventoryhorsechest = this.inventoryChest;
++        if (inventoryhorsechest != null) {
++            this.closeChestViewers();
++        }
+ 
+         this.inventoryChest = new InventoryHorseChest("HorseChest", this.dn(), this); // CraftBukkit
+         this.inventoryChest.a(this.getName());
+@@ -468,9 +479,10 @@ public abstract class EntityHorseAbstract extends EntityAnimal implements IInven
+ 
+     public void die(DamageSource damagesource) {
+         // super.die(damagesource); // Moved down
++        this.closeChestViewers();
+         if (!this.world.isClientSide && this.inventoryChest != null) {
+             for (int i = 0; i < this.inventoryChest.getSize(); ++i) {
+-                ItemStack itemstack = this.inventoryChest.getItem(i);
++                ItemStack itemstack = this.inventoryChest.splitWithoutUpdate(i);
+ 
+                 if (!itemstack.isEmpty()) {
+                     this.a(itemstack, 0.0F);
+diff --git a/main/java/net/minecraft/server/EntityMinecartContainer.java b/main/java/net/minecraft/server/EntityMinecartContainer.java
+index decf483..6ca6059 100644
+--- a/main/java/net/minecraft/server/EntityMinecartContainer.java
++++ b/main/java/net/minecraft/server/EntityMinecartContainer.java
+@@ -89,7 +89,16 @@ public abstract class EntityMinecartContainer extends EntityMinecartAbstract imp
+         this.b = true;
+     }
+ 
++    void closeContainerViewers() {
++        if (!this.transaction.isEmpty()) {
++            for (HumanEntity viewer : new java.util.ArrayList<HumanEntity>(this.transaction)) {
++                viewer.closeInventory();
++            }
++        }
++    }
++
+     public void a(DamageSource damagesource) {
++        this.closeContainerViewers();
+         super.a(damagesource);
+         if (this.world.getGameRules().getBoolean("doEntityDrops")) {
+             InventoryUtils.dropEntity(this.world, this, this);
+@@ -142,7 +151,7 @@ public abstract class EntityMinecartContainer extends EntityMinecartAbstract imp
+     public void update() {}
+ 
+     public boolean a(EntityHuman entityhuman) {
+-        return this.dead ? false : entityhuman.h(this) <= 64.0D;
++        return !this.dead && this.valid && this.world == entityhuman.world && entityhuman.h(this) <= 64.0D;
+     }
+ 
+     public void startOpen(EntityHuman entityhuman) {}
+@@ -159,11 +168,13 @@ public abstract class EntityMinecartContainer extends EntityMinecartAbstract imp
+ 
+     @Nullable
+     public Entity b(int i) {
++        this.closeContainerViewers();
+         this.b = false;
+         return super.b(i);
+     }
+ 
+     public void die() {
++        this.closeContainerViewers();
+         if (this.b) {
+             InventoryUtils.dropEntity(this.world, this, this);
+         }
+diff --git a/main/java/net/minecraft/server/World.java b/main/java/net/minecraft/server/World.java
+index b8b6aeb..c885cce 100644
+--- a/main/java/net/minecraft/server/World.java
++++ b/main/java/net/minecraft/server/World.java
+@@ -1853,6 +1853,11 @@ public abstract class World implements IBlockAccess {
+         if (com.destroystokyo.paper.event.entity.EntityRemoveFromWorldEvent.getHandlerList().getRegisteredListeners().length != 0) {
+             new com.destroystokyo.paper.event.entity.EntityRemoveFromWorldEvent(entity.getBukkitEntity()).callEvent(); // Paper - fire while valid
+         }
++        if (entity instanceof EntityHorseAbstract) {
++            ((EntityHorseAbstract) entity).closeChestViewers();
++        } else if (entity instanceof EntityMinecartContainer) {
++            ((EntityMinecartContainer) entity).closeContainerViewers();
++        }
+         entity.valid = false; // CraftBukkit
+     }
+ 
+diff --git a/test/java/net/minecraft/server/EntityContainerDupeGuardTest.java b/test/java/net/minecraft/server/EntityContainerDupeGuardTest.java
+new file mode 100644
+index 0000000..bf7fdee
+--- /dev/null
++++ b/test/java/net/minecraft/server/EntityContainerDupeGuardTest.java
+@@ -0,0 +1,345 @@
++package net.minecraft.server;
++
++import org.bukkit.craftbukkit.entity.CraftEntity;
++import org.bukkit.craftbukkit.entity.CraftPlayer;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.List;
++
++import static org.junit.Assert.*;
++
++public class EntityContainerDupeGuardTest {
++
++    private static Unsafe UNSAFE;
++
++    @BeforeClass
++    public static void setupTest() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        UNSAFE = (Unsafe) f.get(null);
++    }
++
++    private static final class DummyWorld extends WorldServer {
++        final List<Entity> spawnedEntities = new ArrayList<>();
++
++        DummyWorld() {
++            super(null, null, null, 0, null, null, null);
++        }
++
++        @Override
++        public boolean isMainThread() {
++            return true;
++        }
++
++        @Override
++        public boolean addEntity(Entity entity) {
++            spawnedEntities.add(entity);
++            return true;
++        }
++
++        @Override
++        public boolean addEntity(Entity entity, org.bukkit.event.entity.CreatureSpawnEvent.SpawnReason reason) {
++            spawnedEntities.add(entity);
++            return true;
++        }
++
++        @Override
++        public void broadcastEntityEffect(Entity entity, byte status) {
++        }
++
++        @Override
++        public EntityTracker getTracker() {
++            return null;
++        }
++    }
++
++    private static DummyWorld createWorld(boolean clientSide) throws Exception {
++        DummyWorld world = (DummyWorld) UNSAFE.allocateInstance(DummyWorld.class);
++        Field csField = World.class.getDeclaredField("isClientSide");
++        csField.setAccessible(true);
++        csField.setBoolean(world, clientSide);
++        world.worldData = new WorldData();
++        world.getGameRules().set("doMobLoot", "false");
++        world.worldProvider = new WorldProviderNormal();
++        Field spigotField = World.class.getDeclaredField("spigotConfig");
++        spigotField.setAccessible(true);
++        spigotField.set(world, UNSAFE.allocateInstance(org.spigotmc.SpigotWorldConfig.class));
++        Field uField = World.class.getDeclaredField("u");
++        uField.setAccessible(true);
++        uField.set(world, Collections.emptyList());
++        Field randomField = World.class.getDeclaredField("random");
++        randomField.setAccessible(true);
++        randomField.set(world, new java.util.Random(42L));
++        Field spawnedField = DummyWorld.class.getDeclaredField("spawnedEntities");
++        spawnedField.setAccessible(true);
++        spawnedField.set(world, new ArrayList<Entity>());
++        Field uuidMapField = WorldServer.class.getDeclaredField("entitiesByUUID");
++        uuidMapField.setAccessible(true);
++        uuidMapField.set(world, new java.util.HashMap<>());
++        Field idMapField = World.class.getDeclaredField("entitiesById");
++        idMapField.setAccessible(true);
++        idMapField.set(world, new IntHashMap<>());
++        return world;
++    }
++
++    private static final class TrackingCraftPlayer extends CraftPlayer {
++        int closeCount = 0;
++        IInventory backingInventory;
++
++        TrackingCraftPlayer() {
++            super(null, null);
++        }
++
++        @Override
++        public void closeInventory() {
++            closeCount++;
++            if (backingInventory != null) {
++                backingInventory.onClose(this);
++            }
++        }
++    }
++
++    private static EntityPlayer createMockPlayer(DummyWorld world, double x, double y, double z) throws Exception {
++        EntityPlayer player = (EntityPlayer) UNSAFE.allocateInstance(EntityPlayer.class);
++        player.world = world;
++        player.locX = x;
++        player.locY = y;
++        player.locZ = z;
++        Field uidField = Entity.class.getDeclaredField("uniqueID");
++        uidField.setAccessible(true);
++        uidField.set(player, java.util.UUID.randomUUID());
++        player.inventory = new PlayerInventory(player);
++        TrackingCraftPlayer craftPlayer = (TrackingCraftPlayer) UNSAFE.allocateInstance(TrackingCraftPlayer.class);
++        Field entityField = CraftEntity.class.getDeclaredField("entity");
++        entityField.setAccessible(true);
++        entityField.set(craftPlayer, player);
++        Field beField = Entity.class.getDeclaredField("bukkitEntity");
++        beField.setAccessible(true);
++        beField.set(player, craftPlayer);
++        return player;
++    }
++
++    private static EntityHorseDonkey createMockDonkey(DummyWorld world, boolean carryingChest) throws Exception {
++        EntityHorseDonkey donkey = (EntityHorseDonkey) UNSAFE.allocateInstance(EntityHorseDonkey.class);
++        donkey.world = world;
++        donkey.valid = true;
++        donkey.dead = false;
++        donkey.locX = 0.0D;
++        donkey.locY = 64.0D;
++        donkey.locZ = 0.0D;
++        Field randomField = Entity.class.getDeclaredField("random");
++        randomField.setAccessible(true);
++        randomField.set(donkey, new java.util.Random(1L));
++        DataWatcher dw = new DataWatcher(donkey);
++        dw.register(EntityLiving.HEALTH, 20.0F);
++        Field abField = Entity.class.getDeclaredField("aB");
++        abField.setAccessible(true);
++        @SuppressWarnings("unchecked")
++        DataWatcherObject<String> nameKey = (DataWatcherObject<String>) abField.get(null);
++        dw.register(nameKey, "");
++        Field biField = EntityHorseAbstract.class.getDeclaredField("bI");
++        biField.setAccessible(true);
++        @SuppressWarnings("unchecked")
++        DataWatcherObject<Byte> flagsKey = (DataWatcherObject<Byte>) biField.get(null);
++        dw.register(flagsKey, Byte.valueOf((byte) 0));
++        Field chestField = EntityHorseChestedAbstract.class.getDeclaredField("bH");
++        chestField.setAccessible(true);
++        @SuppressWarnings("unchecked")
++        DataWatcherObject<Boolean> chestKey = (DataWatcherObject<Boolean>) chestField.get(null);
++        dw.register(chestKey, Boolean.valueOf(carryingChest));
++        Field dwField = Entity.class.getDeclaredField("datawatcher");
++        dwField.setAccessible(true);
++        dwField.set(donkey, dw);
++        donkey.drops = new ArrayList<>();
++        donkey.forceDrops = true;
++        Field ctField = EntityLiving.class.getDeclaredField("combatTracker");
++        ctField.setAccessible(true);
++        ctField.set(donkey, new CombatTracker(donkey));
++        donkey.loadChest();
++        return donkey;
++    }
++
++    private static EntityMinecartChest createMockMinecartChest(DummyWorld world) throws Exception {
++        EntityMinecartChest cart = (EntityMinecartChest) UNSAFE.allocateInstance(EntityMinecartChest.class);
++        cart.world = world;
++        cart.valid = true;
++        cart.dead = false;
++        cart.locX = 0.0D;
++        cart.locY = 64.0D;
++        cart.locZ = 0.0D;
++        Field itemsField = EntityMinecartContainer.class.getDeclaredField("items");
++        itemsField.setAccessible(true);
++        itemsField.set(cart, NonNullList.a(cart.getSize(), ItemStack.a));
++        Field bField = EntityMinecartContainer.class.getDeclaredField("b");
++        bField.setAccessible(true);
++        bField.setBoolean(cart, true);
++        Field txField = EntityMinecartContainer.class.getDeclaredField("transaction");
++        txField.setAccessible(true);
++        txField.set(cart, new ArrayList<>());
++        Field lootField = EntityMinecartContainer.class.getDeclaredField("lootableData");
++        lootField.setAccessible(true);
++        lootField.set(cart, new com.destroystokyo.paper.loottable.CraftLootableInventoryData(cart));
++        return cart;
++    }
++
++    @Test
++    public void testContainerHorseRejectsInvalidEntityStatesAndAcceptsValidStates() throws Exception {
++        DummyWorld worldA = createWorld(true);
++        DummyWorld worldB = createWorld(true);
++        EntityPlayer player = createMockPlayer(worldA, 2.0D, 64.0D, 0.0D);
++
++        // Chestless donkey opened for saddle must still work
++        EntityHorseDonkey saddleDonkey = createMockDonkey(worldA, false);
++        ContainerHorse saddleContainer = new ContainerHorse(player.inventory, saddleDonkey.inventoryChest, saddleDonkey, player);
++        assertTrue("Chestless horse/donkey saddle container must remain usable", saddleContainer.canUse(player));
++
++        // Chested donkey in range, same world
++        EntityHorseDonkey donkey = createMockDonkey(worldA, true);
++        ContainerHorse container = new ContainerHorse(player.inventory, donkey.inventoryChest, donkey, player);
++        assertTrue("Valid chested donkey in range must be usable", container.canUse(player));
++
++        // 1. valid = false (unloaded chunk)
++        donkey.valid = false;
++        assertFalse("Unloaded/removed horse must fail canUse", container.canUse(player));
++        donkey.valid = true;
++
++        // 2. dead = true
++        donkey.dead = true;
++        assertFalse("Dead horse must fail canUse", container.canUse(player));
++        donkey.dead = false;
++
++        // 3. inventoryChest replaced (loadChest())
++        donkey.loadChest();
++        assertFalse("Replaced inventoryChest must fail canUse", container.canUse(player));
++
++        // Re-open with new chest
++        container = new ContainerHorse(player.inventory, donkey.inventoryChest, donkey, player);
++        assertTrue(container.canUse(player));
++
++        // 4. chest removed after opening
++        donkey.setCarryingChest(false);
++        assertFalse("Removed chest after opening must fail canUse", container.canUse(player));
++        donkey.setCarryingChest(true);
++
++        // 5. distance >= 8.0 blocks (64.0 sq)
++        player.locX = 8.0D;
++        assertFalse("Out-of-range horse (>= 8 blocks) must fail canUse", container.canUse(player));
++        player.locX = 2.0D;
++
++        // 6. world mismatch
++        player.world = worldB;
++        assertFalse("Cross-world horse must fail canUse", container.canUse(player));
++
++        // 7. checkReachable = false honors remote plugin GUI while still enforcing valid/alive
++        container.checkReachable = false;
++        assertTrue("checkReachable=false must allow remote plugin GUI when alive and valid", container.canUse(player));
++        donkey.dead = true;
++        assertFalse("checkReachable=false must still reject dead horse", container.canUse(player));
++    }
++
++    @Test
++    public void testHorseDieClosesViewersAndClearsSlots() throws Exception {
++        DummyWorld world = createWorld(false);
++        EntityPlayer player = createMockPlayer(world, 1.0D, 64.0D, 0.0D);
++        EntityHorseDonkey donkey = createMockDonkey(world, true);
++
++        donkey.inventoryChest.setItem(0, new ItemStack(Items.SADDLE, 1));
++        donkey.inventoryChest.setItem(2, new ItemStack(Items.DIAMOND, 16));
++
++        TrackingCraftPlayer viewer = (TrackingCraftPlayer) player.getBukkitEntity();
++        viewer.backingInventory = donkey.inventoryChest;
++        donkey.inventoryChest.onOpen(viewer);
++
++        try {
++            donkey.die(DamageSource.GENERIC);
++        } catch (NullPointerException expectedFromCraftEventFactoryWithoutServer) {
++            // EntityLiving.die() invokes CraftEventFactory.callEntityDeathEvent after EntityHorseAbstract.die()
++            // has already closed viewers and drained+cleared inventoryChest.
++        }
++
++        assertEquals("Horse die() must close open chest viewers", 1, viewer.closeCount);
++        assertTrue("Viewer must be removed from transaction list", donkey.inventoryChest.transaction.isEmpty());
++        for (int i = 0; i < donkey.inventoryChest.getSize(); i++) {
++            assertTrue("Slot " + i + " must be cleared on die() to prevent duplication", donkey.inventoryChest.getItem(i).isEmpty());
++        }
++        assertFalse("Killed chested donkey must drop its items", world.spawnedEntities.isEmpty());
++    }
++
++    @Test
++    public void testMinecartContainerGuardsAndWorldRemoval() throws Exception {
++        DummyWorld worldA = createWorld(true);
++        DummyWorld worldB = createWorld(true);
++        EntityPlayer player = createMockPlayer(worldA, 2.0D, 64.0D, 0.0D);
++        EntityMinecartChest cart = createMockMinecartChest(worldA);
++
++        assertTrue("Valid minecart in range must be usable", cart.a((EntityHuman) player));
++
++        cart.valid = false;
++        assertFalse("Invalid/unloaded minecart must fail a(EntityHuman)", cart.a((EntityHuman) player));
++        cart.valid = true;
++
++        cart.dead = true;
++        assertFalse("Dead minecart must fail a(EntityHuman)", cart.a((EntityHuman) player));
++        cart.dead = false;
++
++        player.world = worldB;
++        assertFalse("Cross-world minecart must fail a(EntityHuman)", cart.a((EntityHuman) player));
++        player.world = worldA;
++
++        player.locX = 9.0D;
++        assertFalse("Out-of-range minecart must fail a(EntityHuman)", cart.a((EntityHuman) player));
++        player.locX = 2.0D;
++
++        TrackingCraftPlayer viewer = (TrackingCraftPlayer) player.getBukkitEntity();
++        viewer.backingInventory = cart;
++        cart.onOpen(viewer);
++
++        // World.c(Entity) must close open viewers before valid=false
++        worldA.c(cart);
++        assertEquals("World.c(Entity) must close minecart viewers", 1, viewer.closeCount);
++        assertFalse("World.c(Entity) must mark entity invalid", cart.valid);
++        assertTrue("Minecart transaction list must be empty after close", cart.transaction.isEmpty());
++
++        // die() also closes viewers cleanly
++        cart.valid = true;
++        cart.onOpen(viewer);
++        cart.die();
++        assertEquals("Minecart die() must close open viewers", 2, viewer.closeCount);
++        assertTrue(cart.transaction.isEmpty());
++    }
++
++    @Test
++    public void testCanUseAndEmptyViewerCloseEfficiency() throws Exception {
++        DummyWorld world = createWorld(true);
++        EntityPlayer player = createMockPlayer(world, 2.0D, 64.0D, 0.0D);
++        EntityHorseDonkey donkey = createMockDonkey(world, true);
++        ContainerHorse container = new ContainerHorse(player.inventory, donkey.inventoryChest, donkey, player);
++        EntityMinecartChest cart = createMockMinecartChest(world);
++
++        for (int i = 0; i < 5_000; i++) {
++            container.canUse(player);
++            cart.a((EntityHuman) player);
++            donkey.closeChestViewers();
++            cart.closeContainerViewers();
++        }
++
++        long start = System.nanoTime();
++        int ok = 0;
++        for (int i = 0; i < 50_000; i++) {
++            if (container.canUse(player) && cart.a((EntityHuman) player)) {
++                ok++;
++            }
++            donkey.closeChestViewers();
++            cart.closeContainerViewers();
++        }
++        long elapsedMs = (System.nanoTime() - start) / 1_000_000L;
++        assertEquals(50_000, ok);
++        assertTrue("50k container checks took too long: " + elapsedMs + " ms", elapsedMs < 100L);
++    }
++}
