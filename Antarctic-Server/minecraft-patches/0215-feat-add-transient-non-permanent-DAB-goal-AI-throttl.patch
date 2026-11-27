@@ -1,0 +1,451 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Fri, 27 Nov 2026 11:53:08 +0700
+Subject: [PATCH 215/215] feat: add transient non-permanent DAB goal AI
+ throttling
+
+
+diff --git a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+index 0873d23..d7de231 100644
+--- a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
++++ b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+@@ -17,6 +17,7 @@ import com.destroystokyo.paper.config.toml.modules.misc.Rebrand;
+ import com.destroystokyo.paper.config.toml.modules.network.Deflate;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.ArmourStands;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.ChunkLoading;
++import com.destroystokyo.paper.config.toml.modules.optimizations.Dab;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.MobSpawning;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Pathfinder;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Projectiles;
+@@ -57,7 +58,7 @@ public final class AntarcticTomlConfig {
+             new Rebrand(), new Privacy(),
+             new Deflate(),
+             new VirtualThreads(), new AsyncPlayerDataSaving(),
+-            new Pathfinder(), new Suffocation(), new Projectiles(), new ArmourStands(), new WorldBorder(), new ChunkLoading(), new MobSpawning(), new SunBurn(), new Rails(), new Redstone(), new Physics(), new Lighting(),
++            new Pathfinder(), new Suffocation(), new Projectiles(), new ArmourStands(), new WorldBorder(), new ChunkLoading(), new MobSpawning(), new Dab(), new SunBurn(), new Rails(), new Redstone(), new Physics(), new Lighting(),
+             new MergeChecks(), new ChunkOverloadDupe(), new Collisions(), new Player(),
+             new MapDecorations(), new Books(), new VanillaBugFix());
+     private static final YamlConfiguration yamlFacade = new YamlConfiguration();
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/Dab.java b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/Dab.java
+new file mode 100644
+index 0000000..67a4de1
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/Dab.java
+@@ -0,0 +1,93 @@
++package com.destroystokyo.paper.config.toml.modules.optimizations;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++import com.electronwill.nightconfig.core.file.CommentedFileConfig;
++
++import javax.annotation.Nullable;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Locale;
++import java.util.Set;
++
++public class Dab implements IConfigModule {
++
++    @ConfigInfo(baseName = "enabled", comments = "Transient Dynamic Activation of Brain (goal AI throttling) for distant mobs. Never sets NoAI or mutates NBT/DataWatcher. Default false.")
++    public static boolean enabled = false;
++
++    @ConfigInfo(baseName = "start-distance", comments = "Distance in blocks from the nearest player within which mobs always run full AI every tick. Default 12.")
++    public static int startDistance = 12;
++
++    @ConfigInfo(baseName = "max-tick-freq", comments = "Maximum interval (in ticks) between AI updates for very distant mobs. Default 20.")
++    public static int maxTickFreq = 20;
++
++    @ConfigInfo(baseName = "activation-dist-mod", comments = "Right-shift divisor on squared distance when computing DAB tick frequency (freq = distSq >> mod). Default 8.")
++    public static int activationDistMod = 8;
++
++    @ConfigInfo(baseName = "dont-enable-if-in-water", comments = "If true, mobs currently in water are exempt from DAB AI throttling. Default false.")
++    public static boolean dontEnableIfInWater = false;
++
++    @ConfigInfo(baseName = "blacklisted-entities", comments = "1.12.2 entity keys exempt from DAB throttling (e.g., villager, iron_golem, zombie_pigman).")
++    public static List<String> blacklistedEntities = new ArrayList<>(Arrays.asList("villager", "iron_golem", "zombie_pigman"));
++
++    public static int startDistanceSquared = 144;
++    private static volatile Set<String> blacklistedSet = buildBlacklist(blacklistedEntities);
++
++    private static Set<String> buildBlacklist(@Nullable List<String> entries) {
++        if (entries == null || entries.isEmpty()) {
++            return Set.of();
++        }
++        Set<String> set = new HashSet<>(entries.size());
++        for (String raw : entries) {
++            if (raw == null) {
++                continue;
++            }
++            String trimmed = raw.trim().toLowerCase(Locale.ROOT);
++            if (trimmed.startsWith("minecraft:")) {
++                trimmed = trimmed.substring(10);
++            }
++            if (!trimmed.isEmpty()) {
++                set.add(trimmed);
++            }
++        }
++        return Set.copyOf(set);
++    }
++
++    public static void refreshDerivedState() {
++        startDistance = Math.max(0, startDistance);
++        maxTickFreq = Math.max(1, maxTickFreq);
++        activationDistMod = Math.max(1, Math.min(30, activationDistMod));
++        startDistanceSquared = startDistance * startDistance;
++        blacklistedSet = buildBlacklist(blacklistedEntities);
++    }
++
++    public static boolean isBlacklisted(@Nullable String key) {
++        Set<String> set = blacklistedSet;
++        if (key == null || set.isEmpty()) {
++            return false;
++        }
++        String normalized = key;
++        if (normalized.regionMatches(true, 0, "minecraft:", 0, 10)) {
++            normalized = normalized.substring(10);
++        }
++        return set.contains(normalized.toLowerCase(Locale.ROOT));
++    }
++
++    @Override
++    public void onLoaded(CommentedFileConfig config) {
++        refreshDerivedState();
++    }
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.OPTIMIZATIONS;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "dab";
++    }
++}
+diff --git a/main/java/net/minecraft/server/EntityInsentient.java b/main/java/net/minecraft/server/EntityInsentient.java
+index 2115c0b..4829696 100644
+--- a/main/java/net/minecraft/server/EntityInsentient.java
++++ b/main/java/net/minecraft/server/EntityInsentient.java
+@@ -673,6 +673,45 @@ public abstract class EntityInsentient extends EntityLiving {
+         }
+     }
+ 
++    public int antarcticDabDistSq = Integer.MAX_VALUE;
++    public int antarcticDabTickStamp = Integer.MIN_VALUE;
++
++    boolean isDabExempt() {
++        if (this instanceof EntityWither
++                || this instanceof EntityEnderDragon
++                || this instanceof EntityGuardianElder
++                || this.hasCustomName()
++                || this.isLeashed()
++                || this.isVehicle()
++                || this.isPassenger()
++                || this.hurtTicks > 0
++                || this.lastDamageByPlayerTime > 0) {
++            return true;
++        }
++        if (this instanceof EntityTameableAnimal && ((EntityTameableAnimal) this).isTamed()) {
++            return true;
++        }
++        if (com.destroystokyo.paper.config.toml.modules.optimizations.Dab.dontEnableIfInWater && this.inWater) {
++            return true;
++        }
++        return com.destroystokyo.paper.config.toml.modules.optimizations.Dab.isBlacklisted(this.getMinecraftKeyString());
++    }
++
++    boolean shouldSkipAiForDab(int currentTick) {
++        if (!com.destroystokyo.paper.config.toml.modules.optimizations.Dab.enabled || this.isDabExempt()) {
++            return false;
++        }
++        int distSq = (this.antarcticDabTickStamp == currentTick) ? this.antarcticDabDistSq : Integer.MAX_VALUE;
++        if (distSq <= com.destroystokyo.paper.config.toml.modules.optimizations.Dab.startDistanceSquared) {
++            return false;
++        }
++        int maxFreq = com.destroystokyo.paper.config.toml.modules.optimizations.Dab.maxTickFreq;
++        int freq = (distSq == Integer.MAX_VALUE)
++                ? maxFreq
++                : Math.min(maxFreq, Math.max(1, distSq >> com.destroystokyo.paper.config.toml.modules.optimizations.Dab.activationDistMod));
++        return freq > 1 && ((currentTick + this.getId()) & 0x7FFFFFFF) % freq != 0;
++    }
++
+     protected final void doTick() {
+         ++this.ticksFarFromPlayer;
+         this.world.methodProfiler.a("checkDespawn");
+@@ -690,6 +729,13 @@ public abstract class EntityInsentient extends EntityLiving {
+             return;
+         }
+         // Spigot End
++        if (com.destroystokyo.paper.config.toml.modules.optimizations.Dab.enabled && this.shouldSkipAiForDab(MinecraftServer.currentTick)) {
++            if (this.inWater && this.goalFloat != null) {
++                if (this.goalFloat.validConditions()) this.goalFloat.update();
++                this.getControllerJump().jumpIfSet();
++            }
++            return;
++        }
+         this.world.methodProfiler.a("sensing");
+         this.bw.a();
+         this.world.methodProfiler.b();
+diff --git a/main/java/org/spigotmc/ActivationRange.java b/main/java/org/spigotmc/ActivationRange.java
+index 4c8d94c..bc8feba 100644
+--- a/main/java/org/spigotmc/ActivationRange.java
++++ b/main/java/org/spigotmc/ActivationRange.java
+@@ -139,7 +139,7 @@ public class ActivationRange
+                 {
+                     if ( (chunk = MCUtil.getLoadedChunkWithoutMarkingActive(world, i1, j1 )) != null ) // Paper
+                     {
+-                        activateChunkEntities( chunk ); // Paper
++                        activateChunkEntities( chunk, player ); // Paper
+                     }
+                 }
+             }
+@@ -152,13 +152,36 @@ public class ActivationRange
+      *
+      * @param chunk
+      */
+-    private static void activateChunkEntities(Chunk chunk)
++    private static void activateChunkEntities(Chunk chunk, EntityHuman player)
+     {
++        final boolean dabEnabled = com.destroystokyo.paper.config.toml.modules.optimizations.Dab.enabled;
++        final int currentTick = MinecraftServer.currentTick;
++        final double px = player.locX;
++        final double py = player.locY;
++        final double pz = player.locZ;
+         for ( List<Entity> slice : chunk.entitySlices )
+         {
+             for ( Entity entity : slice )
+             {
+-                if ( MinecraftServer.currentTick > entity.activatedTick )
++                if ( dabEnabled && entity instanceof EntityInsentient )
++                {
++                    EntityInsentient insentient = (EntityInsentient) entity;
++                    double dx = insentient.locX - px;
++                    double dy = insentient.locY - py;
++                    double dz = insentient.locZ - pz;
++                    double dSq = dx * dx + dy * dy + dz * dz;
++                    int clamped = dSq >= (double) Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) dSq;
++                    if ( insentient.antarcticDabTickStamp != currentTick )
++                    {
++                        insentient.antarcticDabTickStamp = currentTick;
++                        insentient.antarcticDabDistSq = clamped;
++                    }
++                    else if ( clamped < insentient.antarcticDabDistSq )
++                    {
++                        insentient.antarcticDabDistSq = clamped;
++                    }
++                }
++                if ( currentTick > entity.activatedTick )
+                 {
+                     if ( entity.defaultActivationState )
+                     {
+diff --git a/test/java/net/minecraft/server/DabThrottlingTest.java b/test/java/net/minecraft/server/DabThrottlingTest.java
+new file mode 100644
+index 0000000..798713f
+--- /dev/null
++++ b/test/java/net/minecraft/server/DabThrottlingTest.java
+@@ -0,0 +1,202 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.config.toml.modules.optimizations.Dab;
++import org.junit.After;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.List;
++
++import static org.junit.Assert.*;
++
++public class DabThrottlingTest {
++
++    private static Unsafe UNSAFE;
++    private static boolean defEnabled;
++    private static int defStartDist;
++    private static int defMaxFreq;
++    private static int defDistMod;
++    private static boolean defDontWater;
++    private static List<String> defBlacklist;
++
++    @BeforeClass
++    public static void setupTest() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        UNSAFE = (Unsafe) f.get(null);
++        defEnabled = Dab.enabled;
++        defStartDist = Dab.startDistance;
++        defMaxFreq = Dab.maxTickFreq;
++        defDistMod = Dab.activationDistMod;
++        defDontWater = Dab.dontEnableIfInWater;
++        defBlacklist = new ArrayList<>(Dab.blacklistedEntities);
++    }
++
++    @After
++    public void restoreConfig() {
++        Dab.enabled = defEnabled;
++        Dab.startDistance = defStartDist;
++        Dab.maxTickFreq = defMaxFreq;
++        Dab.activationDistMod = defDistMod;
++        Dab.dontEnableIfInWater = defDontWater;
++        Dab.blacklistedEntities = new ArrayList<>(defBlacklist);
++        Dab.refreshDerivedState();
++    }
++
++    private static final class DummyWorld extends WorldServer {
++        DummyWorld() {
++            super(null, null, null, 0, null, null, null);
++        }
++
++        @Override
++        public boolean isMainThread() {
++            return true;
++        }
++    }
++
++    private static DummyWorld createWorld() throws Exception {
++        DummyWorld world = (DummyWorld) UNSAFE.allocateInstance(DummyWorld.class);
++        Field csField = World.class.getDeclaredField("isClientSide");
++        csField.setAccessible(true);
++        csField.setBoolean(world, true);
++        world.worldData = new WorldData();
++        world.worldProvider = new WorldProviderNormal();
++        Field mpField = World.class.getDeclaredField("methodProfiler");
++        mpField.setAccessible(true);
++        mpField.set(world, new MethodProfiler());
++        Field randomField = World.class.getDeclaredField("random");
++        randomField.setAccessible(true);
++        randomField.set(world, new java.util.Random(1L));
++        Field spigotField = World.class.getDeclaredField("spigotConfig");
++        spigotField.setAccessible(true);
++        spigotField.set(world, UNSAFE.allocateInstance(org.spigotmc.SpigotWorldConfig.class));
++        Field paperField = World.class.getDeclaredField("paperConfig");
++        paperField.setAccessible(true);
++        paperField.set(world, UNSAFE.allocateInstance(com.destroystokyo.paper.PaperWorldConfig.class));
++        return world;
++    }
++
++    @Test
++    public void testDabNeverSetsNoAiAndRestoresImmediately() throws Exception {
++        DummyWorld world = createWorld();
++        EntityZombie zombie = new EntityZombie(world);
++        Dab.enabled = true;
++        Dab.startDistance = 12;
++        Dab.maxTickFreq = 20;
++        Dab.activationDistMod = 8;
++        Dab.refreshDerivedState();
++
++        // Distant mob: throttles >60% of ticks across 20 ticks, staggered by ID
++        zombie.antarcticDabTickStamp = 100;
++        zombie.antarcticDabDistSq = 5120; // 5120 >> 8 = 20
++        int skipped = 0;
++        for (int t = 100; t < 120; t++) {
++            zombie.antarcticDabTickStamp = t;
++            if (zombie.shouldSkipAiForDab(t)) {
++                skipped++;
++            }
++        }
++        assertEquals("Distant mob must skip 19 of 20 ticks", 19, skipped);
++        assertFalse("DAB must never mutate DataWatcher NoAI", zombie.isNoAI());
++
++        NBTTagCompound saved = new NBTTagCompound();
++        zombie.b(saved);
++        assertFalse("DAB must never persist NoAI:1b to NBT", saved.getBoolean("NoAI"));
++
++        // Player walks within startDistance (distSq = 64 <= 144) -> immediate full AI
++        zombie.antarcticDabTickStamp = 120;
++        zombie.antarcticDabDistSq = 64;
++        assertFalse("Approaching player must restore AI immediately", zombie.shouldSkipAiForDab(120));
++
++        // Hot-reload disable restores immediately even when far
++        zombie.antarcticDabDistSq = 10_000;
++        Dab.enabled = false;
++        assertFalse("Disabling DAB must restore AI immediately", zombie.shouldSkipAiForDab(120));
++    }
++
++    @Test
++    public void testDabExemptions() throws Exception {
++        DummyWorld world = createWorld();
++        Dab.enabled = true;
++        Dab.startDistance = 12;
++        Dab.maxTickFreq = 20;
++        Dab.dontEnableIfInWater = true;
++        Dab.refreshDerivedState();
++
++        // 1. Named mob exempt
++        EntityZombie named = new EntityZombie(world);
++        named.setCustomName("Guard");
++        assertTrue(named.isDabExempt());
++
++        // 2. Hurt mob exempt
++        EntityZombie hurt = new EntityZombie(world);
++        hurt.hurtTicks = 5;
++        assertTrue(hurt.isDabExempt());
++
++        // 3. In water exempt when dontEnableIfInWater=true
++        EntityZombie wet = new EntityZombie(world);
++        wet.inWater = true;
++        assertTrue(wet.isDabExempt());
++        Dab.dontEnableIfInWater = false;
++        assertFalse(wet.isDabExempt());
++
++        // 4. Blacklisted villager (case & minecraft: prefix normalization)
++        assertTrue(Dab.isBlacklisted("villager"));
++        assertTrue(Dab.isBlacklisted("minecraft:Villager"));
++        assertFalse(Dab.isBlacklisted("zombie"));
++
++        EntityVillager villager = new EntityVillager(world) {
++            @Override
++            public String getMinecraftKeyString() {
++                return "minecraft:villager";
++            }
++        };
++        assertTrue(villager.isDabExempt());
++
++        // 5. Boss exempt
++        EntityWither wither = new EntityWither(world);
++        assertTrue(wither.isDabExempt());
++
++        // 6. Tamed wolf exempt
++        EntityWolf wolf = new EntityWolf(world);
++        wolf.setTamed(true);
++        assertTrue(wolf.isDabExempt());
++    }
++
++    @Test
++    public void testDab500MobPerfAndReduction() throws Exception {
++        DummyWorld world = createWorld();
++        Dab.enabled = true;
++        Dab.startDistance = 12;
++        Dab.maxTickFreq = 20;
++        Dab.activationDistMod = 8;
++        Dab.refreshDerivedState();
++
++        EntityZombie[] mobs = new EntityZombie[500];
++        for (int i = 0; i < mobs.length; i++) {
++            mobs[i] = new EntityZombie(world);
++        }
++
++        long start = System.nanoTime();
++        int totalTicks = 0;
++        int executedAiTicks = 0;
++        for (int t = 1; t <= 200; t++) {
++            for (EntityZombie mob : mobs) {
++                mob.antarcticDabTickStamp = t;
++                mob.antarcticDabDistSq = 4096; // 4096 >> 8 = 16
++                totalTicks++;
++                if (!mob.shouldSkipAiForDab(t)) {
++                    executedAiTicks++;
++                }
++            }
++        }
++        long elapsedMs = (System.nanoTime() - start) / 1_000_000L;
++        double reduction = 1.0D - ((double) executedAiTicks / totalTicks);
++        assertTrue("Expected >60% AI reduction, got " + reduction, reduction > 0.60D);
++        assertTrue("500-mob x 200-tick DAB check took too long: " + elapsedMs + " ms", elapsedMs < 150L);
++    }
++}
