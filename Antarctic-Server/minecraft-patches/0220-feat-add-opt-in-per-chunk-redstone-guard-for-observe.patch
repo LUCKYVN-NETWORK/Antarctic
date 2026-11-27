@@ -1,0 +1,905 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Fri, 27 Nov 2026 12:44:43 +0700
+Subject: [PATCH 220/220] feat: add opt-in per-chunk redstone guard for
+ observers, pistons, diodes, and ticks
+
+
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/RedstoneGuard.java b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/RedstoneGuard.java
+index 7bc3788..5d9dd86 100644
+--- a/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/RedstoneGuard.java
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/RedstoneGuard.java
+@@ -31,6 +31,48 @@ public class RedstoneGuard implements IConfigModule {
+     )
+     public static int maxNoteBlockDeferredPerChunk = 1024;
+ 
++    @ConfigInfo(
++        baseName = "window-ticks",
++        comments = "Sliding window length in server ticks for per-chunk redstone guard counters. Default 20."
++    )
++    public static int windowTicks = 20;
++
++    @ConfigInfo(
++        baseName = "max-observer-pulses-per-chunk-per-window",
++        comments = "Maximum BlockObserver rising-edge pulses scheduled per chunk per window (falling edges are never suppressed). Default 128."
++    )
++    public static int maxObserverPulsesPerChunkPerWindow = 128;
++
++    @ConfigInfo(
++        baseName = "max-piston-actions-per-chunk-per-window",
++        comments = "Maximum resting piston extend/retract initiations per chunk per window (active TileEntityPiston movement is never interrupted). Default 96."
++    )
++    public static int maxPistonActionsPerChunkPerWindow = 96;
++
++    @ConfigInfo(
++        baseName = "max-diode-updates-per-chunk-per-window",
++        comments = "Threshold of repeater/comparator updates per chunk per window before stretching delay (up to 20 ticks, never dropping ticks). Default 256."
++    )
++    public static int maxDiodeUpdatesPerChunkPerWindow = 256;
++
++    @ConfigInfo(
++        baseName = "max-noteblock-plays-per-chunk-per-window",
++        comments = "Maximum NoteBlock play events per chunk per window before skipping excess playBlockAction calls. Default 64."
++    )
++    public static int maxNoteBlockPlaysPerChunkPerWindow = 64;
++
++    @ConfigInfo(
++        baseName = "max-scheduled-ticks-per-chunk-per-tick",
++        comments = "Maximum scheduled block ticks executed per chunk per server tick before deferring excess to the next tick (observer falling edges exempt). Default 1024."
++    )
++    public static int maxScheduledTicksPerChunkPerTick = 1024;
++
++    @ConfigInfo(
++        baseName = "unloaded-chunk-tick-backoff-ticks",
++        comments = "Delay in ticks when re-scheduling a block tick in an unloaded chunk instead of immediate delay 0. Default 20."
++    )
++    public static int unloadedChunkTickBackoffTicks = 20;
++
+     @Override
+     public EnumConfigCategory getCategory() {
+         return EnumConfigCategory.OPTIMIZATIONS;
+@@ -46,5 +88,12 @@ public class RedstoneGuard implements IConfigModule {
+         maxBlockActionsPerTick = Math.max(1, maxBlockActionsPerTick);
+         maxBlockActionsPerChunkPerTick = Math.max(1, maxBlockActionsPerChunkPerTick);
+         maxNoteBlockDeferredPerChunk = Math.max(0, maxNoteBlockDeferredPerChunk);
++        windowTicks = Math.max(1, windowTicks);
++        maxObserverPulsesPerChunkPerWindow = Math.max(1, maxObserverPulsesPerChunkPerWindow);
++        maxPistonActionsPerChunkPerWindow = Math.max(1, maxPistonActionsPerChunkPerWindow);
++        maxDiodeUpdatesPerChunkPerWindow = Math.max(1, maxDiodeUpdatesPerChunkPerWindow);
++        maxNoteBlockPlaysPerChunkPerWindow = Math.max(1, maxNoteBlockPlaysPerChunkPerWindow);
++        maxScheduledTicksPerChunkPerTick = Math.max(1, maxScheduledTicksPerChunkPerTick);
++        unloadedChunkTickBackoffTicks = Math.max(0, unloadedChunkTickBackoffTicks);
+     }
+ }
+diff --git a/main/java/net/minecraft/server/BlockDiodeAbstract.java b/main/java/net/minecraft/server/BlockDiodeAbstract.java
+index 716f40a..84284d2 100644
+--- a/main/java/net/minecraft/server/BlockDiodeAbstract.java
++++ b/main/java/net/minecraft/server/BlockDiodeAbstract.java
+@@ -97,7 +97,14 @@ public abstract class BlockDiodeAbstract extends BlockFacingHorizontal {
+                     b0 = -2;
+                 }
+ 
+-                world.a(blockposition, this, this.x(iblockdata), b0);
++                int delay = this.x(iblockdata);
++                if (com.destroystokyo.paper.config.toml.modules.optimizations.RedstoneGuard.enabled) {
++                    Chunk chunk = world.getChunkIfLoaded(blockposition.getX() >> 4, blockposition.getZ() >> 4);
++                    if (chunk != null && chunk.shouldStretchDiodeDelay(world.getTime())) {
++                        delay = Math.min(delay * 4, 20);
++                    }
++                }
++                world.a(blockposition, this, delay, b0);
+             }
+ 
+         }
+diff --git a/main/java/net/minecraft/server/BlockObserver.java b/main/java/net/minecraft/server/BlockObserver.java
+index b36a847..ffc729e 100644
+--- a/main/java/net/minecraft/server/BlockObserver.java
++++ b/main/java/net/minecraft/server/BlockObserver.java
+@@ -63,6 +63,12 @@ public class BlockObserver extends BlockDirectional {
+     private void d(IBlockData iblockdata, World world, BlockPosition blockposition) {
+         if (!((Boolean) iblockdata.get(BlockObserver.a)).booleanValue()) {
+             if (!world.b(blockposition, (Block) this)) {
++                if (com.destroystokyo.paper.config.toml.modules.optimizations.RedstoneGuard.enabled) {
++                    Chunk chunk = world.getChunkIfLoaded(blockposition.getX() >> 4, blockposition.getZ() >> 4);
++                    if (chunk != null && !chunk.allowRedstoneObserverPulse(world.getTime())) {
++                        return;
++                    }
++                }
+                 world.a(blockposition, (Block) this, 2);
+             }
+ 
+diff --git a/main/java/net/minecraft/server/BlockPiston.java b/main/java/net/minecraft/server/BlockPiston.java
+index 0cb87f1..e1bfc83 100644
+--- a/main/java/net/minecraft/server/BlockPiston.java
++++ b/main/java/net/minecraft/server/BlockPiston.java
+@@ -112,6 +112,12 @@ public class BlockPiston extends BlockDirectional {
+ 
+         if (flag && !((Boolean) iblockdata.get(BlockPiston.EXTENDED)).booleanValue()) {
+             if ((new PistonExtendsChecker(world, blockposition, enumdirection, true)).a()) {
++                if (com.destroystokyo.paper.config.toml.modules.optimizations.RedstoneGuard.enabled) {
++                    Chunk chunk = world.getChunkIfLoaded(blockposition.getX() >> 4, blockposition.getZ() >> 4);
++                    if (chunk != null && !chunk.allowRedstonePistonAction(world.getTime())) {
++                        return;
++                    }
++                }
+                 world.playBlockAction(blockposition, this, 0, enumdirection.a());
+             }
+         } else if (!flag && ((Boolean) iblockdata.get(BlockPiston.EXTENDED)).booleanValue()) {
+@@ -127,6 +133,12 @@ public class BlockPiston extends BlockDirectional {
+             }
+             // PAIL: checkME - what happened to setTypeAndData?
+             // CraftBukkit end
++            if (com.destroystokyo.paper.config.toml.modules.optimizations.RedstoneGuard.enabled) {
++                Chunk chunk = world.getChunkIfLoaded(blockposition.getX() >> 4, blockposition.getZ() >> 4);
++                if (chunk != null && !chunk.allowRedstonePistonAction(world.getTime())) {
++                    return;
++                }
++            }
+             world.playBlockAction(blockposition, this, 1, enumdirection.a());
+         }
+ 
+diff --git a/main/java/net/minecraft/server/BlockRedstoneComparator.java b/main/java/net/minecraft/server/BlockRedstoneComparator.java
+index 37dd64f..1efcd41 100644
+--- a/main/java/net/minecraft/server/BlockRedstoneComparator.java
++++ b/main/java/net/minecraft/server/BlockRedstoneComparator.java
+@@ -149,10 +149,17 @@ public class BlockRedstoneComparator extends BlockDiodeAbstract implements ITile
+             int j = tileentity instanceof TileEntityComparator ? ((TileEntityComparator) tileentity).a() : 0;
+ 
+             if (i != j || this.A(iblockdata) != shouldBePowered) {
++                int delay = 2;
++                if (com.destroystokyo.paper.config.toml.modules.optimizations.RedstoneGuard.enabled) {
++                    Chunk chunk = world.getChunkIfLoaded(blockposition.getX() >> 4, blockposition.getZ() >> 4);
++                    if (chunk != null && chunk.shouldStretchDiodeDelay(world.getTime())) {
++                        delay = Math.min(delay * 4, 20);
++                    }
++                }
+                 if (this.i(world, blockposition, iblockdata)) {
+-                    world.a(blockposition, this, 2, -1);
++                    world.a(blockposition, this, delay, -1);
+                 } else {
+-                    world.a(blockposition, this, 2, 0);
++                    world.a(blockposition, this, delay, 0);
+                 }
+             }
+ 
+diff --git a/main/java/net/minecraft/server/Chunk.java b/main/java/net/minecraft/server/Chunk.java
+index aa8460d..c45e6bd 100644
+--- a/main/java/net/minecraft/server/Chunk.java
++++ b/main/java/net/minecraft/server/Chunk.java
+@@ -253,6 +253,46 @@ public class Chunk {
+     }
+     // Airplane end
+ 
++    // Antarctic start - transient per-chunk sliding-window redstone guard counters (not saved to NBT)
++    private long antarcticRedstoneWindowStart = Long.MIN_VALUE;
++    private int antarcticObserverRisingOps;
++    private int antarcticPistonOps;
++    private int antarcticDiodeOps;
++    private int antarcticNoteBlockOps;
++
++    private void rollRedstoneGuardWindow(long nowTick) {
++        if (this.antarcticRedstoneWindowStart == Long.MIN_VALUE
++                || nowTick < this.antarcticRedstoneWindowStart
++                || (nowTick - this.antarcticRedstoneWindowStart) >= com.destroystokyo.paper.config.toml.modules.optimizations.RedstoneGuard.windowTicks) {
++            this.antarcticRedstoneWindowStart = nowTick;
++            this.antarcticObserverRisingOps = 0;
++            this.antarcticPistonOps = 0;
++            this.antarcticDiodeOps = 0;
++            this.antarcticNoteBlockOps = 0;
++        }
++    }
++
++    public boolean allowRedstoneObserverPulse(long nowTick) {
++        this.rollRedstoneGuardWindow(nowTick);
++        return ++this.antarcticObserverRisingOps <= com.destroystokyo.paper.config.toml.modules.optimizations.RedstoneGuard.maxObserverPulsesPerChunkPerWindow;
++    }
++
++    public boolean allowRedstonePistonAction(long nowTick) {
++        this.rollRedstoneGuardWindow(nowTick);
++        return ++this.antarcticPistonOps <= com.destroystokyo.paper.config.toml.modules.optimizations.RedstoneGuard.maxPistonActionsPerChunkPerWindow;
++    }
++
++    public boolean shouldStretchDiodeDelay(long nowTick) {
++        this.rollRedstoneGuardWindow(nowTick);
++        return ++this.antarcticDiodeOps > com.destroystokyo.paper.config.toml.modules.optimizations.RedstoneGuard.maxDiodeUpdatesPerChunkPerWindow;
++    }
++
++    public boolean allowRedstoneNoteBlockPlay(long nowTick) {
++        this.rollRedstoneGuardWindow(nowTick);
++        return ++this.antarcticNoteBlockOps <= com.destroystokyo.paper.config.toml.modules.optimizations.RedstoneGuard.maxNoteBlockPlaysPerChunkPerWindow;
++    }
++    // Antarctic end
++
+     public Chunk(World world, int i, int j) {
+         this.sections = new ChunkSection[16];
+         this.g = new byte[256];
+diff --git a/main/java/net/minecraft/server/TileEntityNote.java b/main/java/net/minecraft/server/TileEntityNote.java
+index 65bcc35..6ee103f 100644
+--- a/main/java/net/minecraft/server/TileEntityNote.java
++++ b/main/java/net/minecraft/server/TileEntityNote.java
+@@ -71,6 +71,12 @@ public class TileEntityNote extends TileEntity {
+             }
+ 
+             // CraftBukkit start
++            if (com.destroystokyo.paper.config.toml.modules.optimizations.RedstoneGuard.enabled) {
++                Chunk chunk = world.getChunkIfLoaded(blockposition.getX() >> 4, blockposition.getZ() >> 4);
++                if (chunk != null && !chunk.allowRedstoneNoteBlockPlay(world.getTime())) {
++                    return;
++                }
++            }
+             org.bukkit.event.block.NotePlayEvent event = org.bukkit.craftbukkit.event.CraftEventFactory.callNotePlayEvent(this.world, blockposition.getX(), blockposition.getY(), blockposition.getZ(), b0, this.note);
+             if (!event.isCancelled()) {
+                 world.playBlockAction(blockposition, Blocks.NOTEBLOCK, event.getInstrument().getType(), event.getNote().getId());
+diff --git a/main/java/net/minecraft/server/WorldServer.java b/main/java/net/minecraft/server/WorldServer.java
+index fe73452..577ccad 100644
+--- a/main/java/net/minecraft/server/WorldServer.java
++++ b/main/java/net/minecraft/server/WorldServer.java
+@@ -63,6 +63,7 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+     private int V;
+     private it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap antarcticBlockActionChunkCounts; // Antarctic
+     private it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap antarcticDeferredNoteCounts; // Antarctic
++    private it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap antarcticScheduledTickChunkCounts; // Antarctic
+     private final java.util.ArrayDeque<NextTickListEntry> W = new java.util.ArrayDeque<NextTickListEntry>(); // Antarctic - O(1) FIFO drain instead of O(n) ArrayList head shifts
+     private final me.stella.antarctic.collection.MultiplicitySet<NextTickListEntry> currentTickBatch = new me.stella.antarctic.collection.MultiplicitySet<NextTickListEntry>(); // Antarctic - O(1) mirror of W for isBlockTickPending checks
+     private final BlockPosition.MutableBlockPosition antarcticTickProbePos = new BlockPosition.MutableBlockPosition(); // Antarctic - zero-alloc tick probe
+@@ -843,31 +844,57 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+                 this.methodProfiler.a("ticking");
+                 timings.scheduledBlocksTicking.startTiming(); // Paper
+ 
+-                while ((nextticklistentry = this.W.pollFirst()) != null) {
+-                    this.currentTickBatch.removeOne(nextticklistentry); // Antarctic
+-                    boolean flag1 = false;
+-
+-                    Chunk chunk = this.getChunkIfLoaded(nextticklistentry.a.getX() >> 4, nextticklistentry.a.getZ() >> 4);
+-                    if (chunk != null) { // Antarctic - single chunk lookup for loaded check + block state
+-                        IBlockData iblockdata = this.captureTreeGeneration ? this.getType(nextticklistentry.a) : chunk.getBlockData(nextticklistentry.a.getX(), nextticklistentry.a.getY(), nextticklistentry.a.getZ());
+-                        co.aikar.timings.Timing timing = iblockdata.getBlock().getTiming(); // Paper
+-                        timing.startTiming(); // Paper
+-
+-                        if (iblockdata.getMaterial() != Material.AIR && Block.a(iblockdata.getBlock(), nextticklistentry.a())) {
+-                            try {
+-                                stopPhysicsEvent = !paperConfig.firePhysicsEventForRedstone && (iblockdata.getBlock() instanceof BlockDiodeAbstract || iblockdata.getBlock() instanceof BlockRedstoneTorch); // Paper
+-                                iblockdata.getBlock().b((World) this, nextticklistentry.a, iblockdata, this.random);
+-                            } catch (Throwable throwable) {
+-                                CrashReport crashreport = CrashReport.a(throwable, "Exception while ticking a block");
+-                                CrashReportSystemDetails crashreportsystemdetails = crashreport.a("Block being ticked");
+-
+-                                CrashReportSystemDetails.a(crashreportsystemdetails, nextticklistentry.a, iblockdata);
+-                                throw new ReportedException(crashreport);
+-                            } finally { stopPhysicsEvent = false; } // Paper
++                final boolean guardTicks = com.destroystokyo.paper.config.toml.modules.optimizations.RedstoneGuard.enabled && !flag;
++                final it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap tickChunkCounts = guardTicks ? this.getAntarcticScheduledTickChunkCounts() : null;
++                if (tickChunkCounts != null) {
++                    tickChunkCounts.clear();
++                }
++
++                try {
++                    while ((nextticklistentry = this.W.pollFirst()) != null) {
++                        this.currentTickBatch.removeOne(nextticklistentry); // Antarctic
++                        boolean flag1 = false;
++
++                        Chunk chunk = this.getChunkIfLoaded(nextticklistentry.a.getX() >> 4, nextticklistentry.a.getZ() >> 4);
++                        if (chunk != null) { // Antarctic - single chunk lookup for loaded check + block state
++                            IBlockData iblockdata = this.captureTreeGeneration ? this.getType(nextticklistentry.a) : chunk.getBlockData(nextticklistentry.a.getX(), nextticklistentry.a.getY(), nextticklistentry.a.getZ());
++                            if (guardTicks) {
++                                boolean isObserverFallingEdge = iblockdata.getBlock() instanceof BlockObserver && ((Boolean) iblockdata.get(BlockObserver.a)).booleanValue();
++                                if (!isObserverFallingEdge) {
++                                    int count = tickChunkCounts.addTo(chunk.chunkKey, 1);
++                                    if (count >= com.destroystokyo.paper.config.toml.modules.optimizations.RedstoneGuard.maxScheduledTicksPerChunkPerTick) {
++                                        this.a(nextticklistentry.a, nextticklistentry.a(), 1, nextticklistentry.c);
++                                        continue;
++                                    }
++                                }
++                            }
++                            co.aikar.timings.Timing timing = iblockdata.getBlock().getTiming(); // Paper
++                            timing.startTiming(); // Paper
++
++                            if (iblockdata.getMaterial() != Material.AIR && Block.a(iblockdata.getBlock(), nextticklistentry.a())) {
++                                try {
++                                    stopPhysicsEvent = !paperConfig.firePhysicsEventForRedstone && (iblockdata.getBlock() instanceof BlockDiodeAbstract || iblockdata.getBlock() instanceof BlockRedstoneTorch); // Paper
++                                    iblockdata.getBlock().b((World) this, nextticklistentry.a, iblockdata, this.random);
++                                } catch (Throwable throwable) {
++                                    CrashReport crashreport = CrashReport.a(throwable, "Exception while ticking a block");
++                                    CrashReportSystemDetails crashreportsystemdetails = crashreport.a("Block being ticked");
++
++                                    CrashReportSystemDetails.a(crashreportsystemdetails, nextticklistentry.a, iblockdata);
++                                    throw new ReportedException(crashreport);
++                                } finally { stopPhysicsEvent = false; } // Paper
++                            }
++                            timing.stopTiming(); // Paper
++                        } else {
++                            if (com.destroystokyo.paper.config.toml.modules.optimizations.RedstoneGuard.enabled) {
++                                this.a(nextticklistentry.a, nextticklistentry.a(), com.destroystokyo.paper.config.toml.modules.optimizations.RedstoneGuard.unloadedChunkTickBackoffTicks, nextticklistentry.c);
++                            } else {
++                                this.a(nextticklistentry.a, nextticklistentry.a(), 0);
++                            }
+                         }
+-                        timing.stopTiming(); // Paper
+-                    } else {
+-                        this.a(nextticklistentry.a, nextticklistentry.a(), 0);
++                    }
++                } finally {
++                    if (tickChunkCounts != null) {
++                        tickChunkCounts.clear();
+                     }
+                 }
+                 timings.scheduledBlocksTicking.stopTiming(); // Paper
+@@ -1382,6 +1409,13 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+         return explosion;
+     }
+ 
++    private it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap getAntarcticScheduledTickChunkCounts() {
++        if (this.antarcticScheduledTickChunkCounts == null) {
++            this.antarcticScheduledTickChunkCounts = new it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap();
++        }
++        return this.antarcticScheduledTickChunkCounts;
++    }
++
+     private it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap getAntarcticBlockActionChunkCounts() {
+         if (this.antarcticBlockActionChunkCounts == null) {
+             this.antarcticBlockActionChunkCounts = new it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap();
+diff --git a/test/java/net/minecraft/server/RedstoneGuardTest.java b/test/java/net/minecraft/server/RedstoneGuardTest.java
+new file mode 100644
+index 0000000..0e633a4
+--- /dev/null
++++ b/test/java/net/minecraft/server/RedstoneGuardTest.java
+@@ -0,0 +1,559 @@
++package net.minecraft.server;
++
++import co.aikar.timings.Timing;
++import co.aikar.timings.WorldTimingsHandler;
++import com.destroystokyo.paper.PaperWorldConfig;
++import com.destroystokyo.paper.config.toml.modules.optimizations.RedstoneGuard;
++import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
++import me.stella.antarctic.collection.ChunkIndexedTreeSet;
++import me.stella.antarctic.collection.MultiplicitySet;
++import org.bukkit.craftbukkit.CraftServer;
++import org.bukkit.plugin.PluginManager;
++import org.junit.After;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++import java.lang.reflect.Field;
++import java.lang.reflect.Proxy;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Random;
++
++import static org.junit.Assert.*;
++
++public class RedstoneGuardTest {
++
++    private static Unsafe UNSAFE;
++    private static Timing NOOP_TIMING;
++
++    private boolean prevEnabled = RedstoneGuard.enabled;
++    private int prevWindowTicks = RedstoneGuard.windowTicks;
++    private int prevMaxObserver = RedstoneGuard.maxObserverPulsesPerChunkPerWindow;
++    private int prevMaxPiston = RedstoneGuard.maxPistonActionsPerChunkPerWindow;
++    private int prevMaxDiode = RedstoneGuard.maxDiodeUpdatesPerChunkPerWindow;
++    private int prevMaxNote = RedstoneGuard.maxNoteBlockPlaysPerChunkPerWindow;
++    private int prevMaxScheduled = RedstoneGuard.maxScheduledTicksPerChunkPerTick;
++    private int prevUnloadedBackoff = RedstoneGuard.unloadedChunkTickBackoffTicks;
++
++    @BeforeClass
++    public static void init() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        UNSAFE = (Unsafe) f.get(null);
++        NOOP_TIMING = (Timing) Proxy.newProxyInstance(
++            Timing.class.getClassLoader(),
++            new Class<?>[] { Timing.class },
++            (proxy, method, args) -> {
++                Class<?> rt = method.getReturnType();
++                if (rt == Timing.class) return proxy;
++                if (rt == boolean.class) return false;
++                if (rt == int.class) return 0;
++                return null;
++            }
++        );
++    }
++
++    @After
++    public void restoreConfig() {
++        RedstoneGuard.enabled = prevEnabled;
++        RedstoneGuard.windowTicks = prevWindowTicks;
++        RedstoneGuard.maxObserverPulsesPerChunkPerWindow = prevMaxObserver;
++        RedstoneGuard.maxPistonActionsPerChunkPerWindow = prevMaxPiston;
++        RedstoneGuard.maxDiodeUpdatesPerChunkPerWindow = prevMaxDiode;
++        RedstoneGuard.maxNoteBlockPlaysPerChunkPerWindow = prevMaxNote;
++        RedstoneGuard.maxScheduledTicksPerChunkPerTick = prevMaxScheduled;
++        RedstoneGuard.unloadedChunkTickBackoffTicks = prevUnloadedBackoff;
++    }
++
++    private static final class ScheduledCall {
++        final BlockPosition pos;
++        final Block block;
++        final int delay;
++        final int priority;
++
++        ScheduledCall(BlockPosition pos, Block block, int delay, int priority) {
++            this.pos = pos.h();
++            this.block = block;
++            this.delay = delay;
++            this.priority = priority;
++        }
++    }
++
++    private static final class PlayActionCall {
++        final BlockPosition pos;
++        final Block block;
++        final int id;
++        final int param;
++
++        PlayActionCall(BlockPosition pos, Block block, int id, int param) {
++            this.pos = pos.h();
++            this.block = block;
++            this.id = id;
++            this.param = param;
++        }
++    }
++
++    private static final class MockWorldServer extends WorldServer {
++        Long2ObjectOpenHashMap<Chunk> loadedChunks;
++        List<ScheduledCall> recordedSchedules;
++        List<PlayActionCall> recordedActions;
++        long worldTime;
++        org.bukkit.World proxyBukkitWorld;
++        CraftServer mockCraftServer;
++        WorldBorder mockWorldBorder;
++
++        MockWorldServer() {
++            super(null, null, null, 0, null, null, null);
++        }
++
++        @Override
++        public WorldBorder getWorldBorder() {
++            return mockWorldBorder;
++        }
++
++        @Override
++        public long getTime() {
++            return worldTime;
++        }
++
++        @Override
++        public Chunk getChunkIfLoaded(int x, int z) {
++            return loadedChunks.get(ChunkCoordIntPair.a(x, z));
++        }
++
++        @Override
++        public boolean isLoaded(BlockPosition pos) {
++            return getChunkIfLoaded(pos.getX() >> 4, pos.getZ() >> 4) != null;
++        }
++
++        @Override
++        public boolean b(BlockPosition pos, Block block) {
++            return false;
++        }
++
++        @Override
++        public void a(BlockPosition pos, Block block, int delay, int priority) {
++            recordedSchedules.add(new ScheduledCall(pos, block, delay, priority));
++            super.a(pos, block, delay, priority);
++        }
++
++        @Override
++        public void playBlockAction(BlockPosition pos, Block block, int id, int param) {
++            recordedActions.add(new PlayActionCall(pos, block, id, param));
++        }
++
++        @Override
++        public IBlockData getType(BlockPosition pos) {
++            Chunk c = getChunkIfLoaded(pos.getX() >> 4, pos.getZ() >> 4);
++            if (c != null) {
++                return c.getBlockData(pos);
++            }
++            return Blocks.AIR.getBlockData();
++        }
++
++        @Override
++        public boolean setTypeAndData(BlockPosition pos, IBlockData data, int flags) {
++            Chunk c = getChunkIfLoaded(pos.getX() >> 4, pos.getZ() >> 4);
++            if (c != null) {
++                setBlock(c, pos, data);
++                return true;
++            }
++            return false;
++        }
++
++        @Override
++        public void applyPhysics(BlockPosition pos, Block block, boolean flag) {}
++
++        @Override
++        public void a(BlockPosition pos, Block block, EnumDirection dir) {}
++
++        @Override
++        public TileEntity getTileEntity(BlockPosition pos) {
++            return null;
++        }
++
++        @Override
++        public org.bukkit.craftbukkit.CraftWorld getWorld() {
++            return null;
++        }
++
++        @Override
++        public CraftServer getServer() {
++            return mockCraftServer;
++        }
++    }
++
++    private static MockWorldServer newMockWorld() throws Exception {
++        MockWorldServer world = (MockWorldServer) UNSAFE.allocateInstance(MockWorldServer.class);
++        world.loadedChunks = new Long2ObjectOpenHashMap<>();
++        world.recordedSchedules = new ArrayList<>();
++        world.recordedActions = new ArrayList<>();
++        world.worldTime = 100L;
++        world.mockWorldBorder = new WorldBorder();
++
++        WorldData wd = new WorldData() {};
++        wd.setTime(100L);
++
++        Field wdField = World.class.getDeclaredField("worldData");
++        wdField.setAccessible(true);
++        wdField.set(world, wd);
++
++        Field mpField = World.class.getDeclaredField("methodProfiler");
++        mpField.setAccessible(true);
++        mpField.set(world, new MethodProfiler());
++
++        Field randField = World.class.getDeclaredField("random");
++        randField.setAccessible(true);
++        randField.set(world, new Random(42L));
++
++        PaperWorldConfig pwc = (PaperWorldConfig) UNSAFE.allocateInstance(PaperWorldConfig.class);
++        pwc.firePhysicsEventForRedstone = false;
++        Field pwcField = World.class.getDeclaredField("paperConfig");
++        pwcField.setAccessible(true);
++        pwcField.set(world, pwc);
++
++        WorldTimingsHandler timings = (WorldTimingsHandler) UNSAFE.allocateInstance(WorldTimingsHandler.class);
++        Field cleanupField = WorldTimingsHandler.class.getDeclaredField("scheduledBlocksCleanup");
++        cleanupField.setAccessible(true);
++        cleanupField.set(timings, NOOP_TIMING);
++        Field tickingField = WorldTimingsHandler.class.getDeclaredField("scheduledBlocksTicking");
++        tickingField.setAccessible(true);
++        tickingField.set(timings, NOOP_TIMING);
++        Field timingsField = World.class.getDeclaredField("timings");
++        timingsField.setAccessible(true);
++        timingsField.set(world, timings);
++
++        Field ntlField = WorldServer.class.getDeclaredField("nextTickList");
++        ntlField.setAccessible(true);
++        Field locField = WorldServer.class.getDeclaredField("NEXT_TICK_LOCATOR");
++        locField.setAccessible(true);
++        ntlField.set(world, new ChunkIndexedTreeSet<>((ChunkIndexedTreeSet.Locator<NextTickListEntry>) locField.get(null)));
++
++        Field wField = WorldServer.class.getDeclaredField("W");
++        wField.setAccessible(true);
++        wField.set(world, new java.util.ArrayDeque<NextTickListEntry>());
++
++        Field ctbField = WorldServer.class.getDeclaredField("currentTickBatch");
++        ctbField.setAccessible(true);
++        ctbField.set(world, new MultiplicitySet<NextTickListEntry>());
++
++        BlockPosition.MutableBlockPosition probePos = new BlockPosition.MutableBlockPosition();
++        Field ppField = WorldServer.class.getDeclaredField("antarcticTickProbePos");
++        ppField.setAccessible(true);
++        ppField.set(world, probePos);
++
++        Field tpField = WorldServer.class.getDeclaredField("antarcticTickProbe");
++        tpField.setAccessible(true);
++        tpField.set(world, NextTickListEntry.createProbe(probePos));
++
++        Field cpField = World.class.getDeclaredField("chunkProvider");
++        cpField.setAccessible(true);
++        cpField.set(world, (IChunkProvider) Proxy.newProxyInstance(
++            IChunkProvider.class.getClassLoader(),
++            new Class<?>[] { IChunkProvider.class },
++            (proxy, method, args) -> {
++                String name = method.getName();
++                if (("getChunkAt".equals(name) || "getLoadedChunkAt".equals(name)) && args != null && args.length == 2) {
++                    return world.getChunkIfLoaded((Integer) args[0], (Integer) args[1]);
++                }
++                if ("unloadChunks".equals(name)) return false;
++                if ("e".equals(name)) return false;
++                return null;
++            }
++        ));
++
++        return world;
++    }
++
++    private static Chunk newLoadedChunk(MockWorldServer world, int cx, int cz) throws Exception {
++        Chunk chunk = (Chunk) UNSAFE.allocateInstance(Chunk.class);
++        Field worldField = Chunk.class.getDeclaredField("world");
++        worldField.setAccessible(true);
++        worldField.set(chunk, world);
++        Field xField = Chunk.class.getDeclaredField("locX");
++        xField.setAccessible(true);
++        xField.setInt(chunk, cx);
++        Field zField = Chunk.class.getDeclaredField("locZ");
++        zField.setAccessible(true);
++        zField.setInt(chunk, cz);
++        Field secField = Chunk.class.getDeclaredField("sections");
++        secField.setAccessible(true);
++        secField.set(chunk, new ChunkSection[16]);
++        Field hmField = Chunk.class.getDeclaredField("heightMap");
++        hmField.setAccessible(true);
++        hmField.set(chunk, new int[256]);
++        Field keyField = Chunk.class.getDeclaredField("chunkKey");
++        keyField.setAccessible(true);
++        keyField.setLong(chunk, ChunkCoordIntPair.a(cx, cz));
++        Field winField = Chunk.class.getDeclaredField("antarcticRedstoneWindowStart");
++        winField.setAccessible(true);
++        winField.setLong(chunk, Long.MIN_VALUE);
++        world.loadedChunks.put(chunk.chunkKey, chunk);
++        return chunk;
++    }
++
++    private static void setBlock(Chunk chunk, BlockPosition pos, IBlockData data) {
++        int secIdx = pos.getY() >> 4;
++        ChunkSection[] sections = chunk.getSections();
++        ChunkSection section = sections[secIdx];
++        if (section == null) {
++            section = new ChunkSection(pos.getY() & ~15, true);
++            sections[secIdx] = section;
++        }
++        section.setType(pos.getX() & 15, pos.getY() & 15, pos.getZ() & 15, data);
++    }
++
++    @Test
++    public void testObserverRisingThrottledButFallingEdgeNeverStuck() throws Exception {
++        RedstoneGuard.enabled = true;
++        RedstoneGuard.windowTicks = 20;
++        RedstoneGuard.maxObserverPulsesPerChunkPerWindow = 5;
++        RedstoneGuard.maxScheduledTicksPerChunkPerTick = 2;
++
++        MockWorldServer world = newMockWorld();
++        Chunk chunk = newLoadedChunk(world, 0, 0);
++
++        BlockObserver observer = (BlockObserver) Blocks.dk;
++        Timing prevTiming = observer.timing;
++        observer.timing = NOOP_TIMING;
++        try {
++            IBlockData unpowered = observer.getBlockData().set(BlockObserver.a, Boolean.FALSE);
++            IBlockData powered = observer.getBlockData().set(BlockObserver.a, Boolean.TRUE);
++            BlockPosition front = new BlockPosition(5, 64, 5);
++            BlockPosition changed = front.shift(EnumDirection.SOUTH);
++
++            // Trigger 10 rising edges in same window -> only first 5 schedule
++            for (int i = 0; i < 10; i++) {
++                observer.b(unpowered, world, front, Blocks.STONE, changed);
++            }
++            assertEquals(5, world.recordedSchedules.size());
++
++            // Now place a POWERED observer in chunk (0,0) and flood chunk (0,0) with >2 scheduled ticks
++            BlockPosition obsPos = new BlockPosition(2, 64, 2);
++            setBlock(chunk, obsPos, powered);
++
++            BlockPosition filler1 = new BlockPosition(3, 64, 2);
++            BlockPosition filler2 = new BlockPosition(4, 64, 2);
++            Block fillerBlock = new Block(Material.STONE) {};
++            fillerBlock.timing = NOOP_TIMING;
++            setBlock(chunk, filler1, fillerBlock.getBlockData());
++            setBlock(chunk, filler2, fillerBlock.getBlockData());
++
++            world.a(filler1, fillerBlock, 0);
++            world.a(filler2, fillerBlock, 0);
++            world.a(new BlockPosition(6, 64, 2), fillerBlock, 0);
++            // Observer falling edge scheduled AFTER chunk already has >=2 scheduled ticks
++            world.a(obsPos, observer, 0);
++
++            world.a(false);
++
++            // Falling edge MUST have executed and cleared POWERED=false!
++            assertEquals(Boolean.FALSE, chunk.getBlockData(obsPos).get(BlockObserver.a));
++        } finally {
++            observer.timing = prevTiming;
++        }
++    }
++
++    @Test
++    public void testPistonInitiationThrottledWithoutOrphaningState() throws Exception {
++        RedstoneGuard.enabled = true;
++        RedstoneGuard.windowTicks = 20;
++        RedstoneGuard.maxPistonActionsPerChunkPerWindow = 3;
++
++        MockWorldServer world = newMockWorld();
++        Chunk chunk = newLoadedChunk(world, 0, 0);
++
++        BlockPosition pistonPos = new BlockPosition(4, 64, 4);
++        BlockPosition powerPos = pistonPos.down();
++        setBlock(chunk, powerPos, Blocks.REDSTONE_BLOCK.getBlockData());
++        IBlockData pistonData = Blocks.PISTON.getBlockData()
++                .set(BlockPiston.FACING, EnumDirection.UP)
++                .set(BlockPiston.EXTENDED, Boolean.FALSE);
++        setBlock(chunk, pistonPos, pistonData);
++
++        for (int i = 0; i < 8; i++) {
++            Blocks.PISTON.onPlace(world, pistonPos, pistonData);
++        }
++
++        assertEquals(3, world.recordedActions.size());
++        assertEquals(Boolean.FALSE, chunk.getBlockData(pistonPos).get(BlockPiston.EXTENDED));
++    }
++
++    @Test
++    public void testDiodeAndComparatorStretchDelayAndRecover() throws Exception {
++        RedstoneGuard.enabled = true;
++        RedstoneGuard.windowTicks = 20;
++        RedstoneGuard.maxDiodeUpdatesPerChunkPerWindow = 2;
++
++        MockWorldServer world = newMockWorld();
++        Chunk chunk = newLoadedChunk(world, 0, 0);
++
++        BlockPosition repPos = new BlockPosition(5, 64, 5);
++        BlockPosition backPos = repPos.shift(EnumDirection.NORTH);
++        setBlock(chunk, backPos, Blocks.REDSTONE_BLOCK.getBlockData());
++        IBlockData repData = Blocks.UNPOWERED_REPEATER.getBlockData().set(BlockDiodeAbstract.FACING, EnumDirection.NORTH);
++        setBlock(chunk, repPos, repData);
++
++        // 1st & 2nd updates within threshold -> vanilla 2-tick delay
++        ((BlockDiodeAbstract) Blocks.UNPOWERED_REPEATER).g(world, repPos, repData);
++        ((BlockDiodeAbstract) Blocks.UNPOWERED_REPEATER).g(world, repPos, repData);
++        // 3rd update exceeds threshold -> stretched delay (2 * 4 = 8)
++        ((BlockDiodeAbstract) Blocks.UNPOWERED_REPEATER).g(world, repPos, repData);
++
++        assertEquals(3, world.recordedSchedules.size());
++        assertEquals(2, world.recordedSchedules.get(0).delay);
++        assertEquals(2, world.recordedSchedules.get(1).delay);
++        assertEquals(8, world.recordedSchedules.get(2).delay);
++
++        // Advance past windowTicks -> recovers to vanilla 2-tick delay
++        world.worldTime += 20;
++        world.worldData.setTime(world.worldTime);
++        ((BlockDiodeAbstract) Blocks.UNPOWERED_REPEATER).g(world, repPos, repData);
++        assertEquals(2, world.recordedSchedules.get(3).delay);
++
++        // Comparator delay stretch check (in a fresh window)
++        world.worldTime += 20;
++        world.worldData.setTime(world.worldTime);
++        BlockPosition compPos = new BlockPosition(7, 64, 7);
++        setBlock(chunk, compPos.shift(EnumDirection.NORTH), Blocks.REDSTONE_BLOCK.getBlockData());
++        IBlockData compData = Blocks.UNPOWERED_COMPARATOR.getBlockData().set(BlockDiodeAbstract.FACING, EnumDirection.NORTH);
++        setBlock(chunk, compPos, compData);
++        for (int i = 0; i < 4; i++) {
++            ((BlockRedstoneComparator) Blocks.UNPOWERED_COMPARATOR).g(world, compPos, compData);
++        }
++        assertEquals(2, world.recordedSchedules.get(4).delay);
++        assertEquals(2, world.recordedSchedules.get(5).delay);
++        assertEquals(8, world.recordedSchedules.get(6).delay);
++    }
++
++    @Test
++    public void testNoteBlockCapSkipsPlayBlockAction() throws Exception {
++        RedstoneGuard.enabled = true;
++        RedstoneGuard.windowTicks = 20;
++        RedstoneGuard.maxNoteBlockPlaysPerChunkPerWindow = 2;
++
++        MockWorldServer world = newMockWorld();
++        Chunk chunk = newLoadedChunk(world, 0, 0);
++        BlockPosition notePos = new BlockPosition(3, 64, 3);
++        setBlock(chunk, notePos, Blocks.NOTEBLOCK.getBlockData());
++        setBlock(chunk, notePos.up(), Blocks.AIR.getBlockData());
++        setBlock(chunk, notePos.down(), Blocks.STONE.getBlockData());
++
++        // Pre-consume 2 allowed plays on the chunk window so 3rd call hits the guard cleanly
++        assertTrue(chunk.allowRedstoneNoteBlockPlay(world.getTime()));
++        assertTrue(chunk.allowRedstoneNoteBlockPlay(world.getTime()));
++
++        TileEntityNote note = new TileEntityNote();
++        note.note = 7;
++        note.play(world, notePos);
++
++        assertEquals(0, world.recordedActions.size());
++        assertEquals(7, note.note);
++    }
++
++    @Test
++    public void testFairScheduledTickQuotaAndUnloadedBackoff() throws Exception {
++        RedstoneGuard.enabled = true;
++        RedstoneGuard.maxScheduledTicksPerChunkPerTick = 8;
++        RedstoneGuard.unloadedChunkTickBackoffTicks = 20;
++
++        MockWorldServer world = newMockWorld();
++        Chunk chunkA = newLoadedChunk(world, 0, 0);
++        Chunk chunkB = newLoadedChunk(world, 1, 0);
++
++        final int[] countA = {0};
++        final int[] countB = {0};
++        Block counterA = new Block(Material.STONE) {
++            @Override
++            public void b(World w, BlockPosition p, IBlockData d, Random r) {
++                countA[0]++;
++            }
++        };
++        counterA.timing = NOOP_TIMING;
++        Block counterB = new Block(Material.STONE) {
++            @Override
++            public void b(World w, BlockPosition p, IBlockData d, Random r) {
++                countB[0]++;
++            }
++        };
++        counterB.timing = NOOP_TIMING;
++
++        for (int i = 0; i < 20; i++) {
++            BlockPosition p = new BlockPosition(i & 15, 64 + (i >> 4), 0);
++            setBlock(chunkA, p, counterA.getBlockData());
++            world.a(p, counterA, 0);
++        }
++        for (int i = 0; i < 6; i++) {
++            BlockPosition p = new BlockPosition(16 + i, 64, 0);
++            setBlock(chunkB, p, counterB.getBlockData());
++            world.a(p, counterB, 0);
++        }
++        // Unloaded chunk tick at (320, 64, 320) scheduled before chunk unload
++        world.b(new BlockPosition(320, 64, 320), counterA, 0, 0);
++
++        world.recordedSchedules.clear();
++        world.a(false);
++
++        // Chunk A bounded to 8, Chunk B runs all 6 unstarved!
++        assertEquals(8, countA[0]);
++        assertEquals(6, countB[0]);
++
++        // Unloaded chunk tick was re-scheduled with backoff = 20 (not 0), and 12 deferred ticks from A with delay 1
++        boolean sawUnloadedBackoff = false;
++        int deferredA = 0;
++        for (ScheduledCall call : world.recordedSchedules) {
++            if (call.pos.getX() == 320 && call.delay == 20) {
++                sawUnloadedBackoff = true;
++            } else if ((call.pos.getX() >> 4) == 0 && call.delay == 1) {
++                deferredA++;
++            }
++        }
++        assertTrue(sawUnloadedBackoff);
++        assertEquals(12, deferredA);
++    }
++
++    @Test
++    public void testObserverCubeStressBenchmark() throws Exception {
++        MockWorldServer world = newMockWorld();
++        newLoadedChunk(world, 0, 0);
++        BlockObserver observer = (BlockObserver) Blocks.dk;
++        IBlockData unpowered = observer.getBlockData().set(BlockObserver.a, Boolean.FALSE);
++        BlockPosition[] positions = new BlockPosition[2048];
++        for (int i = 0; i < 2048; i++) {
++            positions[i] = new BlockPosition(i & 15, 16 + ((i >> 4) & 7), (i >> 7) & 15);
++        }
++
++        RedstoneGuard.enabled = false;
++        world.recordedSchedules.clear();
++        long t0 = System.nanoTime();
++        for (int tick = 0; tick < 40; tick++) {
++            world.worldTime = 100L + tick;
++            for (int i = 0; i < 2048; i++) {
++                observer.b(unpowered, world, positions[i], Blocks.STONE, positions[i].shift(EnumDirection.SOUTH));
++            }
++        }
++        long unguardedNs = System.nanoTime() - t0;
++        int unguardedScheduled = world.recordedSchedules.size();
++
++        RedstoneGuard.enabled = true;
++        RedstoneGuard.windowTicks = 20;
++        RedstoneGuard.maxObserverPulsesPerChunkPerWindow = 128;
++        world.recordedSchedules.clear();
++        long t1 = System.nanoTime();
++        for (int tick = 0; tick < 40; tick++) {
++            world.worldTime = 200L + tick;
++            for (int i = 0; i < 2048; i++) {
++                observer.b(unpowered, world, positions[i], Blocks.STONE, positions[i].shift(EnumDirection.SOUTH));
++            }
++        }
++        long guardedNs = System.nanoTime() - t1;
++        int guardedScheduled = world.recordedSchedules.size();
++
++        assertEquals(81920, unguardedScheduled);
++        assertEquals(256, guardedScheduled);
++        System.out.printf("E2_BENCH observer_cube_40t unguarded_sched=%d (%d us) guarded_sched=%d (%d us)%n",
++                unguardedScheduled, unguardedNs / 1000, guardedScheduled, guardedNs / 1000);
++    }
++}
