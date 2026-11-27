@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Fri, 27 Nov 2026 11:35:35 +0700
-Subject: [PATCH 213/213] fix: validate beacon tiers, book edit container
+Subject: [PATCH 213/226] fix: validate beacon tiers, book edit container
  state, and merchant reach
 
 

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Fri, 27 Nov 2026 12:12:26 +0700
-Subject: [PATCH 217/217] feat: add opt-in stacked-entity and water-column
+Subject: [PATCH 217/226] feat: add opt-in stacked-entity and water-column
  physics lag-machine guard
 
 

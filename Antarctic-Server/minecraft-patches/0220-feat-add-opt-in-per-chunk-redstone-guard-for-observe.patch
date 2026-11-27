@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Fri, 27 Nov 2026 12:44:43 +0700
-Subject: [PATCH 220/220] feat: add opt-in per-chunk redstone guard for
+Subject: [PATCH 220/226] feat: add opt-in per-chunk redstone guard for
  observers, pistons, diodes, and ticks
 
 

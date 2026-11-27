@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: StellarSeal <emnoigi1452@gmail.com>
 Date: Fri, 27 Nov 2026 12:57:01 +0700
-Subject: [PATCH 221/221] feat: add gameplay spawner-settings and
+Subject: [PATCH 221/226] feat: add gameplay spawner-settings and
  throttle-mob-spawning configs
 
 
