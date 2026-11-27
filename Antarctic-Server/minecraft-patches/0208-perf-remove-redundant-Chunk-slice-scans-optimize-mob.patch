@@ -1,0 +1,600 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Fri, 27 Nov 2026 10:13:49 +0700
+Subject: [PATCH 208/208] perf: remove redundant Chunk slice scans, optimize
+ mob looting, and cap CombatTracker
+
+
+diff --git a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+index 89eded4..e274eb0 100644
+--- a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
++++ b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+@@ -7,6 +7,7 @@ import com.destroystokyo.paper.config.toml.modules.concurrency.AsyncPlayerDataSa
+ import com.destroystokyo.paper.config.toml.modules.concurrency.VirtualThreads;
+ import com.destroystokyo.paper.config.toml.modules.fixes.Books;
+ import com.destroystokyo.paper.config.toml.modules.fixes.MapDecorations;
++import com.destroystokyo.paper.config.toml.modules.fixes.VanillaBugFix;
+ import com.destroystokyo.paper.config.toml.modules.gameplay.ChunkOverloadDupe;
+ import com.destroystokyo.paper.config.toml.modules.gameplay.Collisions;
+ import com.destroystokyo.paper.config.toml.modules.gameplay.MergeChecks;
+@@ -57,7 +58,7 @@ public final class AntarcticTomlConfig {
+             new VirtualThreads(), new AsyncPlayerDataSaving(),
+             new Pathfinder(), new Suffocation(), new Projectiles(), new ArmourStands(), new WorldBorder(), new ChunkLoading(), new MobSpawning(), new SunBurn(), new Rails(), new Redstone(), new Physics(), new Lighting(),
+             new MergeChecks(), new ChunkOverloadDupe(), new Collisions(),
+-            new MapDecorations(), new Books());
++            new MapDecorations(), new Books(), new VanillaBugFix());
+     private static final YamlConfiguration yamlFacade = new YamlConfiguration();
+     private static File configFile = new File("antarctic.toml");
+     private static CommentedFileConfig configFileInstance;
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/fixes/VanillaBugFix.java b/main/java/com/destroystokyo/paper/config/toml/modules/fixes/VanillaBugFix.java
+new file mode 100644
+index 0000000..5dc3177
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/fixes/VanillaBugFix.java
+@@ -0,0 +1,40 @@
++package com.destroystokyo.paper.config.toml.modules.fixes;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++import com.electronwill.nightconfig.core.file.CommentedFileConfig;
++
++public class VanillaBugFix implements IConfigModule {
++
++    @ConfigInfo(
++        baseName = "mc-301114-combat-tracker-memory-leak",
++        comments = "Evict oldest CombatEntry records from CombatTracker once mc-301114-max-combat-entries is exceeded.\nPrevents unbounded memory growth on long-lived mobs/players taking repeated damage while preserving the latest killer and death message (default: false)."
++    )
++    public static boolean mc301114CombatTrackerMemoryLeak = false;
++
++    @ConfigInfo(
++        baseName = "mc-301114-max-combat-entries",
++        comments = "Maximum CombatEntry records retained per CombatTracker when mc-301114-combat-tracker-memory-leak is enabled (>= 64, default: 10240)."
++    )
++    public static int mc301114MaxCombatEntries = 10240;
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.FIXES;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "vanilla-bug-fix";
++    }
++
++    @Override
++    public void onLoaded(CommentedFileConfig config) {
++        if (mc301114MaxCombatEntries < 64) {
++            throw new IllegalArgumentException(
++                "fixes.vanilla-bug-fix.mc-301114-max-combat-entries must be >= 64, got: " + mc301114MaxCombatEntries
++            );
++        }
++    }
++}
+diff --git a/main/java/net/minecraft/server/Chunk.java b/main/java/net/minecraft/server/Chunk.java
+index 5ac550a..7bdffcc 100644
+--- a/main/java/net/minecraft/server/Chunk.java
++++ b/main/java/net/minecraft/server/Chunk.java
+@@ -877,8 +877,10 @@ public class Chunk {
+         }
+ 
+         // Antarctic start - capture previous chunk and slice before overwriting entity.ab/ac/ad
++        // Antarctic start - track previous slice before updating aa so brand-new entities skip redundant contains() scans
+         Chunk prevChunk = entity.getCurrentChunk();
+         int prevChunkY = entity.ac;
++        boolean wasAdded = entity.aa;
+         // Antarctic end
+         entity.aa = true;
+         entity.ab = this.locX;
+@@ -887,12 +889,12 @@ public class Chunk {
+ 
+         // Paper start
+         List<Entity> entitySlice = this.entitySlices[k];
+-        boolean inThis = entitySlice.contains(entity);
+-        List<Entity> currentSlice = entity.entitySlice;
+-        if (inThis || (currentSlice != null && currentSlice.contains(entity))) {
+-            if (currentSlice == entitySlice || inThis) {
++        if (wasAdded || entity.entitySlice != null) {
++            List<Entity> currentSlice = entity.entitySlice;
++            if (currentSlice == entitySlice || entitySlice.contains(entity)) {
+                 return;
+-            } else {
++            }
++            if (currentSlice != null && currentSlice.contains(entity)) {
+                 if (prevChunk != null) {
+                     prevChunk.a(entity, prevChunkY); // Antarctic - remove from previous slice index so counts decrement cleanly
+                 } else {
+@@ -945,7 +947,7 @@ public class Chunk {
+         }
+ 
+         // Paper start
+-        if (entity.entitySlice == null || !entity.entitySlice.contains(entity) || entitySlices[i] == entity.entitySlice) {
++        if (entity.entitySlice == null || entitySlices[i] == entity.entitySlice || !entity.entitySlice.contains(entity)) {
+             entity.entitySlice = null;
+         }
+         if (!this.entitySlices[i].remove(entity)) { return; }
+@@ -1356,6 +1358,15 @@ public class Chunk {
+ 
+     private static final ThreadLocal<MergeScratch> MERGE_SCRATCH = ThreadLocal.withInitial(MergeScratch::new);
+ 
++    boolean hasAnyItemInSlices(int minSlice, int maxSlice) {
++        for (int sliceY = minSlice; sliceY <= maxSlice; ++sliceY) {
++            if (this.itemCounts[sliceY] > 0) {
++                return true;
++            }
++        }
++        return false;
++    }
++
+     void mergeNearbyItems(EntityItem self, double minX, double minY, double minZ, double maxX, double maxY, double maxZ, @Nullable Chunk selfChunk, int selfSlice) {
+         ItemStack selfStack = self.getItemStack();
+         Item selfItem = selfStack.getItem();
+diff --git a/main/java/net/minecraft/server/CombatTracker.java b/main/java/net/minecraft/server/CombatTracker.java
+index bddd66e..140c56b 100644
+--- a/main/java/net/minecraft/server/CombatTracker.java
++++ b/main/java/net/minecraft/server/CombatTracker.java
+@@ -42,6 +42,13 @@ public class CombatTracker {
+         CombatEntry combatentry = new CombatEntry(damagesource, this.b.ticksLived, f, f1, this.h, this.b.fallDistance);
+ 
+         this.a.add(combatentry);
++        if (com.destroystokyo.paper.config.toml.modules.fixes.VanillaBugFix.mc301114CombatTrackerMemoryLeak) {
++            int maxEntries = com.destroystokyo.paper.config.toml.modules.fixes.VanillaBugFix.mc301114MaxCombatEntries;
++            if (this.a.size() > maxEntries) {
++                int targetSize = Math.max(1, maxEntries - (maxEntries >> 3));
++                this.a.subList(0, this.a.size() - targetSize).clear();
++            }
++        }
+         this.c = this.b.ticksLived;
+         this.g = true;
+         if (combatentry.f() && !this.f && this.b.isAlive()) {
+diff --git a/main/java/net/minecraft/server/EntityInsentient.java b/main/java/net/minecraft/server/EntityInsentient.java
+index a2e2968..2115c0b 100644
+--- a/main/java/net/minecraft/server/EntityInsentient.java
++++ b/main/java/net/minecraft/server/EntityInsentient.java
+@@ -517,21 +517,24 @@ public abstract class EntityInsentient extends EntityLiving {
+     public void n() {
+         super.n();
+         this.world.methodProfiler.a("looting");
+-        if (!this.world.isClientSide && this.cX() && !this.aU && this.world.getGameRules().getBoolean("mobGriefing")) {
+-            List list = this.world.a(EntityItem.class, this.getBoundingBox().grow(1.0D, 0.0D, 1.0D));
+-            Iterator iterator = list.iterator();
++        if (!this.world.isClientSide && this.cX() && !this.aU && this.world.getGameRules().getMobGriefing()) {
++            AxisAlignedBB bb = this.getBoundingBox();
++            if (this.world.hasAnyItemInBounds(bb.a - 1.0D, bb.b, bb.c - 1.0D, bb.d + 1.0D, bb.e, bb.f + 1.0D)) {
++                List list = this.world.a(EntityItem.class, bb.grow(1.0D, 0.0D, 1.0D));
++                Iterator iterator = list.iterator();
+ 
+-            while (iterator.hasNext()) {
+-                EntityItem entityitem = (EntityItem) iterator.next();
++                while (iterator.hasNext()) {
++                    EntityItem entityitem = (EntityItem) iterator.next();
+ 
+-                // Paper Start
+-                if (!entityitem.canMobPickup) {
+-                    continue;
+-                }
+-                // Paper End
++                    // Paper Start
++                    if (!entityitem.canMobPickup) {
++                        continue;
++                    }
++                    // Paper End
+ 
+-                if (!entityitem.dead && !entityitem.getItemStack().isEmpty() && !entityitem.t()) {
+-                    this.a(entityitem);
++                    if (!entityitem.dead && !entityitem.getItemStack().isEmpty() && !entityitem.t()) {
++                        this.a(entityitem);
++                    }
+                 }
+             }
+         }
+@@ -582,10 +585,12 @@ public abstract class EntityInsentient extends EntityLiving {
+         // CraftBukkit start
+         boolean canPickup = flag && this.c(itemstack);
+ 
+-        EntityPickupItemEvent entityEvent = new EntityPickupItemEvent((LivingEntity) getBukkitEntity(), (org.bukkit.entity.Item) entityitem.getBukkitEntity(), 0);
+-        entityEvent.setCancelled(!canPickup);
+-        this.world.getServer().getPluginManager().callEvent(entityEvent);
+-        canPickup = !entityEvent.isCancelled();
++        if (EntityPickupItemEvent.getHandlerList().getRegisteredListeners().length != 0) {
++            EntityPickupItemEvent entityEvent = new EntityPickupItemEvent((LivingEntity) getBukkitEntity(), (org.bukkit.entity.Item) entityitem.getBukkitEntity(), 0);
++            entityEvent.setCancelled(!canPickup);
++            this.world.getServer().getPluginManager().callEvent(entityEvent);
++            canPickup = !entityEvent.isCancelled();
++        }
+         if (canPickup) {
+             // CraftBukkit end
+             double d0;
+diff --git a/main/java/net/minecraft/server/GameRules.java b/main/java/net/minecraft/server/GameRules.java
+index dc89c6b..09d4431 100644
+--- a/main/java/net/minecraft/server/GameRules.java
++++ b/main/java/net/minecraft/server/GameRules.java
+@@ -8,6 +8,7 @@ public class GameRules {
+ 
+     private final TreeMap<String, GameRules.GameRuleValue> a = new TreeMap();
+     private int maxEntityCramming = 24;
++    private boolean mobGriefing = true;
+ 
+     public GameRules() {
+         this.a("doFireTick", "true", GameRules.EnumGameRuleType.BOOLEAN_VALUE);
+@@ -41,6 +42,8 @@ public class GameRules {
+         this.a.put(s, val);
+         if ("maxEntityCramming".equals(s)) {
+             this.maxEntityCramming = val.c();
++        } else if ("mobGriefing".equals(s)) {
++            this.mobGriefing = val.b();
+         }
+     }
+ 
+@@ -51,6 +54,8 @@ public class GameRules {
+             gamerules_gamerulevalue.a(s1);
+             if ("maxEntityCramming".equals(s)) {
+                 this.maxEntityCramming = gamerules_gamerulevalue.c();
++            } else if ("mobGriefing".equals(s)) {
++                this.mobGriefing = gamerules_gamerulevalue.b();
+             }
+         } else {
+             this.a(s, s1, GameRules.EnumGameRuleType.ANY_VALUE);
+@@ -65,11 +70,18 @@ public class GameRules {
+     }
+ 
+     public boolean getBoolean(String s) {
++        if ("mobGriefing".equals(s)) {
++            return this.mobGriefing;
++        }
+         GameRules.GameRuleValue gamerules_gamerulevalue = (GameRules.GameRuleValue) this.a.get(s);
+ 
+         return gamerules_gamerulevalue != null ? gamerules_gamerulevalue.b() : false;
+     }
+ 
++    public boolean getMobGriefing() {
++        return this.mobGriefing;
++    }
++
+     public int getMaxEntityCramming() {
+         return this.maxEntityCramming;
+     }
+diff --git a/main/java/net/minecraft/server/World.java b/main/java/net/minecraft/server/World.java
+index 4650437..b8b6aeb 100644
+--- a/main/java/net/minecraft/server/World.java
++++ b/main/java/net/minecraft/server/World.java
+@@ -1840,7 +1840,9 @@ public abstract class World implements IBlockAccess {
+ 
+         entity.valid = true; // CraftBukkit
+         entity.shouldBeRemoved = false; // Paper - shouldn't be removed after being re-added
+-        new com.destroystokyo.paper.event.entity.EntityAddToWorldEvent(entity.getBukkitEntity()).callEvent(); // Paper - fire while valid
++        if (com.destroystokyo.paper.event.entity.EntityAddToWorldEvent.getHandlerList().getRegisteredListeners().length != 0) {
++            new com.destroystokyo.paper.event.entity.EntityAddToWorldEvent(entity.getBukkitEntity()).callEvent(); // Paper - fire while valid
++        }
+     }
+ 
+     protected void c(Entity entity) {
+@@ -1848,7 +1850,9 @@ public abstract class World implements IBlockAccess {
+             ((IWorldAccess) this.u.get(i)).b(entity);
+         }
+ 
+-        new com.destroystokyo.paper.event.entity.EntityRemoveFromWorldEvent(entity.getBukkitEntity()).callEvent(); // Paper - fire while valid
++        if (com.destroystokyo.paper.event.entity.EntityRemoveFromWorldEvent.getHandlerList().getRegisteredListeners().length != 0) {
++            new com.destroystokyo.paper.event.entity.EntityRemoveFromWorldEvent(entity.getBukkitEntity()).callEvent(); // Paper - fire while valid
++        }
+         entity.valid = false; // CraftBukkit
+     }
+ 
+@@ -4537,6 +4541,25 @@ public abstract class World implements IBlockAccess {
+         }
+     }
+ 
++    boolean hasAnyItemInBounds(double minX, double minY, double minZ, double maxX, double maxY, double maxZ) {
++        int minChunkX = MathHelper.floor((minX - 2.0D) / 16.0D);
++        int maxChunkX = MathHelper.f((maxX + 2.0D) / 16.0D);
++        int minChunkZ = MathHelper.floor((minZ - 2.0D) / 16.0D);
++        int maxChunkZ = MathHelper.f((maxZ + 2.0D) / 16.0D);
++        int minSlice = MathHelper.clamp(MathHelper.floor((minY - 2.0D) / 16.0D), 0, 15);
++        int maxSlice = MathHelper.clamp(MathHelper.floor((maxY + 2.0D) / 16.0D), 0, 15);
++
++        for (int cx = minChunkX; cx < maxChunkX; ++cx) {
++            for (int cz = minChunkZ; cz < maxChunkZ; ++cz) {
++                Chunk chunk = this.getChunkIfLoaded(cx, cz);
++                if (chunk != null && chunk.hasAnyItemInSlices(minSlice, maxSlice)) {
++                    return true;
++                }
++            }
++        }
++        return false;
++    }
++
+     boolean hasAnyHardCollidableInBounds(AxisAlignedBB axisalignedbb) {
+         int minChunkX = MathHelper.floor((axisalignedbb.a - 2.0D) / 16.0D);
+         int maxChunkX = MathHelper.floor((axisalignedbb.d + 2.0D) / 16.0D);
+diff --git a/test/java/net/minecraft/server/ChunkSliceAndCombatTrackerTest.java b/test/java/net/minecraft/server/ChunkSliceAndCombatTrackerTest.java
+new file mode 100644
+index 0000000..1e2160d
+--- /dev/null
++++ b/test/java/net/minecraft/server/ChunkSliceAndCombatTrackerTest.java
+@@ -0,0 +1,285 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.config.toml.AntarcticTomlConfig;
++import com.destroystokyo.paper.config.toml.modules.fixes.VanillaBugFix;
++import org.junit.After;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++import java.io.File;
++import java.lang.reflect.Field;
++import java.nio.file.Files;
++import java.util.ArrayList;
++import java.util.List;
++
++import static org.junit.Assert.*;
++
++public class ChunkSliceAndCombatTrackerTest {
++
++    private static Unsafe UNSAFE;
++    private static int nextEntityId = 30000;
++    private static boolean savedMc301114;
++    private static int savedMaxEntries;
++
++    @BeforeClass
++    public static void setup() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        UNSAFE = (Unsafe) f.get(null);
++        savedMc301114 = VanillaBugFix.mc301114CombatTrackerMemoryLeak;
++        savedMaxEntries = VanillaBugFix.mc301114MaxCombatEntries;
++    }
++
++    @After
++    public void restoreConfig() {
++        VanillaBugFix.mc301114CombatTrackerMemoryLeak = savedMc301114;
++        VanillaBugFix.mc301114MaxCombatEntries = savedMaxEntries;
++    }
++
++    private static final class SliceTestWorld extends World {
++        final Chunk chunk;
++
++        SliceTestWorld(Chunk chunk) {
++            super(null, new WorldData(), new WorldProviderNormal(), new MethodProfiler(), false, null, null);
++            this.chunk = chunk;
++        }
++
++        @Override
++        protected IChunkProvider n() {
++            return null;
++        }
++
++        @Override
++        protected boolean isChunkLoaded(int i, int j, boolean flag) {
++            return i == 0 && j == 0;
++        }
++
++        @Override
++        public Chunk getChunkIfLoaded(int i, int j) {
++            return (i == 0 && j == 0) ? this.chunk : null;
++        }
++    }
++
++    private static SliceTestWorld createTestWorld() throws Exception {
++        Chunk chunk = (Chunk) UNSAFE.allocateInstance(Chunk.class);
++        Field secField = Chunk.class.getDeclaredField("sections");
++        secField.setAccessible(true);
++        ChunkSection[] sections = new ChunkSection[16];
++        for (int s = 0; s < 16; ++s) {
++            sections[s] = new ChunkSection(s << 4, true);
++        }
++        secField.set(chunk, sections);
++
++        Field slicesField = Chunk.class.getDeclaredField("entitySlices");
++        slicesField.setAccessible(true);
++        @SuppressWarnings("unchecked")
++        List<Entity>[] slices = new List[16];
++        for (int s = 0; s < 16; ++s) {
++            slices[s] = new ArrayList<>();
++        }
++        slicesField.set(chunk, slices);
++
++        for (String fn : new String[]{"hardCollidableCounts", "itemCounts", "inventoryEntityCounts", "itemFrameCounts"}) {
++            Field f = Chunk.class.getDeclaredField(fn);
++            f.setAccessible(true);
++            f.set(chunk, new int[16]);
++        }
++        Field ec = Chunk.class.getDeclaredField("entityCounts");
++        ec.setAccessible(true);
++        ec.set(chunk, new co.aikar.util.Counter<String>());
++        Field ect = Chunk.class.getDeclaredField("entityCount");
++        ect.setAccessible(true);
++        ect.set(chunk, new gnu.trove.map.hash.TObjectIntHashMap<Class>());
++        Field acc = Chunk.class.getDeclaredField("antarcticCreatureCounts");
++        acc.setAccessible(true);
++        acc.set(chunk, new int[EnumCreatureType.values().length]);
++
++        SliceTestWorld world = (SliceTestWorld) UNSAFE.allocateInstance(SliceTestWorld.class);
++        Field cf = SliceTestWorld.class.getDeclaredField("chunk");
++        cf.setAccessible(true);
++        cf.set(world, chunk);
++        Field wc = Chunk.class.getDeclaredField("world");
++        wc.setAccessible(true);
++        wc.set(chunk, world);
++        Field pwc = World.class.getDeclaredField("paperConfig");
++        pwc.setAccessible(true);
++        pwc.set(world, UNSAFE.allocateInstance(com.destroystokyo.paper.PaperWorldConfig.class));
++        Field swc = World.class.getDeclaredField("spigotConfig");
++        swc.setAccessible(true);
++        swc.set(world, UNSAFE.allocateInstance(org.spigotmc.SpigotWorldConfig.class));
++        world.worldProvider = new WorldProviderNormal();
++        Field cpField = World.class.getDeclaredField("chunkProvider");
++        cpField.setAccessible(true);
++        cpField.set(world, new IChunkProvider() {
++            @Override public Chunk getLoadedChunkAt(int i, int j) { return (i == 0 && j == 0) ? chunk : null; }
++            @Override public Chunk getChunkAt(int i, int j) { return (i == 0 && j == 0) ? chunk : null; }
++            @Override public boolean unloadChunks() { return false; }
++            @Override public String getName() { return "SliceTestChunkProvider"; }
++            @Override public boolean e(int i, int j) { return i == 0 && j == 0; }
++        });
++        return world;
++    }
++
++    private static EntityItem createItem(World world, double x, double y, double z) throws Exception {
++        EntityItem item = (EntityItem) UNSAFE.allocateInstance(EntityItem.class);
++        item.h(nextEntityId++);
++        item.world = world;
++        item.locX = x;
++        item.locY = y;
++        item.locZ = z;
++        item.a(new AxisAlignedBB(x - 0.125, y, z - 0.125, x + 0.125, y + 0.25, z + 0.125));
++        return item;
++    }
++
++    private static EntityMinecartRideable createMinecart(World world, double x, double y, double z) throws Exception {
++        EntityMinecartRideable cart = (EntityMinecartRideable) UNSAFE.allocateInstance(EntityMinecartRideable.class);
++        cart.h(nextEntityId++);
++        cart.world = world;
++        cart.locX = x;
++        cart.locY = y;
++        cart.locZ = z;
++        cart.a(new AxisAlignedBB(x - 0.49, y, z - 0.49, x + 0.49, y + 0.7, z + 0.49));
++        return cart;
++    }
++
++    @Test
++    public void testChunkSliceInvariantsAndBounds() throws Exception {
++        SliceTestWorld world = createTestWorld();
++        EntityItem item = createItem(world, 8.0, 20.0, 8.0);
++        EntityMinecartRideable cart = createMinecart(world, 8.0, 20.0, 8.0);
++
++        Field itemCountsField = Chunk.class.getDeclaredField("itemCounts");
++        itemCountsField.setAccessible(true);
++        int[] itemCounts = (int[]) itemCountsField.get(world.chunk);
++
++        assertFalse(world.hasAnyItemInBounds(6.0, 18.0, 6.0, 10.0, 22.0, 10.0));
++        world.chunk.a(item);
++        world.chunk.a(cart);
++        assertEquals(1, itemCounts[1]);
++        assertEquals(1, world.chunk.hardCollidableCounts[1]);
++        assertSame(world.chunk.entitySlices[1], item.entitySlice);
++        assertTrue(world.hasAnyItemInBounds(6.0, 18.0, 6.0, 10.0, 22.0, 10.0));
++
++        // Duplicate add to same slice is a no-op
++        world.chunk.a(item);
++        assertEquals(1, itemCounts[1]);
++        assertEquals(2, world.chunk.entitySlices[1].size());
++
++        // Move item to slice 3 (y=52)
++        item.locY = 52.0;
++        world.chunk.a(item);
++        assertEquals(0, itemCounts[1]);
++        assertEquals(1, itemCounts[3]);
++        assertSame(world.chunk.entitySlices[3], item.entitySlice);
++
++        // Remove both
++        world.chunk.a(item, 3);
++        world.chunk.a(cart, 1);
++        assertEquals(0, itemCounts[3]);
++        assertEquals(0, world.chunk.hardCollidableCounts[1]);
++        assertNull(item.entitySlice);
++        assertFalse(world.hasAnyItemInBounds(6.0, 48.0, 6.0, 10.0, 56.0, 10.0));
++    }
++
++    @Test
++    public void testGameRulesMobGriefingCacheParity() {
++        GameRules rules = new GameRules();
++        assertTrue(rules.getMobGriefing());
++        assertEquals(rules.getBoolean("mobGriefing"), rules.getMobGriefing());
++
++        rules.set("mobGriefing", "false");
++        assertFalse(rules.getMobGriefing());
++        assertFalse(rules.getBoolean("mobGriefing"));
++
++        rules.set("mobGriefing", "true");
++        assertTrue(rules.getMobGriefing());
++        assertTrue(rules.getBoolean("mobGriefing"));
++    }
++
++    @Test
++    public void testCombatTrackerCapAndTomlConfig() throws Exception {
++        File tempDir = Files.createTempDirectory("antarctic-a4-toml").toFile();
++        try {
++            File toml = new File(tempDir, "antarctic.toml");
++            AntarcticTomlConfig.load(toml);
++            assertFalse(VanillaBugFix.mc301114CombatTrackerMemoryLeak);
++            assertEquals(10240, VanillaBugFix.mc301114MaxCombatEntries);
++
++            VanillaBugFix module = new VanillaBugFix();
++            VanillaBugFix.mc301114MaxCombatEntries = 32;
++            try {
++                module.onLoaded(AntarcticTomlConfig.getTomlConfig());
++                fail("Expected IllegalArgumentException for max-combat-entries < 64");
++            } catch (IllegalArgumentException expected) {
++                // expected
++            }
++        } finally {
++            VanillaBugFix.mc301114CombatTrackerMemoryLeak = savedMc301114;
++            VanillaBugFix.mc301114MaxCombatEntries = savedMaxEntries;
++            for (File f : tempDir.listFiles()) {
++                f.delete();
++            }
++            tempDir.delete();
++        }
++
++        SliceTestWorld world = createTestWorld();
++        EntityZombie victim = new EntityZombie(world);
++        victim.setPosition(8.0, 20.0, 8.0);
++        victim.ticksLived = 1;
++
++        EntityZombie attacker = new EntityZombie(world);
++        attacker.setPosition(8.0, 20.0, 8.0);
++
++        Field listField = CombatTracker.class.getDeclaredField("a");
++        listField.setAccessible(true);
++
++        // Disabled (vanilla): retains all 200 entries
++        VanillaBugFix.mc301114CombatTrackerMemoryLeak = false;
++        CombatTracker vanillaTracker = new CombatTracker(victim);
++        for (int i = 0; i < 200; i++) {
++            victim.ticksLived = i + 1;
++            vanillaTracker.trackDamage(DamageSource.GENERIC, 20.0F, 1.0F);
++        }
++        assertEquals(200, ((List<?>) listField.get(vanillaTracker)).size());
++
++        // Enabled with cap 64: stays <= 64 across 5,000 entries and preserves latest killer
++        VanillaBugFix.mc301114CombatTrackerMemoryLeak = true;
++        VanillaBugFix.mc301114MaxCombatEntries = 64;
++        CombatTracker cappedTracker = new CombatTracker(victim);
++        for (int i = 0; i < 4999; i++) {
++            victim.ticksLived = i + 1;
++            cappedTracker.trackDamage(DamageSource.GENERIC, 20.0F, 1.0F);
++        }
++        victim.ticksLived = 5000;
++        cappedTracker.trackDamage(DamageSource.mobAttack(attacker), 20.0F, 5.0F);
++        List<?> entries = (List<?>) listField.get(cappedTracker);
++        assertTrue("Expected <= 64 entries, got " + entries.size(), entries.size() <= 64);
++        assertSame(attacker, cappedTracker.c());
++        assertNotNull(cappedTracker.getDeathMessage());
++    }
++
++    @Test
++    public void testChunkSliceAddRemovePerformance() throws Exception {
++        SliceTestWorld world = createTestWorld();
++        for (int i = 0; i < 500; i++) {
++            world.chunk.a(createItem(world, 8.0, 20.0, 8.0));
++        }
++        EntityItem probe = createItem(world, 8.0, 20.0, 8.0);
++        for (int i = 0; i < 500; i++) {
++            world.chunk.a(probe);
++            world.chunk.a(probe, 1);
++        }
++        long t0 = System.nanoTime();
++        for (int i = 0; i < 5000; i++) {
++            world.chunk.a(probe);
++            world.chunk.a(probe, 1);
++        }
++        long elapsedNs = System.nanoTime() - t0;
++        System.out.printf("[A4 Perf] 5000x Chunk slice add/remove in 500-entity slice: %d us%n", elapsedNs / 1000L);
++        Field itemCountsField = Chunk.class.getDeclaredField("itemCounts");
++        itemCountsField.setAccessible(true);
++        assertEquals(500, ((int[]) itemCountsField.get(world.chunk))[1]);
++    }
++}
