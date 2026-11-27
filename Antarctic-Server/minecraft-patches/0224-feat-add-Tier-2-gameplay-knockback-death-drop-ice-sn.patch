@@ -1,0 +1,618 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Fri, 27 Nov 2026 13:30:54 +0700
+Subject: [PATCH 224/224] feat: add Tier 2 gameplay knockback, death drop,
+ ice-snow chance, and tripwire dupe configs
+
+
+diff --git a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+index 4ecb284..c9ff10f 100644
+--- a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
++++ b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+@@ -10,9 +10,13 @@ import com.destroystokyo.paper.config.toml.modules.fixes.MapDecorations;
+ import com.destroystokyo.paper.config.toml.modules.fixes.VanillaBugFix;
+ import com.destroystokyo.paper.config.toml.modules.gameplay.ChunkOverloadDupe;
+ import com.destroystokyo.paper.config.toml.modules.gameplay.Collisions;
++import com.destroystokyo.paper.config.toml.modules.gameplay.DeathItemDropKnockback;
++import com.destroystokyo.paper.config.toml.modules.gameplay.Knockback;
+ import com.destroystokyo.paper.config.toml.modules.gameplay.MergeChecks;
+ import com.destroystokyo.paper.config.toml.modules.gameplay.Player;
+ import com.destroystokyo.paper.config.toml.modules.gameplay.SpawnerSettings;
++import com.destroystokyo.paper.config.toml.modules.gameplay.Tripwire;
++import com.destroystokyo.paper.config.toml.modules.gameplay.World;
+ import com.destroystokyo.paper.config.toml.modules.misc.Privacy;
+ import com.destroystokyo.paper.config.toml.modules.misc.Rebrand;
+ import com.destroystokyo.paper.config.toml.modules.network.Deflate;
+@@ -69,7 +73,7 @@ public final class AntarcticTomlConfig {
+             new Deflate(),
+             new VirtualThreads(), new AsyncPlayerDataSaving(),
+             new Pathfinder(), new Suffocation(), new Projectiles(), new ArmourStands(), new WorldBorder(), new ChunkLoading(), new MobSpawning(), new Dab(), new FarmAiCulling(), new EntityPhysicsGuard(), new DontSaveEntity(), new EntityGoal(), new ReducePackets(), new Growth(), new Hopper(), new Inventory(), new SunBurn(), new Rails(), new Redstone(), new RedstoneGuard(), new Physics(), new Lighting(),
+-            new MergeChecks(), new ChunkOverloadDupe(), new Collisions(), new Player(), new SpawnerSettings(),
++            new MergeChecks(), new ChunkOverloadDupe(), new Collisions(), new Player(), new SpawnerSettings(), new Knockback(), new DeathItemDropKnockback(), new World(), new Tripwire(),
+             new MapDecorations(), new Books(), new VanillaBugFix());
+     private static final YamlConfiguration yamlFacade = new YamlConfiguration();
+     private static File configFile = new File("antarctic.toml");
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/gameplay/DeathItemDropKnockback.java b/main/java/com/destroystokyo/paper/config/toml/modules/gameplay/DeathItemDropKnockback.java
+new file mode 100644
+index 0000000..6ed8c00
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/gameplay/DeathItemDropKnockback.java
+@@ -0,0 +1,27 @@
++package com.destroystokyo.paper.config.toml.modules.gameplay;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++
++public class DeathItemDropKnockback implements IConfigModule {
++
++    @ConfigInfo(baseName = "drop-around", comments = "Scatter dropped items around the player on death. Default true (vanilla 1.12.2).")
++    public static boolean dropAround = true;
++
++    @ConfigInfo(baseName = "horizontal-force", comments = "Maximum horizontal scatter speed on death item drops. Default 0.5 (vanilla 1.12.2).")
++    public static double horizontalForce = 0.5D;
++
++    @ConfigInfo(baseName = "vertical-force", comments = "Vertical upward velocity on death item drops. Default 0.2 (vanilla 1.12.2).")
++    public static double verticalForce = 0.2D;
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.GAMEPLAY;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "death-item-drop-knockback";
++    }
++}
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/gameplay/Knockback.java b/main/java/com/destroystokyo/paper/config/toml/modules/gameplay/Knockback.java
+new file mode 100644
+index 0000000..fd3aead
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/gameplay/Knockback.java
+@@ -0,0 +1,36 @@
++package com.destroystokyo.paper.config.toml.modules.gameplay;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++
++public class Knockback implements IConfigModule {
++
++    @ConfigInfo(
++        baseName = "snowball-knockback-players",
++        comments = "Allow snowballs to deal 0.0001F knockback damage to players (honoring EntityDamageByEntityEvent cancellation). Default false (vanilla 1.12.2)."
++    )
++    public static boolean snowballKnockbackPlayers = false;
++
++    @ConfigInfo(
++        baseName = "egg-knockback-players",
++        comments = "Allow thrown eggs to deal 0.0001F knockback damage to players (honoring EntityDamageByEntityEvent cancellation). Default false (vanilla 1.12.2)."
++    )
++    public static boolean eggKnockbackPlayers = false;
++
++    @ConfigInfo(
++        baseName = "can-player-knockback-zombie",
++        comments = "Allow players to knock back zombies when damaging them. Default true (vanilla 1.12.2)."
++    )
++    public static boolean canPlayerKnockbackZombie = true;
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.GAMEPLAY;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "knockback";
++    }
++}
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/gameplay/Tripwire.java b/main/java/com/destroystokyo/paper/config/toml/modules/gameplay/Tripwire.java
+new file mode 100644
+index 0000000..6a9be8a
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/gameplay/Tripwire.java
+@@ -0,0 +1,24 @@
++package com.destroystokyo.paper.config.toml.modules.gameplay;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++
++public class Tripwire implements IConfigModule {
++
++    @ConfigInfo(
++        baseName = "allow-tripwire-dupe",
++        comments = "Allow vanilla 1.12.2 tripwire hook duplication behavior. Default true; set false to verify hook blocks before updating state."
++    )
++    public static boolean allowTripwireDupe = true;
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.GAMEPLAY;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "tripwire";
++    }
++}
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/gameplay/World.java b/main/java/com/destroystokyo/paper/config/toml/modules/gameplay/World.java
+new file mode 100644
+index 0000000..3272ada
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/gameplay/World.java
+@@ -0,0 +1,24 @@
++package com.destroystokyo.paper.config.toml.modules.gameplay;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++
++public class World implements IConfigModule {
++
++    @ConfigInfo(
++        baseName = "ice-and-snow-chance",
++        comments = "Inverse chance (1 in N) per chunk tick to form ice and snow (<= 0 disables). Default 16 (vanilla 1.12.2)."
++    )
++    public static int iceAndSnowChance = 16;
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.GAMEPLAY;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "world";
++    }
++}
+diff --git a/main/java/net/minecraft/server/BlockTripwireHook.java b/main/java/net/minecraft/server/BlockTripwireHook.java
+index a59b734..def033d 100644
+--- a/main/java/net/minecraft/server/BlockTripwireHook.java
++++ b/main/java/net/minecraft/server/BlockTripwireHook.java
+@@ -157,9 +157,12 @@ public class BlockTripwireHook extends Block {
+             blockposition1 = blockposition.shift(enumdirection, j);
+             EnumDirection enumdirection1 = enumdirection.opposite();
+ 
+-            world.setTypeAndData(blockposition1, iblockdata3.set(BlockTripwireHook.FACING, enumdirection1), 3);
+-            this.a(world, blockposition1, enumdirection1);
+-            this.a(world, blockposition1, flag4, flag5, flag2, flag3);
++            if (com.destroystokyo.paper.config.toml.modules.gameplay.Tripwire.allowTripwireDupe
++                    || world.getType(blockposition1).getBlock() == Blocks.TRIPWIRE_HOOK) {
++                world.setTypeAndData(blockposition1, iblockdata3.set(BlockTripwireHook.FACING, enumdirection1), 3);
++                this.a(world, blockposition1, enumdirection1);
++                this.a(world, blockposition1, flag4, flag5, flag2, flag3);
++            }
+         }
+ 
+         // CraftBukkit start
+@@ -174,7 +177,8 @@ public class BlockTripwireHook extends Block {
+         // CraftBukkit end
+ 
+         this.a(world, blockposition, flag4, flag5, flag2, flag3);
+-        if (!flag) {
++        if (!flag && (com.destroystokyo.paper.config.toml.modules.gameplay.Tripwire.allowTripwireDupe
++                || world.getType(blockposition).getBlock() == Blocks.TRIPWIRE_HOOK)) {
+             world.setTypeAndData(blockposition, iblockdata3.set(BlockTripwireHook.FACING, enumdirection), 3);
+             if (flag1) {
+                 this.a(world, blockposition, enumdirection);
+diff --git a/main/java/net/minecraft/server/EntityEgg.java b/main/java/net/minecraft/server/EntityEgg.java
+index 08131af..68b821e 100644
+--- a/main/java/net/minecraft/server/EntityEgg.java
++++ b/main/java/net/minecraft/server/EntityEgg.java
+@@ -27,7 +27,10 @@ public class EntityEgg extends EntityProjectile {
+ 
+     protected void a(MovingObjectPosition movingobjectposition) {
+         if (movingobjectposition.entity != null) {
+-            movingobjectposition.entity.damageEntity(DamageSource.projectile(this, this.getShooter()), 0.0F);
++            float damage = (movingobjectposition.entity instanceof EntityPlayer
++                    && com.destroystokyo.paper.config.toml.modules.gameplay.Knockback.eggKnockbackPlayers)
++                    ? 0.0001F : 0.0F;
++            movingobjectposition.entity.damageEntity(DamageSource.projectile(this, this.getShooter()), damage);
+         }
+ 
+         if (!this.world.isClientSide) {
+diff --git a/main/java/net/minecraft/server/EntityHuman.java b/main/java/net/minecraft/server/EntityHuman.java
+index 2f01ed4..06086a4 100644
+--- a/main/java/net/minecraft/server/EntityHuman.java
++++ b/main/java/net/minecraft/server/EntityHuman.java
+@@ -515,11 +515,17 @@ public abstract class EntityHuman extends EntityLiving {
+             float f1;
+ 
+             if (flag) {
+-                f = this.random.nextFloat() * 0.5F;
+-                f1 = this.random.nextFloat() * 6.2831855F;
+-                entityitem.motX = (double) (-MathHelper.sin(f1) * f);
+-                entityitem.motZ = (double) (MathHelper.cos(f1) * f);
+-                entityitem.motY = 0.20000000298023224D;
++                if (com.destroystokyo.paper.config.toml.modules.gameplay.DeathItemDropKnockback.dropAround) {
++                    f = this.random.nextFloat() * (float) com.destroystokyo.paper.config.toml.modules.gameplay.DeathItemDropKnockback.horizontalForce;
++                    f1 = this.random.nextFloat() * 6.2831855F;
++                    entityitem.motX = (double) (-MathHelper.sin(f1) * f);
++                    entityitem.motZ = (double) (MathHelper.cos(f1) * f);
++                    entityitem.motY = (double) (float) com.destroystokyo.paper.config.toml.modules.gameplay.DeathItemDropKnockback.verticalForce;
++                } else {
++                    entityitem.motX = 0.0D;
++                    entityitem.motY = 0.0D;
++                    entityitem.motZ = 0.0D;
++                }
+             } else {
+                 f = 0.3F;
+                 entityitem.motX = (double) (-MathHelper.sin(this.yaw * 0.017453292F) * MathHelper.cos(this.pitch * 0.017453292F) * f);
+diff --git a/main/java/net/minecraft/server/EntityLiving.java b/main/java/net/minecraft/server/EntityLiving.java
+index 7d24d18..43000c5 100644
+--- a/main/java/net/minecraft/server/EntityLiving.java
++++ b/main/java/net/minecraft/server/EntityLiving.java
+@@ -1001,7 +1001,10 @@ public abstract class EntityLiving extends Entity {
+                         }
+ 
+                         this.aA = (float) (MathHelper.c(d1, d0) * 57.2957763671875D - (double) this.yaw);
+-                        this.a(entity1, 0.4F, d0, d1);
++                        if (!(this instanceof EntityZombie && entity1 instanceof EntityHuman
++                                && !com.destroystokyo.paper.config.toml.modules.gameplay.Knockback.canPlayerKnockbackZombie)) {
++                            this.a(entity1, 0.4F, d0, d1);
++                        }
+                     } else {
+                         this.aA = (float) ((int) (Math.random() * 2.0D) * 180);
+                     }
+diff --git a/main/java/net/minecraft/server/EntitySnowball.java b/main/java/net/minecraft/server/EntitySnowball.java
+new file mode 100644
+index 0000000..a76c6fa
+--- /dev/null
++++ b/main/java/net/minecraft/server/EntitySnowball.java
+@@ -0,0 +1,41 @@
++package net.minecraft.server;
++
++public class EntitySnowball extends EntityProjectile {
++
++    public EntitySnowball(World world) {
++        super(world);
++    }
++
++    public EntitySnowball(World world, EntityLiving entityliving) {
++        super(world, entityliving);
++    }
++
++    public EntitySnowball(World world, double d0, double d1, double d2) {
++        super(world, d0, d1, d2);
++    }
++
++    public static void a(DataConverterManager dataconvertermanager) {
++        EntityProjectile.a(dataconvertermanager, "Snowball");
++    }
++
++    protected void a(MovingObjectPosition movingobjectposition) {
++        if (movingobjectposition.entity != null) {
++            float damage = 0.0F;
++
++            if (movingobjectposition.entity instanceof EntityBlaze) {
++                damage = 3.0F;
++            } else if (movingobjectposition.entity instanceof EntityPlayer
++                    && com.destroystokyo.paper.config.toml.modules.gameplay.Knockback.snowballKnockbackPlayers) {
++                damage = 0.0001F;
++            }
++
++            movingobjectposition.entity.damageEntity(DamageSource.projectile(this, this.getShooter()), damage);
++        }
++
++        if (!this.world.isClientSide) {
++            this.world.broadcastEntityEffect(this, (byte) 3);
++            this.die();
++        }
++
++    }
++}
+diff --git a/main/java/net/minecraft/server/WorldServer.java b/main/java/net/minecraft/server/WorldServer.java
+index 577ccad..a36315c 100644
+--- a/main/java/net/minecraft/server/WorldServer.java
++++ b/main/java/net/minecraft/server/WorldServer.java
+@@ -535,7 +535,7 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+                 }
+ 
+                 this.methodProfiler.c("iceandsnow");
+-                if (!this.paperConfig.disableIceAndSnow && (currentIceAndSnowTick++ & 15) == 0) { // Paper - Disable ice and snow // Airplane - optimize further random ticking
++                if (!this.paperConfig.disableIceAndSnow && shouldTickIceAndSnow(currentIceAndSnowTick++)) { // Paper - Disable ice and snow // Airplane - optimize further random ticking
+                     this.l = this.l * 3 + 1013904223;
+                     l = this.l >> 2;
+                     blockposition = this.p(new BlockPosition(j + (l & 15), 0, k + (l >> 8 & 15)));
+@@ -1409,6 +1409,14 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+         return explosion;
+     }
+ 
++    static boolean shouldTickIceAndSnow(int tickCount) {
++        int chance = com.destroystokyo.paper.config.toml.modules.gameplay.World.iceAndSnowChance;
++        if (chance <= 0) {
++            return false;
++        }
++        return chance == 16 ? (tickCount & 15) == 0 : (tickCount % chance) == 0;
++    }
++
+     private it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap getAntarcticScheduledTickChunkCounts() {
+         if (this.antarcticScheduledTickChunkCounts == null) {
+             this.antarcticScheduledTickChunkCounts = new it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap();
+diff --git a/test/java/net/minecraft/server/Tier2GameplayConfigTest.java b/test/java/net/minecraft/server/Tier2GameplayConfigTest.java
+new file mode 100644
+index 0000000..5445f4d
+--- /dev/null
++++ b/test/java/net/minecraft/server/Tier2GameplayConfigTest.java
+@@ -0,0 +1,279 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.config.toml.modules.gameplay.DeathItemDropKnockback;
++import com.destroystokyo.paper.config.toml.modules.gameplay.Knockback;
++import com.destroystokyo.paper.config.toml.modules.gameplay.Tripwire;
++import org.bukkit.block.Block;
++import org.bukkit.craftbukkit.CraftServer;
++import org.bukkit.craftbukkit.CraftWorld;
++import org.bukkit.event.Event;
++import org.bukkit.plugin.PluginManager;
++import org.junit.After;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++import java.lang.reflect.Field;
++import java.lang.reflect.Proxy;
++import java.util.HashMap;
++import java.util.Map;
++import java.util.Random;
++
++import static org.junit.Assert.*;
++
++public class Tier2GameplayConfigTest {
++
++    private static Unsafe UNSAFE;
++
++    private final boolean prevSnowballKb = Knockback.snowballKnockbackPlayers;
++    private final boolean prevEggKb = Knockback.eggKnockbackPlayers;
++    private final boolean prevZombieKb = Knockback.canPlayerKnockbackZombie;
++    private final boolean prevDropAround = DeathItemDropKnockback.dropAround;
++    private final double prevHoriz = DeathItemDropKnockback.horizontalForce;
++    private final double prevVert = DeathItemDropKnockback.verticalForce;
++    private final int prevIceSnow = com.destroystokyo.paper.config.toml.modules.gameplay.World.iceAndSnowChance;
++    private final boolean prevTripwire = Tripwire.allowTripwireDupe;
++
++    @BeforeClass
++    public static void init() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        UNSAFE = (Unsafe) f.get(null);
++    }
++
++    @After
++    public void restoreConfig() {
++        Knockback.snowballKnockbackPlayers = prevSnowballKb;
++        Knockback.eggKnockbackPlayers = prevEggKb;
++        Knockback.canPlayerKnockbackZombie = prevZombieKb;
++        DeathItemDropKnockback.dropAround = prevDropAround;
++        DeathItemDropKnockback.horizontalForce = prevHoriz;
++        DeathItemDropKnockback.verticalForce = prevVert;
++        com.destroystokyo.paper.config.toml.modules.gameplay.World.iceAndSnowChance = prevIceSnow;
++        Tripwire.allowTripwireDupe = prevTripwire;
++    }
++
++    private static final class RecordingPlayer extends EntityPlayer {
++        float lastDamage = -1.0F;
++
++        RecordingPlayer() {
++            super(null, null, null, null);
++        }
++
++        @Override
++        public boolean damageEntity(DamageSource source, float f) {
++            this.lastDamage = f;
++            return true;
++        }
++    }
++
++    private static final class RecordingBlaze extends EntityBlaze {
++        float lastDamage = -1.0F;
++
++        RecordingBlaze() {
++            super(null);
++        }
++
++        @Override
++        public boolean damageEntity(DamageSource source, float f) {
++            this.lastDamage = f;
++            return true;
++        }
++    }
++
++    private static final class MockCraftWorld extends CraftWorld {
++        final Block proxyBlock = (Block) Proxy.newProxyInstance(
++                Block.class.getClassLoader(),
++                new Class<?>[] { Block.class },
++                (p, m, a) -> {
++                    if (m.getReturnType() == int.class) return 0;
++                    if (m.getReturnType() == boolean.class) return false;
++                    return null;
++                }
++        );
++
++        MockCraftWorld() {
++            super(null, null, null);
++        }
++
++        @Override
++        public Block getBlockAt(int x, int y, int z) {
++            return proxyBlock;
++        }
++    }
++
++    private static final class MockWorld extends World {
++        Map<BlockPosition, IBlockData> blocks;
++        MockCraftWorld mockCraftWorld;
++        CraftServer mockCraftServer;
++
++        MockWorld() throws Exception {
++            super(null, null, null, null, true, null, null);
++        }
++
++        @Override
++        protected IChunkProvider n() {
++            return null;
++        }
++
++        @Override
++        protected boolean isChunkLoaded(int i, int j, boolean flag) {
++            return true;
++        }
++
++        @Override
++        public IBlockData getType(BlockPosition pos) {
++            return blocks.getOrDefault(pos, Blocks.AIR.getBlockData());
++        }
++
++        @Override
++        public boolean setTypeAndData(BlockPosition pos, IBlockData data, int flags) {
++            blocks.put(pos.h(), data);
++            return true;
++        }
++
++        public void a(BlockPosition pos, Block block, int delay) {}
++
++        public void applyPhysics(BlockPosition pos, Block block, boolean flag) {}
++
++        @Override
++        public void a(EntityHuman entityhuman, BlockPosition pos, SoundEffect sound, SoundCategory cat, float f, float f1) {}
++
++        public CraftWorld getWorld() {
++            return mockCraftWorld;
++        }
++
++        public CraftServer getServer() {
++            return mockCraftServer;
++        }
++    }
++
++    private static MockWorld newMockWorld() throws Exception {
++        MockWorld world = (MockWorld) UNSAFE.allocateInstance(MockWorld.class);
++        world.blocks = new HashMap<>();
++        world.mockCraftWorld = (MockCraftWorld) UNSAFE.allocateInstance(MockCraftWorld.class);
++        Field pbField = MockCraftWorld.class.getDeclaredField("proxyBlock");
++        pbField.setAccessible(true);
++        pbField.set(world.mockCraftWorld, Proxy.newProxyInstance(
++                Block.class.getClassLoader(),
++                new Class<?>[] { Block.class },
++                (p, m, a) -> {
++                    if (m.getReturnType() == int.class) return 0;
++                    if (m.getReturnType() == boolean.class) return false;
++                    return null;
++                }
++        ));
++        CraftServer cs = (CraftServer) UNSAFE.allocateInstance(CraftServer.class);
++        org.bukkit.plugin.SimplePluginManager pm = (org.bukkit.plugin.SimplePluginManager) UNSAFE.allocateInstance(org.bukkit.plugin.SimplePluginManager.class);
++        Field pmField = CraftServer.class.getDeclaredField("pluginManager");
++        pmField.setAccessible(true);
++        pmField.set(cs, pm);
++        world.mockCraftServer = cs;
++        Field clientField = World.class.getDeclaredField("isClientSide");
++        clientField.setAccessible(true);
++        clientField.setBoolean(world, true);
++        Field randField = World.class.getDeclaredField("random");
++        randField.setAccessible(true);
++        randField.set(world, new Random(1L));
++        Field cpcField = World.class.getDeclaredField("chunkPacketBlockController");
++        cpcField.setAccessible(true);
++        cpcField.set(world, new com.destroystokyo.paper.antixray.ChunkPacketBlockController() {});
++        return world;
++    }
++
++    @Test
++    public void testVanilla1122Defaults() {
++        assertEquals(16, com.destroystokyo.paper.config.toml.modules.gameplay.World.iceAndSnowChance);
++        assertEquals(0.5D, DeathItemDropKnockback.horizontalForce, 1e-9);
++        assertEquals(0.2D, DeathItemDropKnockback.verticalForce, 1e-9);
++        assertTrue(DeathItemDropKnockback.dropAround);
++        assertFalse(Knockback.snowballKnockbackPlayers);
++        assertFalse(Knockback.eggKnockbackPlayers);
++        assertTrue(Knockback.canPlayerKnockbackZombie);
++        assertTrue(Tripwire.allowTripwireDupe);
++    }
++
++    @Test
++    public void testSnowballAndEggKnockbackToggle() throws Exception {
++        MockWorld world = newMockWorld();
++        RecordingPlayer player = (RecordingPlayer) UNSAFE.allocateInstance(RecordingPlayer.class);
++        RecordingBlaze blaze = (RecordingBlaze) UNSAFE.allocateInstance(RecordingBlaze.class);
++
++        EntitySnowball snowball = (EntitySnowball) UNSAFE.allocateInstance(EntitySnowball.class);
++        Field wField = Entity.class.getDeclaredField("world");
++        wField.setAccessible(true);
++        wField.set(snowball, world);
++
++        Knockback.snowballKnockbackPlayers = false;
++        snowball.a(new MovingObjectPosition(player));
++        assertEquals(0.0F, player.lastDamage, 1e-6F);
++
++        Knockback.snowballKnockbackPlayers = true;
++        snowball.a(new MovingObjectPosition(player));
++        assertEquals(0.0001F, player.lastDamage, 1e-6F);
++
++        snowball.a(new MovingObjectPosition(blaze));
++        assertEquals(3.0F, blaze.lastDamage, 1e-6F);
++
++        EntityEgg egg = (EntityEgg) UNSAFE.allocateInstance(EntityEgg.class);
++        wField.set(egg, world);
++
++        Knockback.eggKnockbackPlayers = false;
++        egg.a(new MovingObjectPosition(player));
++        assertEquals(0.0F, player.lastDamage, 1e-6F);
++
++        Knockback.eggKnockbackPlayers = true;
++        egg.a(new MovingObjectPosition(player));
++        assertEquals(0.0001F, player.lastDamage, 1e-6F);
++    }
++
++    @Test
++    public void testIceAndSnowChanceParity() {
++        com.destroystokyo.paper.config.toml.modules.gameplay.World.iceAndSnowChance = 16;
++        int hits16 = 0;
++        for (int t = 0; t < 480; t++) {
++            if (WorldServer.shouldTickIceAndSnow(t)) hits16++;
++        }
++        assertEquals(30, hits16);
++
++        com.destroystokyo.paper.config.toml.modules.gameplay.World.iceAndSnowChance = 0;
++        for (int t = 0; t < 100; t++) {
++            assertFalse(WorldServer.shouldTickIceAndSnow(t));
++        }
++
++        com.destroystokyo.paper.config.toml.modules.gameplay.World.iceAndSnowChance = 48;
++        int hits48 = 0;
++        for (int t = 0; t < 480; t++) {
++            if (WorldServer.shouldTickIceAndSnow(t)) hits48++;
++        }
++        assertEquals(10, hits48);
++    }
++
++    @Test
++    public void testTripwireDupePreventionReChecksHookBlock() throws Exception {
++        MockWorld world = newMockWorld();
++        BlockPosition hook1 = new BlockPosition(0, 64, 0);
++        BlockPosition wire1 = new BlockPosition(1, 64, 0);
++        BlockPosition hook2 = new BlockPosition(2, 64, 0);
++
++        IBlockData attachedWire = Blocks.TRIPWIRE.getBlockData()
++                .set(BlockTripwire.DISARMED, Boolean.FALSE)
++                .set(BlockTripwire.POWERED, Boolean.FALSE);
++        IBlockData hook2State = Blocks.TRIPWIRE_HOOK.getBlockData()
++                .set(BlockTripwireHook.FACING, EnumDirection.WEST)
++                .set(BlockTripwireHook.ATTACHED, Boolean.TRUE);
++        world.blocks.put(wire1, attachedWire);
++        world.blocks.put(hook2, hook2State);
++
++        // Simulate hook1 already broken (now AIR) during update
++        world.blocks.put(hook1, Blocks.AIR.getBlockData());
++
++        Tripwire.allowTripwireDupe = false;
++        ((BlockTripwireHook) Blocks.TRIPWIRE_HOOK).a(world, hook1, hook2State.set(BlockTripwireHook.FACING, EnumDirection.EAST), false, true, -1, null);
++
++        // hook1 MUST remain AIR (not recreated into a duped tripwire hook!), while hook2 (still TRIPWIRE_HOOK) updated
++        assertEquals(Blocks.AIR, world.blocks.get(hook1).getBlock());
++        assertEquals(Blocks.TRIPWIRE_HOOK, world.blocks.get(hook2).getBlock());
++    }
++}
