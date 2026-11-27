@@ -1,0 +1,512 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Fri, 27 Nov 2026 10:02:14 +0700
+Subject: [PATCH 207/207] perf: optimize Chunk item merge pre-filtering and
+ Item/XP BlockPosition churn
+
+
+diff --git a/main/java/net/minecraft/server/Chunk.java b/main/java/net/minecraft/server/Chunk.java
+index c45dece..5ac550a 100644
+--- a/main/java/net/minecraft/server/Chunk.java
++++ b/main/java/net/minecraft/server/Chunk.java
+@@ -1357,6 +1357,14 @@ public class Chunk {
+     private static final ThreadLocal<MergeScratch> MERGE_SCRATCH = ThreadLocal.withInitial(MergeScratch::new);
+ 
+     void mergeNearbyItems(EntityItem self, double minX, double minY, double minZ, double maxX, double maxY, double maxZ, @Nullable Chunk selfChunk, int selfSlice) {
++        ItemStack selfStack = self.getItemStack();
++        Item selfItem = selfStack.getItem();
++        int selfCount = selfStack.getCount();
++        int maxStack = selfStack.getMaxStackSize();
++        if (selfItem == null || selfCount >= maxStack || !self.canMerge()) {
++            return;
++        }
++
+         int i = MathHelper.floor((minY - 2.0D) / 16.0D);
+         int j = MathHelper.floor((maxY + 2.0D) / 16.0D);
+ 
+@@ -1382,16 +1390,24 @@ public class Chunk {
+                 for (int idx = 0, len = slice.size(); idx < len; ++idx) {
+                     Entity entity = slice.get(idx);
+                     if (entity instanceof EntityItem && entity != self) {
+-                        AxisAlignedBB entityBB = entity.getBoundingBox();
++                        EntityItem other = (EntityItem) entity;
++                        if (!other.canMerge()) {
++                            continue;
++                        }
++                        ItemStack otherStack = other.getItemStack();
++                        if (otherStack.getItem() != selfItem || otherStack.getCount() + selfCount > maxStack) {
++                            continue;
++                        }
++                        AxisAlignedBB entityBB = other.getBoundingBox();
+                         if (entityBB.d > minX && entityBB.a < maxX && entityBB.e > minY && entityBB.b < maxY && entityBB.f > minZ && entityBB.c < maxZ) {
+-                            candidates.add((EntityItem) entity);
++                            candidates.add(other);
+                         }
+                     }
+                 }
+             }
+             for (int idx = 0, len = candidates.size(); idx < len; ++idx) {
+                 self.tryMergeWith(candidates.get(idx));
+-                if (!self.isAlive()) {
++                if (!self.isAlive() || self.getItemStack().getCount() >= maxStack) {
+                     return;
+                 }
+             }
+diff --git a/main/java/net/minecraft/server/Entity.java b/main/java/net/minecraft/server/Entity.java
+index 8c6657f..582425f 100644
+--- a/main/java/net/minecraft/server/Entity.java
++++ b/main/java/net/minecraft/server/Entity.java
+@@ -2446,14 +2446,13 @@ public abstract class Entity implements ICommandListener, KeyedObject { // Paper
+     public void b(EntityLiving entityliving) {}
+ 
+     protected boolean i(double d0, double d1, double d2) {
+-        BlockPosition blockposition = new BlockPosition(d0, d1, d2);
+-        double d3 = d0 - (double) blockposition.getX();
+-        double d4 = d1 - (double) blockposition.getY();
+-        double d5 = d2 - (double) blockposition.getZ();
+-
+         if (!this.world.a(this.getBoundingBox())) {
+             return false;
+         } else {
++            BlockPosition blockposition = new BlockPosition(d0, d1, d2);
++            double d3 = d0 - (double) blockposition.getX();
++            double d4 = d1 - (double) blockposition.getY();
++            double d5 = d2 - (double) blockposition.getZ();
+             EnumDirection enumdirection = EnumDirection.UP;
+             double d6 = Double.MAX_VALUE;
+ 
+diff --git a/main/java/net/minecraft/server/EntityExperienceOrb.java b/main/java/net/minecraft/server/EntityExperienceOrb.java
+index becb102..c8d1495 100644
+--- a/main/java/net/minecraft/server/EntityExperienceOrb.java
++++ b/main/java/net/minecraft/server/EntityExperienceOrb.java
+@@ -97,7 +97,7 @@ public class EntityExperienceOrb extends Entity {
+             this.motY -= 0.029999999329447746D;
+         }
+ 
+-        if (this.world.getType(new BlockPosition(this)).getMaterial() == Material.LAVA) {
++        if (this.world.getType(MathHelper.floor(this.locX), MathHelper.floor(this.locY), MathHelper.floor(this.locZ)).getMaterial() == Material.LAVA) {
+             this.motY = 0.20000000298023224D;
+             this.motX = (double) ((this.random.nextFloat() - this.random.nextFloat()) * 0.2F);
+             this.motZ = (double) ((this.random.nextFloat() - this.random.nextFloat()) * 0.2F);
+@@ -150,7 +150,7 @@ public class EntityExperienceOrb extends Entity {
+         float f = 0.98F;
+ 
+         if (this.onGround) {
+-            f = this.world.getType(new BlockPosition(MathHelper.floor(this.locX), MathHelper.floor(this.getBoundingBox().b) - 1, MathHelper.floor(this.locZ))).getBlock().frictionFactor * 0.98F;
++            f = this.world.getType(MathHelper.floor(this.locX), MathHelper.floor(this.getBoundingBox().b) - 1, MathHelper.floor(this.locZ)).getBlock().frictionFactor * 0.98F;
+         }
+ 
+         this.motX *= (double) f;
+diff --git a/main/java/net/minecraft/server/EntityItem.java b/main/java/net/minecraft/server/EntityItem.java
+index 7a19508..682032b 100644
+--- a/main/java/net/minecraft/server/EntityItem.java
++++ b/main/java/net/minecraft/server/EntityItem.java
+@@ -98,7 +98,7 @@ public class EntityItem extends Entity implements HopperPusher {
+             boolean flag = (int) this.lastX != (int) this.locX || (int) this.lastY != (int) this.locY || (int) this.lastZ != (int) this.locZ;
+ 
+             if (flag || this.ticksLived % 25 == 0) {
+-                if (this.world.getType(new BlockPosition(this)).getMaterial() == Material.LAVA) {
++                if (this.world.getType(MathHelper.floor(this.locX), MathHelper.floor(this.locY), MathHelper.floor(this.locZ)).getMaterial() == Material.LAVA) {
+                     this.motY = 0.20000000298023224D;
+                     this.motX = (double) ((this.random.nextFloat() - this.random.nextFloat()) * 0.2F);
+                     this.motZ = (double) ((this.random.nextFloat() - this.random.nextFloat()) * 0.2F);
+@@ -113,7 +113,7 @@ public class EntityItem extends Entity implements HopperPusher {
+             float f = 0.98F;
+ 
+             if (this.onGround) {
+-                f = this.world.getType(new BlockPosition(MathHelper.floor(this.locX), MathHelper.floor(this.getBoundingBox().b) - 1, MathHelper.floor(this.locZ))).getBlock().frictionFactor * 0.98F;
++                f = this.world.getType(MathHelper.floor(this.locX), MathHelper.floor(this.getBoundingBox().b) - 1, MathHelper.floor(this.locZ)).getBlock().frictionFactor * 0.98F;
+             }
+ 
+             this.motX *= (double) f;
+@@ -187,6 +187,10 @@ public class EntityItem extends Entity implements HopperPusher {
+         this.world.mergeNearbyItems(this, world.spigotConfig.itemMerge);
+     }
+ 
++    boolean canMerge() {
++        return this.isAlive() && this.pickupDelay != 32767 && this.age != -32768;
++    }
++
+     boolean tryMergeWith(EntityItem other) {
+         return this.a(other);
+     }
+diff --git a/main/java/net/minecraft/server/World.java b/main/java/net/minecraft/server/World.java
+index d9060a7..4650437 100644
+--- a/main/java/net/minecraft/server/World.java
++++ b/main/java/net/minecraft/server/World.java
+@@ -1790,27 +1790,7 @@ public abstract class World implements IBlockAccess {
+                 final int maxValue = paperConfig.expMergeMaxValue;
+                 final boolean mergeUnconditionally = paperConfig.expMergeMaxValue <= 0;
+                 if (mergeUnconditionally || xp.value < maxValue) { // Paper - Skip iteration if unnecessary
+-
+-                List<Entity> entities = this.getEntities(entity, entity.getBoundingBox().grow(radius, radius, radius));
+-                for (Entity e : entities) {
+-                    if (e instanceof EntityExperienceOrb) {
+-                        EntityExperienceOrb loopItem = (EntityExperienceOrb) e;
+-                        // Paper start
+-                        if (!loopItem.dead && !(maxValue > 0 && loopItem.value >= maxValue) && new com.destroystokyo.paper.event.entity.ExperienceOrbMergeEvent((org.bukkit.entity.ExperienceOrb) entity.getBukkitEntity(), (org.bukkit.entity.ExperienceOrb) loopItem.getBukkitEntity()).callEvent()) {
+-                            long newTotal = (long)xp.value + (long)loopItem.value;
+-                            if ((int) newTotal < 0) continue; // Overflow
+-                            if (maxValue > 0 && newTotal > (long)maxValue) {
+-                                loopItem.value = (int) (newTotal - maxValue);
+-                                xp.value = maxValue;
+-                            } else {
+-                                xp.value += loopItem.value;
+-                                loopItem.die();
+-                            }
+-                            // Paper end
+-                        }
+-                    }
+-                }
+-
++                    this.mergeNearbyExperienceOrbs(xp, radius, maxValue);
+                 } // Paper end - End iteration skip check - All tweaking ends here
+             }
+         } // Spigot end
+@@ -3472,8 +3452,81 @@ public abstract class World implements IBlockAccess {
+         // Antarctic end
+     }
+ 
++    void mergeNearbyExperienceOrbs(EntityExperienceOrb xp, double radius, int maxValue) {
++        AxisAlignedBB bb = xp.getBoundingBox().grow(radius, radius, radius);
++        int minChunkX = MathHelper.floor((bb.a - 2.0D) / 16.0D);
++        int maxChunkX = MathHelper.f((bb.d + 2.0D) / 16.0D);
++        int minChunkZ = MathHelper.floor((bb.c - 2.0D) / 16.0D);
++        int maxChunkZ = MathHelper.f((bb.f + 2.0D) / 16.0D);
++        int minSlice = MathHelper.clamp(MathHelper.floor((bb.b - 2.0D) / 16.0D), 0, 15);
++        int maxSlice = MathHelper.clamp(MathHelper.floor((bb.e + 2.0D) / 16.0D), 0, 15);
++        boolean hasListeners = com.destroystokyo.paper.event.entity.ExperienceOrbMergeEvent.getHandlerList().getRegisteredListeners().length != 0;
++        ArrayList<EntityExperienceOrb> snapshot = hasListeners ? new ArrayList<>() : null;
++
++        for (int cx = minChunkX; cx < maxChunkX; ++cx) {
++            for (int cz = minChunkZ; cz < maxChunkZ; ++cz) {
++                Chunk chunk = this.getChunkIfLoaded(cx, cz);
++                if (chunk == null) {
++                    continue;
++                }
++                for (int sliceY = minSlice; sliceY <= maxSlice; ++sliceY) {
++                    List<Entity> slice = chunk.entitySlices[sliceY];
++                    for (int idx = 0, len = slice.size(); idx < len; ++idx) {
++                        Entity e = slice.get(idx);
++                        if (e instanceof EntityExperienceOrb && e != xp) {
++                            EntityExperienceOrb loopItem = (EntityExperienceOrb) e;
++                            if (!loopItem.dead && !(maxValue > 0 && loopItem.value >= maxValue) && bb.c(loopItem.getBoundingBox())) {
++                                if (snapshot != null) {
++                                    snapshot.add(loopItem);
++                                } else {
++                                    long newTotal = (long) xp.value + (long) loopItem.value;
++                                    if ((int) newTotal < 0) {
++                                        continue;
++                                    }
++                                    if (maxValue > 0 && newTotal > (long) maxValue) {
++                                        loopItem.value = (int) (newTotal - maxValue);
++                                        xp.value = maxValue;
++                                        return;
++                                    } else {
++                                        xp.value += loopItem.value;
++                                        loopItem.die();
++                                    }
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++        }
++
++        if (snapshot != null) {
++            for (int idx = 0, len = snapshot.size(); idx < len; ++idx) {
++                EntityExperienceOrb loopItem = snapshot.get(idx);
++                if (!loopItem.dead && !(maxValue > 0 && loopItem.value >= maxValue)
++                        && new com.destroystokyo.paper.event.entity.ExperienceOrbMergeEvent((org.bukkit.entity.ExperienceOrb) xp.getBukkitEntity(), (org.bukkit.entity.ExperienceOrb) loopItem.getBukkitEntity()).callEvent()) {
++                    long newTotal = (long) xp.value + (long) loopItem.value;
++                    if ((int) newTotal < 0) {
++                        continue;
++                    }
++                    if (maxValue > 0 && newTotal > (long) maxValue) {
++                        loopItem.value = (int) (newTotal - maxValue);
++                        xp.value = maxValue;
++                    } else {
++                        xp.value += loopItem.value;
++                        loopItem.die();
++                    }
++                }
++            }
++        }
++    }
++
+     void mergeNearbyItems(EntityItem self, double radius) {
+-        if (!self.isAlive()) {
++        if (!self.canMerge()) {
++            return;
++        }
++        ItemStack selfStack = self.getItemStack();
++        int maxStack = selfStack.getMaxStackSize();
++        if (selfStack.getCount() >= maxStack) {
+             return;
+         }
+         AxisAlignedBB bb = self.getBoundingBox();
+@@ -3497,6 +3550,9 @@ public abstract class World implements IBlockAccess {
+                 Chunk chunk = this.getChunkIfLoaded(i1, j1);
+                 if (chunk != null) {
+                     chunk.mergeNearbyItems(self, minX, minY, minZ, maxX, maxY, maxZ, selfChunk, selfSlice);
++                    if (!self.isAlive() || self.getItemStack().getCount() >= maxStack) {
++                        return;
++                    }
+                 }
+             }
+         }
+diff --git a/test/java/net/minecraft/server/ItemXpMergeParityTest.java b/test/java/net/minecraft/server/ItemXpMergeParityTest.java
+new file mode 100644
+index 0000000..779590b
+--- /dev/null
++++ b/test/java/net/minecraft/server/ItemXpMergeParityTest.java
+@@ -0,0 +1,248 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.PaperWorldConfig;
++import com.sun.management.ThreadMXBean;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import org.spigotmc.SpigotWorldConfig;
++import sun.misc.Unsafe;
++
++import java.lang.management.ManagementFactory;
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.List;
++
++import static org.junit.Assert.*;
++
++public class ItemXpMergeParityTest {
++
++    private static Unsafe UNSAFE;
++    private static int nextEntityId = 20000;
++
++    @BeforeClass
++    public static void setup() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        UNSAFE = (Unsafe) f.get(null);
++    }
++
++    private static final class MergeTestWorld extends World {
++        final Chunk chunk;
++
++        MergeTestWorld(Chunk chunk) {
++            super(null, new WorldData(), new WorldProviderNormal(), new MethodProfiler(), false, null, null);
++            this.chunk = chunk;
++        }
++
++        @Override
++        protected IChunkProvider n() {
++            return null;
++        }
++
++        @Override
++        protected boolean isChunkLoaded(int i, int j, boolean flag) {
++            return i == 0 && j == 0;
++        }
++
++        @Override
++        public Chunk getChunkIfLoaded(int i, int j) {
++            return (i == 0 && j == 0) ? this.chunk : null;
++        }
++    }
++
++    private static MergeTestWorld createTestWorld() throws Exception {
++        Chunk chunk = (Chunk) UNSAFE.allocateInstance(Chunk.class);
++        Field secField = Chunk.class.getDeclaredField("sections");
++        secField.setAccessible(true);
++        ChunkSection[] sections = new ChunkSection[16];
++        for (int s = 0; s < 16; ++s) {
++            sections[s] = new ChunkSection(s << 4, true);
++        }
++        secField.set(chunk, sections);
++
++        Field slicesField = Chunk.class.getDeclaredField("entitySlices");
++        slicesField.setAccessible(true);
++        @SuppressWarnings("unchecked")
++        List<Entity>[] slices = new List[16];
++        for (int s = 0; s < 16; ++s) {
++            slices[s] = new ArrayList<>();
++        }
++        slicesField.set(chunk, slices);
++
++        for (String fn : new String[]{"hardCollidableCounts", "itemCounts", "inventoryEntityCounts", "itemFrameCounts"}) {
++            Field f = Chunk.class.getDeclaredField(fn);
++            f.setAccessible(true);
++            f.set(chunk, new int[16]);
++        }
++        Field ec = Chunk.class.getDeclaredField("entityCounts");
++        ec.setAccessible(true);
++        ec.set(chunk, new co.aikar.util.Counter<String>());
++        Field ect = Chunk.class.getDeclaredField("entityCount");
++        ect.setAccessible(true);
++        ect.set(chunk, new gnu.trove.map.hash.TObjectIntHashMap<Class>());
++        Field acc = Chunk.class.getDeclaredField("antarcticCreatureCounts");
++        acc.setAccessible(true);
++        acc.set(chunk, new int[EnumCreatureType.values().length]);
++
++        MergeTestWorld world = (MergeTestWorld) UNSAFE.allocateInstance(MergeTestWorld.class);
++        Field cf = MergeTestWorld.class.getDeclaredField("chunk");
++        cf.setAccessible(true);
++        cf.set(world, chunk);
++        Field wc = Chunk.class.getDeclaredField("world");
++        wc.setAccessible(true);
++        wc.set(chunk, world);
++        Field sc = World.class.getDeclaredField("spigotConfig");
++        sc.setAccessible(true);
++        SpigotWorldConfig spigotConfig = (SpigotWorldConfig) UNSAFE.allocateInstance(SpigotWorldConfig.class);
++        spigotConfig.itemMerge = 2.5D;
++        spigotConfig.expMerge = 3.0D;
++        sc.set(world, spigotConfig);
++        Field pwc = World.class.getDeclaredField("paperConfig");
++        pwc.setAccessible(true);
++        PaperWorldConfig paperConfig = (PaperWorldConfig) UNSAFE.allocateInstance(PaperWorldConfig.class);
++        paperConfig.expMergeMaxValue = 100;
++        pwc.set(world, paperConfig);
++        world.worldProvider = new WorldProviderNormal();
++        return world;
++    }
++
++    private static EntityItem createItem(World world, double x, double y, double z, ItemStack stack) throws Exception {
++        EntityItem item = (EntityItem) UNSAFE.allocateInstance(EntityItem.class);
++        item.h(nextEntityId++);
++        item.world = world;
++        item.locX = x;
++        item.locY = y;
++        item.locZ = z;
++        item.a(new AxisAlignedBB(x - 0.125, y, z - 0.125, x + 0.125, y + 0.25, z + 0.125));
++        DataWatcher dw = new DataWatcher(item);
++        Field cField = EntityItem.class.getDeclaredField("c");
++        cField.setAccessible(true);
++        @SuppressWarnings("unchecked")
++        DataWatcherObject<ItemStack> itemKey = (DataWatcherObject<ItemStack>) cField.get(null);
++        dw.register(itemKey, stack);
++        Field dwField = Entity.class.getDeclaredField("datawatcher");
++        dwField.setAccessible(true);
++        dwField.set(item, dw);
++        return item;
++    }
++
++    private static EntityExperienceOrb createOrb(World world, double x, double y, double z, int value) throws Exception {
++        EntityExperienceOrb orb = (EntityExperienceOrb) UNSAFE.allocateInstance(EntityExperienceOrb.class);
++        orb.h(nextEntityId++);
++        orb.world = world;
++        orb.locX = x;
++        orb.locY = y;
++        orb.locZ = z;
++        orb.a(new AxisAlignedBB(x - 0.25, y, z - 0.25, x + 0.25, y + 0.5, z + 0.25));
++        orb.value = value;
++        return orb;
++    }
++
++    @Test
++    public void testMixedItemMergeFilteringParity() throws Exception {
++        MergeTestWorld world = createTestWorld();
++        List<EntityItem> mergeCandidatesReached = new ArrayList<>();
++        EntityItem self = new EntityItem(world, 8.0, 64.0, 8.0, new ItemStack(Items.COAL, 10)) {
++            @Override
++            boolean tryMergeWith(EntityItem other) {
++                mergeCandidatesReached.add(other);
++                ItemStack s1 = this.getItemStack();
++                ItemStack s2 = other.getItemStack();
++                if (s1.getItem() == s2.getItem() && (!s1.hasTag() && !s2.hasTag())) {
++                    s1.add(s2.getCount());
++                    this.setItemStack(s1);
++                    other.die();
++                    return true;
++                }
++                return false;
++            }
++        };
++        EntityItem match = createItem(world, 8.5, 64.0, 8.5, new ItemStack(Items.COAL, 12));
++        EntityItem fullStack = createItem(world, 8.5, 64.0, 8.5, new ItemStack(Items.COAL, 64));
++        EntityItem noPickup = createItem(world, 8.5, 64.0, 8.5, new ItemStack(Items.COAL, 5));
++        noPickup.pickupDelay = 32767;
++        EntityItem immortal = createItem(world, 8.5, 64.0, 8.5, new ItemStack(Items.COAL, 5));
++        Field ageField = EntityItem.class.getDeclaredField("age");
++        ageField.setAccessible(true);
++        ageField.setInt(immortal, -32768);
++        EntityItem sword = createItem(world, 8.5, 64.0, 8.5, new ItemStack(Items.IRON_SWORD, 1));
++        EntityItem nbtDiff = createItem(world, 8.5, 64.0, 8.5, new ItemStack(Items.COAL, 5));
++        NBTTagCompound tag = new NBTTagCompound();
++        tag.setInt("Custom", 1);
++        nbtDiff.getItemStack().setTag(tag);
++
++        world.chunk.a(self);
++        world.chunk.a(match);
++        world.chunk.a(fullStack);
++        world.chunk.a(noPickup);
++        world.chunk.a(immortal);
++        world.chunk.a(sword);
++        world.chunk.a(nbtDiff);
++
++        world.mergeNearbyItems(self, 2.5D);
++        // match (12) merges into self (10) -> 22; ineligible items are pre-filtered before tryMergeWith (only match + same-item nbtDiff can reach it)
++        assertEquals(22, self.getItemStack().getCount());
++        assertFalse(match.isAlive());
++        assertTrue(mergeCandidatesReached.contains(match));
++        assertFalse(mergeCandidatesReached.contains(fullStack));
++        assertFalse(mergeCandidatesReached.contains(noPickup));
++        assertFalse(mergeCandidatesReached.contains(immortal));
++        assertFalse(mergeCandidatesReached.contains(sword));
++        assertTrue(fullStack.isAlive());
++        assertTrue(noPickup.isAlive());
++        assertTrue(immortal.isAlive());
++        assertTrue(sword.isAlive());
++        assertTrue(nbtDiff.isAlive());
++
++        // Unstackable self exits immediately without scanning
++        world.mergeNearbyItems(sword, 2.5D);
++        assertTrue(sword.isAlive());
++    }
++
++    @Test
++    public void testExperienceOrbMergeZeroAllocAndMaxCapParity() throws Exception {
++        MergeTestWorld world = createTestWorld();
++        EntityExperienceOrb orb1 = createOrb(world, 8.0, 64.0, 8.0, 60);
++        EntityExperienceOrb orb2 = createOrb(world, 8.5, 64.0, 8.5, 70);
++        EntityItem nonOrb = createItem(world, 8.5, 64.0, 8.5, new ItemStack(Items.APPLE, 1));
++        world.chunk.a(orb1);
++        world.chunk.a(nonOrb);
++
++        // Merge orb2 (70) into orb1 (60) with maxValue=100 -> orb2 caps at 100 and orb1 keeps remainder 30
++        world.mergeNearbyExperienceOrbs(orb2, 3.0D, 100);
++        assertEquals(100, orb2.value);
++        assertEquals(30, orb1.value);
++        assertTrue(orb1.isAlive());
++        assertTrue(nonOrb.isAlive());
++    }
++
++    @Test
++    public void testMixedUnstackableItemMergePerformance() throws Exception {
++        MergeTestWorld world = createTestWorld();
++        EntityItem self = createItem(world, 8.0, 64.0, 8.0, new ItemStack(Items.COAL, 1));
++        world.chunk.a(self);
++        for (int i = 0; i < 1000; i++) {
++            world.chunk.a(createItem(world, 8.2, 64.0, 8.2, new ItemStack(Items.STONE_SWORD, 1)));
++        }
++
++        ThreadMXBean threadBean = (ThreadMXBean) ManagementFactory.getThreadMXBean();
++        long tid = Thread.currentThread().getId();
++
++        for (int i = 0; i < 200; i++) {
++            world.mergeNearbyItems(self, 2.5D);
++        }
++
++        long a0 = threadBean.getThreadAllocatedBytes(tid);
++        long t0 = System.nanoTime();
++        for (int i = 0; i < 1000; i++) {
++            world.mergeNearbyItems(self, 2.5D);
++        }
++        long elapsedNs = System.nanoTime() - t0;
++        long allocBytes = Math.max(0L, threadBean.getThreadAllocatedBytes(tid) - a0);
++
++        System.out.printf("[A3 Perf] 1000x mergeNearbyItems over 1000 mismatched items: %d us, alloc=%d bytes%n",
++                elapsedNs / 1000L, allocBytes);
++        assertTrue("Expected zero candidate-list allocation on mismatched slice, got " + allocBytes, allocBytes <= 4096L);
++    }
++}
