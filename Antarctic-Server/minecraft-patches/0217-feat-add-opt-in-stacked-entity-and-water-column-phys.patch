@@ -1,0 +1,627 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Fri, 27 Nov 2026 12:12:26 +0700
+Subject: [PATCH 217/217] feat: add opt-in stacked-entity and water-column
+ physics lag-machine guard
+
+
+diff --git a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+index 7f6bfc0..005f828 100644
+--- a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
++++ b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+@@ -18,6 +18,7 @@ import com.destroystokyo.paper.config.toml.modules.network.Deflate;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.ArmourStands;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.ChunkLoading;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Dab;
++import com.destroystokyo.paper.config.toml.modules.optimizations.EntityPhysicsGuard;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.FarmAiCulling;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.MobSpawning;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Pathfinder;
+@@ -59,7 +60,7 @@ public final class AntarcticTomlConfig {
+             new Rebrand(), new Privacy(),
+             new Deflate(),
+             new VirtualThreads(), new AsyncPlayerDataSaving(),
+-            new Pathfinder(), new Suffocation(), new Projectiles(), new ArmourStands(), new WorldBorder(), new ChunkLoading(), new MobSpawning(), new Dab(), new FarmAiCulling(), new SunBurn(), new Rails(), new Redstone(), new Physics(), new Lighting(),
++            new Pathfinder(), new Suffocation(), new Projectiles(), new ArmourStands(), new WorldBorder(), new ChunkLoading(), new MobSpawning(), new Dab(), new FarmAiCulling(), new EntityPhysicsGuard(), new SunBurn(), new Rails(), new Redstone(), new Physics(), new Lighting(),
+             new MergeChecks(), new ChunkOverloadDupe(), new Collisions(), new Player(),
+             new MapDecorations(), new Books(), new VanillaBugFix());
+     private static final YamlConfiguration yamlFacade = new YamlConfiguration();
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/EntityPhysicsGuard.java b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/EntityPhysicsGuard.java
+new file mode 100644
+index 0000000..dd891d2
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/EntityPhysicsGuard.java
+@@ -0,0 +1,57 @@
++package com.destroystokyo.paper.config.toml.modules.optimizations;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++import com.electronwill.nightconfig.core.file.CommentedFileConfig;
++
++public class EntityPhysicsGuard implements IConfigModule {
++
++    @ConfigInfo(baseName = "enabled", comments = "Opt-in guard against stacked-entity and water-column physics lag machines (e.g., 5k-10k bouncing armor stands). Default false.")
++    public static boolean enabled = false;
++
++    @ConfigInfo(baseName = "slice-check-threshold", comments = "Minimum entities in a 16x16x16 chunk slice before running O(S) cell density detection. Normal slices pay 1 int check. Default 48.")
++    public static int sliceCheckThreshold = 48;
++
++    @ConfigInfo(baseName = "soft-cell-threshold", comments = "Entities in one block cell before overriding EAR water/air immunity and throttling physics ticks. Default 24.")
++    public static int softCellThreshold = 24;
++
++    @ConfigInfo(baseName = "throttled-physics-interval", comments = "Physics tick interval (1 in N ticks) for non-exempt entities in soft-throttled cells. Default 10.")
++    public static int throttledPhysicsInterval = 10;
++
++    @ConfigInfo(baseName = "splash-suppress-threshold", comments = "Cell density at which water splash/bubble particle & sound spam in Entity.ar() is suppressed (0 disables). Default 12.")
++    public static int splashSuppressThreshold = 12;
++
++    @ConfigInfo(baseName = "hard-cell-cull-threshold", comments = "Cell density at which hard-action ('freeze' or 'cull') engages (0 disables). Default 0.")
++    public static int hardCellCullThreshold = 0;
++
++    @ConfigInfo(baseName = "hard-action", comments = "Action when hard-cell-cull-threshold is exceeded: 'freeze' (skip physics) or 'cull' (die excess entities). Default 'freeze'.")
++    public static String hardAction = "freeze";
++
++    @ConfigInfo(baseName = "exempt-plugin-metadata", comments = "Exempt entities with Bukkit plugin metadata (Entity#setMetadata) from throttling and culling. Default true.")
++    public static boolean exemptPluginMetadata = true;
++
++    @Override
++    public void onLoaded(CommentedFileConfig config) {
++        sliceCheckThreshold = Math.max(1, sliceCheckThreshold);
++        softCellThreshold = Math.max(1, softCellThreshold);
++        throttledPhysicsInterval = Math.max(1, throttledPhysicsInterval);
++        splashSuppressThreshold = Math.max(0, splashSuppressThreshold);
++        hardCellCullThreshold = Math.max(0, hardCellCullThreshold);
++        if (!"cull".equalsIgnoreCase(hardAction)) {
++            hardAction = "freeze";
++        } else {
++            hardAction = "cull";
++        }
++    }
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.OPTIMIZATIONS;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "entity-physics-guard";
++    }
++}
+diff --git a/main/java/me/stella/antarctic/spatial/CellDensityScratch.java b/main/java/me/stella/antarctic/spatial/CellDensityScratch.java
+new file mode 100644
+index 0000000..89a9b42
+--- /dev/null
++++ b/main/java/me/stella/antarctic/spatial/CellDensityScratch.java
+@@ -0,0 +1,62 @@
++package me.stella.antarctic.spatial;
++
++/**
++ * Reusable zero-allocation per-slice spatial density histogram (16x16x16 = 4096 cells).
++ * Clears only touched indices on reset() so O(S) slice scans pay zero allocation and zero full-array clear cost.
++ */
++public final class CellDensityScratch {
++
++    public static final int CELL_COUNT = 4096;
++
++    private final short[] totalCounts = new short[CELL_COUNT];
++    private final short[] fluidOrAirCounts = new short[CELL_COUNT];
++    private final int[] touchedIndices = new int[CELL_COUNT];
++    private int touchedCount;
++
++    public static int packIndex(int localX, int localY, int localZ) {
++        return ((localY & 15) << 8) | ((localZ & 15) << 4) | (localX & 15);
++    }
++
++    public void record(int idx, boolean inWaterOrAirborne) {
++        short prev = this.totalCounts[idx];
++        if (prev == 0) {
++            this.touchedIndices[this.touchedCount++] = idx;
++        }
++        if (prev < Short.MAX_VALUE) {
++            this.totalCounts[idx] = (short) (prev + 1);
++        }
++        if (inWaterOrAirborne) {
++            short prevFluid = this.fluidOrAirCounts[idx];
++            if (prevFluid < Short.MAX_VALUE) {
++                this.fluidOrAirCounts[idx] = (short) (prevFluid + 1);
++            }
++        }
++    }
++
++    public short getTotalCount(int idx) {
++        return this.totalCounts[idx];
++    }
++
++    public void decrementTotal(int idx) {
++        if (this.totalCounts[idx] > 0) {
++            this.totalCounts[idx]--;
++        }
++    }
++
++    public short getFluidOrAirCount(int idx) {
++        return this.fluidOrAirCounts[idx];
++    }
++
++    public int getTouchedCount() {
++        return this.touchedCount;
++    }
++
++    public void reset() {
++        for (int i = 0; i < this.touchedCount; ++i) {
++            int idx = this.touchedIndices[i];
++            this.totalCounts[idx] = 0;
++            this.fluidOrAirCounts[idx] = 0;
++        }
++        this.touchedCount = 0;
++    }
++}
+diff --git a/main/java/net/minecraft/server/Chunk.java b/main/java/net/minecraft/server/Chunk.java
+index 4e3d9b2..aa8460d 100644
+--- a/main/java/net/minecraft/server/Chunk.java
++++ b/main/java/net/minecraft/server/Chunk.java
+@@ -1049,6 +1049,89 @@ public class Chunk {
+         return false;
+     }
+ 
++    private static final ThreadLocal<me.stella.antarctic.spatial.CellDensityScratch> PHYSICS_SCRATCH =
++            ThreadLocal.withInitial(me.stella.antarctic.spatial.CellDensityScratch::new);
++    private final int[] antarcticPhysicsGuardStamp = new int[16];
++    private static int antarcticLastPhysicsWarnTick = Integer.MIN_VALUE;
++
++    int scanDenseSliceIfNeeded(int sliceY, int currentTick) {
++        if (!com.destroystokyo.paper.config.toml.modules.optimizations.EntityPhysicsGuard.enabled
++                || sliceY < 0 || sliceY >= 16
++                || this.antarcticPhysicsGuardStamp == null
++                || this.antarcticPhysicsGuardStamp[sliceY] == currentTick) {
++            return 0;
++        }
++        List<Entity> slice = this.entitySlices[sliceY];
++        int size = slice.size();
++        if (size < com.destroystokyo.paper.config.toml.modules.optimizations.EntityPhysicsGuard.sliceCheckThreshold) {
++            return 0;
++        }
++        this.antarcticPhysicsGuardStamp[sliceY] = currentTick;
++        me.stella.antarctic.spatial.CellDensityScratch scratch = PHYSICS_SCRATCH.get();
++        int culled = 0;
++        int maxCellSeen = 0;
++        int warnX = 0, warnY = 0, warnZ = 0;
++        try {
++            for (int i = 0; i < size; ++i) {
++                Entity e = slice.get(i);
++                if (e.dead || e.isPhysicsGuardExempt()) {
++                    continue;
++                }
++                int idx = me.stella.antarctic.spatial.CellDensityScratch.packIndex(
++                        MathHelper.floor(e.locX), MathHelper.floor(e.locY), MathHelper.floor(e.locZ));
++                scratch.record(idx, e.inWater || !e.onGround);
++            }
++            final int hardThreshold = com.destroystokyo.paper.config.toml.modules.optimizations.EntityPhysicsGuard.hardCellCullThreshold;
++            final boolean doCull = hardThreshold > 0
++                    && "cull".equalsIgnoreCase(com.destroystokyo.paper.config.toml.modules.optimizations.EntityPhysicsGuard.hardAction);
++            for (int i = 0; i < size; ++i) {
++                Entity e = slice.get(i);
++                if (e.dead || e.isPhysicsGuardExempt()) {
++                    continue;
++                }
++                int idx = me.stella.antarctic.spatial.CellDensityScratch.packIndex(
++                        MathHelper.floor(e.locX), MathHelper.floor(e.locY), MathHelper.floor(e.locZ));
++                short density = scratch.getTotalCount(idx);
++                e.antarcticCellDensity = density;
++                e.antarcticCellDensityStamp = currentTick;
++                if (density > maxCellSeen) {
++                    maxCellSeen = density;
++                    warnX = MathHelper.floor(e.locX);
++                    warnY = MathHelper.floor(e.locY);
++                    warnZ = MathHelper.floor(e.locZ);
++                }
++            }
++            if (doCull && maxCellSeen > hardThreshold) {
++                for (int i = slice.size() - 1; i >= 0; --i) {
++                    Entity e = slice.get(i);
++                    if (e.dead || e.isPhysicsGuardExempt()) {
++                        continue;
++                    }
++                    if (!(e instanceof EntityArmorStand || e instanceof EntityBoat || e instanceof EntityMinecartAbstract
++                            || e instanceof EntityFallingBlock || e instanceof EntityItem || e instanceof EntityInsentient)) {
++                        continue;
++                    }
++                    int idx = me.stella.antarctic.spatial.CellDensityScratch.packIndex(
++                            MathHelper.floor(e.locX), MathHelper.floor(e.locY), MathHelper.floor(e.locZ));
++                    short cur = scratch.getTotalCount(idx);
++                    if (cur > hardThreshold) {
++                        e.die();
++                        culled++;
++                        scratch.decrementTotal(idx);
++                    }
++                }
++                if (culled > 0 && currentTick - antarcticLastPhysicsWarnTick >= 100) {
++                    antarcticLastPhysicsWarnTick = currentTick;
++                    Chunk.e.warn("[Antarctic PhysicsGuard] Culled {} stacked entities at ({}, {}, {}) in world '{}'",
++                            culled, warnX, warnY, warnZ, this.world.getWorldData().getName());
++                }
++            }
++        } finally {
++            scratch.reset();
++        }
++        return culled;
++    }
++
+     public boolean c(BlockPosition blockposition) {
+         int i = blockposition.getX() & 15;
+         int j = blockposition.getY();
+diff --git a/main/java/net/minecraft/server/Entity.java b/main/java/net/minecraft/server/Entity.java
+index 582425f..68ec209 100644
+--- a/main/java/net/minecraft/server/Entity.java
++++ b/main/java/net/minecraft/server/Entity.java
+@@ -1319,7 +1319,50 @@ public abstract class Entity implements ICommandListener, KeyedObject { // Paper
+         return this.inWater;
+     }
+ 
++    public boolean antarcticHasBukkitMetadata;
++    public short antarcticCellDensity;
++    public int antarcticCellDensityStamp = Integer.MIN_VALUE;
++
++    public boolean isPhysicsGuardExempt() {
++        if (this instanceof EntityHuman || this instanceof EntityWither || this instanceof EntityEnderDragon) {
++            return true;
++        }
++        if (this instanceof EntityArmorStand) {
++            EntityArmorStand stand = (EntityArmorStand) this;
++            if (stand.isMarker() || stand.isNoGravity() || stand.hasCustomName()) {
++                return true;
++            }
++        }
++        if (com.destroystokyo.paper.config.toml.modules.optimizations.EntityPhysicsGuard.exemptPluginMetadata && this.antarcticHasBukkitMetadata) {
++            return true;
++        }
++        if (this.isVehicle()) {
++            for (int i = 0, len = this.passengers.size(); i < len; ++i) {
++                if (this.passengers.get(i) instanceof EntityHuman) {
++                    return true;
++                }
++            }
++        }
++        return false;
++    }
++
++    public boolean isPhysicsGuardThrottled(int currentTick) {
++        if (!com.destroystokyo.paper.config.toml.modules.optimizations.EntityPhysicsGuard.enabled
++                || this.antarcticCellDensityStamp != currentTick
++                || this.isPhysicsGuardExempt()) {
++            return false;
++        }
++        return this.antarcticCellDensity >= com.destroystokyo.paper.config.toml.modules.optimizations.EntityPhysicsGuard.softCellThreshold;
++    }
++
+     protected void ar() {
++        if (com.destroystokyo.paper.config.toml.modules.optimizations.EntityPhysicsGuard.enabled
++                && com.destroystokyo.paper.config.toml.modules.optimizations.EntityPhysicsGuard.splashSuppressThreshold > 0
++                && this.antarcticCellDensityStamp == MinecraftServer.currentTick
++                && this.antarcticCellDensity >= com.destroystokyo.paper.config.toml.modules.optimizations.EntityPhysicsGuard.splashSuppressThreshold
++                && !this.isPhysicsGuardExempt()) {
++            return;
++        }
+         Entity entity = this.isVehicle() && this.bE() != null ? this.bE() : this;
+         float f = entity == this ? 0.2F : 0.9F;
+         float f1 = MathHelper.sqrt(entity.motX * entity.motX * 0.20000000298023224D + entity.motY * entity.motY + entity.motZ * entity.motZ * 0.20000000298023224D) * f;
+diff --git a/main/java/net/minecraft/server/World.java b/main/java/net/minecraft/server/World.java
+index c885cce..d23e4f2 100644
+--- a/main/java/net/minecraft/server/World.java
++++ b/main/java/net/minecraft/server/World.java
+@@ -2978,6 +2978,28 @@ public abstract class World implements IBlockAccess {
+         // TODO: Go back to Vanilla behaviour when comfortable
+         // Spigot start
+         // Chunk startingChunk = this.getChunkIfLoaded(MathHelper.floor(entity.locX) >> 4, MathHelper.floor(entity.locZ) >> 4);
++        if (flag && com.destroystokyo.paper.config.toml.modules.optimizations.EntityPhysicsGuard.enabled && entity.aa) {
++            Chunk physicsChunk = entity.getCurrentChunk();
++            if (physicsChunk != null) {
++                physicsChunk.scanDenseSliceIfNeeded(entity.ac, MinecraftServer.currentTick);
++            }
++            if (entity.isPhysicsGuardThrottled(MinecraftServer.currentTick)) {
++                int hardThresh = com.destroystokyo.paper.config.toml.modules.optimizations.EntityPhysicsGuard.hardCellCullThreshold;
++                if (hardThresh > 0
++                        && entity.antarcticCellDensity >= hardThresh
++                        && "freeze".equalsIgnoreCase(com.destroystokyo.paper.config.toml.modules.optimizations.EntityPhysicsGuard.hardAction)) {
++                    entity.ticksLived++;
++                    entity.inactiveTick();
++                    return;
++                }
++                int interval = com.destroystokyo.paper.config.toml.modules.optimizations.EntityPhysicsGuard.throttledPhysicsInterval;
++                if (interval > 1 && ((MinecraftServer.currentTick + entity.getId()) & 0x7FFFFFFF) % interval != 0) {
++                    entity.ticksLived++;
++                    entity.inactiveTick();
++                    return;
++                }
++            }
++        }
+         if (flag && !org.spigotmc.ActivationRange.checkIfActive(entity)) {
+             entity.ticksLived++;
+             entity.inactiveTick();
+diff --git a/main/java/org/bukkit/craftbukkit/entity/CraftEntity.java b/main/java/org/bukkit/craftbukkit/entity/CraftEntity.java
+index 47edc04..0e8a19d 100644
+--- a/main/java/org/bukkit/craftbukkit/entity/CraftEntity.java
++++ b/main/java/org/bukkit/craftbukkit/entity/CraftEntity.java
+@@ -522,6 +522,7 @@ public abstract class CraftEntity implements org.bukkit.entity.Entity {
+     }
+ 
+     public void setMetadata(String metadataKey, MetadataValue newMetadataValue) {
++        this.entity.antarcticHasBukkitMetadata = true;
+         server.getEntityMetadata().setMetadata(this, metadataKey, newMetadataValue);
+     }
+ 
+diff --git a/main/java/org/spigotmc/ActivationRange.java b/main/java/org/spigotmc/ActivationRange.java
+index bc8feba..2309edb 100644
+--- a/main/java/org/spigotmc/ActivationRange.java
++++ b/main/java/org/spigotmc/ActivationRange.java
+@@ -231,6 +231,9 @@ public class ActivationRange
+      */
+     public static boolean checkEntityImmunities(Entity entity)
+     {
++        if (entity.isPhysicsGuardThrottled(MinecraftServer.currentTick)) {
++            return false;
++        }
+         // Paper start - optimize Water cases
+         if ((entity.inWater && (!(entity instanceof EntityInsentient) || !(((EntityInsentient) entity).getNavigation() instanceof NavigationGuardian)))) {
+             return true;
+diff --git a/test/java/net/minecraft/server/EntityPhysicsGuardTest.java b/test/java/net/minecraft/server/EntityPhysicsGuardTest.java
+new file mode 100644
+index 0000000..f50e39a
+--- /dev/null
++++ b/test/java/net/minecraft/server/EntityPhysicsGuardTest.java
+@@ -0,0 +1,254 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.config.toml.modules.optimizations.EntityPhysicsGuard;
++import me.stella.antarctic.spatial.CellDensityScratch;
++import org.junit.After;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.List;
++
++import static org.junit.Assert.*;
++
++public class EntityPhysicsGuardTest {
++
++    private static Unsafe UNSAFE;
++    private static boolean defEnabled;
++    private static int defSliceThresh;
++    private static int defSoftCellThresh;
++    private static int defInterval;
++    private static int defSplashThresh;
++    private static int defHardThresh;
++    private static String defHardAction;
++    private static boolean defExemptMeta;
++
++    @BeforeClass
++    public static void setupTest() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        UNSAFE = (Unsafe) f.get(null);
++        defEnabled = EntityPhysicsGuard.enabled;
++        defSliceThresh = EntityPhysicsGuard.sliceCheckThreshold;
++        defSoftCellThresh = EntityPhysicsGuard.softCellThreshold;
++        defInterval = EntityPhysicsGuard.throttledPhysicsInterval;
++        defSplashThresh = EntityPhysicsGuard.splashSuppressThreshold;
++        defHardThresh = EntityPhysicsGuard.hardCellCullThreshold;
++        defHardAction = EntityPhysicsGuard.hardAction;
++        defExemptMeta = EntityPhysicsGuard.exemptPluginMetadata;
++    }
++
++    @After
++    public void restoreConfig() {
++        EntityPhysicsGuard.enabled = defEnabled;
++        EntityPhysicsGuard.sliceCheckThreshold = defSliceThresh;
++        EntityPhysicsGuard.softCellThreshold = defSoftCellThresh;
++        EntityPhysicsGuard.throttledPhysicsInterval = defInterval;
++        EntityPhysicsGuard.splashSuppressThreshold = defSplashThresh;
++        EntityPhysicsGuard.hardCellCullThreshold = defHardThresh;
++        EntityPhysicsGuard.hardAction = defHardAction;
++        EntityPhysicsGuard.exemptPluginMetadata = defExemptMeta;
++    }
++
++    private static final class TrackingWorld extends WorldServer {
++        int particleCalls = 0;
++
++        TrackingWorld() {
++            super(null, null, null, 0, null, null, null);
++        }
++
++        @Override
++        public boolean isMainThread() {
++            return true;
++        }
++
++        @Override
++        public void addParticle(EnumParticle enumparticle, double d0, double d1, double d2, double d3, double d4, double d5, int... aint) {
++            particleCalls++;
++        }
++    }
++
++    private static TrackingWorld createWorld() throws Exception {
++        TrackingWorld world = (TrackingWorld) UNSAFE.allocateInstance(TrackingWorld.class);
++        Field csField = World.class.getDeclaredField("isClientSide");
++        csField.setAccessible(true);
++        csField.setBoolean(world, true);
++        world.worldData = new WorldData();
++        world.worldProvider = new WorldProviderNormal();
++        Field mpField = World.class.getDeclaredField("methodProfiler");
++        mpField.setAccessible(true);
++        mpField.set(world, new MethodProfiler());
++        Field randomField = World.class.getDeclaredField("random");
++        randomField.setAccessible(true);
++        randomField.set(world, new java.util.Random(1L));
++        Field spigotField = World.class.getDeclaredField("spigotConfig");
++        spigotField.setAccessible(true);
++        spigotField.set(world, UNSAFE.allocateInstance(org.spigotmc.SpigotWorldConfig.class));
++        Field paperField = World.class.getDeclaredField("paperConfig");
++        paperField.setAccessible(true);
++        paperField.set(world, UNSAFE.allocateInstance(com.destroystokyo.paper.PaperWorldConfig.class));
++        return world;
++    }
++
++    private static Chunk createChunk(TrackingWorld world) throws Exception {
++        Chunk chunk = (Chunk) UNSAFE.allocateInstance(Chunk.class);
++        Field worldField = Chunk.class.getDeclaredField("world");
++        worldField.setAccessible(true);
++        worldField.set(chunk, world);
++        Field slicesField = Chunk.class.getDeclaredField("entitySlices");
++        slicesField.setAccessible(true);
++        @SuppressWarnings("unchecked")
++        List<Entity>[] slices = new List[16];
++        for (int i = 0; i < 16; i++) {
++            slices[i] = new ArrayList<>();
++        }
++        slicesField.set(chunk, slices);
++        Field ecField = Chunk.class.getDeclaredField("entityCounts");
++        ecField.setAccessible(true);
++        ecField.set(chunk, new co.aikar.util.Counter<String>());
++        Field icField = Chunk.class.getDeclaredField("itemCounts");
++        icField.setAccessible(true);
++        icField.set(chunk, new int[16]);
++        Field iecField = Chunk.class.getDeclaredField("inventoryEntityCounts");
++        iecField.setAccessible(true);
++        iecField.set(chunk, new int[16]);
++        Field ifcField = Chunk.class.getDeclaredField("itemFrameCounts");
++        ifcField.setAccessible(true);
++        ifcField.set(chunk, new int[16]);
++        Field hccField = Chunk.class.getDeclaredField("hardCollidableCounts");
++        hccField.setAccessible(true);
++        hccField.set(chunk, new int[16]);
++        Field sCountsField = Chunk.class.getDeclaredField("antarcticInsentientSliceCounts");
++        sCountsField.setAccessible(true);
++        sCountsField.set(chunk, new int[16]);
++        Field sCulledField = Chunk.class.getDeclaredField("antarcticSliceAiCulled");
++        sCulledField.setAccessible(true);
++        sCulledField.set(chunk, new boolean[16]);
++        Field accField = Chunk.class.getDeclaredField("antarcticCreatureCounts");
++        accField.setAccessible(true);
++        accField.set(chunk, new int[EnumCreatureType.values().length]);
++        Field eCountField = Chunk.class.getDeclaredField("entityCount");
++        eCountField.setAccessible(true);
++        eCountField.set(chunk, new gnu.trove.map.hash.TObjectIntHashMap<>());
++        Field pStampField = Chunk.class.getDeclaredField("antarcticPhysicsGuardStamp");
++        pStampField.setAccessible(true);
++        pStampField.set(chunk, new int[16]);
++        return chunk;
++    }
++
++    @Test
++    public void testCellDensityScratchAndReset() {
++        CellDensityScratch scratch = new CellDensityScratch();
++        int idxA = CellDensityScratch.packIndex(3, 4, 5);
++        int idxB = CellDensityScratch.packIndex(15, 15, 15);
++        scratch.record(idxA, true);
++        scratch.record(idxA, false);
++        scratch.record(idxB, true);
++        assertEquals(2, scratch.getTotalCount(idxA));
++        assertEquals(1, scratch.getFluidOrAirCount(idxA));
++        assertEquals(1, scratch.getTotalCount(idxB));
++        assertEquals(2, scratch.getTouchedCount());
++
++        scratch.decrementTotal(idxA);
++        assertEquals(1, scratch.getTotalCount(idxA));
++
++        scratch.reset();
++        assertEquals(0, scratch.getTotalCount(idxA));
++        assertEquals(0, scratch.getFluidOrAirCount(idxA));
++        assertEquals(0, scratch.getTotalCount(idxB));
++        assertEquals(0, scratch.getTouchedCount());
++    }
++
++    @Test
++    public void testHologramMetadataAndPlayerExemptions() throws Exception {
++        TrackingWorld world = createWorld();
++        Chunk chunk = createChunk(world);
++        EntityPhysicsGuard.enabled = true;
++        EntityPhysicsGuard.sliceCheckThreshold = 10;
++        EntityPhysicsGuard.softCellThreshold = 5;
++        EntityPhysicsGuard.hardCellCullThreshold = 5;
++        EntityPhysicsGuard.hardAction = "cull";
++        EntityPhysicsGuard.exemptPluginMetadata = true;
++
++        EntityArmorStand marker = new EntityArmorStand(world, 8.0D, 64.0D, 8.0D);
++        marker.setMarker(true);
++        EntityArmorStand noGravity = new EntityArmorStand(world, 8.0D, 64.0D, 8.0D);
++        noGravity.setNoGravity(true);
++        EntityArmorStand named = new EntityArmorStand(world, 8.0D, 64.0D, 8.0D);
++        named.setCustomName("Hologram");
++        EntityArmorStand metadataStand = new EntityArmorStand(world, 8.0D, 64.0D, 8.0D);
++        metadataStand.antarcticHasBukkitMetadata = true;
++        EntityBoat playerBoat = new EntityBoat(world, 8.0D, 64.0D, 8.0D);
++        EntityPlayer passenger = (EntityPlayer) UNSAFE.allocateInstance(EntityPlayer.class);
++        playerBoat.passengers.add(passenger);
++
++        chunk.a(marker);
++        chunk.a(noGravity);
++        chunk.a(named);
++        chunk.a(metadataStand);
++        chunk.a(playerBoat);
++
++        // Add 20 non-exempt normal armor stands to trigger hard cull at 5
++        for (int i = 0; i < 20; i++) {
++            EntityArmorStand normal = new EntityArmorStand(world, 8.0D, 64.0D, 8.0D);
++            chunk.a(normal);
++        }
++
++        int culled = chunk.scanDenseSliceIfNeeded(4, 100);
++        assertEquals(15, culled);
++        assertFalse(marker.dead);
++        assertFalse(noGravity.dead);
++        assertFalse(named.dead);
++        assertFalse(metadataStand.dead);
++        assertFalse(playerBoat.dead);
++        assertFalse(marker.isPhysicsGuardThrottled(100));
++        assertFalse(metadataStand.isPhysicsGuardThrottled(100));
++    }
++
++    @Test
++    public void test5000WaterColumnArmorStandsGuardAndPerf() throws Exception {
++        TrackingWorld world = createWorld();
++        Chunk chunk = createChunk(world);
++        EntityPhysicsGuard.enabled = true;
++        EntityPhysicsGuard.sliceCheckThreshold = 48;
++        EntityPhysicsGuard.softCellThreshold = 24;
++        EntityPhysicsGuard.throttledPhysicsInterval = 10;
++        EntityPhysicsGuard.splashSuppressThreshold = 12;
++        EntityPhysicsGuard.hardCellCullThreshold = 0;
++
++        // Sparse slice short-circuit (< 48)
++        for (int i = 0; i < 10; i++) {
++            chunk.a(new EntityArmorStand(world, 8.0D, 32.0D, 8.0D));
++        }
++        assertEquals(0, chunk.scanDenseSliceIfNeeded(2, 1));
++
++        // 5,000 bouncing water-column armor stands in 1 cell (slice 4)
++        EntityArmorStand[] stands = new EntityArmorStand[5_000];
++        for (int i = 0; i < stands.length; i++) {
++            stands[i] = new EntityArmorStand(world, 8.5D, 64.5D, 8.5D);
++            stands[i].inWater = true;
++            stands[i].onGround = false;
++            chunk.a(stands[i]);
++        }
++
++        long start = System.nanoTime();
++        chunk.scanDenseSliceIfNeeded(4, 200);
++        long scanMs = (System.nanoTime() - start) / 1_000_000L;
++        assertTrue("5k cell scan took too long: " + scanMs + " ms", scanMs < 30L);
++
++        // ActivationRange water/air immunity overridden
++        MinecraftServer.currentTick = 200;
++        assertFalse("Dense water-column entity must lose EAR water/air immunity",
++                org.spigotmc.ActivationRange.checkEntityImmunities(stands[0]));
++        assertTrue(stands[0].isPhysicsGuardThrottled(200));
++
++        // Splash particle spam suppressed in ar()
++        world.particleCalls = 0;
++        stands[0].ar();
++        assertEquals("Splash particle spam must be suppressed in dense cell", 0, world.particleCalls);
++    }
++}
