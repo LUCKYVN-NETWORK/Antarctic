@@ -1,0 +1,543 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Fri, 27 Nov 2026 12:05:13 +0700
+Subject: [PATCH 216/216] feat: add opt-in crowded farm chunk and region AI
+ culling with hysteresis
+
+
+diff --git a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+index d7de231..7f6bfc0 100644
+--- a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
++++ b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+@@ -18,6 +18,7 @@ import com.destroystokyo.paper.config.toml.modules.network.Deflate;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.ArmourStands;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.ChunkLoading;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Dab;
++import com.destroystokyo.paper.config.toml.modules.optimizations.FarmAiCulling;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.MobSpawning;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Pathfinder;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Projectiles;
+@@ -58,7 +59,7 @@ public final class AntarcticTomlConfig {
+             new Rebrand(), new Privacy(),
+             new Deflate(),
+             new VirtualThreads(), new AsyncPlayerDataSaving(),
+-            new Pathfinder(), new Suffocation(), new Projectiles(), new ArmourStands(), new WorldBorder(), new ChunkLoading(), new MobSpawning(), new Dab(), new SunBurn(), new Rails(), new Redstone(), new Physics(), new Lighting(),
++            new Pathfinder(), new Suffocation(), new Projectiles(), new ArmourStands(), new WorldBorder(), new ChunkLoading(), new MobSpawning(), new Dab(), new FarmAiCulling(), new SunBurn(), new Rails(), new Redstone(), new Physics(), new Lighting(),
+             new MergeChecks(), new ChunkOverloadDupe(), new Collisions(), new Player(),
+             new MapDecorations(), new Books(), new VanillaBugFix());
+     private static final YamlConfiguration yamlFacade = new YamlConfiguration();
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/FarmAiCulling.java b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/FarmAiCulling.java
+new file mode 100644
+index 0000000..091efb4
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/FarmAiCulling.java
+@@ -0,0 +1,56 @@
++package com.destroystokyo.paper.config.toml.modules.optimizations;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++import com.electronwill.nightconfig.core.file.CommentedFileConfig;
++
++public class FarmAiCulling implements IConfigModule {
++
++    @ConfigInfo(baseName = "enabled", comments = "Opt-in AI culling for crowded farm slices/chunks/regions with hysteresis auto-resume. Never sets NoAI. Default false.")
++    public static boolean enabled = false;
++
++    @ConfigInfo(baseName = "slice-threshold", comments = "Insentient mob count in a 16x16x16 chunk slice to engage culling (0 disables). Default 32.")
++    public static int sliceThreshold = 32;
++
++    @ConfigInfo(baseName = "chunk-threshold", comments = "Insentient mob count in a full chunk to engage culling (0 disables). Default 64.")
++    public static int chunkThreshold = 64;
++
++    @ConfigInfo(baseName = "region-threshold", comments = "Insentient mob count across a loaded 3x3 chunk region to engage culling (0 disables). Default 0.")
++    public static int regionThreshold = 0;
++
++    @ConfigInfo(baseName = "resume-ratio", comments = "Hysteresis ratio below threshold at which full AI resumes automatically. Default 0.75.")
++    public static double resumeRatio = 0.75D;
++
++    @ConfigInfo(baseName = "culled-ai-tick-interval", comments = "AI tick interval while crowded (0 suspends goal AI until count drops; > 0 runs 1 AI tick per N ticks). Default 0.")
++    public static int culledAiTickInterval = 0;
++
++    @ConfigInfo(baseName = "allow-float-in-water", comments = "Allow culled mobs to run goalFloat when in water so grinders and water streams work normally. Default true.")
++    public static boolean allowFloatInWater = true;
++
++    @ConfigInfo(baseName = "exempt-villagers", comments = "Never cull villager AI so trading halls keep working normally. Default true.")
++    public static boolean exemptVillagers = true;
++
++    @ConfigInfo(baseName = "wake-on-hurt-ticks", comments = "Temporarily wake culled mobs for this many ticks when damaged. Default 40.")
++    public static int wakeOnHurtTicks = 40;
++
++    @Override
++    public void onLoaded(CommentedFileConfig config) {
++        sliceThreshold = Math.max(0, sliceThreshold);
++        chunkThreshold = Math.max(0, chunkThreshold);
++        regionThreshold = Math.max(0, regionThreshold);
++        resumeRatio = Math.max(0.0D, Math.min(1.0D, resumeRatio));
++        culledAiTickInterval = Math.max(0, culledAiTickInterval);
++        wakeOnHurtTicks = Math.max(0, wakeOnHurtTicks);
++    }
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.OPTIMIZATIONS;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "farm-ai-culling";
++    }
++}
+diff --git a/main/java/net/minecraft/server/Chunk.java b/main/java/net/minecraft/server/Chunk.java
+index 7bdffcc..4e3d9b2 100644
+--- a/main/java/net/minecraft/server/Chunk.java
++++ b/main/java/net/minecraft/server/Chunk.java
+@@ -919,6 +919,12 @@ public class Chunk {
+         } else if (entity instanceof EntityItemFrame) {
+             itemFrameCounts[k]++;
+         }
++        if (entity instanceof EntityInsentient) {
++            if (this.antarcticInsentientSliceCounts != null) {
++                antarcticInsentientSliceCounts[k]++;
++            }
++            antarcticInsentientCount++;
++        }
+         if (isHardCollidableEntity(entity)) {
+             hardCollidableCounts[k]++;
+         }
+@@ -961,6 +967,12 @@ public class Chunk {
+         } else if (entity instanceof EntityItemFrame) {
+             itemFrameCounts[i]--;
+         }
++        if (entity instanceof EntityInsentient) {
++            if (this.antarcticInsentientSliceCounts != null) {
++                antarcticInsentientSliceCounts[i]--;
++            }
++            antarcticInsentientCount--;
++        }
+         if (isHardCollidableEntity(entity)) {
+             hardCollidableCounts[i]--;
+         }
+@@ -970,6 +982,73 @@ public class Chunk {
+         // Antarctic end
+     }
+ 
++    final int[] antarcticInsentientSliceCounts = new int[16];
++    int antarcticInsentientCount;
++    private final boolean[] antarcticSliceAiCulled = new boolean[16];
++    private boolean antarcticChunkAiCulled;
++    private boolean antarcticRegionAiCulled;
++    private int antarcticRegionCountStamp = Integer.MIN_VALUE;
++    private int antarcticCachedRegionInsentientCount;
++
++    boolean isFarmAiCulledForSlice(int sliceY, int currentTick) {
++        if (sliceY < 0 || sliceY >= 16 || this.antarcticInsentientSliceCounts == null || this.antarcticSliceAiCulled == null) {
++            return false;
++        }
++        final double ratio = com.destroystokyo.paper.config.toml.modules.optimizations.FarmAiCulling.resumeRatio;
++        final int sliceThreshold = com.destroystokyo.paper.config.toml.modules.optimizations.FarmAiCulling.sliceThreshold;
++        if (sliceThreshold > 0) {
++            int count = this.antarcticInsentientSliceCounts[sliceY];
++            if (this.antarcticSliceAiCulled[sliceY]) {
++                if (count <= (int) (sliceThreshold * ratio)) {
++                    this.antarcticSliceAiCulled[sliceY] = false;
++                }
++            } else if (count >= sliceThreshold) {
++                this.antarcticSliceAiCulled[sliceY] = true;
++            }
++            if (this.antarcticSliceAiCulled[sliceY]) {
++                return true;
++            }
++        }
++        final int chunkThreshold = com.destroystokyo.paper.config.toml.modules.optimizations.FarmAiCulling.chunkThreshold;
++        if (chunkThreshold > 0) {
++            if (this.antarcticChunkAiCulled) {
++                if (this.antarcticInsentientCount <= (int) (chunkThreshold * ratio)) {
++                    this.antarcticChunkAiCulled = false;
++                }
++            } else if (this.antarcticInsentientCount >= chunkThreshold) {
++                this.antarcticChunkAiCulled = true;
++            }
++            if (this.antarcticChunkAiCulled) {
++                return true;
++            }
++        }
++        final int regionThreshold = com.destroystokyo.paper.config.toml.modules.optimizations.FarmAiCulling.regionThreshold;
++        if (regionThreshold > 0) {
++            if (this.antarcticRegionCountStamp != currentTick) {
++                int sum = 0;
++                for (int dx = -1; dx <= 1; ++dx) {
++                    for (int dz = -1; dz <= 1; ++dz) {
++                        Chunk neighbor = (dx == 0 && dz == 0) ? this : this.world.getChunkIfLoaded(this.locX + dx, this.locZ + dz);
++                        if (neighbor != null) {
++                            sum += neighbor.antarcticInsentientCount;
++                        }
++                    }
++                }
++                this.antarcticCachedRegionInsentientCount = sum;
++                this.antarcticRegionCountStamp = currentTick;
++            }
++            if (this.antarcticRegionAiCulled) {
++                if (this.antarcticCachedRegionInsentientCount <= (int) (regionThreshold * ratio)) {
++                    this.antarcticRegionAiCulled = false;
++                }
++            } else if (this.antarcticCachedRegionInsentientCount >= regionThreshold) {
++                this.antarcticRegionAiCulled = true;
++            }
++            return this.antarcticRegionAiCulled;
++        }
++        return false;
++    }
++
+     public boolean c(BlockPosition blockposition) {
+         int i = blockposition.getX() & 15;
+         int j = blockposition.getY();
+diff --git a/main/java/net/minecraft/server/EntityInsentient.java b/main/java/net/minecraft/server/EntityInsentient.java
+index 4829696..a2bba19 100644
+--- a/main/java/net/minecraft/server/EntityInsentient.java
++++ b/main/java/net/minecraft/server/EntityInsentient.java
+@@ -675,6 +675,47 @@ public abstract class EntityInsentient extends EntityLiving {
+ 
+     public int antarcticDabDistSq = Integer.MAX_VALUE;
+     public int antarcticDabTickStamp = Integer.MIN_VALUE;
++    int antarcticFarmWakeUntilTick = Integer.MIN_VALUE;
++
++    boolean isFarmAiCullingExempt(int currentTick) {
++        if (this instanceof EntityWither
++                || this instanceof EntityEnderDragon
++                || this instanceof EntityGuardianElder
++                || this.hasCustomName()
++                || this.isLeashed()
++                || this.isVehicle()
++                || this.isPassenger()) {
++            return true;
++        }
++        if (this instanceof EntityTameableAnimal && ((EntityTameableAnimal) this).isTamed()) {
++            return true;
++        }
++        if (com.destroystokyo.paper.config.toml.modules.optimizations.FarmAiCulling.exemptVillagers && this instanceof EntityVillager) {
++            return true;
++        }
++        if (this.hurtTicks > 0 || this.lastDamageByPlayerTime > 0) {
++            int wake = com.destroystokyo.paper.config.toml.modules.optimizations.FarmAiCulling.wakeOnHurtTicks;
++            if (wake > 0) {
++                this.antarcticFarmWakeUntilTick = currentTick + wake;
++            }
++            return true;
++        }
++        return this.antarcticFarmWakeUntilTick >= currentTick;
++    }
++
++    boolean shouldSkipAiForFarmCulling(int currentTick) {
++        if (!com.destroystokyo.paper.config.toml.modules.optimizations.FarmAiCulling.enabled
++                || !this.aa
++                || this.isFarmAiCullingExempt(currentTick)) {
++            return false;
++        }
++        Chunk chunk = this.getCurrentChunk();
++        if (chunk == null || !chunk.isFarmAiCulledForSlice(this.ac, currentTick)) {
++            return false;
++        }
++        int interval = com.destroystokyo.paper.config.toml.modules.optimizations.FarmAiCulling.culledAiTickInterval;
++        return interval <= 0 || ((currentTick + this.getId()) & 0x7FFFFFFF) % interval != 0;
++    }
+ 
+     boolean isDabExempt() {
+         if (this instanceof EntityWither
+@@ -736,6 +777,13 @@ public abstract class EntityInsentient extends EntityLiving {
+             }
+             return;
+         }
++        if (com.destroystokyo.paper.config.toml.modules.optimizations.FarmAiCulling.enabled && this.shouldSkipAiForFarmCulling(MinecraftServer.currentTick)) {
++            if (com.destroystokyo.paper.config.toml.modules.optimizations.FarmAiCulling.allowFloatInWater && this.inWater && this.goalFloat != null) {
++                if (this.goalFloat.validConditions()) this.goalFloat.update();
++                this.getControllerJump().jumpIfSet();
++            }
++            return;
++        }
+         this.world.methodProfiler.a("sensing");
+         this.bw.a();
+         this.world.methodProfiler.b();
+diff --git a/test/java/net/minecraft/server/FarmAiCullingTest.java b/test/java/net/minecraft/server/FarmAiCullingTest.java
+new file mode 100644
+index 0000000..c73ebdc
+--- /dev/null
++++ b/test/java/net/minecraft/server/FarmAiCullingTest.java
+@@ -0,0 +1,277 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.config.toml.modules.optimizations.FarmAiCulling;
++import org.junit.After;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++import java.lang.reflect.Field;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++
++import static org.junit.Assert.*;
++
++public class FarmAiCullingTest {
++
++    private static Unsafe UNSAFE;
++    private static boolean defEnabled;
++    private static int defSliceThresh;
++    private static int defChunkThresh;
++    private static int defRegionThresh;
++    private static double defResumeRatio;
++    private static int defInterval;
++    private static boolean defFloatWater;
++    private static boolean defExemptVillagers;
++    private static int defWakeHurt;
++
++    @BeforeClass
++    public static void setupTest() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        UNSAFE = (Unsafe) f.get(null);
++        defEnabled = FarmAiCulling.enabled;
++        defSliceThresh = FarmAiCulling.sliceThreshold;
++        defChunkThresh = FarmAiCulling.chunkThreshold;
++        defRegionThresh = FarmAiCulling.regionThreshold;
++        defResumeRatio = FarmAiCulling.resumeRatio;
++        defInterval = FarmAiCulling.culledAiTickInterval;
++        defFloatWater = FarmAiCulling.allowFloatInWater;
++        defExemptVillagers = FarmAiCulling.exemptVillagers;
++        defWakeHurt = FarmAiCulling.wakeOnHurtTicks;
++    }
++
++    @After
++    public void restoreConfig() {
++        FarmAiCulling.enabled = defEnabled;
++        FarmAiCulling.sliceThreshold = defSliceThresh;
++        FarmAiCulling.chunkThreshold = defChunkThresh;
++        FarmAiCulling.regionThreshold = defRegionThresh;
++        FarmAiCulling.resumeRatio = defResumeRatio;
++        FarmAiCulling.culledAiTickInterval = defInterval;
++        FarmAiCulling.allowFloatInWater = defFloatWater;
++        FarmAiCulling.exemptVillagers = defExemptVillagers;
++        FarmAiCulling.wakeOnHurtTicks = defWakeHurt;
++    }
++
++    private static final class DummyWorld extends WorldServer {
++        final Map<Long, Chunk> loadedChunks = new HashMap<>();
++
++        DummyWorld() {
++            super(null, null, null, 0, null, null, null);
++        }
++
++        @Override
++        public boolean isMainThread() {
++            return true;
++        }
++
++        @Override
++        public Chunk getChunkIfLoaded(int x, int z) {
++            return loadedChunks.get(ChunkCoordIntPair.a(x, z));
++        }
++    }
++
++    private static DummyWorld createWorld() throws Exception {
++        DummyWorld world = (DummyWorld) UNSAFE.allocateInstance(DummyWorld.class);
++        Field csField = World.class.getDeclaredField("isClientSide");
++        csField.setAccessible(true);
++        csField.setBoolean(world, true);
++        world.worldData = new WorldData();
++        world.worldProvider = new WorldProviderNormal();
++        Field mpField = World.class.getDeclaredField("methodProfiler");
++        mpField.setAccessible(true);
++        mpField.set(world, new MethodProfiler());
++        Field randomField = World.class.getDeclaredField("random");
++        randomField.setAccessible(true);
++        randomField.set(world, new java.util.Random(1L));
++        Field spigotField = World.class.getDeclaredField("spigotConfig");
++        spigotField.setAccessible(true);
++        spigotField.set(world, UNSAFE.allocateInstance(org.spigotmc.SpigotWorldConfig.class));
++        Field paperField = World.class.getDeclaredField("paperConfig");
++        paperField.setAccessible(true);
++        paperField.set(world, UNSAFE.allocateInstance(com.destroystokyo.paper.PaperWorldConfig.class));
++        Field lcField = DummyWorld.class.getDeclaredField("loadedChunks");
++        lcField.setAccessible(true);
++        lcField.set(world, new HashMap<>());
++        return world;
++    }
++
++    private static Chunk createChunk(DummyWorld world, int cx, int cz) throws Exception {
++        Chunk chunk = (Chunk) UNSAFE.allocateInstance(Chunk.class);
++        Field worldField = Chunk.class.getDeclaredField("world");
++        worldField.setAccessible(true);
++        worldField.set(chunk, world);
++        Field xField = Chunk.class.getDeclaredField("locX");
++        xField.setAccessible(true);
++        xField.setInt(chunk, cx);
++        Field zField = Chunk.class.getDeclaredField("locZ");
++        zField.setAccessible(true);
++        zField.setInt(chunk, cz);
++        Field slicesField = Chunk.class.getDeclaredField("entitySlices");
++        slicesField.setAccessible(true);
++        @SuppressWarnings("unchecked")
++        List<Entity>[] slices = new List[16];
++        for (int i = 0; i < 16; i++) {
++            slices[i] = new java.util.ArrayList<>();
++        }
++        slicesField.set(chunk, slices);
++        Field ecField = Chunk.class.getDeclaredField("entityCounts");
++        ecField.setAccessible(true);
++        ecField.set(chunk, new co.aikar.util.Counter<String>());
++        Field icField = Chunk.class.getDeclaredField("itemCounts");
++        icField.setAccessible(true);
++        icField.set(chunk, new int[16]);
++        Field iecField = Chunk.class.getDeclaredField("inventoryEntityCounts");
++        iecField.setAccessible(true);
++        iecField.set(chunk, new int[16]);
++        Field ifcField = Chunk.class.getDeclaredField("itemFrameCounts");
++        ifcField.setAccessible(true);
++        ifcField.set(chunk, new int[16]);
++        Field hccField = Chunk.class.getDeclaredField("hardCollidableCounts");
++        hccField.setAccessible(true);
++        hccField.set(chunk, new int[16]);
++        Field accField = Chunk.class.getDeclaredField("antarcticCreatureCounts");
++        accField.setAccessible(true);
++        accField.set(chunk, new int[EnumCreatureType.values().length]);
++        Field eCountField = Chunk.class.getDeclaredField("entityCount");
++        eCountField.setAccessible(true);
++        eCountField.set(chunk, new gnu.trove.map.hash.TObjectIntHashMap<>());
++        Field sCountsField = Chunk.class.getDeclaredField("antarcticInsentientSliceCounts");
++        sCountsField.setAccessible(true);
++        sCountsField.set(chunk, new int[16]);
++        Field sCulledField = Chunk.class.getDeclaredField("antarcticSliceAiCulled");
++        sCulledField.setAccessible(true);
++        sCulledField.set(chunk, new boolean[16]);
++        Field rStampField = Chunk.class.getDeclaredField("antarcticRegionCountStamp");
++        rStampField.setAccessible(true);
++        rStampField.setInt(chunk, Integer.MIN_VALUE);
++        world.loadedChunks.put(ChunkCoordIntPair.a(cx, cz), chunk);
++        return chunk;
++    }
++
++    @Test
++    public void testSliceCountsAndHysteresisAutoResume() throws Exception {
++        DummyWorld world = createWorld();
++        Chunk chunk = createChunk(world, 0, 0);
++        FarmAiCulling.enabled = true;
++        FarmAiCulling.sliceThreshold = 32;
++        FarmAiCulling.chunkThreshold = 0;
++        FarmAiCulling.regionThreshold = 0;
++        FarmAiCulling.resumeRatio = 0.75D;
++
++        EntityZombie[] mobs = new EntityZombie[32];
++        for (int i = 0; i < 32; i++) {
++            mobs[i] = new EntityZombie(world);
++            mobs[i].locX = 8.0D;
++            mobs[i].locY = 68.0D; // slice 4
++            mobs[i].locZ = 8.0D;
++            chunk.a(mobs[i]);
++        }
++        assertEquals(32, chunk.antarcticInsentientSliceCounts[4]);
++        assertEquals(32, chunk.antarcticInsentientCount);
++        assertTrue("Culling must engage at sliceThreshold=32", chunk.isFarmAiCulledForSlice(4, 1));
++
++        // Remove 4 mobs -> 28 remaining (> 24 hysteresis floor) -> stays culled
++        for (int i = 0; i < 4; i++) {
++            chunk.b(mobs[i]);
++        }
++        assertEquals(28, chunk.antarcticInsentientSliceCounts[4]);
++        assertEquals(28, chunk.antarcticInsentientCount);
++        assertTrue("Hysteresis must keep culling active at 28 (> 24)", chunk.isFarmAiCulledForSlice(4, 2));
++
++        // Remove 4 more -> 24 remaining (<= 24 floor) -> auto-resumes
++        for (int i = 4; i < 8; i++) {
++            chunk.b(mobs[i]);
++        }
++        assertEquals(24, chunk.antarcticInsentientSliceCounts[4]);
++        assertFalse("Culling must auto-resume at <= 24", chunk.isFarmAiCulledForSlice(4, 3));
++    }
++
++    @Test
++    public void testRegionThresholdAndExemptionsAndNoAiPreserved() throws Exception {
++        DummyWorld world = createWorld();
++        Chunk center = createChunk(world, 0, 0);
++        Chunk neighbor = createChunk(world, 1, 0);
++
++        FarmAiCulling.enabled = true;
++        FarmAiCulling.sliceThreshold = 0;
++        FarmAiCulling.chunkThreshold = 0;
++        FarmAiCulling.regionThreshold = 20;
++        FarmAiCulling.resumeRatio = 0.5D;
++        FarmAiCulling.culledAiTickInterval = 0;
++        FarmAiCulling.exemptVillagers = true;
++        FarmAiCulling.wakeOnHurtTicks = 40;
++
++        for (int i = 0; i < 10; i++) {
++            EntityZombie z1 = new EntityZombie(world);
++            z1.locX = 8.0D; z1.locY = 64.0D; z1.locZ = 8.0D;
++            center.a(z1);
++            EntityZombie z2 = new EntityZombie(world);
++            z2.locX = 24.0D; z2.locY = 64.0D; z2.locZ = 8.0D;
++            neighbor.a(z2);
++        }
++        assertTrue("3x3 region sum=20 must engage culling", center.isFarmAiCulledForSlice(4, 10));
++
++        // Non-exempt mob in center chunk is culled without setting NoAI
++        EntityZombie farmMob = new EntityZombie(world);
++        farmMob.locX = 8.0D; farmMob.locY = 64.0D; farmMob.locZ = 8.0D;
++        center.a(farmMob);
++        assertTrue(farmMob.shouldSkipAiForFarmCulling(10));
++        assertFalse("Farm AI culling must never mutate NoAI", farmMob.isNoAI());
++
++        // Hurt wake-up
++        farmMob.hurtTicks = 5;
++        assertTrue(farmMob.shouldSkipAiForFarmCulling(10) == false);
++        farmMob.hurtTicks = 0;
++        assertFalse("Wake window must keep mob awake for wakeOnHurtTicks", farmMob.shouldSkipAiForFarmCulling(20));
++        assertTrue("Mob re-enters culling after wake window expires", farmMob.shouldSkipAiForFarmCulling(60));
++
++        // Named, villager, boss, tamed exempt
++        EntityZombie named = new EntityZombie(world);
++        named.setCustomName("BossGuard");
++        center.a(named);
++        assertFalse(named.shouldSkipAiForFarmCulling(60));
++
++        EntityVillager villager = new EntityVillager(world);
++        center.a(villager);
++        assertFalse(villager.shouldSkipAiForFarmCulling(60));
++    }
++
++    @Test
++    public void test400MobFarmReductionAndPerf() throws Exception {
++        DummyWorld world = createWorld();
++        Chunk chunk = createChunk(world, 0, 0);
++        FarmAiCulling.enabled = true;
++        FarmAiCulling.sliceThreshold = 32;
++        FarmAiCulling.chunkThreshold = 64;
++        FarmAiCulling.culledAiTickInterval = 10;
++
++        EntityZombie[] mobs = new EntityZombie[400];
++        for (int i = 0; i < mobs.length; i++) {
++            mobs[i] = new EntityZombie(world);
++            mobs[i].locX = 8.0D;
++            mobs[i].locY = 64.0D;
++            mobs[i].locZ = 8.0D;
++            chunk.a(mobs[i]);
++        }
++
++        long start = System.nanoTime();
++        int total = 0;
++        int executed = 0;
++        for (int t = 1; t <= 100; t++) {
++            for (EntityZombie mob : mobs) {
++                total++;
++                if (!mob.shouldSkipAiForFarmCulling(t)) {
++                    executed++;
++                }
++            }
++        }
++        long elapsedMs = (System.nanoTime() - start) / 1_000_000L;
++        double reduction = 1.0D - ((double) executed / total);
++        assertTrue("Expected >70% AI reduction, got " + reduction, reduction > 0.70D);
++        assertTrue("400-mob x 100-tick farm culling took too long: " + elapsedMs + " ms", elapsedMs < 100L);
++    }
++}
