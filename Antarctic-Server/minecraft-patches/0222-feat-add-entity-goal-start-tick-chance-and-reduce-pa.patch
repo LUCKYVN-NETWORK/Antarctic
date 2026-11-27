@@ -1,0 +1,769 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Fri, 27 Nov 2026 13:06:55 +0700
+Subject: [PATCH 222/222] feat: add entity-goal start-tick-chance and
+ reduce-packets configs
+
+
+diff --git a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+index 12a61b5..ac617d6 100644
+--- a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
++++ b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+@@ -20,6 +20,7 @@ import com.destroystokyo.paper.config.toml.modules.optimizations.ArmourStands;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.ChunkLoading;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Dab;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.DontSaveEntity;
++import com.destroystokyo.paper.config.toml.modules.optimizations.EntityGoal;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.EntityPhysicsGuard;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.FarmAiCulling;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.MobSpawning;
+@@ -30,6 +31,7 @@ import com.destroystokyo.paper.config.toml.modules.optimizations.Physics;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Rails;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Redstone;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.RedstoneGuard;
++import com.destroystokyo.paper.config.toml.modules.optimizations.ReducePackets;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Lighting;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.SunBurn;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.WorldBorder;
+@@ -63,7 +65,7 @@ public final class AntarcticTomlConfig {
+             new Rebrand(), new Privacy(),
+             new Deflate(),
+             new VirtualThreads(), new AsyncPlayerDataSaving(),
+-            new Pathfinder(), new Suffocation(), new Projectiles(), new ArmourStands(), new WorldBorder(), new ChunkLoading(), new MobSpawning(), new Dab(), new FarmAiCulling(), new EntityPhysicsGuard(), new DontSaveEntity(), new SunBurn(), new Rails(), new Redstone(), new RedstoneGuard(), new Physics(), new Lighting(),
++            new Pathfinder(), new Suffocation(), new Projectiles(), new ArmourStands(), new WorldBorder(), new ChunkLoading(), new MobSpawning(), new Dab(), new FarmAiCulling(), new EntityPhysicsGuard(), new DontSaveEntity(), new EntityGoal(), new ReducePackets(), new SunBurn(), new Rails(), new Redstone(), new RedstoneGuard(), new Physics(), new Lighting(),
+             new MergeChecks(), new ChunkOverloadDupe(), new Collisions(), new Player(), new SpawnerSettings(),
+             new MapDecorations(), new Books(), new VanillaBugFix());
+     private static final YamlConfiguration yamlFacade = new YamlConfiguration();
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/EntityGoal.java b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/EntityGoal.java
+new file mode 100644
+index 0000000..ff8f139
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/EntityGoal.java
+@@ -0,0 +1,76 @@
++package com.destroystokyo.paper.config.toml.modules.optimizations;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++import com.electronwill.nightconfig.core.file.CommentedFileConfig;
++import java.util.Random;
++
++public class EntityGoal implements IConfigModule {
++
++    @ConfigInfo(
++        baseName = "start-tick-chance.nearest-attackable-target",
++        comments = "Probability (0.0-1.0) per tick to run PathfinderGoalNearestAttackableTarget.a() start check. Default -1.0 preserves vanilla roll."
++    )
++    public static double nearestAttackableTargetStartTickChance = -1.0D;
++
++    @ConfigInfo(
++        baseName = "start-tick-chance.avoid-target",
++        comments = "Probability (0.0-1.0) per tick to run PathfinderGoalAvoidTarget.a() start check. Default -1.0 preserves vanilla."
++    )
++    public static double avoidTargetStartTickChance = -1.0D;
++
++    @ConfigInfo(
++        baseName = "start-tick-chance.tempt",
++        comments = "Probability (0.0-1.0) per tick to run PathfinderGoalTempt.a() start check when not already tempting. Default -1.0 preserves vanilla."
++    )
++    public static double temptStartTickChance = -1.0D;
++
++    @ConfigInfo(
++        baseName = "start-tick-chance.follow-parent",
++        comments = "Probability (0.0-1.0) per tick to run PathfinderGoalFollowParent.a() start check. Default -1.0 preserves vanilla."
++    )
++    public static double followParentStartTickChance = -1.0D;
++
++    @ConfigInfo(
++        baseName = "start-tick-chance.enderman-look-for-player",
++        comments = "Probability (0.0-1.0) per tick to run EntityEnderman look-for-player goal start check. Default -1.0 preserves vanilla."
++    )
++    public static double endermanLookForPlayerStartTickChance = -1.0D;
++
++    public static boolean shouldSkipStartTick(double chance, Random random) {
++        if (chance < 0.0D || chance >= 1.0D) {
++            return false;
++        }
++        if (chance == 0.0D) {
++            return true;
++        }
++        return random.nextDouble() >= chance;
++    }
++
++    private static double normalizeChance(double value) {
++        if (value < 0.0D) {
++            return -1.0D;
++        }
++        return Math.min(1.0D, value);
++    }
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.OPTIMIZATIONS;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "entity-goal";
++    }
++
++    @Override
++    public void onLoaded(CommentedFileConfig config) {
++        nearestAttackableTargetStartTickChance = normalizeChance(nearestAttackableTargetStartTickChance);
++        avoidTargetStartTickChance = normalizeChance(avoidTargetStartTickChance);
++        temptStartTickChance = normalizeChance(temptStartTickChance);
++        followParentStartTickChance = normalizeChance(followParentStartTickChance);
++        endermanLookForPlayerStartTickChance = normalizeChance(endermanLookForPlayerStartTickChance);
++    }
++}
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/ReducePackets.java b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/ReducePackets.java
+new file mode 100644
+index 0000000..1379f46
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/ReducePackets.java
+@@ -0,0 +1,30 @@
++package com.destroystokyo.paper.config.toml.modules.optimizations;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++
++public class ReducePackets implements IConfigModule {
++
++    @ConfigInfo(
++        baseName = "reduce-useless-move-packets",
++        comments = "Suppress zero-delta periodic (a % 60 == 0) entity move packets when position did not change. Default false."
++    )
++    public static boolean reduceUselessMovePackets = false;
++
++    @ConfigInfo(
++        baseName = "reduce-useless-velocity-packets",
++        comments = "Suppress tiny (< 1e-4 squared) zero-motion entity velocity packets. Default false."
++    )
++    public static boolean reduceUselessVelocityPackets = false;
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.OPTIMIZATIONS;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "reduce-packets";
++    }
++}
+diff --git a/main/java/net/minecraft/server/EntityEnderman.java b/main/java/net/minecraft/server/EntityEnderman.java
+index f3a6648..9deda4d 100644
+--- a/main/java/net/minecraft/server/EntityEnderman.java
++++ b/main/java/net/minecraft/server/EntityEnderman.java
+@@ -401,6 +401,7 @@ public class EntityEnderman extends EntityMonster {
+     static class PathfinderGoalPlayerWhoLookedAtTarget extends PathfinderGoalNearestAttackableTarget<EntityHuman> {
+ 
+         private final EntityEnderman i; public EntityEnderman getEnderman() { return i; } // Paper - OBFHELPER
++        private final Predicate<EntityHuman> lookPredicate;
+         private EntityHuman j;
+         private int k;
+         private int l;
+@@ -408,20 +409,25 @@ public class EntityEnderman extends EntityMonster {
+         public PathfinderGoalPlayerWhoLookedAtTarget(EntityEnderman entityenderman) {
+             super(entityenderman, EntityHuman.class, false);
+             this.i = entityenderman;
+-        }
+-
+-        public boolean a() {
+-            double d0 = this.i();
+-
+-            this.j = this.i.world.a(this.i.locX, this.i.locY, this.i.locZ, d0, d0, (Function) null, new Predicate() {
++            this.lookPredicate = new Predicate<EntityHuman>() {
+                 public boolean a(@Nullable EntityHuman entityhuman) {
+                     return entityhuman != null && PathfinderGoalPlayerWhoLookedAtTarget.this.i.f(entityhuman);
+                 }
+ 
+-                public boolean apply(@Nullable Object object) {
+-                    return this.a((EntityHuman) object);
++                public boolean apply(@Nullable EntityHuman object) {
++                    return this.a(object);
+                 }
+-            });
++            };
++        }
++
++        public boolean a() {
++            if (com.destroystokyo.paper.config.toml.modules.optimizations.EntityGoal.shouldSkipStartTick(
++                    com.destroystokyo.paper.config.toml.modules.optimizations.EntityGoal.endermanLookForPlayerStartTickChance, this.i.getRandom())) {
++                return false;
++            }
++            double d0 = this.i();
++
++            this.j = this.i.world.a(this.i.locX, this.i.locY, this.i.locZ, d0, d0, (Function) null, this.lookPredicate);
+             return this.j != null;
+         }
+ 
+diff --git a/main/java/net/minecraft/server/EntityTrackerEntry.java b/main/java/net/minecraft/server/EntityTrackerEntry.java
+index 809bfa7..7964e00 100644
+--- a/main/java/net/minecraft/server/EntityTrackerEntry.java
++++ b/main/java/net/minecraft/server/EntityTrackerEntry.java
+@@ -170,7 +170,8 @@ public class EntityTrackerEntry {
+                 long i2 = l - this.yLoc;
+                 long j2 = i1 - this.zLoc;
+                 Object object = null;
+-                boolean flag1 = l1 * l1 + i2 * i2 + j2 * j2 >= 128L || this.a % 60 == 0;
++                boolean flag1 = l1 * l1 + i2 * i2 + j2 * j2 >= 128L
++                        || (!com.destroystokyo.paper.config.toml.modules.optimizations.ReducePackets.reduceUselessMovePackets && this.a % 60 == 0);
+                 boolean flag2 = Math.abs(j1 - this.yRot) >= 1 || Math.abs(k1 - this.xRot) >= 1;
+ 
+                 if (this.a > 0 || this.tracker instanceof EntityArrow) { // Paper - Moved up
+@@ -223,7 +224,8 @@ public class EntityTrackerEntry {
+                     double d3 = 0.02D;
+                     double d4 = d0 * d0 + d1 * d1 + d2 * d2;
+ 
+-                    if (d4 > 4.0E-4D || d4 > 0.0D && this.tracker.motX == 0.0D && this.tracker.motY == 0.0D && this.tracker.motZ == 0.0D) {
++                    double stopFloor = com.destroystokyo.paper.config.toml.modules.optimizations.ReducePackets.reduceUselessVelocityPackets ? 1.0E-4D : 0.0D;
++                    if (d4 > 4.0E-4D || d4 > stopFloor && this.tracker.motX == 0.0D && this.tracker.motY == 0.0D && this.tracker.motZ == 0.0D) {
+                         this.n = this.tracker.motX;
+                         this.o = this.tracker.motY;
+                         this.p = this.tracker.motZ;
+diff --git a/main/java/net/minecraft/server/PathfinderGoalAvoidTarget.java b/main/java/net/minecraft/server/PathfinderGoalAvoidTarget.java
+new file mode 100644
+index 0000000..994e2bf
+--- /dev/null
++++ b/main/java/net/minecraft/server/PathfinderGoalAvoidTarget.java
+@@ -0,0 +1,91 @@
++package net.minecraft.server;
++
++import com.google.common.base.Predicate;
++import com.google.common.base.Predicates;
++import java.util.List;
++import javax.annotation.Nullable;
++
++public class PathfinderGoalAvoidTarget<T extends Entity> extends PathfinderGoal {
++
++    private final Predicate<Entity> c;
++    protected EntityCreature a;
++    private final double d;
++    private final double e;
++    protected T b;
++    private final float f;
++    private PathEntity g;
++    private final NavigationAbstract h;
++    private final Class<T> i;
++    private final Predicate<? super T> j;
++    private final Predicate<Entity> combinedPredicate;
++
++    public PathfinderGoalAvoidTarget(EntityCreature entitycreature, Class<T> oclass, float f, double d0, double d1) {
++        this(entitycreature, oclass, Predicates.alwaysTrue(), f, d0, d1);
++    }
++
++    public PathfinderGoalAvoidTarget(EntityCreature entitycreature, Class<T> oclass, Predicate<? super T> predicate, float f, double d0, double d1) {
++        this.c = new Predicate() {
++            public boolean a(@Nullable Entity entity) {
++                return entity.isAlive() && PathfinderGoalAvoidTarget.this.a.getEntitySenses().a(entity) && !PathfinderGoalAvoidTarget.this.a.r(entity);
++            }
++
++            public boolean apply(@Nullable Object object) {
++                return this.a((Entity) object);
++            }
++        };
++        this.a = entitycreature;
++        this.i = oclass;
++        this.j = predicate;
++        this.f = f;
++        this.d = d0;
++        this.e = d1;
++        this.h = entitycreature.getNavigation();
++        this.combinedPredicate = Predicates.and(new Predicate[] { IEntitySelector.d, this.c, this.j});
++        this.a(1);
++    }
++
++    public boolean a() {
++        if (com.destroystokyo.paper.config.toml.modules.optimizations.EntityGoal.shouldSkipStartTick(
++                com.destroystokyo.paper.config.toml.modules.optimizations.EntityGoal.avoidTargetStartTickChance, this.a.getRandom())) {
++            return false;
++        }
++        List list = this.a.world.a(this.i, this.a.getBoundingBox().grow((double) this.f, 3.0D, (double) this.f), this.combinedPredicate);
++
++        if (list.isEmpty()) {
++            return false;
++        } else {
++            this.b = (T) list.get(0);
++            Vec3D vec3d = RandomPositionGenerator.b(this.a, 16, 7, new Vec3D(this.b.locX, this.b.locY, this.b.locZ));
++
++            if (vec3d == null) {
++                return false;
++            } else if (this.b.d(vec3d.x, vec3d.y, vec3d.z) < this.b.h(this.a)) {
++                return false;
++            } else {
++                this.g = this.h.a(vec3d.x, vec3d.y, vec3d.z);
++                return this.g != null;
++            }
++        }
++    }
++
++    public boolean b() {
++        return !this.h.o();
++    }
++
++    public void c() {
++        this.h.a(this.g, this.d);
++    }
++
++    public void d() {
++        this.b = null;
++    }
++
++    public void e() {
++        if (this.a.h(this.b) < 49.0D) {
++            this.a.getNavigation().a(this.e);
++        } else {
++            this.a.getNavigation().a(this.d);
++        }
++
++    }
++}
+diff --git a/main/java/net/minecraft/server/PathfinderGoalFollowParent.java b/main/java/net/minecraft/server/PathfinderGoalFollowParent.java
+new file mode 100644
+index 0000000..19dd046
+--- /dev/null
++++ b/main/java/net/minecraft/server/PathfinderGoalFollowParent.java
+@@ -0,0 +1,80 @@
++package net.minecraft.server;
++
++import java.util.Iterator;
++import java.util.List;
++
++public class PathfinderGoalFollowParent extends PathfinderGoal {
++
++    EntityAnimal a;
++    EntityAnimal b;
++    double c;
++    private int d;
++
++    public PathfinderGoalFollowParent(EntityAnimal entityanimal, double d0) {
++        this.a = entityanimal;
++        this.c = d0;
++    }
++
++    public boolean a() {
++        if (this.a.getAge() >= 0) {
++            return false;
++        } else if (com.destroystokyo.paper.config.toml.modules.optimizations.EntityGoal.shouldSkipStartTick(
++                com.destroystokyo.paper.config.toml.modules.optimizations.EntityGoal.followParentStartTickChance, this.a.getRandom())) {
++            return false;
++        } else {
++            List list = this.a.world.a(this.a.getClass(), this.a.getBoundingBox().grow(8.0D, 4.0D, 8.0D));
++            EntityAnimal entityanimal = null;
++            double d0 = Double.MAX_VALUE;
++            Iterator iterator = list.iterator();
++
++            while (iterator.hasNext()) {
++                EntityAnimal entityanimal1 = (EntityAnimal) iterator.next();
++
++                if (entityanimal1.getAge() >= 0) {
++                    double d1 = this.a.h(entityanimal1);
++
++                    if (d1 <= d0) {
++                        d0 = d1;
++                        entityanimal = entityanimal1;
++                    }
++                }
++            }
++
++            if (entityanimal == null) {
++                return false;
++            } else if (d0 < 9.0D) {
++                return false;
++            } else {
++                this.b = entityanimal;
++                return true;
++            }
++        }
++    }
++
++    public boolean b() {
++        if (this.a.getAge() >= 0) {
++            return false;
++        } else if (!this.b.isAlive()) {
++            return false;
++        } else {
++            double d0 = this.a.h(this.b);
++
++            return d0 >= 9.0D && d0 <= 256.0D;
++        }
++    }
++
++    public void c() {
++        this.d = 0;
++    }
++
++    public void d() {
++        this.b = null;
++    }
++
++    public void e() {
++        if (--this.d <= 0) {
++            this.d = 10;
++            this.a.getNavigation().a((Entity) this.b, this.c);
++        }
++    }
++}
+diff --git a/main/java/net/minecraft/server/PathfinderGoalNearestAttackableTarget.java b/main/java/net/minecraft/server/PathfinderGoalNearestAttackableTarget.java
+index ebc7ff7..177168d 100644
+--- a/main/java/net/minecraft/server/PathfinderGoalNearestAttackableTarget.java
++++ b/main/java/net/minecraft/server/PathfinderGoalNearestAttackableTarget.java
+@@ -13,6 +13,7 @@ public class PathfinderGoalNearestAttackableTarget<T extends EntityLiving> exten
+     private final int i;
+     protected final PathfinderGoalNearestAttackableTarget.DistanceComparator b;
+     protected final Predicate<? super T> c;
++    private final Function<EntityHuman, Double> skullMultiplier;
+     protected T d;
+ 
+     public PathfinderGoalNearestAttackableTarget(EntityCreature entitycreature, Class<T> oclass, boolean flag) {
+@@ -38,12 +39,42 @@ public class PathfinderGoalNearestAttackableTarget<T extends EntityLiving> exten
+                 return this.a((T) object); // CraftBukkit - fix decompile error
+             }
+         };
++        this.skullMultiplier = new Function<EntityHuman, Double>() { // CraftBukkit - fix decompile error
++            @Nullable
++            public Double a(@Nullable EntityHuman entityhuman) {
++                ItemStack itemstack = entityhuman.getEquipment(EnumItemSlot.HEAD);
++
++                if (itemstack.getItem() == Items.SKULL) {
++                    int skullType = itemstack.i();
++                    boolean flag = PathfinderGoalNearestAttackableTarget.this.e instanceof EntitySkeleton && skullType == 0;
++                    boolean flag1 = PathfinderGoalNearestAttackableTarget.this.e instanceof EntityZombie && skullType == 2;
++                    boolean flag2 = PathfinderGoalNearestAttackableTarget.this.e instanceof EntityCreeper && skullType == 4;
++
++                    if (flag || flag1 || flag2) {
++                        return Double.valueOf(0.5D);
++                    }
++                }
++
++                return Double.valueOf(1.0D);
++            }
++
++            @Nullable
++            public Double apply(@Nullable EntityHuman object) { // CraftBukkit - fix decompile error
++                return this.a((EntityHuman) object);
++            }
++        };
+     }
+ 
+     public boolean a() {
+-        if (this.i > 0 && this.e.getRandom().nextInt(this.i) != 0) {
++        double configuredChance = com.destroystokyo.paper.config.toml.modules.optimizations.EntityGoal.nearestAttackableTargetStartTickChance;
++        if (configuredChance >= 0.0D) {
++            if (com.destroystokyo.paper.config.toml.modules.optimizations.EntityGoal.shouldSkipStartTick(configuredChance, this.e.getRandom())) {
++                return false;
++            }
++        } else if (this.i > 0 && this.e.getRandom().nextInt(this.i) != 0) {
+             return false;
+-        } else if (this.a != EntityHuman.class && this.a != EntityPlayer.class) {
++        }
++        if (this.a != EntityHuman.class && this.a != EntityPlayer.class) {
+             List list = this.e.world.a(this.a, this.a(this.i()), this.c);
+ 
+             if (list.isEmpty()) {
+@@ -54,30 +85,7 @@ public class PathfinderGoalNearestAttackableTarget<T extends EntityLiving> exten
+                 return true;
+             }
+         } else {
+-            this.d = (T) this.e.world.a(this.e.locX, this.e.locY + (double) this.e.getHeadHeight(), this.e.locZ, this.i(), this.i(), new Function<EntityHuman, Double>() { // CraftBukkit - fix decompile error
+-                @Nullable
+-                public Double a(@Nullable EntityHuman entityhuman) {
+-                    ItemStack itemstack = entityhuman.getEquipment(EnumItemSlot.HEAD);
+-
+-                    if (itemstack.getItem() == Items.SKULL) {
+-                        int i = itemstack.i();
+-                        boolean flag = PathfinderGoalNearestAttackableTarget.this.e instanceof EntitySkeleton && i == 0;
+-                        boolean flag1 = PathfinderGoalNearestAttackableTarget.this.e instanceof EntityZombie && i == 2;
+-                        boolean flag2 = PathfinderGoalNearestAttackableTarget.this.e instanceof EntityCreeper && i == 4;
+-
+-                        if (flag || flag1 || flag2) {
+-                            return Double.valueOf(0.5D);
+-                        }
+-                    }
+-
+-                    return Double.valueOf(1.0D);
+-                }
+-
+-                @Nullable
+-                public Double apply(@Nullable EntityHuman object) { // CraftBukkit - fix decompile error
+-                    return this.a((EntityHuman) object);
+-                }
+-            }, (Predicate<EntityHuman>) this.c); // CraftBukkit - fix decompile error
++            this.d = (T) this.e.world.a(this.e.locX, this.e.locY + (double) this.e.getHeadHeight(), this.e.locZ, this.i(), this.i(), this.skullMultiplier, (Predicate<EntityHuman>) this.c); // CraftBukkit - fix decompile error
+             return this.d != null;
+         }
+     }
+diff --git a/main/java/net/minecraft/server/PathfinderGoalTempt.java b/main/java/net/minecraft/server/PathfinderGoalTempt.java
+index 8004f3a..4015d71 100644
+--- a/main/java/net/minecraft/server/PathfinderGoalTempt.java
++++ b/main/java/net/minecraft/server/PathfinderGoalTempt.java
+@@ -44,6 +44,10 @@ public class PathfinderGoalTempt extends PathfinderGoal {
+             --this.i;
+             return false;
+         } else {
++            if (!this.j && com.destroystokyo.paper.config.toml.modules.optimizations.EntityGoal.shouldSkipStartTick(
++                    com.destroystokyo.paper.config.toml.modules.optimizations.EntityGoal.temptStartTickChance, this.a.getRandom())) {
++                return false;
++            }
+             this.target = this.a.world.findNearbyPlayer(this.a, 10.0D);
+             // CraftBukkit start
+             boolean tempt = this.target == null ? false : this.a(this.target.getItemInMainHand()) || this.a(this.target.getItemInOffHand());
+diff --git a/test/java/net/minecraft/server/GoalChanceAndPacketReduceTest.java b/test/java/net/minecraft/server/GoalChanceAndPacketReduceTest.java
+new file mode 100644
+index 0000000..6343542
+--- /dev/null
++++ b/test/java/net/minecraft/server/GoalChanceAndPacketReduceTest.java
+@@ -0,0 +1,251 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.config.toml.modules.optimizations.EntityGoal;
++import com.destroystokyo.paper.config.toml.modules.optimizations.ReducePackets;
++import com.google.common.base.Predicate;
++import it.unimi.dsi.fastutil.objects.Object2BooleanOpenHashMap;
++import org.junit.After;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Random;
++
++import static org.junit.Assert.*;
++
++public class GoalChanceAndPacketReduceTest {
++
++    private static Unsafe UNSAFE;
++
++    private final double prevNearest = EntityGoal.nearestAttackableTargetStartTickChance;
++    private final double prevAvoid = EntityGoal.avoidTargetStartTickChance;
++    private final double prevTempt = EntityGoal.temptStartTickChance;
++    private final double prevFollow = EntityGoal.followParentStartTickChance;
++    private final double prevEnderman = EntityGoal.endermanLookForPlayerStartTickChance;
++    private final boolean prevReduceMove = ReducePackets.reduceUselessMovePackets;
++    private final boolean prevReduceVel = ReducePackets.reduceUselessVelocityPackets;
++
++    @BeforeClass
++    public static void init() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        UNSAFE = (Unsafe) f.get(null);
++    }
++
++    @After
++    public void restoreConfig() {
++        EntityGoal.nearestAttackableTargetStartTickChance = prevNearest;
++        EntityGoal.avoidTargetStartTickChance = prevAvoid;
++        EntityGoal.temptStartTickChance = prevTempt;
++        EntityGoal.followParentStartTickChance = prevFollow;
++        EntityGoal.endermanLookForPlayerStartTickChance = prevEnderman;
++        ReducePackets.reduceUselessMovePackets = prevReduceMove;
++        ReducePackets.reduceUselessVelocityPackets = prevReduceVel;
++    }
++
++    private static final class MockWorld extends World {
++        int queryCount = 0;
++        EntityHuman nearbyPlayer = null;
++
++        MockWorld() throws Exception {
++            super(null, null, null, null, false, null, null);
++        }
++
++        @Override
++        protected IChunkProvider n() {
++            return null;
++        }
++
++        @Override
++        protected boolean isChunkLoaded(int i, int j, boolean flag) {
++            return false;
++        }
++
++        @Override
++        public <T extends Entity> List<T> a(Class<? extends T> oclass, AxisAlignedBB axisalignedbb, Predicate<? super T> predicate) {
++            queryCount++;
++            return Collections.emptyList();
++        }
++
++        @Override
++        public EntityHuman findNearbyPlayer(Entity entity, double d0) {
++            queryCount++;
++            return nearbyPlayer;
++        }
++    }
++
++    private static MockWorld newMockWorld() throws Exception {
++        MockWorld world = (MockWorld) UNSAFE.allocateInstance(MockWorld.class);
++        Field randField = World.class.getDeclaredField("random");
++        randField.setAccessible(true);
++        randField.set(world, new Random(77L));
++        return world;
++    }
++
++    @Test
++    public void testGoalStartTickChanceProbabilityAndGuards() throws Exception {
++        Random rng = new Random(12345L);
++        assertFalse(EntityGoal.shouldSkipStartTick(-1.0D, rng));
++        assertFalse(EntityGoal.shouldSkipStartTick(1.0D, rng));
++        assertTrue(EntityGoal.shouldSkipStartTick(0.0D, rng));
++
++        int skipped = 0;
++        for (int i = 0; i < 10_000; i++) {
++            if (EntityGoal.shouldSkipStartTick(0.25D, rng)) {
++                skipped++;
++            }
++        }
++        assertTrue("Expected ~7500 skipped for chance 0.25, got " + skipped, skipped > 7200 && skipped < 7800);
++
++        MockWorld world = newMockWorld();
++        EntityCow cow = (EntityCow) UNSAFE.allocateInstance(EntityCow.class);
++        Field worldField = Entity.class.getDeclaredField("world");
++        worldField.setAccessible(true);
++        worldField.set(cow, world);
++        Field randField = EntityLiving.class.getSuperclass().getDeclaredField("random");
++        randField.setAccessible(true);
++        randField.set(cow, new Random(11L));
++        Field bbField = Entity.class.getDeclaredField("boundingBox");
++        bbField.setAccessible(true);
++        bbField.set(cow, new AxisAlignedBB(0, 0, 0, 1, 1, 1));
++        Field ageField = EntityAgeable.class.getDeclaredField("a");
++        ageField.setAccessible(true);
++        ageField.setInt(cow, -1000);
++
++        PathfinderGoalFollowParent follow = new PathfinderGoalFollowParent(cow, 1.0D);
++        EntityGoal.followParentStartTickChance = 0.0D;
++        assertFalse(follow.a());
++        assertEquals(0, world.queryCount);
++
++        EntityGoal.followParentStartTickChance = -1.0D;
++        assertFalse(follow.a());
++        assertEquals(1, world.queryCount);
++
++        // PathfinderGoalAvoidTarget
++        PathfinderGoalAvoidTarget<EntityHuman> avoid = new PathfinderGoalAvoidTarget<>(cow, EntityHuman.class, 8.0F, 1.0D, 1.2D);
++        EntityGoal.avoidTargetStartTickChance = 0.0D;
++        assertFalse(avoid.a());
++        assertEquals(1, world.queryCount);
++        EntityGoal.avoidTargetStartTickChance = -1.0D;
++        assertFalse(avoid.a());
++        assertEquals(2, world.queryCount);
++
++        // PathfinderGoalTempt: active tempt (j == true) is NOT aborted by temptStartTickChance = 0.0
++        PathfinderGoalTempt tempt = (PathfinderGoalTempt) UNSAFE.allocateInstance(PathfinderGoalTempt.class);
++        Field taField = PathfinderGoalTempt.class.getDeclaredField("a");
++        taField.setAccessible(true);
++        taField.set(tempt, cow);
++        Field tjField = PathfinderGoalTempt.class.getDeclaredField("j");
++        tjField.setAccessible(true);
++        tjField.setBoolean(tempt, false);
++        EntityGoal.temptStartTickChance = 0.0D;
++        assertFalse(tempt.a());
++        assertEquals(2, world.queryCount);
++
++        tjField.setBoolean(tempt, true);
++        assertFalse(tempt.a());
++        assertEquals(3, world.queryCount);
++    }
++
++    private static final class RecordingPlayerConnection extends PlayerConnection {
++        List<Packet<?>> sent;
++
++        RecordingPlayerConnection() {
++            super(null, null, null);
++        }
++
++        @Override
++        public void sendPacket(Packet<?> packet) {
++            sent.add(packet);
++        }
++    }
++
++    @Test
++    public void testReducePacketsStationaryAndVelocity() throws Exception {
++        EntityPig entity = (EntityPig) UNSAFE.allocateInstance(EntityPig.class);
++        DataWatcher dw = new DataWatcher(entity);
++        Field zField = Entity.class.getDeclaredField("Z");
++        zField.setAccessible(true);
++        dw.register((DataWatcherObject<Byte>) zField.get(null), (byte) 0);
++        Field dwField = Entity.class.getDeclaredField("datawatcher");
++        dwField.setAccessible(true);
++        dwField.set(entity, dw);
++        Field passField = Entity.class.getDeclaredField("passengers");
++        passField.setAccessible(true);
++        passField.set(entity, Collections.emptyList());
++        entity.locX = 10.0D;
++        entity.locY = 64.0D;
++        entity.locZ = 10.0D;
++        entity.onGround = true;
++
++        EntityTrackerEntry entry = new EntityTrackerEntry(entity, 64, 64, 1, true);
++        final List<Packet<?>> sent = new ArrayList<>();
++
++        EntityPlayer mockViewer = (EntityPlayer) UNSAFE.allocateInstance(EntityPlayer.class);
++        RecordingPlayerConnection conn = (RecordingPlayerConnection) UNSAFE.allocateInstance(RecordingPlayerConnection.class);
++        conn.sent = sent;
++        mockViewer.playerConnection = conn;
++
++        entry.trackedPlayerMap.put(mockViewer, Boolean.FALSE);
++        entry.trackedPlayers = new HashSet<>(Collections.singletonList(mockViewer));
++
++        // 1. Stationary entity at a == 60: vanilla emits PacketPlayOutRelEntityMove; reduceUselessMovePackets=true suppresses it
++        entry.a = 60;
++        Field yRotField = EntityTrackerEntry.class.getDeclaredField("yRot");
++        yRotField.setAccessible(true);
++        yRotField.setInt(entry, MathHelper.d(entity.yaw * 256.0F / 360.0F));
++        Field xRotField = EntityTrackerEntry.class.getDeclaredField("xRot");
++        xRotField.setAccessible(true);
++        xRotField.setInt(entry, MathHelper.d(entity.pitch * 256.0F / 360.0F));
++        Field yField = EntityTrackerEntry.class.getDeclaredField("y");
++        yField.setAccessible(true);
++        yField.setBoolean(entry, true);
++
++        ReducePackets.reduceUselessMovePackets = false;
++        sent.clear();
++        entry.track(Collections.emptyList());
++        assertEquals(1, sent.size());
++        assertTrue(sent.get(0) instanceof PacketPlayOutEntity.PacketPlayOutRelEntityMove);
++
++        entry.a = 60;
++        ReducePackets.reduceUselessMovePackets = true;
++        sent.clear();
++        entry.track(Collections.emptyList());
++        assertEquals(0, sent.size());
++
++        // Real movement (>= 128 delta) still emits move packet
++        entry.a = 61;
++        entity.locX = 11.0D;
++        sent.clear();
++        entry.track(Collections.emptyList());
++        assertEquals(1, sent.size());
++        assertTrue(sent.get(0) instanceof PacketPlayOutEntity.PacketPlayOutRelEntityMove);
++
++        // 2. Tiny stop velocity (mot == 0, prev n == 0.001 -> d4 == 1e-6 < 1e-4)
++        Field nField = EntityTrackerEntry.class.getDeclaredField("n");
++        nField.setAccessible(true);
++        nField.setDouble(entry, 0.001D);
++        entity.motX = 0.0D;
++        entity.motY = 0.0D;
++        entity.motZ = 0.0D;
++        entry.a = 62;
++        ReducePackets.reduceUselessVelocityPackets = false;
++        sent.clear();
++        entry.track(Collections.emptyList());
++        assertEquals(1, sent.size());
++        assertTrue(sent.get(0) instanceof PacketPlayOutEntityVelocity);
++
++        nField.setDouble(entry, 0.001D);
++        entry.a = 63;
++        ReducePackets.reduceUselessVelocityPackets = true;
++        sent.clear();
++        entry.track(Collections.emptyList());
++        assertEquals(0, sent.size());
++    }
++}
