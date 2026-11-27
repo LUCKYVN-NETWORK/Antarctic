@@ -1,0 +1,328 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StellarSeal <emnoigi1452@gmail.com>
+Date: Fri, 27 Nov 2026 12:20:14 +0700
+Subject: [PATCH 218/218] feat: add safe no-metadata dont-save-entity filter
+
+
+diff --git a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+index 005f828..4a0e655 100644
+--- a/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
++++ b/main/java/com/destroystokyo/paper/config/toml/AntarcticTomlConfig.java
+@@ -18,6 +18,7 @@ import com.destroystokyo.paper.config.toml.modules.network.Deflate;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.ArmourStands;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.ChunkLoading;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.Dab;
++import com.destroystokyo.paper.config.toml.modules.optimizations.DontSaveEntity;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.EntityPhysicsGuard;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.FarmAiCulling;
+ import com.destroystokyo.paper.config.toml.modules.optimizations.MobSpawning;
+@@ -60,7 +61,7 @@ public final class AntarcticTomlConfig {
+             new Rebrand(), new Privacy(),
+             new Deflate(),
+             new VirtualThreads(), new AsyncPlayerDataSaving(),
+-            new Pathfinder(), new Suffocation(), new Projectiles(), new ArmourStands(), new WorldBorder(), new ChunkLoading(), new MobSpawning(), new Dab(), new FarmAiCulling(), new EntityPhysicsGuard(), new SunBurn(), new Rails(), new Redstone(), new Physics(), new Lighting(),
++            new Pathfinder(), new Suffocation(), new Projectiles(), new ArmourStands(), new WorldBorder(), new ChunkLoading(), new MobSpawning(), new Dab(), new FarmAiCulling(), new EntityPhysicsGuard(), new DontSaveEntity(), new SunBurn(), new Rails(), new Redstone(), new Physics(), new Lighting(),
+             new MergeChecks(), new ChunkOverloadDupe(), new Collisions(), new Player(),
+             new MapDecorations(), new Books(), new VanillaBugFix());
+     private static final YamlConfiguration yamlFacade = new YamlConfiguration();
+diff --git a/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/DontSaveEntity.java b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/DontSaveEntity.java
+new file mode 100644
+index 0000000..31c866f
+--- /dev/null
++++ b/main/java/com/destroystokyo/paper/config/toml/modules/optimizations/DontSaveEntity.java
+@@ -0,0 +1,34 @@
++package com.destroystokyo.paper.config.toml.modules.optimizations;
++
++import com.destroystokyo.paper.config.toml.EnumConfigCategory;
++import com.destroystokyo.paper.config.toml.IConfigModule;
++import com.destroystokyo.paper.config.toml.annotations.ConfigInfo;
++
++public class DontSaveEntity implements IConfigModule {
++
++    @ConfigInfo(baseName = "dont-save-primed-tnt", comments = "Skip saving unmodified primed TNT (no source, default yield/non-incendiary, no metadata/tags) on chunk unload. Default false.")
++    public static boolean dontSavePrimedTnt = false;
++
++    @ConfigInfo(baseName = "dont-save-falling-block", comments = "Skip saving unmarked falling blocks (excluding anvils, dragon eggs, and tile-entity blocks like chests/shulkers). Default false.")
++    public static boolean dontSaveFallingBlock = false;
++
++    @ConfigInfo(baseName = "dont-save-non-pickup-arrows", comments = "Skip saving non-pickup, non-tipped, unmarked arrows on chunk unload. Default false.")
++    public static boolean dontSaveNonPickupArrows = false;
++
++    @ConfigInfo(baseName = "dont-save-throwables", comments = "Skip saving unmarked disposable throwables (snowballs, eggs, small fireballs, llama spit; never ender pearls or potions). Default false.")
++    public static boolean dontSaveThrowables = false;
++
++    public static boolean anyEnabled() {
++        return dontSavePrimedTnt || dontSaveFallingBlock || dontSaveNonPickupArrows || dontSaveThrowables;
++    }
++
++    @Override
++    public EnumConfigCategory getCategory() {
++        return EnumConfigCategory.OPTIMIZATIONS;
++    }
++
++    @Override
++    public String getBaseName() {
++        return "dont-save-entity";
++    }
++}
+diff --git a/main/java/net/minecraft/server/ChunkRegionLoader.java b/main/java/net/minecraft/server/ChunkRegionLoader.java
+index bde566c..8adb3b3 100644
+--- a/main/java/net/minecraft/server/ChunkRegionLoader.java
++++ b/main/java/net/minecraft/server/ChunkRegionLoader.java
+@@ -395,6 +395,51 @@ public class ChunkRegionLoader implements IChunkLoader, IAsyncChunkSaver {
+         // Spigot start - End this method here and split off entity saving to another method
+     }
+ 
++    static boolean shouldSkipSavingEntity(Entity entity) {
++        if (!com.destroystokyo.paper.config.toml.modules.optimizations.DontSaveEntity.anyEnabled()) {
++            return false;
++        }
++        // Universal metadata and tracking protection: never discard marked, tagged, mounted, glowing, or invulnerable entities
++        if (entity.hasCustomName()
++                || (entity.getScoreboardTags() != null && !entity.getScoreboardTags().isEmpty())
++                || entity.isVehicle()
++                || entity.isPassenger()
++                || entity.antarcticHasBukkitMetadata
++                || entity.aW()
++                || entity.isInvulnerable(DamageSource.GENERIC)) {
++            return false;
++        }
++        if (com.destroystokyo.paper.config.toml.modules.optimizations.DontSaveEntity.dontSavePrimedTnt
++                && entity instanceof EntityTNTPrimed) {
++            EntityTNTPrimed tnt = (EntityTNTPrimed) entity;
++            return tnt.getSource() == null && tnt.yield == 4.0F && !tnt.isIncendiary;
++        }
++        if (com.destroystokyo.paper.config.toml.modules.optimizations.DontSaveEntity.dontSaveFallingBlock
++                && entity instanceof EntityFallingBlock) {
++            EntityFallingBlock fb = (EntityFallingBlock) entity;
++            if (fb.tileEntityData != null || fb.getBlock() == null) {
++                return false;
++            }
++            Block block = fb.getBlock().getBlock();
++            return block != Blocks.ANVIL && block != Blocks.DRAGON_EGG;
++        }
++        if (com.destroystokyo.paper.config.toml.modules.optimizations.DontSaveEntity.dontSaveNonPickupArrows
++                && entity instanceof EntityArrow) {
++            EntityArrow arrow = (EntityArrow) entity;
++            if (arrow.fromPlayer == EntityArrow.PickupStatus.ALLOWED) {
++                return false;
++            }
++            return !(arrow instanceof EntityTippedArrow && ((EntityTippedArrow) arrow).isTipped());
++        }
++        if (com.destroystokyo.paper.config.toml.modules.optimizations.DontSaveEntity.dontSaveThrowables) {
++            return entity instanceof EntitySnowball
++                    || entity instanceof EntityEgg
++                    || entity instanceof EntitySmallFireball
++                    || entity instanceof EntityLlamaSpit;
++        }
++        return false;
++    }
++
+     private static void saveEntities(NBTTagCompound nbttagcompound, Chunk chunk, World world) {
+         int i;
+         NBTTagCompound nbttagcompound1;
+@@ -417,7 +462,7 @@ public class ChunkRegionLoader implements IChunkLoader, IAsyncChunkSaver {
+                     toUpdate.add(entity);
+                     continue;
+                 }
+-                if (entity.dead) {
++                if (entity.dead || shouldSkipSavingEntity(entity)) {
+                     continue;
+                 }
+                 // Paper end
+diff --git a/test/java/net/minecraft/server/DontSaveEntityTest.java b/test/java/net/minecraft/server/DontSaveEntityTest.java
+new file mode 100644
+index 0000000..83fdde8
+--- /dev/null
++++ b/test/java/net/minecraft/server/DontSaveEntityTest.java
+@@ -0,0 +1,190 @@
++package net.minecraft.server;
++
++import com.destroystokyo.paper.config.toml.modules.optimizations.DontSaveEntity;
++import org.junit.After;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import sun.misc.Unsafe;
++
++import java.lang.reflect.Field;
++
++import static org.junit.Assert.*;
++
++public class DontSaveEntityTest {
++
++    private static Unsafe UNSAFE;
++    private static boolean defTnt;
++    private static boolean defFalling;
++    private static boolean defArrows;
++    private static boolean defThrowables;
++
++    @BeforeClass
++    public static void setupTest() throws Exception {
++        DispenserRegistry.c();
++        Field f = Unsafe.class.getDeclaredField("theUnsafe");
++        f.setAccessible(true);
++        UNSAFE = (Unsafe) f.get(null);
++        defTnt = DontSaveEntity.dontSavePrimedTnt;
++        defFalling = DontSaveEntity.dontSaveFallingBlock;
++        defArrows = DontSaveEntity.dontSaveNonPickupArrows;
++        defThrowables = DontSaveEntity.dontSaveThrowables;
++    }
++
++    @After
++    public void restoreConfig() {
++        DontSaveEntity.dontSavePrimedTnt = defTnt;
++        DontSaveEntity.dontSaveFallingBlock = defFalling;
++        DontSaveEntity.dontSaveNonPickupArrows = defArrows;
++        DontSaveEntity.dontSaveThrowables = defThrowables;
++    }
++
++    private static final class DummyWorld extends WorldServer {
++        DummyWorld() {
++            super(null, null, null, 0, null, null, null);
++        }
++
++        @Override
++        public boolean isMainThread() {
++            return true;
++        }
++    }
++
++    private static DummyWorld createWorld() throws Exception {
++        DummyWorld world = (DummyWorld) UNSAFE.allocateInstance(DummyWorld.class);
++        Field csField = World.class.getDeclaredField("isClientSide");
++        csField.setAccessible(true);
++        csField.setBoolean(world, true);
++        world.worldData = new WorldData();
++        world.worldProvider = new WorldProviderNormal();
++        Field mpField = World.class.getDeclaredField("methodProfiler");
++        mpField.setAccessible(true);
++        mpField.set(world, new MethodProfiler());
++        Field randomField = World.class.getDeclaredField("random");
++        randomField.setAccessible(true);
++        randomField.set(world, new java.util.Random(1L));
++        Field spigotField = World.class.getDeclaredField("spigotConfig");
++        spigotField.setAccessible(true);
++        spigotField.set(world, UNSAFE.allocateInstance(org.spigotmc.SpigotWorldConfig.class));
++        Field paperField = World.class.getDeclaredField("paperConfig");
++        paperField.setAccessible(true);
++        paperField.set(world, UNSAFE.allocateInstance(com.destroystokyo.paper.PaperWorldConfig.class));
++        return world;
++    }
++
++    @Test
++    public void testDefaultsPreserveAllEntities() throws Exception {
++        DummyWorld world = createWorld();
++        DontSaveEntity.dontSavePrimedTnt = false;
++        DontSaveEntity.dontSaveFallingBlock = false;
++        DontSaveEntity.dontSaveNonPickupArrows = false;
++        DontSaveEntity.dontSaveThrowables = false;
++
++        assertFalse(ChunkRegionLoader.shouldSkipSavingEntity(new EntityTNTPrimed(world)));
++        assertFalse(ChunkRegionLoader.shouldSkipSavingEntity(new EntityFallingBlock(world, 0, 64, 0, Blocks.SAND.getBlockData())));
++        assertFalse(ChunkRegionLoader.shouldSkipSavingEntity(new EntityTippedArrow(world)));
++        assertFalse(ChunkRegionLoader.shouldSkipSavingEntity(new EntitySnowball(world)));
++    }
++
++    @Test
++    public void testSafeTransientEntitiesSkippedWhileMetadataAndValuablesSaved() throws Exception {
++        DummyWorld world = createWorld();
++        DontSaveEntity.dontSavePrimedTnt = true;
++        DontSaveEntity.dontSaveFallingBlock = true;
++        DontSaveEntity.dontSaveNonPickupArrows = true;
++        DontSaveEntity.dontSaveThrowables = true;
++
++        // 1. Unmarked transient entities ARE skipped
++        EntityTNTPrimed plainTnt = new EntityTNTPrimed(world);
++        assertTrue(ChunkRegionLoader.shouldSkipSavingEntity(plainTnt));
++
++        EntityFallingBlock plainSand = new EntityFallingBlock(world, 0, 64, 0, Blocks.SAND.getBlockData());
++        assertTrue(ChunkRegionLoader.shouldSkipSavingEntity(plainSand));
++
++        EntityTippedArrow skeletonArrow = new EntityTippedArrow(world);
++        skeletonArrow.fromPlayer = EntityArrow.PickupStatus.DISALLOWED;
++        assertTrue(ChunkRegionLoader.shouldSkipSavingEntity(skeletonArrow));
++
++        assertTrue(ChunkRegionLoader.shouldSkipSavingEntity(new EntitySnowball(world)));
++        assertTrue(ChunkRegionLoader.shouldSkipSavingEntity(new EntityEgg(world)));
++        assertTrue(ChunkRegionLoader.shouldSkipSavingEntity(new EntitySmallFireball(world)));
++        assertTrue(ChunkRegionLoader.shouldSkipSavingEntity(new EntityLlamaSpit(world)));
++
++        // 2. Universal metadata / tracking rejections (MUST BE SAVED)
++        EntitySnowball named = new EntitySnowball(world);
++        named.setCustomName("BossOrb");
++        assertFalse("Named entity must be saved", ChunkRegionLoader.shouldSkipSavingEntity(named));
++
++        EntitySnowball tagged = new EntitySnowball(world);
++        tagged.getScoreboardTags().add("custom_tag");
++        assertFalse("Scoreboard-tagged entity must be saved", ChunkRegionLoader.shouldSkipSavingEntity(tagged));
++
++        EntitySnowball metadata = new EntitySnowball(world);
++        metadata.antarcticHasBukkitMetadata = true;
++        assertFalse("Bukkit-metadata entity must be saved", ChunkRegionLoader.shouldSkipSavingEntity(metadata));
++
++        EntitySnowball glowing = new EntitySnowball(world);
++        glowing.g(true);
++        assertFalse("Glowing entity must be saved", ChunkRegionLoader.shouldSkipSavingEntity(glowing));
++
++        EntitySnowball invuln = new EntitySnowball(world);
++        invuln.setInvulnerable(true);
++        assertFalse("Invulnerable entity must be saved", ChunkRegionLoader.shouldSkipSavingEntity(invuln));
++
++        EntitySnowball rider = new EntitySnowball(world);
++        rider.passengers.add(new EntityEgg(world));
++        assertFalse("Vehicle entity must be saved", ChunkRegionLoader.shouldSkipSavingEntity(rider));
++
++        // 3. Per-type safety guards (MUST BE SAVED)
++        EntityTNTPrimed sourcedTnt = new EntityTNTPrimed(world, 0, 64, 0, new EntityZombie(world));
++        assertFalse("Attributed TNT must be saved", ChunkRegionLoader.shouldSkipSavingEntity(sourcedTnt));
++
++        EntityTNTPrimed customYieldTnt = new EntityTNTPrimed(world);
++        customYieldTnt.yield = 8.0F;
++        assertFalse("Custom-yield TNT must be saved", ChunkRegionLoader.shouldSkipSavingEntity(customYieldTnt));
++
++        EntityFallingBlock fallingChest = new EntityFallingBlock(world, 0, 64, 0, Blocks.CHEST.getBlockData());
++        fallingChest.tileEntityData = new NBTTagCompound();
++        assertFalse("Falling block with TileEntityData must be saved", ChunkRegionLoader.shouldSkipSavingEntity(fallingChest));
++
++        EntityFallingBlock fallingAnvil = new EntityFallingBlock(world, 0, 64, 0, Blocks.ANVIL.getBlockData());
++        assertFalse("Falling anvil must be saved", ChunkRegionLoader.shouldSkipSavingEntity(fallingAnvil));
++
++        EntityFallingBlock dragonEgg = new EntityFallingBlock(world, 0, 64, 0, Blocks.DRAGON_EGG.getBlockData());
++        assertFalse("Falling dragon egg must be saved", ChunkRegionLoader.shouldSkipSavingEntity(dragonEgg));
++
++        EntityTippedArrow pickupArrow = new EntityTippedArrow(world);
++        pickupArrow.fromPlayer = EntityArrow.PickupStatus.ALLOWED;
++        assertFalse("Pickupable player arrow must be saved", ChunkRegionLoader.shouldSkipSavingEntity(pickupArrow));
++
++        EntityTippedArrow tippedArrow = new EntityTippedArrow(world);
++        tippedArrow.fromPlayer = EntityArrow.PickupStatus.DISALLOWED;
++        tippedArrow.a(new MobEffect(MobEffects.POISON, 100, 0));
++        assertFalse("Tipped potion arrow must be saved", ChunkRegionLoader.shouldSkipSavingEntity(tippedArrow));
++
++        // 4. Valuable throwables & items never skipped
++        assertFalse("Ender pearl must always be saved", ChunkRegionLoader.shouldSkipSavingEntity(new EntityEnderPearl(world)));
++        assertFalse("Thrown potion must always be saved", ChunkRegionLoader.shouldSkipSavingEntity(new EntityPotion(world)));
++        assertFalse("Item entity must always be saved", ChunkRegionLoader.shouldSkipSavingEntity(new EntityItem(world)));
++        assertFalse("XP orb must always be saved", ChunkRegionLoader.shouldSkipSavingEntity(new EntityExperienceOrb(world)));
++    }
++
++    @Test
++    public void testDontSaveEntityFilterEfficiency() throws Exception {
++        DummyWorld world = createWorld();
++        DontSaveEntity.dontSaveThrowables = true;
++        EntitySnowball ball = new EntitySnowball(world);
++        for (int i = 0; i < 5_000; i++) {
++            ChunkRegionLoader.shouldSkipSavingEntity(ball);
++        }
++        int skipped = 0;
++        long start = System.nanoTime();
++        for (int i = 0; i < 50_000; i++) {
++            if (ChunkRegionLoader.shouldSkipSavingEntity(ball)) {
++                skipped++;
++            }
++        }
++        long elapsedMs = (System.nanoTime() - start) / 1_000_000L;
++        assertEquals(50_000, skipped);
++        assertTrue("50k dont-save-entity checks took too long: " + elapsedMs + " ms", elapsedMs < 30L);
++    }
++}
